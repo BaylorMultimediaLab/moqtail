@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { useState, useRef, useCallback } from 'preact/hooks';
+import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
@@ -23,6 +23,8 @@ import MSEBuffer from '@/lib/buffer';
 
 type Track = CMSF['tracks'][number];
 type Status = 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
+
+type BlurMode = 'none' | 'global' | 'localized';
 
 const GITHUB_REPO = 'moqtail/moqtail';
 
@@ -213,11 +215,57 @@ export function App() {
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const [isBlurred, setIsBlurred] = useState(false);
+  const [blurMode, setBlurMode] = useState<BlurMode>('none');
 
   const playerRef = useRef<Player | null>(null);
   const bufferRef = useRef<MSEBuffer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Example detection rects, for real localized blurring (these come from your MoQ metadata)
+  const [localRects] = useState([{ x: 100, y: 100, w: 300, h: 200 }]);
+
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const requestRef = useRef<number>();
+
+  //localized blur code
+  const renderFrame = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || blurMode !== 'localized') return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Sync canvas resolution to the actual video stream dimensions
+    if (canvas.width !== video.videoWidth) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    localRects.forEach(rect => {
+      ctx.save();
+      // Clip the drawing area to the detection box
+      ctx.beginPath();
+      ctx.rect(rect.x, rect.y, rect.w, rect.h);
+      ctx.clip();
+      
+      // Draw the blurred video slice
+      ctx.filter = 'blur(25px)';
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    });
+
+    requestRef.current = requestAnimationFrame(renderFrame);
+  }, [blurMode, localRects]);
+
+  useEffect(() => {
+    if (blurMode === 'localized') {
+      requestRef.current = requestAnimationFrame(renderFrame);
+    }
+    return () => cancelAnimationFrame(requestRef.current!);
+  }, [blurMode, renderFrame]);
 
   const disposePlayer = useCallback(async () => {
     if (playerRef.current) {
@@ -419,15 +467,32 @@ export function App() {
           </div>
 
           <div className="border-b border-white/6 p-4">
-            <Field label="Video Filters">
-              <label className="flex cursor-pointer items-center gap-3 rounded-lg bg-neutral-900/50 px-3 py-2 transition-colors hover:bg-neutral-800">
-                <Checkbox 
-                  checked={isBlurred} 
-                  disabled={!hasTracks} 
-                  onChange={setIsBlurred} 
-                />
-                <span className="text-xs font-medium text-neutral-300">Blur Content</span>
-              </label>
+            <Field label="Blur Effects">
+            <div className="mt-2 flex flex-col gap-2">
+              <button
+                onClick={() => setBlurMode(blurMode === 'global' ? 'none' : 'global')}
+                disabled={!hasTracks}
+                className={cn(
+                  "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
+                  blurMode === 'global' ? "bg-blue-600/20 ring-1 ring-blue-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
+                )}
+              >
+                <div className={cn("h-2 w-2 rounded-full", blurMode === 'global' ? "bg-blue-400" : "bg-neutral-600")} />
+                <span className={blurMode === 'global' ? "text-blue-100" : "text-neutral-400"}>Full Video Blur</span>
+              </button>
+
+              <button
+                onClick={() => setBlurMode(blurMode === 'localized' ? 'none' : 'localized')}
+                disabled={!hasTracks}
+                className={cn(
+                  "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
+                  blurMode === 'localized' ? "bg-violet-600/20 ring-1 ring-violet-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
+                )}
+              >
+                <div className={cn("h-2 w-2 rounded-full", blurMode === 'localized' ? "bg-violet-400" : "bg-neutral-600")} />
+                <span className={blurMode === 'localized' ? "text-violet-100" : "text-neutral-400"}>Area Redaction</span>
+              </button>
+            </div>
             </Field>
           </div>
 
