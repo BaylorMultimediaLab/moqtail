@@ -213,6 +213,8 @@ export function App() {
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [isBlurred, setIsBlurred] = useState(false);
+
   const playerRef = useRef<Player | null>(null);
   const bufferRef = useRef<MSEBuffer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -416,6 +418,19 @@ export function App() {
             )}
           </div>
 
+          <div className="border-b border-white/6 p-4">
+            <Field label="Video Filters">
+              <label className="flex cursor-pointer items-center gap-3 rounded-lg bg-neutral-900/50 px-3 py-2 transition-colors hover:bg-neutral-800">
+                <Checkbox 
+                  checked={isBlurred} 
+                  disabled={!hasTracks} 
+                  onChange={setIsBlurred} 
+                />
+                <span className="text-xs font-medium text-neutral-300">Blur Content</span>
+              </label>
+            </Field>
+          </div>
+
           {/* Tracks */}
           {hasTracks && (
             <div className="space-y-4 p-3">
@@ -443,15 +458,32 @@ export function App() {
 
         {/* Main — video */}
         <main className="relative flex flex-1 flex-col items-center justify-center overflow-hidden bg-neutral-950 p-4 md:p-6">
-          <video
-            ref={videoRef}
-            controls
+          <div 
             className={cn(
-              'w-full overflow-hidden rounded-xl bg-black shadow-2xl shadow-black/60 transition-opacity duration-300',
-              hasTracks ? 'opacity-100' : 'pointer-events-none opacity-0',
+              "relative w-full overflow-hidden rounded-xl bg-black shadow-2xl shadow-black/60 transition-opacity duration-300",
+              hasTracks ? 'opacity-100' : 'pointer-events-none opacity-0'
             )}
             style={{ aspectRatio: '16/9' }}
-          />
+          >
+            <video
+              ref={videoRef}
+              controls
+              className={cn(
+                'h-full w-full object-cover transition-all duration-300',
+                // We scale slightly during blur to ensure the 'clear' edges of the filter are clipped
+                isBlurred ? 'blur-2xl scale-110' : 'blur-0 scale-100'
+              )}
+            />
+            
+            {/* Optional: Add an overlay icon when blurred to signal "Filtered Content" */}
+            {isBlurred && hasTracks && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/20 pointer-events-none">
+                <svg className="h-12 w-12 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+                </svg>
+              </div>
+            )}
+          </div>
           {!hasTracks && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 px-6 text-center select-none">
               {/* Icon */}
