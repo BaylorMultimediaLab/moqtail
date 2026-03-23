@@ -468,31 +468,31 @@ export function App() {
 
           <div className="border-b border-white/6 p-4">
             <Field label="Blur Effects">
-            <div className="mt-2 flex flex-col gap-2">
-              <button
-                onClick={() => setBlurMode(blurMode === 'global' ? 'none' : 'global')}
-                disabled={!hasTracks}
-                className={cn(
-                  "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
-                  blurMode === 'global' ? "bg-blue-600/20 ring-1 ring-blue-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
-                )}
-              >
-                <div className={cn("h-2 w-2 rounded-full", blurMode === 'global' ? "bg-blue-400" : "bg-neutral-600")} />
-                <span className={blurMode === 'global' ? "text-blue-100" : "text-neutral-400"}>Full Video Blur</span>
-              </button>
+              <div className="mt-2 flex flex-col gap-2">
+                <button
+                  onClick={() => setBlurMode(blurMode === 'global' ? 'none' : 'global')}
+                  disabled={!hasTracks}
+                  className={cn(
+                    "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
+                    blurMode === 'global' ? "bg-blue-600/20 ring-1 ring-blue-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
+                  )}
+                >
+                  <div className={cn("h-2 w-2 rounded-full", blurMode === 'global' ? "bg-blue-400" : "bg-neutral-600")} />
+                  <span className={blurMode === 'global' ? "text-blue-100" : "text-neutral-400"}>Full Video Blur</span>
+                </button>
 
-              <button
-                onClick={() => setBlurMode(blurMode === 'localized' ? 'none' : 'localized')}
-                disabled={!hasTracks}
-                className={cn(
-                  "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
-                  blurMode === 'localized' ? "bg-violet-600/20 ring-1 ring-violet-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
-                )}
-              >
-                <div className={cn("h-2 w-2 rounded-full", blurMode === 'localized' ? "bg-violet-400" : "bg-neutral-600")} />
-                <span className={blurMode === 'localized' ? "text-violet-100" : "text-neutral-400"}>Area Redaction</span>
-              </button>
-            </div>
+                <button
+                  onClick={() => setBlurMode(blurMode === 'localized' ? 'none' : 'localized')}
+                  disabled={!hasTracks}
+                  className={cn(
+                    "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
+                    blurMode === 'localized' ? "bg-violet-600/20 ring-1 ring-violet-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
+                  )}
+                >
+                  <div className={cn("h-2 w-2 rounded-full", blurMode === 'localized' ? "bg-violet-400" : "bg-neutral-600")} />
+                  <span className={blurMode === 'localized' ? "text-violet-100" : "text-neutral-400"}>Area Redaction</span>
+                </button>
+              </div>
             </Field>
           </div>
 
@@ -535,20 +535,30 @@ export function App() {
               controls
               className={cn(
                 'h-full w-full object-cover transition-all duration-300',
-                // We scale slightly during blur to ensure the 'clear' edges of the filter are clipped
-                isBlurred ? 'blur-2xl scale-110' : 'blur-0 scale-100'
+                blurMode === 'global' ? 'blur-3xl scale-110' : 'blur-0 scale-100'
               )}
             />
             
-            {/* Optional: Add an overlay icon when blurred to signal "Filtered Content" */}
-            {isBlurred && hasTracks && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/20 pointer-events-none">
-                <svg className="h-12 w-12 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                </svg>
+            {/* Localized Blur Overlay */}
+            <canvas
+              ref={canvasRef}
+              className={cn(
+                "absolute inset-0 h-full w-full pointer-events-none transition-opacity duration-300",
+                blurMode === 'localized' ? "opacity-100" : "opacity-0"
+              )}
+            />
+
+            {/* full blur overlay */}
+            {blurMode !== 'none' && hasTracks && (
+              <div className="absolute top-4 right-4 flex items-center gap-2 rounded-full bg-black/40 px-3 py-1.5 border border-white/10 backdrop-blur-md">
+                <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-400" />
+                <span className="text-[10px] font-bold uppercase tracking-tighter text-white/80">
+                  {blurMode === 'global' ? 'Full Blur Active' : 'Object Redaction Active'}
+                </span>
               </div>
             )}
           </div>
+
           {!hasTracks && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 px-6 text-center select-none">
               {/* Icon */}
