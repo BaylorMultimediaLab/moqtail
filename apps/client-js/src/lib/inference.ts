@@ -4,15 +4,15 @@ import * as cocossd from '@tensorflow-models/coco-ssd';
 export interface AIResult {
   detections: cocossd.DetectedObject[];
   metrics: {
-    inferenceTime: number;
-    fps: number;
-    modelName: string;
+    inferenceTime: number; 
+    fps: number;           
+    modelName: string;     
   };
 }
 
 /**
- * PIPELINE: Consistent Dataset Benchmarking
- * Pass a 'testFrame' to bypass live video for controlled testing.
+ * RESEARCH PIPELINE: runBenchmark
+ * Measures the speed/accuracy trade-off for any input.
  */
 export async function runBenchmark(
   model: cocossd.ObjectDetection,
@@ -22,7 +22,7 @@ export async function runBenchmark(
   const t0 = performance.now();
   
   // Model inference
-  const predictions = await model.detect(input, 5, 0.4);
+  const predictions = await model.detect(input as any, 5, 0.4);
   
   const delta = performance.now() - t0;
 
@@ -37,22 +37,10 @@ export async function runBenchmark(
 }
 
 /**
- * RENDERING: Draw MoQ Relay Metadata
- * This uses the 'official' data from the relay, NOT the local AI.
+ * UTILITY: Consistent Dataset Loader
  */
-export function drawRelayBlur(
-  ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
-  relayRects: Array<{ x: number, y: number, w: number, h: number }>
-) {
-  ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-  relayRects.forEach(rect => {
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(rect.x, rect.y, rect.w, rect.h);
-    ctx.clip();
-    ctx.filter = 'blur(40px)'; // The "Official" Blur
-    ctx.drawImage(video, 0, 0, ctx.canvas.width, ctx.canvas.height);
-    ctx.restore();
-  });
+export async function loadImageToBitmap(url: string): Promise<ImageBitmap> {
+  const response = await fetch(url);
+  const blob = await response.blob();
+  return await createImageBitmap(blob);
 }

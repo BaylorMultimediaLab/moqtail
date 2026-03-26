@@ -21,7 +21,9 @@ import { cn } from '@/lib/utils';
 import { Tuple, type CMSF } from 'moqtail';
 import MSEBuffer from '@/lib/buffer';
 
-import { initInferenceModel, runInference, drawRedaction, type InferenceMetrics } from '@/lib/inference';
+import * as cocossd from '@tensorflow-models/coco-ssd';
+
+import { runBenchmark } from './lib/inference';
 
 type Track = CMSF['tracks'][number];
 type Status = 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
@@ -230,18 +232,25 @@ export function App() {
   const requestRef = useRef<number>();
 
   // --- RESEARCH DATA: Local AI Benchmarking (The "Comparison" Source) ---
-  const [model, setModel] = useState<any>(null); // From coco-ssd
+  const [model, setModel] = useState<cocossd.ObjectDetection | null>(null);
   const [isHighAccuracy, setIsHighAccuracy] = useState(false);
-  const [metrics, setMetrics] = useState<InferenceMetrics>({ 
+  const [metrics, setMetrics] = useState({ 
     inferenceTime: 0, fps: 0, objectCount: 0, resolution: '0x0' 
   });
 
-  // Load Model for Benchmarking
+  // Load Model for Benchmarking/embedded AI
   useEffect(() => {
-    initInferenceModel(isHighAccuracy).then(setModel);
+    const loadModel = async () => {
+      const loadedModel = await cocossd.load({ 
+        base: isHighAccuracy ? 'mobilenet_v2' : 'lite_mobilenet_v2' 
+      });
+      setModel(loadedModel);
+    };
+    loadModel();
   }, [isHighAccuracy]);
 
   //localized blur code
+  // --- UI THREAD: Localized Blur (MoQ Relay Metadata) ---
   const renderFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -250,23 +259,19 @@ export function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Sync canvas resolution to the actual video stream dimensions
     if (canvas.width !== video.videoWidth) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
     }
 
+    // This logic is now purely for the "Official" Relay visual
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
     localRects.forEach(rect => {
       ctx.save();
-      // Clip the drawing area to the detection box
       ctx.beginPath();
       ctx.rect(rect.x, rect.y, rect.w, rect.h);
       ctx.clip();
-      
-      // Draw the blurred video slice
-      ctx.filter = 'blur(25px)';
+      ctx.filter = 'blur(40px)'; 
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       ctx.restore();
     });
@@ -274,28 +279,46 @@ export function App() {
     requestRef.current = requestAnimationFrame(renderFrame);
   }, [blurMode, localRects]);
 
+  // --- RESEARCH THREAD: Independent AI Benchmarking ---
+  useEffect(() => {
+    let active = true;
+
+    const benchmarkLoop = async () => {
+      if (!active) return;
+
+      const video = videoRef.current;
+      // readyState 4 means enough data is available to play
+      if (model && video && video.readyState === 4 && !video.paused) {
+        
+        // Use the pure measurement pipeline
+        const result = await runBenchmark(
+          model, 
+          video, 
+          isHighAccuracy ? 'MobileNetV2' : 'Lite'
+        );
+
+        setMetrics({
+          inferenceTime: result.metrics.inferenceTime,
+          fps: result.metrics.fps,
+          objectCount: result.detections.length,
+          resolution: `${video.videoWidth}x${video.videoHeight}`
+        });
+      }
+
+      // Run as fast as the CPU allows for maximum data gathering
+      setTimeout(benchmarkLoop, 0); 
+    };
+
+    benchmarkLoop();
+    return () => { active = false; };
+  }, [model, isHighAccuracy]);
+
   useEffect(() => {
     if (blurMode === 'localized') {
       requestRef.current = requestAnimationFrame(renderFrame);
     }
     return () => cancelAnimationFrame(requestRef.current!);
   }, [blurMode, renderFrame]);
-
-  // INFERENCE PIPELINE: Independent background benchmarking
-  useEffect(() => {
-    let active = true;
-    const benchmarkLoop = async () => {
-      if (!active) return;
-      if (model && videoRef.current && videoRef.current.readyState === 4) {
-        const result = await runInference(model, videoRef.current);
-        setMetrics(result.metrics);
-      }
-      // Delay slightly if not playing to save CPU, otherwise run as fast as possible
-      setTimeout(benchmarkLoop, videoRef.current?.paused ? 500 : 0);
-    };
-    benchmarkLoop();
-    return () => { active = false; };
-  }, [model]);
 
   useEffect(() => {
     if (blurMode === 'localized') {
