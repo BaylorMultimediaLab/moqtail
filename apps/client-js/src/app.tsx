@@ -21,6 +21,8 @@ import { cn } from '@/lib/utils';
 import { Tuple, type CMSF } from 'moqtail';
 import MSEBuffer from '@/lib/buffer';
 
+import { initInferenceModel, runInference, drawRedaction, type InferenceMetrics } from '@/lib/inference';
+
 type Track = CMSF['tracks'][number];
 type Status = 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
 
@@ -227,6 +229,18 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const requestRef = useRef<number>();
 
+  // --- RESEARCH DATA: Local AI Benchmarking (The "Comparison" Source) ---
+  const [model, setModel] = useState<any>(null); // From coco-ssd
+  const [isHighAccuracy, setIsHighAccuracy] = useState(false);
+  const [metrics, setMetrics] = useState<InferenceMetrics>({ 
+    inferenceTime: 0, fps: 0, objectCount: 0, resolution: '0x0' 
+  });
+
+  // Load Model for Benchmarking
+  useEffect(() => {
+    initInferenceModel(isHighAccuracy).then(setModel);
+  }, [isHighAccuracy]);
+
   //localized blur code
   const renderFrame = useCallback(() => {
     const video = videoRef.current;
@@ -259,6 +273,29 @@ export function App() {
 
     requestRef.current = requestAnimationFrame(renderFrame);
   }, [blurMode, localRects]);
+
+  useEffect(() => {
+    if (blurMode === 'localized') {
+      requestRef.current = requestAnimationFrame(renderFrame);
+    }
+    return () => cancelAnimationFrame(requestRef.current!);
+  }, [blurMode, renderFrame]);
+
+  // INFERENCE PIPELINE: Independent background benchmarking
+  useEffect(() => {
+    let active = true;
+    const benchmarkLoop = async () => {
+      if (!active) return;
+      if (model && videoRef.current && videoRef.current.readyState === 4) {
+        const result = await runInference(model, videoRef.current);
+        setMetrics(result.metrics);
+      }
+      // Delay slightly if not playing to save CPU, otherwise run as fast as possible
+      setTimeout(benchmarkLoop, videoRef.current?.paused ? 500 : 0);
+    };
+    benchmarkLoop();
+    return () => { active = false; };
+  }, [model]);
 
   useEffect(() => {
     if (blurMode === 'localized') {
@@ -491,6 +528,40 @@ export function App() {
                 >
                   <div className={cn("h-2 w-2 rounded-full", blurMode === 'localized' ? "bg-violet-400" : "bg-neutral-600")} />
                   <span className={blurMode === 'localized' ? "text-violet-100" : "text-neutral-400"}>Area Redaction</span>
+                </button>
+              </div>
+            </Field>
+          </div>
+
+          {/* AI Benchmarking & Metrics Section */}
+          <div className="border-b border-white/6 p-4 space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold tracking-widest text-neutral-500 uppercase">Benchmarking</span>
+              <button 
+                onClick={() => setIsHighAccuracy(!isHighAccuracy)}
+                className={cn("text-[10px] px-2 py-0.5 rounded border transition-colors", 
+                  isHighAccuracy ? "border-violet-500 text-violet-400" : "border-neutral-700 text-neutral-500")}
+              >
+                {isHighAccuracy ? "High Accuracy (V2)" : "High Speed (Lite)"}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-lg bg-neutral-900/50 p-2 border border-white/5">
+                <div className="text-[10px] text-neutral-500 uppercase">Latency</div>
+                <div className="text-sm font-mono text-emerald-400">{metrics.inferenceTime}ms</div>
+              </div>
+              <div className="rounded-lg bg-neutral-900/50 p-2 border border-white/5">
+                <div className="text-[10px] text-neutral-500 uppercase">AI FPS</div>
+                <div className="text-sm font-mono text-blue-400">{metrics.fps}</div>
+              </div>
+            </div>
+
+            <Field label="Visual Mode">
+              <div className="mt-2 flex flex-col gap-2">
+                <button onClick={() => setBlurMode(blurMode === 'localized' ? 'none' : 'localized')} className={cn("flex items-center gap-3 rounded-lg px-3 py-2 text-xs", blurMode === 'localized' ? "bg-violet-600/20 ring-1 ring-violet-500/50" : "bg-neutral-900/50")}>
+                  <div className={cn("h-2 w-2 rounded-full", blurMode === 'localized' ? "bg-violet-400" : "bg-neutral-600")} />
+                  <span>MoQ Relay Redaction</span>
                 </button>
               </div>
             </Field>
