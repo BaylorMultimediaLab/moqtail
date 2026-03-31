@@ -1,5 +1,17 @@
 import * as tf from '@tensorflow/tfjs';
 import * as cocossd from '@tensorflow-models/coco-ssd';
+import '@tensorflow/tfjs-backend-webgpu'; // Must import to register the backend
+
+async function setupAI() {
+  // 1. Force the WebGPU backend
+  await tf.setBackend('webgpu');
+  
+  // 2. Ready the hardware
+  await tf.ready();
+  
+  console.log("Active Backend:", tf.getBackend()); 
+  // Should print 'webgpu'. If it says 'cpu' or 'webgl', the T1000 isn't being hit.
+}
 
 export interface AIResult {
   detections: cocossd.DetectedObject[];
