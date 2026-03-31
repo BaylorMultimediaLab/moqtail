@@ -2,15 +2,19 @@ import * as tf from '@tensorflow/tfjs';
 import * as cocossd from '@tensorflow-models/coco-ssd';
 import '@tensorflow/tfjs-backend-webgpu'; // Must import to register the backend
 
-async function setupAI() {
-  // 1. Force the WebGPU backend
+/**
+ * 1. Unified Setup: Ensures the T1000 is ready BEFORE the model loads
+ */
+export async function initializeObjectDetection() {
+  // Wait for WebGPU registration
   await tf.setBackend('webgpu');
-  
-  // 2. Ready the hardware
   await tf.ready();
   
-  console.log("Active Backend:", tf.getBackend()); 
-  // Should print 'webgpu'. If it says 'cpu' or 'webgl', the T1000 isn't being hit.
+  console.log("T1000 WebGPU Backend Active:", tf.getBackend());
+
+  // Only load the model AFTER tf.ready()
+  const model = await cocossd.load();
+  return model;
 }
 
 export interface AIResult {
