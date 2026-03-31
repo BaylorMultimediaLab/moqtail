@@ -305,6 +305,13 @@ export function App() {
     };
   }, [blurSettings]);
 
+  useEffect(() => {
+    window.__moqtailMetrics = {
+      abr: abrMetrics,
+      samples: metricsSnapshot,
+    };
+  }, [abrMetrics, metricsSnapshot]);
+
   const disposePlayer = useCallback(async () => {
     if (abrRef.current) {
       abrRef.current.stop();
