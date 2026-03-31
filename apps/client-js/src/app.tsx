@@ -23,7 +23,11 @@ import MSEBuffer from '@/lib/buffer';
 
 import * as cocossd from '@tensorflow-models/coco-ssd';
 
-import { runBenchmark } from './lib/inference';
+import * as tf from '@tensorflow/tfjs';
+// Make sure the WebGPU backend is imported so it registers itself
+import '@tensorflow/tfjs-backend-webgpu';
+
+import { initializeObjectDetection, runBenchmark } from './lib/inference';
 
 type Track = CMSF['tracks'][number];
 type Status = 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
@@ -238,16 +242,34 @@ export function App() {
     inferenceTime: 0, fps: 0, objectCount: 0, resolution: '0x0' 
   });
 
-  // Load Model for Benchmarking/embedded AI
-  useEffect(() => {
-    const loadModel = async () => {
-      const loadedModel = await cocossd.load({ 
-        base: isHighAccuracy ? 'mobilenet_v2' : 'lite_mobilenet_v2' 
-      });
+// --- RESEARCH DATA: Local AI Benchmarking ---
+const [isModelReady, setIsModelReady] = useState(false);
+useEffect(() => {
+  const loadModel = async () => {
+    setIsModelReady(false);
+    try {
+      // 1. Wait for TFJS to be ready
+      await tf.ready(); 
+      
+      // 2. Explicitly set and double-check the backend
+      try {
+        await tf.setBackend('webgpu');
+      } catch (e) {
+        console.warn("WebGPU not available, falling back to WebGL");
+        await tf.setBackend('webgl');
+      }
+
+      // 3. Now call your custom init and load the model
+      const loadedModel = await initializeObjectDetection(); 
+      
       setModel(loadedModel);
-    };
-    loadModel();
-  }, [isHighAccuracy]);
+      setIsModelReady(true);
+    } catch (err) {
+      console.error("AI Initialization failed:", err);
+    }
+  };
+  loadModel();
+}, [isHighAccuracy]);
 
   //localized blur code
   // --- UI THREAD: Localized Blur (MoQ Relay Metadata) ---
@@ -312,13 +334,6 @@ export function App() {
     benchmarkLoop();
     return () => { active = false; };
   }, [model, isHighAccuracy]);
-
-  useEffect(() => {
-    if (blurMode === 'localized') {
-      requestRef.current = requestAnimationFrame(renderFrame);
-    }
-    return () => cancelAnimationFrame(requestRef.current!);
-  }, [blurMode, renderFrame]);
 
   useEffect(() => {
     if (blurMode === 'localized') {
