@@ -1,0 +1,48 @@
+thresholds:
+  downswitch_latency_s: 10
+  upswitch_latency_s: 15
+  rebuffer_recovery_s: 15
+  max_switches_per_minute: 4
+  min_stable_buffer_s: 2
+  quality_floor: '360p'
+
+topology:
+  publisher_ip: '10.0.1.1'
+  relay_ip_pub: '10.0.1.2'
+  relay_ip_client: '10.0.2.2'
+  client_ip: '10.0.2.1'
+  link1_default_bw: 10
+  link2_default_bw: 5
+  default_delay: '10ms'
+  default_loss: 0
+
+quality_map:
+  5.0: '1080p'
+  4.0: '1080p'
+  3.0: '720p'
+  2.0: '720p'
+  1.0: '480p'
+  0.6: '360p'
+
+binaries:
+  relay: '../../target/release/relay'
+  publisher: '../../target/release/publisher'
+  video_path: '../../data/video/smoking_test_1080p.mp4'
+  relay_cert: '../../apps/relay/cert/cert.pem'
+  relay_key: '../../apps/relay/cert/key.pem'
+
+client_js:
+  dist_path: '../../apps/client-js/dist'
+  relay_url: 'https://10.0.2.2:4433'
+
+polling:
+  metrics_interval_ms: 500
+  relay_log_poll_ms: 1000
+
+chromium:
+  flags:
+    - '--headless=new'
+    - '--disable-gpu'
+    - '--no-sandbox'
+    - '--ignore-certificate-errors'
+    - '--origin-to-force-quic-on=10.0.2.2:4433'
