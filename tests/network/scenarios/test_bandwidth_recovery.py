@@ -5,7 +5,6 @@ import time
 import pytest
 
 from assertions import assert_downswitch_within, assert_upswitch_within, assert_quality_floor
-from metrics_collector import MetricsCollector
 from shaper import shape_link2
 
 

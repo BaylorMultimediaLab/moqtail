@@ -9,7 +9,6 @@ from assertions import (
     assert_no_rebuffering,
     assert_quality_floor,
 )
-from metrics_collector import MetricsCollector
 from shaper import shape_link2
 
 

@@ -6,7 +6,6 @@ import time
 import pytest
 
 from assertions import assert_max_switches, assert_quality_floor
-from metrics_collector import MetricsCollector
 from shaper import shape_link2
 
 

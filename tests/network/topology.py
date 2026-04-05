@@ -85,12 +85,13 @@ def create_network(
     relay.setIP("10.0.1.2/24", intf="relay-eth0")
     relay.setIP("10.0.2.2/24", intf="relay-eth1")
 
-    # Add routes so client can reach relay and vice versa
+    net.start()
+
+    # Add routes after start so network namespaces are fully up
     client = net.get("client")
     client.cmd("ip route add 10.0.1.0/24 via 10.0.2.2")
 
     publisher = net.get("publisher")
     publisher.cmd("ip route add 10.0.2.0/24 via 10.0.1.2")
 
-    net.start()
     return net

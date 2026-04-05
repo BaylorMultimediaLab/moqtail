@@ -1,8 +1,6 @@
 """Pytest fixtures for Mininet ABR testing."""
 
 import asyncio
-import os
-import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -81,9 +79,10 @@ def relay_proc(net, config, project_root, results_dir):
     key_file = str(project_root / config["binaries"]["relay_key"])
     stdout_path = results_dir / "relay.log"
 
+    log_file = open(stdout_path, "w")
     proc = relay.popen(
         [relay_bin, "--cert-file", cert_file, "--key-file", key_file, "--port", "4433"],
-        stdout=open(stdout_path, "w"),
+        stdout=log_file,
         stderr=subprocess.STDOUT,
     )
 
@@ -95,11 +94,13 @@ def relay_proc(net, config, project_root, results_dir):
         time.sleep(0.5)
     else:
         proc.terminate()
+        log_file.close()
         raise RuntimeError(f"Relay failed to start. Check {stdout_path}")
 
     yield proc, stdout_path
     proc.terminate()
     proc.wait(timeout=5)
+    log_file.close()
 
 
 @pytest.fixture
@@ -148,11 +149,11 @@ async def browser_page(net, config):
 
     # Start a simple HTTP server on h3 to serve client-js dist
     client.cmd(f"python3 -m http.server 8080 --directory {dist_path} &")
-    time.sleep(1)
+    await asyncio.sleep(1)
 
     # Start Xvfb on h3
     client.cmd("Xvfb :99 -screen 0 1920x1080x24 &")
-    time.sleep(1)
+    await asyncio.sleep(1)
 
     # Start Chromium with remote debugging on h3
     cdp_port = 9222
@@ -165,7 +166,7 @@ async def browser_page(net, config):
         f" &"
     )
     client.cmd(chrome_cmd)
-    time.sleep(3)
+    await asyncio.sleep(3)
 
     # Connect Playwright to the Chromium instance running inside h3's namespace
     # We need to access it via the client's IP
