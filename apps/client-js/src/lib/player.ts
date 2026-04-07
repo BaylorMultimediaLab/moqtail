@@ -77,6 +77,26 @@ const DefaultOptions = {
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
+export interface PlayerMetrics {
+  bandwidthBps: number;
+  fastEmaBps: number;
+  slowEmaBps: number;
+  bufferSeconds: number;
+  activeTrack: string | null;
+  droppedFrames: number;
+  totalFrames: number;
+  playbackRate: number;
+  deliveryTimeMs: number;
+  lastObjectBytes: number;
+  liveEdgeTime: number | null;
+  playbackTime: number | null;
+  liveOffsetSeconds: number | null;
+  currentVideoGroup: string | null;
+  pendingSwitchTrack: string | null;
+  metadataReady: boolean;
+  metadataDelayMs: number;
+}
+
 export class Player {
   catalog: CMSFCatalog | null = null;
   client: MOQtailClient | null = null;
@@ -84,6 +104,8 @@ export class Player {
   #element: HTMLVideoElement | null = null;
   #mse?: MediaSource;
   #streams: MOQStreamStruct[] = [];
+  #metadataReady = true;
+  #metadataDelayMs = 0;
   #options: Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
     Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -402,24 +424,15 @@ export class Player {
     }
   }
 
-  getMetrics(): {
-    bandwidthBps: number;
-    fastEmaBps: number;
-    slowEmaBps: number;
-    bufferSeconds: number;
-    activeTrack: string | null;
-    droppedFrames: number;
-    totalFrames: number;
-    playbackRate: number;
-    deliveryTimeMs: number;
-    lastObjectBytes: number;
-  } {
+  getMetrics(): PlayerMetrics {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     const buffered = this.#element?.buffered;
+    const liveEdgeTime = buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) : null;
+    const playbackTime = this.#element ? this.#element.currentTime : null;
     const bufferSeconds =
-      buffered && buffered.length > 0 && this.#element
-        ? Math.max(0, buffered.end(buffered.length - 1) - this.#element.currentTime)
-        : 0;
+      liveEdgeTime !== null && playbackTime !== null ? Math.max(0, liveEdgeTime - playbackTime) : 0;
+    const currentVideoGroup =
+      videoStruct && videoStruct.lastGroupId >= 0n ? videoStruct.lastGroupId.toString() : null;
     const quality = this.#element?.getVideoPlaybackQuality?.();
     return {
       bandwidthBps: videoStruct?.tracker.getBandwidthBps() ?? 0,
@@ -432,12 +445,27 @@ export class Player {
       playbackRate: this.#element?.playbackRate ?? 1,
       deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
       lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
+      liveEdgeTime,
+      playbackTime,
+      liveOffsetSeconds:
+        liveEdgeTime !== null && playbackTime !== null
+          ? Math.max(0, liveEdgeTime - playbackTime)
+          : null,
+      currentVideoGroup,
+      pendingSwitchTrack: videoStruct?.pendingSwitch?.trackName ?? null,
+      metadataReady: this.#metadataReady,
+      metadataDelayMs: this.#metadataDelayMs,
     };
   }
 
   setEmaAlphas(alphaFast: number, alphaSlow: number): void {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     videoStruct?.tracker.setAlphas(alphaFast, alphaSlow);
+  }
+
+  setMetadataState(ready: boolean, delayMs: number): void {
+    this.#metadataReady = ready;
+    this.#metadataDelayMs = Math.max(0, delayMs);
   }
 
   /** Poll WebTransport stats for the active video track's goodput tracker. */

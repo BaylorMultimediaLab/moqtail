@@ -9,6 +9,13 @@ export interface MetricsSample {
   totalFrames: number;
   playbackRate: number;
   deliveryTimeMs: number;
+  liveEdgeTime: number | null;
+  playbackTime: number | null;
+  liveOffsetSeconds: number | null;
+  currentVideoGroup: string | null;
+  pendingSwitchTrack: string | null;
+  metadataReady: boolean;
+  metadataDelayMs: number;
 }
 
 export interface MetricsSnapshot {

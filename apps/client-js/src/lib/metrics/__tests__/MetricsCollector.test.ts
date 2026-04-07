@@ -14,13 +14,24 @@ function makeMockPlayer() {
       playbackRate: 1,
       deliveryTimeMs: 50,
       lastObjectBytes: 10000,
+      liveEdgeTime: 12,
+      playbackTime: 2,
+      liveOffsetSeconds: 10,
+      currentVideoGroup: '42',
+      pendingSwitchTrack: null,
+      metadataReady: true,
+      metadataDelayMs: 0,
     })),
   };
 }
 
 describe('MetricsCollector', () => {
-  beforeEach(() => { vi.useFakeTimers(); });
-  afterEach(() => { vi.useRealTimers(); });
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it('starts empty', () => {
     const player = makeMockPlayer();

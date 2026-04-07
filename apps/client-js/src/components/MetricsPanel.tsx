@@ -83,6 +83,22 @@ const METRIC_DEFS: MetricDef[] = [
     color: '#14b8a6',
     extract: s => s.deliveryTimeMs,
   },
+  {
+    key: 'liveOffset',
+    label: 'Live Offset',
+    unit: 's',
+    unitLabel: 'Seconds',
+    color: '#f97316',
+    extract: s => s.liveOffsetSeconds ?? 0,
+  },
+  {
+    key: 'metadataDelay',
+    label: 'Metadata Delay',
+    unit: 'ms',
+    unitLabel: 'ms',
+    color: '#8b5cf6',
+    extract: s => s.metadataDelayMs,
+  },
 ];
 
 const METRIC_MAP = new Map(METRIC_DEFS.map(d => [d.key, d]));
@@ -306,6 +322,41 @@ export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
             label="Playback Rate"
             value={fmt(metrics.playbackRate, 'x')}
             metricKey="playbackRate"
+            activeMetrics={activeMetrics}
+            onToggle={toggle}
+          />
+          <StatRow
+            label="Live Offset"
+            value={metrics.liveOffsetSeconds !== null ? fmt(metrics.liveOffsetSeconds, 's') : '-'}
+            metricKey="liveOffset"
+            activeMetrics={activeMetrics}
+            onToggle={toggle}
+          />
+          <StatRow
+            label="Live Edge Position"
+            value={metrics.liveEdgeTime !== null ? fmt(metrics.liveEdgeTime, 's') : '-'}
+          />
+          <StatRow
+            label="Playback Position"
+            value={metrics.playbackTime !== null ? fmt(metrics.playbackTime, 's') : '-'}
+          />
+        </div>
+      </div>
+
+      {/* ── Playout State ── */}
+      <div>
+        <p className="mb-1 font-semibold tracking-widest text-neutral-500 uppercase">
+          Playout State
+        </p>
+        <div className="space-y-0">
+          <StatRow label="Active Representation" value={metrics.activeTrack ?? '-'} />
+          <StatRow label="Current Video Group" value={metrics.currentVideoGroup ?? '-'} />
+          <StatRow label="Pending Switch Target" value={metrics.pendingSwitchTrack ?? '-'} />
+          <StatRow label="Metadata Ready" value={metrics.metadataReady ? 'Yes' : 'No'} />
+          <StatRow
+            label="Metadata Delay"
+            value={fmt(metrics.metadataDelayMs, 'ms')}
+            metricKey="metadataDelay"
             activeMetrics={activeMetrics}
             onToggle={toggle}
           />

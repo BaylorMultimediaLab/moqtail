@@ -7,7 +7,7 @@ const INTERVAL_MS = 250;
 const LOG_FLUSH_INTERVAL = 4; // every 1 second (4 * 250ms)
 
 const CSV_HEADER =
-  'timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms';
+  'timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms,live_edge_s,playback_time_s,live_offset_s,current_video_group,pending_switch_track,metadata_ready,metadata_delay_ms';
 
 export class MetricsCollector {
   readonly #player: Player;
@@ -65,6 +65,13 @@ export class MetricsCollector {
       totalFrames: m.totalFrames,
       playbackRate: m.playbackRate,
       deliveryTimeMs: m.deliveryTimeMs,
+      liveEdgeTime: m.liveEdgeTime,
+      playbackTime: m.playbackTime,
+      liveOffsetSeconds: m.liveOffsetSeconds,
+      currentVideoGroup: m.currentVideoGroup,
+      pendingSwitchTrack: m.pendingSwitchTrack,
+      metadataReady: m.metadataReady,
+      metadataDelayMs: m.metadataDelayMs,
     };
 
     this.#samples.push(sample);
@@ -97,16 +104,25 @@ export class MetricsCollector {
       s.totalFrames,
       s.playbackRate.toFixed(4),
       s.deliveryTimeMs.toFixed(1),
+      this.#formatOptionalNumber(s.liveEdgeTime, 3),
+      this.#formatOptionalNumber(s.playbackTime, 3),
+      this.#formatOptionalNumber(s.liveOffsetSeconds, 3),
+      s.currentVideoGroup ?? '',
+      s.pendingSwitchTrack ?? '',
+      s.metadataReady ? '1' : '0',
+      s.metadataDelayMs.toFixed(1),
     ].join(',');
+  }
+
+  #formatOptionalNumber(value: number | null, fractionDigits: number): string {
+    return value === null ? '' : value.toFixed(fractionDigits);
   }
 
   #flushToServer(): void {
     if (this.#pendingLogRows.length === 0) return;
 
     const rows = this.#pendingLogRows.splice(0);
-    const body = this.#headerSent
-      ? rows.join('\n')
-      : [CSV_HEADER, ...rows].join('\n');
+    const body = this.#headerSent ? rows.join('\n') : [CSV_HEADER, ...rows].join('\n');
     this.#headerSent = true;
 
     // Fire-and-forget — don't block the sampling loop

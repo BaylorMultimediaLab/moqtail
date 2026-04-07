@@ -43,6 +43,13 @@ function makePlayerMetrics(overrides: Partial<ReturnType<MockPlayer['getMetrics'
     playbackRate: 1,
     deliveryTimeMs: 50,
     lastObjectBytes: 8000,
+    liveEdgeTime: 20,
+    playbackTime: 15,
+    liveOffsetSeconds: 5,
+    currentVideoGroup: '100',
+    pendingSwitchTrack: null,
+    metadataReady: true,
+    metadataDelayMs: 0,
     ...overrides,
   };
 }

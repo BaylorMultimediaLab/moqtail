@@ -20,6 +20,13 @@ export interface AbrMetrics {
   playbackRate: number;
   deliveryTimeMs: number;
   lastObjectBytes: number;
+  liveEdgeTime: number | null;
+  playbackTime: number | null;
+  liveOffsetSeconds: number | null;
+  currentVideoGroup: string | null;
+  pendingSwitchTrack: string | null;
+  metadataReady: boolean;
+  metadataDelayMs: number;
   switchHistory: SwitchEvent[];
   mode: 'auto' | 'manual';
   switching: boolean;
@@ -105,6 +112,13 @@ export class AbrController {
       playbackRate,
       deliveryTimeMs,
       lastObjectBytes,
+      liveEdgeTime,
+      playbackTime,
+      liveOffsetSeconds,
+      currentVideoGroup,
+      pendingSwitchTrack,
+      metadataReady,
+      metadataDelayMs,
     } = raw;
 
     // Find the active track index in the sorted tracks array
@@ -124,6 +138,13 @@ export class AbrController {
       playbackRate,
       deliveryTimeMs,
       lastObjectBytes,
+      liveEdgeTime,
+      playbackTime,
+      liveOffsetSeconds,
+      currentVideoGroup,
+      pendingSwitchTrack,
+      metadataReady,
+      metadataDelayMs,
       switchHistory: [...this.#switchHistory],
       mode,
       switching: this.#switching,
