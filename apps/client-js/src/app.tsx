@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { useState, useRef, useCallback } from 'preact/hooks';
+import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
@@ -29,6 +29,12 @@ import { MetricsPanel } from '@/components/MetricsPanel';
 
 type Track = CMSF['tracks'][number];
 type Status = 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
+type ModerationDelayMode = 'fixed' | 'variable';
+
+interface GroupModerationDecision {
+  delayMs: number;
+  readyAt: number;
+}
 
 const GITHUB_REPO = 'moqtail/moqtail';
 
@@ -227,11 +233,40 @@ export function App() {
   const [abrSettings, setAbrSettings] = useState<AbrSettings>(DEFAULT_ABR_SETTINGS);
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const [filteredPlaybackEnabled, setFilteredPlaybackEnabled] = useState(false);
+  const [moderationDelayMode, setModerationDelayMode] = useState<ModerationDelayMode>('fixed');
+  const [fixedModerationDelayMs, setFixedModerationDelayMs] = useState(1200);
+  const [variableDelayMinMs, setVariableDelayMinMs] = useState(800);
+  const [variableDelayMaxMs, setVariableDelayMaxMs] = useState(2000);
   const abrRef = useRef<AbrController | null>(null);
   const rulesRef = useRef<AbrRulesCollection | null>(null);
   const metricsRef = useRef<MetricsCollector | null>(null);
+  const moderationDecisionsRef = useRef<Map<string, GroupModerationDecision>>(new Map());
+  const moderationTimersRef = useRef<Map<string, number>>(new Map());
+  const gatePausedPlaybackRef = useRef(false);
+
+  const clearModerationSimulation = useCallback(() => {
+    for (const timeoutId of moderationTimersRef.current.values()) {
+      window.clearTimeout(timeoutId);
+    }
+    moderationTimersRef.current.clear();
+    moderationDecisionsRef.current.clear();
+    gatePausedPlaybackRef.current = false;
+    playerRef.current?.setMetadataState(true, 0);
+  }, []);
+
+  const getSyntheticModerationDelayMs = useCallback(() => {
+    if (moderationDelayMode === 'fixed') {
+      return Math.max(0, fixedModerationDelayMs);
+    }
+
+    const minMs = Math.max(0, Math.min(variableDelayMinMs, variableDelayMaxMs));
+    const maxMs = Math.max(minMs, Math.max(variableDelayMinMs, variableDelayMaxMs));
+    return minMs + Math.round(Math.random() * (maxMs - minMs));
+  }, [fixedModerationDelayMs, moderationDelayMode, variableDelayMaxMs, variableDelayMinMs]);
 
   const disposePlayer = useCallback(async () => {
+    clearModerationSimulation();
     if (abrRef.current) {
       abrRef.current.stop();
       abrRef.current = null;
@@ -255,7 +290,79 @@ export function App() {
       } catch {}
       bufferRef.current = null;
     }
-  }, []);
+  }, [clearModerationSimulation]);
+
+  useEffect(() => {
+    return () => {
+      clearModerationSimulation();
+    };
+  }, [clearModerationSimulation]);
+
+  useEffect(() => {
+    clearModerationSimulation();
+  }, [
+    clearModerationSimulation,
+    filteredPlaybackEnabled,
+    moderationDelayMode,
+    fixedModerationDelayMs,
+    variableDelayMinMs,
+    variableDelayMaxMs,
+  ]);
+
+  useEffect(() => {
+    const player = playerRef.current;
+    const video = videoRef.current;
+    if (!player) return;
+
+    if (!filteredPlaybackEnabled || status !== 'playing') {
+      player.setMetadataState(true, 0);
+      if (gatePausedPlaybackRef.current && video) {
+        gatePausedPlaybackRef.current = false;
+        void video.play().catch(() => {});
+      }
+      return;
+    }
+
+    const currentGroup = abrMetrics?.currentVideoGroup;
+    if (!currentGroup) {
+      player.setMetadataState(true, 0);
+      return;
+    }
+
+    let decision = moderationDecisionsRef.current.get(currentGroup);
+    if (!decision) {
+      const delayMs = getSyntheticModerationDelayMs();
+      decision = {
+        delayMs,
+        readyAt: Date.now() + delayMs,
+      };
+      moderationDecisionsRef.current.set(currentGroup, decision);
+
+      const timeoutId = window.setTimeout(() => {
+        moderationTimersRef.current.delete(currentGroup);
+      }, delayMs + 100);
+      moderationTimersRef.current.set(currentGroup, timeoutId);
+    }
+
+    const remainingDelayMs = Math.max(0, decision.readyAt - Date.now());
+    const metadataReady = remainingDelayMs === 0;
+    player.setMetadataState(metadataReady, remainingDelayMs);
+
+    if (!video) return;
+
+    if (!metadataReady) {
+      if (!video.paused) {
+        video.pause();
+        gatePausedPlaybackRef.current = true;
+      }
+      return;
+    }
+
+    if (gatePausedPlaybackRef.current) {
+      gatePausedPlaybackRef.current = false;
+      void video.play().catch(() => {});
+    }
+  }, [abrMetrics, filteredPlaybackEnabled, getSyntheticModerationDelayMs, status]);
 
   const handleConnect = useCallback(async () => {
     if (!videoRef.current) return;
@@ -540,6 +647,83 @@ export function App() {
               <p className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-400">
                 {error}
               </p>
+            )}
+          </div>
+
+          <div className="space-y-3 border-b border-white/6 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold tracking-widest text-neutral-500 uppercase">
+                  Filtered Playback
+                </p>
+                <p className="mt-1 text-xs leading-relaxed text-neutral-500">
+                  Simulate moderation latency by pausing playout until metadata is ready for the current video group.
+                </p>
+              </div>
+              <Checkbox
+                checked={filteredPlaybackEnabled}
+                disabled={isBusy || !hasTracks}
+                onChange={setFilteredPlaybackEnabled}
+              />
+            </div>
+
+            <Field label="Metadata Delay Mode">
+              <select
+                value={moderationDelayMode}
+                onInput={e =>
+                  setModerationDelayMode((e.target as HTMLSelectElement).value as ModerationDelayMode)
+                }
+                disabled={!filteredPlaybackEnabled}
+                class={inputCls}
+              >
+                <option value="fixed">Fixed delay</option>
+                <option value="variable">Variable delay</option>
+              </select>
+            </Field>
+
+            {moderationDelayMode === 'fixed' ? (
+              <Field label="Fixed Metadata Delay (ms)">
+                <input
+                  type="number"
+                  min="0"
+                  step="100"
+                  value={fixedModerationDelayMs}
+                  onInput={e =>
+                    setFixedModerationDelayMs(Number((e.target as HTMLInputElement).value) || 0)
+                  }
+                  disabled={!filteredPlaybackEnabled}
+                  class={inputCls}
+                />
+              </Field>
+            ) : (
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-1">
+                <Field label="Min Delay (ms)">
+                  <input
+                    type="number"
+                    min="0"
+                    step="100"
+                    value={variableDelayMinMs}
+                    onInput={e =>
+                      setVariableDelayMinMs(Number((e.target as HTMLInputElement).value) || 0)
+                    }
+                    disabled={!filteredPlaybackEnabled}
+                    class={inputCls}
+                  />
+                </Field>
+                <Field label="Max Delay (ms)">
+                  <input
+                    type="number"
+                    min="0"
+                    step="100"
+                    value={variableDelayMaxMs}
+                    onInput={e =>
+                      setVariableDelayMaxMs(Number((e.target as HTMLInputElement).value) || 0)
+                    }
+                    disabled={!filteredPlaybackEnabled}
+                    class={inputCls}
+                  />
+                </Field>
+              </div>
             )}
           </div>
 
