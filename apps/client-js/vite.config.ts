@@ -25,25 +25,36 @@ function metricsLogPlugin(): Plugin {
         }
 
         let body = '';
-        req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        req.on('data', (chunk: Buffer) => {
+          body += chunk.toString();
+        });
         req.on('end', () => {
           if (!logPath) {
             fs.mkdirSync(logDir, { recursive: true });
-            const ts = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+            const ts = new Date()
+              .toISOString()
+              .replace(/[:.]/g, '-')
+              .replace('T', '_')
+              .slice(0, 19);
             logPath = path.join(logDir, `client-metrics_${ts}.csv`);
           }
 
-          if (!headerWritten) {
-            const header = body.split('\n')[0];
-            if (header) {
-              fs.appendFileSync(logPath, header + '\n');
-              headerWritten = true;
-            }
+          const lines = body.split('\n');
+          const firstLine = lines[0]?.trim() ?? '';
+
+          // First line is treated as header only when it looks like a CSV header row.
+          const firstLineIsHeader = firstLine.startsWith('timestamp,');
+          if (firstLineIsHeader && !headerWritten && firstLine) {
+            fs.appendFileSync(logPath, firstLine + '\n');
+            headerWritten = true;
           }
 
-          // Append data lines (skip header if present)
-          const lines = body.split('\n');
-          const dataLines = lines.slice(headerWritten ? 1 : 0).filter(l => l.length > 0);
+          // Append only data lines. If this payload starts with a header, skip exactly that line.
+          const dataLines = lines
+            .slice(firstLineIsHeader ? 1 : 0)
+            .map(line => line.trim())
+            .filter(line => line.length > 0);
+
           if (dataLines.length > 0) {
             fs.appendFileSync(logPath, dataLines.join('\n') + '\n');
           }

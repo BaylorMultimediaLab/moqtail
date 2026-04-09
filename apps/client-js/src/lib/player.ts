@@ -37,6 +37,27 @@ interface PendingSwitch {
   mimeType: string;
 }
 
+type SwitchOutcome = 'idle' | 'pending' | 'success' | 'rejected' | 'error';
+
+interface SwitchTelemetry {
+  outcome: SwitchOutcome;
+  fromTrack: string | null;
+  toTrack: string | null;
+  requestedAtMs: number | null;
+  settledAtMs: number | null;
+  durationMs: number | null;
+  fromPlaybackTime: number | null;
+  toPlaybackTime: number | null;
+  playbackDeltaSeconds: number | null;
+  fromLiveOffsetSeconds: number | null;
+  toLiveOffsetSeconds: number | null;
+  liveOffsetDeltaSeconds: number | null;
+  fromGroup: string | null;
+  toGroup: string | null;
+  groupDelta: number | null;
+  alignmentErrorSeconds: number | null;
+}
+
 interface MOQStreamStruct {
   trackName: string;
   source: ReadableStream<MoqtObject>;
@@ -77,6 +98,42 @@ const DefaultOptions = {
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
+export interface PlayerMetrics {
+  bandwidthBps: number;
+  fastEmaBps: number;
+  slowEmaBps: number;
+  bufferSeconds: number;
+  activeTrack: string | null;
+  droppedFrames: number;
+  totalFrames: number;
+  playbackRate: number;
+  deliveryTimeMs: number;
+  lastObjectBytes: number;
+  liveEdgeTime: number | null;
+  playbackTime: number | null;
+  liveOffsetSeconds: number | null;
+  currentVideoGroup: string | null;
+  pendingSwitchTrack: string | null;
+  metadataReady: boolean;
+  metadataDelayMs: number;
+  switchOutcome: SwitchOutcome;
+  switchFromTrack: string | null;
+  switchToTrack: string | null;
+  switchRequestedAtMs: number | null;
+  switchSettledAtMs: number | null;
+  switchDurationMs: number | null;
+  switchFromPlaybackTime: number | null;
+  switchToPlaybackTime: number | null;
+  switchPlaybackDeltaSeconds: number | null;
+  switchFromLiveOffsetSeconds: number | null;
+  switchToLiveOffsetSeconds: number | null;
+  switchLiveOffsetDeltaSeconds: number | null;
+  switchFromGroup: string | null;
+  switchToGroup: string | null;
+  switchGroupDelta: number | null;
+  switchAlignmentErrorSeconds: number | null;
+}
+
 export class Player {
   catalog: CMSFCatalog | null = null;
   client: MOQtailClient | null = null;
@@ -84,6 +141,26 @@ export class Player {
   #element: HTMLVideoElement | null = null;
   #mse?: MediaSource;
   #streams: MOQStreamStruct[] = [];
+  #metadataReady = true;
+  #metadataDelayMs = 0;
+  #switchTelemetry: SwitchTelemetry = {
+    outcome: 'idle',
+    fromTrack: null,
+    toTrack: null,
+    requestedAtMs: null,
+    settledAtMs: null,
+    durationMs: null,
+    fromPlaybackTime: null,
+    toPlaybackTime: null,
+    playbackDeltaSeconds: null,
+    fromLiveOffsetSeconds: null,
+    toLiveOffsetSeconds: null,
+    liveOffsetDeltaSeconds: null,
+    fromGroup: null,
+    toGroup: null,
+    groupDelta: null,
+    alignmentErrorSeconds: null,
+  };
   #options: Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
     Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -161,6 +238,24 @@ export class Player {
     this.#element = null;
     this.#mse = undefined;
     this.#streams = [];
+    this.#switchTelemetry = {
+      outcome: 'idle',
+      fromTrack: null,
+      toTrack: null,
+      requestedAtMs: null,
+      settledAtMs: null,
+      durationMs: null,
+      fromPlaybackTime: null,
+      toPlaybackTime: null,
+      playbackDeltaSeconds: null,
+      fromLiveOffsetSeconds: null,
+      toLiveOffsetSeconds: null,
+      liveOffsetDeltaSeconds: null,
+      fromGroup: null,
+      toGroup: null,
+      groupDelta: null,
+      alignmentErrorSeconds: null,
+    };
   }
 
   async attachMedia(element: HTMLVideoElement) {
@@ -320,6 +415,50 @@ export class Player {
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
 
+              const settledAtMs = Date.now();
+              const toPlaybackTime = this.#element ? this.#element.currentTime : null;
+              const toLiveEdgeTime =
+                this.#element?.buffered && this.#element.buffered.length > 0
+                  ? this.#element.buffered.end(this.#element.buffered.length - 1)
+                  : null;
+              const toLiveOffsetSeconds =
+                toLiveEdgeTime !== null && toPlaybackTime !== null
+                  ? Math.max(0, toLiveEdgeTime - toPlaybackTime)
+                  : null;
+              const fromGroupBigInt =
+                this.#switchTelemetry.fromGroup !== null
+                  ? BigInt(this.#switchTelemetry.fromGroup)
+                  : null;
+              const groupDelta =
+                fromGroupBigInt !== null ? Number(object.location.group - fromGroupBigInt) : null;
+              const playbackDeltaSeconds =
+                this.#switchTelemetry.fromPlaybackTime !== null && toPlaybackTime !== null
+                  ? toPlaybackTime - this.#switchTelemetry.fromPlaybackTime
+                  : null;
+              const liveOffsetDeltaSeconds =
+                this.#switchTelemetry.fromLiveOffsetSeconds !== null && toLiveOffsetSeconds !== null
+                  ? toLiveOffsetSeconds - this.#switchTelemetry.fromLiveOffsetSeconds
+                  : null;
+              const durationMs =
+                this.#switchTelemetry.requestedAtMs !== null
+                  ? settledAtMs - this.#switchTelemetry.requestedAtMs
+                  : null;
+
+              this.#switchTelemetry = {
+                ...this.#switchTelemetry,
+                outcome: 'success',
+                settledAtMs,
+                durationMs,
+                toPlaybackTime,
+                playbackDeltaSeconds,
+                toLiveOffsetSeconds,
+                liveOffsetDeltaSeconds,
+                toGroup: object.location.group.toString(),
+                groupDelta,
+                alignmentErrorSeconds:
+                  playbackDeltaSeconds !== null ? Math.abs(playbackDeltaSeconds) : null,
+              };
+
               // changeType() must not be called while the SourceBuffer is updating
               if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
               try {
@@ -332,6 +471,11 @@ export class Player {
                   `switchTrack: failed to apply init segment for ${newTrackName}:`,
                   switchError,
                 );
+                this.#switchTelemetry = {
+                  ...this.#switchTelemetry,
+                  outcome: 'error',
+                  settledAtMs: Date.now(),
+                };
                 // Release the guard and abort the write stream — the source buffer
                 // may be in an inconsistent state after a partial changeType/append.
                 this.#options.onTrackSwitched?.(newTrackName);
@@ -402,24 +546,15 @@ export class Player {
     }
   }
 
-  getMetrics(): {
-    bandwidthBps: number;
-    fastEmaBps: number;
-    slowEmaBps: number;
-    bufferSeconds: number;
-    activeTrack: string | null;
-    droppedFrames: number;
-    totalFrames: number;
-    playbackRate: number;
-    deliveryTimeMs: number;
-    lastObjectBytes: number;
-  } {
+  getMetrics(): PlayerMetrics {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     const buffered = this.#element?.buffered;
+    const liveEdgeTime = buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) : null;
+    const playbackTime = this.#element ? this.#element.currentTime : null;
     const bufferSeconds =
-      buffered && buffered.length > 0 && this.#element
-        ? Math.max(0, buffered.end(buffered.length - 1) - this.#element.currentTime)
-        : 0;
+      liveEdgeTime !== null && playbackTime !== null ? Math.max(0, liveEdgeTime - playbackTime) : 0;
+    const currentVideoGroup =
+      videoStruct && videoStruct.lastGroupId >= 0n ? videoStruct.lastGroupId.toString() : null;
     const quality = this.#element?.getVideoPlaybackQuality?.();
     return {
       bandwidthBps: videoStruct?.tracker.getBandwidthBps() ?? 0,
@@ -432,12 +567,43 @@ export class Player {
       playbackRate: this.#element?.playbackRate ?? 1,
       deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
       lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
+      liveEdgeTime,
+      playbackTime,
+      liveOffsetSeconds:
+        liveEdgeTime !== null && playbackTime !== null
+          ? Math.max(0, liveEdgeTime - playbackTime)
+          : null,
+      currentVideoGroup,
+      pendingSwitchTrack: videoStruct?.pendingSwitch?.trackName ?? null,
+      metadataReady: this.#metadataReady,
+      metadataDelayMs: this.#metadataDelayMs,
+      switchOutcome: this.#switchTelemetry.outcome,
+      switchFromTrack: this.#switchTelemetry.fromTrack,
+      switchToTrack: this.#switchTelemetry.toTrack,
+      switchRequestedAtMs: this.#switchTelemetry.requestedAtMs,
+      switchSettledAtMs: this.#switchTelemetry.settledAtMs,
+      switchDurationMs: this.#switchTelemetry.durationMs,
+      switchFromPlaybackTime: this.#switchTelemetry.fromPlaybackTime,
+      switchToPlaybackTime: this.#switchTelemetry.toPlaybackTime,
+      switchPlaybackDeltaSeconds: this.#switchTelemetry.playbackDeltaSeconds,
+      switchFromLiveOffsetSeconds: this.#switchTelemetry.fromLiveOffsetSeconds,
+      switchToLiveOffsetSeconds: this.#switchTelemetry.toLiveOffsetSeconds,
+      switchLiveOffsetDeltaSeconds: this.#switchTelemetry.liveOffsetDeltaSeconds,
+      switchFromGroup: this.#switchTelemetry.fromGroup,
+      switchToGroup: this.#switchTelemetry.toGroup,
+      switchGroupDelta: this.#switchTelemetry.groupDelta,
+      switchAlignmentErrorSeconds: this.#switchTelemetry.alignmentErrorSeconds,
     };
   }
 
   setEmaAlphas(alphaFast: number, alphaSlow: number): void {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     videoStruct?.tracker.setAlphas(alphaFast, alphaSlow);
+  }
+
+  setMetadataState(ready: boolean, delayMs: number): void {
+    this.#metadataReady = ready;
+    this.#metadataDelayMs = Math.max(0, delayMs);
   }
 
   /** Poll WebTransport stats for the active video track's goodput tracker. */
@@ -478,6 +644,11 @@ export class Player {
 
     if (!initData || !role || !codec) {
       logger.error('media', `switchTrack: missing catalog data for track ${trackName}`);
+      this.#switchTelemetry = {
+        ...this.#switchTelemetry,
+        outcome: 'error',
+        settledAtMs: Date.now(),
+      };
       this.#options.onTrackSwitched?.(videoStruct.trackName);
       return;
     }
@@ -496,6 +667,11 @@ export class Player {
           `switchTrack: SWITCH rejected for ${trackName}:`,
           result.errorReason.phrase,
         );
+        this.#switchTelemetry = {
+          ...this.#switchTelemetry,
+          outcome: 'rejected',
+          settledAtMs: Date.now(),
+        };
         this.#options.onTrackSwitched?.(videoStruct.trackName);
         return;
       }
@@ -512,9 +688,42 @@ export class Player {
       // guard) is NOT called here — it fires in the write handler AFTER the relay
       // has actually delivered data on the new track. This prevents rapid
       // consecutive SWITCH messages that corrupt the relay's switch context.
+      const requestedAtMs = Date.now();
+      const fromPlaybackTime = this.#element ? this.#element.currentTime : null;
+      const fromLiveEdgeTime =
+        this.#element?.buffered && this.#element.buffered.length > 0
+          ? this.#element.buffered.end(this.#element.buffered.length - 1)
+          : null;
+      const fromLiveOffsetSeconds =
+        fromLiveEdgeTime !== null && fromPlaybackTime !== null
+          ? Math.max(0, fromLiveEdgeTime - fromPlaybackTime)
+          : null;
       videoStruct.pendingSwitch = { trackName, initData: initData.buffer as ArrayBuffer, mimeType };
+      this.#switchTelemetry = {
+        outcome: 'pending',
+        fromTrack: videoStruct.trackName,
+        toTrack: trackName,
+        requestedAtMs,
+        settledAtMs: null,
+        durationMs: null,
+        fromPlaybackTime,
+        toPlaybackTime: null,
+        playbackDeltaSeconds: null,
+        fromLiveOffsetSeconds,
+        toLiveOffsetSeconds: null,
+        liveOffsetDeltaSeconds: null,
+        fromGroup: videoStruct.lastGroupId >= 0n ? videoStruct.lastGroupId.toString() : null,
+        toGroup: null,
+        groupDelta: null,
+        alignmentErrorSeconds: null,
+      };
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
+      this.#switchTelemetry = {
+        ...this.#switchTelemetry,
+        outcome: 'error',
+        settledAtMs: Date.now(),
+      };
       this.#options.onTrackSwitched?.(videoStruct.trackName);
     }
   }

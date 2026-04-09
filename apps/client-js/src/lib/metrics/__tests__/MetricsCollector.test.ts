@@ -14,13 +14,40 @@ function makeMockPlayer() {
       playbackRate: 1,
       deliveryTimeMs: 50,
       lastObjectBytes: 10000,
+      liveEdgeTime: 12,
+      playbackTime: 2,
+      liveOffsetSeconds: 10,
+      currentVideoGroup: '42',
+      pendingSwitchTrack: null,
+      metadataReady: true,
+      metadataDelayMs: 0,
+      switchOutcome: 'idle',
+      switchFromTrack: null,
+      switchToTrack: null,
+      switchRequestedAtMs: null,
+      switchSettledAtMs: null,
+      switchDurationMs: null,
+      switchFromPlaybackTime: null,
+      switchToPlaybackTime: null,
+      switchPlaybackDeltaSeconds: null,
+      switchFromLiveOffsetSeconds: null,
+      switchToLiveOffsetSeconds: null,
+      switchLiveOffsetDeltaSeconds: null,
+      switchFromGroup: null,
+      switchToGroup: null,
+      switchGroupDelta: null,
+      switchAlignmentErrorSeconds: null,
     })),
   };
 }
 
 describe('MetricsCollector', () => {
-  beforeEach(() => { vi.useFakeTimers(); });
-  afterEach(() => { vi.useRealTimers(); });
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it('starts empty', () => {
     const player = makeMockPlayer();
