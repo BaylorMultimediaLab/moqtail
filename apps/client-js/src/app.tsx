@@ -89,36 +89,30 @@ function Checkbox({
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <span className="flex shrink-0 items-center">
-      {/* Real input — kept 1 px so it remains in the accessibility tree without position:absolute */}
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled}
-        className="size-px overflow-hidden opacity-0"
-        onChange={e => onChange((e.target as HTMLInputElement).checked)}
-      />
-      {/* Visual indicator */}
-      <span
-        aria-hidden="true"
-        className={cn(
-          'flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors',
-          checked ? 'border-blue-500 bg-blue-500' : 'border-neutral-600 bg-neutral-800/60',
-        )}
-      >
-        {checked && (
-          <svg
-            className="h-2.5 w-2.5 text-white"
-            viewBox="0 0 10 10"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-          >
-            <polyline points="2,5 4,8 8,2" />
-          </svg>
-        )}
-      </span>
-    </span>
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={cn(
+        'flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors',
+        checked ? 'border-blue-500 bg-blue-500' : 'border-neutral-600 bg-neutral-800/60',
+        disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer',
+      )}
+    >
+      {checked && (
+        <svg
+          className="h-2.5 w-2.5 text-white"
+          viewBox="0 0 10 10"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+        >
+          <polyline points="2,5 4,8 8,2" />
+        </svg>
+      )}
+    </button>
   );
 }
 
@@ -657,7 +651,8 @@ export function App() {
                   Filtered Playback
                 </p>
                 <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-                  Simulate moderation latency by pausing playout until metadata is ready for the current video group.
+                  Simulate moderation latency by pausing playout until metadata is ready for the
+                  current video group.
                 </p>
               </div>
               <Checkbox
@@ -671,7 +666,9 @@ export function App() {
               <select
                 value={moderationDelayMode}
                 onInput={e =>
-                  setModerationDelayMode((e.target as HTMLSelectElement).value as ModerationDelayMode)
+                  setModerationDelayMode(
+                    (e.target as HTMLSelectElement).value as ModerationDelayMode,
+                  )
                 }
                 disabled={!filteredPlaybackEnabled}
                 class={inputCls}

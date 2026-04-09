@@ -7,7 +7,7 @@ const INTERVAL_MS = 250;
 const LOG_FLUSH_INTERVAL = 4; // every 1 second (4 * 250ms)
 
 const CSV_HEADER =
-  'timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms,live_edge_s,playback_time_s,live_offset_s,current_video_group,pending_switch_track,metadata_ready,metadata_delay_ms';
+  'timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms,live_edge_s,playback_time_s,live_offset_s,current_video_group,pending_switch_track,metadata_ready,metadata_delay_ms,switch_outcome,switch_from_track,switch_to_track,switch_requested_at_ms,switch_settled_at_ms,switch_duration_ms,switch_from_playback_s,switch_to_playback_s,switch_playback_delta_s,switch_from_live_offset_s,switch_to_live_offset_s,switch_live_offset_delta_s,switch_from_group,switch_to_group,switch_group_delta,switch_alignment_error_s';
 
 export class MetricsCollector {
   readonly #player: Player;
@@ -72,6 +72,22 @@ export class MetricsCollector {
       pendingSwitchTrack: m.pendingSwitchTrack,
       metadataReady: m.metadataReady,
       metadataDelayMs: m.metadataDelayMs,
+      switchOutcome: m.switchOutcome,
+      switchFromTrack: m.switchFromTrack,
+      switchToTrack: m.switchToTrack,
+      switchRequestedAtMs: m.switchRequestedAtMs,
+      switchSettledAtMs: m.switchSettledAtMs,
+      switchDurationMs: m.switchDurationMs,
+      switchFromPlaybackTime: m.switchFromPlaybackTime,
+      switchToPlaybackTime: m.switchToPlaybackTime,
+      switchPlaybackDeltaSeconds: m.switchPlaybackDeltaSeconds,
+      switchFromLiveOffsetSeconds: m.switchFromLiveOffsetSeconds,
+      switchToLiveOffsetSeconds: m.switchToLiveOffsetSeconds,
+      switchLiveOffsetDeltaSeconds: m.switchLiveOffsetDeltaSeconds,
+      switchFromGroup: m.switchFromGroup,
+      switchToGroup: m.switchToGroup,
+      switchGroupDelta: m.switchGroupDelta,
+      switchAlignmentErrorSeconds: m.switchAlignmentErrorSeconds,
     };
 
     this.#samples.push(sample);
@@ -111,6 +127,22 @@ export class MetricsCollector {
       s.pendingSwitchTrack ?? '',
       s.metadataReady ? '1' : '0',
       s.metadataDelayMs.toFixed(1),
+      s.switchOutcome,
+      s.switchFromTrack ?? '',
+      s.switchToTrack ?? '',
+      this.#formatOptionalNumber(s.switchRequestedAtMs, 0),
+      this.#formatOptionalNumber(s.switchSettledAtMs, 0),
+      this.#formatOptionalNumber(s.switchDurationMs, 1),
+      this.#formatOptionalNumber(s.switchFromPlaybackTime, 3),
+      this.#formatOptionalNumber(s.switchToPlaybackTime, 3),
+      this.#formatOptionalNumber(s.switchPlaybackDeltaSeconds, 3),
+      this.#formatOptionalNumber(s.switchFromLiveOffsetSeconds, 3),
+      this.#formatOptionalNumber(s.switchToLiveOffsetSeconds, 3),
+      this.#formatOptionalNumber(s.switchLiveOffsetDeltaSeconds, 3),
+      s.switchFromGroup ?? '',
+      s.switchToGroup ?? '',
+      this.#formatOptionalNumber(s.switchGroupDelta, 0),
+      this.#formatOptionalNumber(s.switchAlignmentErrorSeconds, 3),
     ].join(',');
   }
 

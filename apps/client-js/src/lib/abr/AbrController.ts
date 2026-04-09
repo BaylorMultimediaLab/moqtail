@@ -27,6 +27,22 @@ export interface AbrMetrics {
   pendingSwitchTrack: string | null;
   metadataReady: boolean;
   metadataDelayMs: number;
+  switchOutcome: 'idle' | 'pending' | 'success' | 'rejected' | 'error';
+  switchFromTrack: string | null;
+  switchToTrack: string | null;
+  switchRequestedAtMs: number | null;
+  switchSettledAtMs: number | null;
+  switchDurationMs: number | null;
+  switchFromPlaybackTime: number | null;
+  switchToPlaybackTime: number | null;
+  switchPlaybackDeltaSeconds: number | null;
+  switchFromLiveOffsetSeconds: number | null;
+  switchToLiveOffsetSeconds: number | null;
+  switchLiveOffsetDeltaSeconds: number | null;
+  switchFromGroup: string | null;
+  switchToGroup: string | null;
+  switchGroupDelta: number | null;
+  switchAlignmentErrorSeconds: number | null;
   switchHistory: SwitchEvent[];
   mode: 'auto' | 'manual';
   switching: boolean;
@@ -119,6 +135,22 @@ export class AbrController {
       pendingSwitchTrack,
       metadataReady,
       metadataDelayMs,
+      switchOutcome,
+      switchFromTrack,
+      switchToTrack,
+      switchRequestedAtMs,
+      switchSettledAtMs,
+      switchDurationMs,
+      switchFromPlaybackTime,
+      switchToPlaybackTime,
+      switchPlaybackDeltaSeconds,
+      switchFromLiveOffsetSeconds,
+      switchToLiveOffsetSeconds,
+      switchLiveOffsetDeltaSeconds,
+      switchFromGroup,
+      switchToGroup,
+      switchGroupDelta,
+      switchAlignmentErrorSeconds,
     } = raw;
 
     // Find the active track index in the sorted tracks array
@@ -145,6 +177,22 @@ export class AbrController {
       pendingSwitchTrack,
       metadataReady,
       metadataDelayMs,
+      switchOutcome,
+      switchFromTrack,
+      switchToTrack,
+      switchRequestedAtMs,
+      switchSettledAtMs,
+      switchDurationMs,
+      switchFromPlaybackTime,
+      switchToPlaybackTime,
+      switchPlaybackDeltaSeconds,
+      switchFromLiveOffsetSeconds,
+      switchToLiveOffsetSeconds,
+      switchLiveOffsetDeltaSeconds,
+      switchFromGroup,
+      switchToGroup,
+      switchGroupDelta,
+      switchAlignmentErrorSeconds,
       switchHistory: [...this.#switchHistory],
       mode,
       switching: this.#switching,
