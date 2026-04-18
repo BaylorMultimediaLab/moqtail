@@ -1,19 +1,157 @@
 # MOQtail Installation Guide
 
-Complete setup guide for running the MOQtail stack natively on **Windows**.
+Complete setup guide for running the MOQtail stack natively on **Windows** or **Linux**.
 
 ## Table of Contents
 
-- [Prerequisites](#prerequisites)
-- [Install Dependencies via vcpkg](#install-dependencies-via-vcpkg)
-- [Environment Configuration](#environment-configuration)
-- [Clone and Install](#clone-and-install)
-- [TLS Certificate Setup](#tls-certificate-setup)
-- [Building the Project](#building-the-project)
-- [Running the Stack](#running-the-stack)
-- [Running Components Manually](#running-components-manually)
-- [Video Encoding](#video-encoding)
-- [Troubleshooting](#troubleshooting)
+- [Linux Setup](#linux-setup)
+  - [System Packages](#1-system-packages)
+  - [Rust (Linux)](#2-rust)
+  - [Node.js (Linux)](#3-nodejs-v18)
+  - [Clone and Install (Linux)](#4-clone-and-install)
+  - [TLS Certificates (Linux)](#5-tls-certificate-setup)
+  - [Build and Run (Linux)](#6-build-and-run)
+  - [AMD GPU Hardware Encoding](#amd-gpu-hardware-encoding)
+- [Windows Setup](#windows-setup)
+  - [Prerequisites](#prerequisites)
+  - [Install Dependencies via vcpkg](#install-dependencies-via-vcpkg)
+  - [Environment Configuration](#environment-configuration)
+  - [Clone and Install (Windows)](#clone-and-install)
+  - [TLS Certificate Setup (Windows)](#tls-certificate-setup)
+  - [Building the Project](#building-the-project)
+  - [Running the Stack](#running-the-stack)
+  - [Running Components Manually](#running-components-manually)
+  - [Video Encoding](#video-encoding)
+  - [Troubleshooting](#troubleshooting)
+
+---
+
+## Linux Setup
+
+Tested on **Ubuntu 24.04**. The `ffmpeg-next` Rust crate links against system FFmpeg libraries detected via `pkg-config` — no vcpkg required.
+
+### 1. System Packages
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential pkg-config git git-lfs \
+  clang libclang-dev nasm \
+  libavcodec-dev libavformat-dev libavutil-dev \
+  libavfilter-dev libavdevice-dev \
+  libswscale-dev libswresample-dev \
+  mkcert libnss3-tools
+```
+
+| Package                    | Purpose                                       |
+| -------------------------- | --------------------------------------------- |
+| `build-essential`          | C/C++ compiler and linker                     |
+| `libclang-dev`             | Required by `bindgen` (used by `ffmpeg-next`) |
+| `nasm`                     | Required for some FFmpeg codec builds         |
+| `libav*-dev`, `libsw*-dev` | FFmpeg development headers and libraries      |
+| `mkcert` / `libnss3-tools` | Local TLS certificate generation              |
+| `git-lfs`                  | Large file support for test video data        |
+
+### 2. Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+### 3. Node.js v18+
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+### 4. Clone and Install
+
+```bash
+git clone https://github.com/BaylorMultimediaLab/moqtail.git
+cd moqtail
+```
+
+#### Git submodule (test video data)
+
+```bash
+git lfs install
+git submodule update --init --recursive
+cd data && git lfs pull && cd ..
+```
+
+If the submodule clone hangs waiting for credentials, follow the same steps as [Windows](#clone-and-install) to embed a GitLab personal access token or supply your own video file:
+
+```bash
+mkdir -p data/video
+cp /path/to/your/video.mp4 data/video/smoking_test_1080p.mp4
+```
+
+#### Node dependencies
+
+Run from the repo root — npm workspaces install everything for all packages at once:
+
+```bash
+npm install
+```
+
+> Do not run `npm install` inside a subdirectory (e.g. `apps/client`) first. The root `prepare` script installs Husky, and subdirectory installs will fail if the root `node_modules` is not present yet.
+
+### 5. TLS Certificate Setup
+
+WebTransport requires TLS. Place `cert.pem` and `key.pem` in `apps/relay/cert/`.
+
+```bash
+mkcert -install
+cd apps/relay/cert
+mkcert -key-file key.pem -cert-file cert.pem localhost 127.0.0.1 ::1
+cd ../../..
+```
+
+Then enable WebTransport in Chrome:
+
+1. Navigate to `chrome://flags/#webtransport-developer-mode`
+2. Set it to **Enabled**
+3. Restart Chrome
+
+### 6. Build and Run
+
+```bash
+cargo build --release
+./scripts/run-stack.sh
+```
+
+To use a custom video file:
+
+```bash
+./scripts/run-stack.sh data/video/my_video.mp4
+```
+
+To stop the stack:
+
+```bash
+./scripts/run-stack.sh stop
+```
+
+| Component | URL                    |
+| --------- | ---------------------- |
+| Relay     | https://localhost:4433 |
+| Client-JS | http://localhost:5173  |
+
+### AMD GPU Hardware Encoding
+
+Ubuntu 24.04's packaged FFmpeg does not include AMF (AMD's proprietary hardware encoder). Software encoding via `libx265` works out of the box with no extra setup. If you want open-source AMD hardware encoding via VAAPI:
+
+```bash
+sudo apt install -y mesa-va-drivers vainfo
+```
+
+VAAPI encoders (`hevc_vaapi`, `h264_vaapi`) are included in the system FFmpeg and work with any AMD GPU running the `amdgpu` kernel driver. The publisher currently uses the default encoder selection, so no additional flags are needed unless you modify the encoder configuration.
+
+---
+
+## Windows Setup
 
 ---
 
@@ -65,15 +203,15 @@ cd $HOME\vcpkg
 
 The enabled codec features are:
 
-| Feature | Purpose |
-|---------|---------|
-| `x265` | H.265/HEVC encoder (required by publisher) |
-| `x264` | H.264 encoder |
-| `dav1d` | AV1 decoder (required if source video is AV1-encoded) |
-| `vpx` | VP8/VP9 codec support |
-| `opus` | Opus audio codec |
-| `mp3lame` | MP3 encoding support |
-| `amf` | AMD AMF hardware encoder support |
+| Feature   | Purpose                                               |
+| --------- | ----------------------------------------------------- |
+| `x265`    | H.265/HEVC encoder (required by publisher)            |
+| `x264`    | H.264 encoder                                         |
+| `dav1d`   | AV1 decoder (required if source video is AV1-encoded) |
+| `vpx`     | VP8/VP9 codec support                                 |
+| `opus`    | Opus audio codec                                      |
+| `mp3lame` | MP3 encoding support                                  |
+| `amf`     | AMD AMF hardware encoder support                      |
 
 After installation, register vcpkg system-wide (one-time):
 
@@ -97,13 +235,13 @@ Run it in every new terminal before building or running the project:
 
 The script sets the following variables:
 
-| Variable | Purpose |
-|----------|---------|
-| `FFMPEG_DIR` | Root vcpkg install path |
-| `FFMPEG_INCLUDE_DIR` | FFmpeg headers |
-| `FFMPEG_LIB_DIR` | FFmpeg import libraries |
-| `PATH` | vcpkg `bin` directory (prevents `STATUS_DLL_NOT_FOUND`) |
-| `LIBCLANG_PATH` | Required by `bindgen` to locate `libclang.dll` |
+| Variable             | Purpose                                                 |
+| -------------------- | ------------------------------------------------------- |
+| `FFMPEG_DIR`         | Root vcpkg install path                                 |
+| `FFMPEG_INCLUDE_DIR` | FFmpeg headers                                          |
+| `FFMPEG_LIB_DIR`     | FFmpeg import libraries                                 |
+| `PATH`               | vcpkg `bin` directory (prevents `STATUS_DLL_NOT_FOUND`) |
+| `LIBCLANG_PATH`      | Required by `bindgen` to locate `libclang.dll`          |
 
 ---
 
@@ -227,11 +365,11 @@ To stop all components:
 
 Logs are written to `logs\` with one file per component.
 
-| Component | URL |
-|-----------|-----|
-| Relay | https://localhost:4433 |
-| Client-JS | http://localhost:5173 |
-| Publisher | (connects to relay) |
+| Component | URL                    |
+| --------- | ---------------------- |
+| Relay     | https://localhost:4433 |
+| Client-JS | http://localhost:5173  |
+| Publisher | (connects to relay)    |
 
 ---
 
@@ -253,12 +391,12 @@ cargo run --bin publisher -- --video-path '.\data\video\Smoking Test.mp4'
 
 **Publisher flags** (all optional):
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--max-variants <2-4>` | `4` | Number of ABR quality variants to encode |
-| `--namespace <name>` | `moqtail` | Track namespace |
-| `--target-latency-ms <ms>` | `1500` | Target playback latency in milliseconds |
-| `--validate-cert` | off | Validate TLS certificate |
+| Flag                       | Default   | Description                              |
+| -------------------------- | --------- | ---------------------------------------- |
+| `--max-variants <2-4>`     | `4`       | Number of ABR quality variants to encode |
+| `--namespace <name>`       | `moqtail` | Track namespace                          |
+| `--target-latency-ms <ms>` | `1500`    | Target playback latency in milliseconds  |
+| `--validate-cert`          | off       | Validate TLS certificate                 |
 
 ### Viewer
 
@@ -282,12 +420,12 @@ The source video can be in any format supported by the installed FFmpeg codecs, 
 
 The publisher generates up to 4 adaptive bitrate variants:
 
-| Variant | Resolution | Bitrate |
-|---------|-----------|---------|
-| 1080p | 1920x1080 | 4000 kbps |
-| 720p | 1280x720 | 2000 kbps |
-| 480p | 854x480 | 1000 kbps |
-| 360p | 640x360 | 500 kbps |
+| Variant | Resolution | Bitrate   |
+| ------- | ---------- | --------- |
+| 1080p   | 1920x1080  | 4000 kbps |
+| 720p    | 1280x720   | 2000 kbps |
+| 480p    | 854x480    | 1000 kbps |
+| 360p    | 640x360    | 500 kbps  |
 
 Use `--max-variants <2-4>` to limit the number of variants encoded (fewer = less CPU/memory usage).
 
@@ -295,15 +433,15 @@ Use `--max-variants <2-4>` to limit the number of variants encoded (fewer = less
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| `STATUS_DLL_NOT_FOUND (0xc0000135)` | Run `. .\scripts\win-env-setup.ps1` to add the vcpkg `bin` directory to PATH |
-| FFmpeg not found during build | Check `$env:FFMPEG_DIR` is set — if empty, run the setup script and retry |
-| `Cannot find module 'moqtail'` | Run `npm run build` from the repo root, not from inside `apps/client-js` |
-| Relay fails with cert `NotFound` | Generate certificates (see [TLS Certificate Setup](#tls-certificate-setup)) |
-| Publisher says `box with a larger size` | Video file is a Git LFS pointer — run `cd data; git lfs pull; cd ..` |
-| Submodule clone hangs | Git is waiting for credentials — see [Clone and Install](#clone-and-install) |
-| `Opening handshake failed` | Certificate not trusted — ensure `mkcert -install` was run and WebTransport Developer Mode is enabled in Chrome |
-| `Catalog stream unavailable` | Publisher is not running or crashed — check `logs\publisher_*.log` and restart the stack |
+| Problem                                                                     | Fix                                                                                                                                                                                              |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `STATUS_DLL_NOT_FOUND (0xc0000135)`                                         | Run `. .\scripts\win-env-setup.ps1` to add the vcpkg `bin` directory to PATH                                                                                                                     |
+| FFmpeg not found during build                                               | Check `$env:FFMPEG_DIR` is set — if empty, run the setup script and retry                                                                                                                        |
+| `Cannot find module 'moqtail'`                                              | Run `npm run build` from the repo root, not from inside `apps/client-js`                                                                                                                         |
+| Relay fails with cert `NotFound`                                            | Generate certificates (see [TLS Certificate Setup](#tls-certificate-setup))                                                                                                                      |
+| Publisher says `box with a larger size`                                     | Video file is a Git LFS pointer — run `cd data; git lfs pull; cd ..`                                                                                                                             |
+| Submodule clone hangs                                                       | Git is waiting for credentials — see [Clone and Install](#clone-and-install)                                                                                                                     |
+| `Opening handshake failed`                                                  | Certificate not trusted — ensure `mkcert -install` was run and WebTransport Developer Mode is enabled in Chrome                                                                                  |
+| `Catalog stream unavailable`                                                | Publisher is not running or crashed — check `logs\publisher_*.log` and restart the stack                                                                                                         |
 | `encoder 'libx265' not found` or `Decoder failed: Function not implemented` | FFmpeg is missing a required codec — reinstall with the full feature set (see [Install Dependencies via vcpkg](#install-dependencies-via-vcpkg)), then `cargo clean` and `cargo build --release` |
-| `VCPKG_ROOT` not found / FFmpeg not found | You opened a new terminal without sourcing the env script — run `. .\scripts\win-env-setup.ps1` first |
+| `VCPKG_ROOT` not found / FFmpeg not found                                   | You opened a new terminal without sourcing the env script — run `. .\scripts\win-env-setup.ps1` first                                                                                            |
