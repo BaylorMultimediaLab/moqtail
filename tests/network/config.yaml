@@ -25,14 +25,14 @@ quality_map:
   0.6: '360p'
 
 binaries:
-  relay: '../../target/release/relay'
-  publisher: '../../target/release/publisher'
-  video_path: '../../data/video/smoking_test_1080p.mp4'
-  relay_cert: '../../apps/relay/cert/cert.pem'
-  relay_key: '../../apps/relay/cert/key.pem'
+  relay: 'target/release/relay'
+  publisher: 'target/release/publisher'
+  video_path: 'data/video/smoking_test_1080p.mp4'
+  relay_cert: 'apps/relay/cert/cert.pem'
+  relay_key: 'apps/relay/cert/key.pem'
 
 client_js:
-  dist_path: '../../apps/client-js/dist'
+  dist_path: 'apps/client-js/dist'
   relay_url: 'https://10.0.2.2:4433'
 
 polling:

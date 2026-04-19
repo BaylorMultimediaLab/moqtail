@@ -86,9 +86,9 @@ def relay_proc(net, config, project_root, results_dir):
         stderr=subprocess.STDOUT,
     )
 
-    # Wait for relay to be ready (listen on port 4433)
+    # Wait for relay to be ready (listening on UDP 4433 — MoQT runs over QUIC)
     for _ in range(30):
-        result = relay.cmd("ss -tlnp | grep 4433")
+        result = relay.cmd("ss -ulnp | grep 4433")
         if "4433" in result:
             break
         time.sleep(0.5)
