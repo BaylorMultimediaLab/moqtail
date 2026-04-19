@@ -244,6 +244,9 @@ Cargo.lock
 relay.log.*
 logs/*
 
+### `script` command output ###
+/typescript
+
 ### Superpowers ###
 docs/*
 apps/client-js/specs/
