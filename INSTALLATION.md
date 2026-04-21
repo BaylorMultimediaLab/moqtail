@@ -117,10 +117,15 @@ Then enable WebTransport in Chrome:
 
 ### 6. Build and Run
 
+Build the TypeScript client library first — `apps/client-js` imports `moqtail` from `libs/moqtail-ts/dist/`, and Vite will fail with `Failed to resolve entry for package "moqtail"` if `dist/` is missing:
+
 ```bash
+npm --prefix libs/moqtail-ts run build
 cargo build --release
 ./scripts/run-stack.sh
 ```
+
+> You only need to rerun `npm --prefix libs/moqtail-ts run build` after changes inside `libs/moqtail-ts/src/`.
 
 To use a custom video file:
 
