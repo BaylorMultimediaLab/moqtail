@@ -229,7 +229,7 @@ function TrackGroup({
 }
 
 export function App() {
-  const [relayUrl, setRelayUrl] = useState('https://localhost:4433');
+  const [relayUrl, setRelayUrl] = useState('https://ord.abr.moqtail.dev');
   const [namespace, setNamespace] = useState('moqtail');
   const [status, setStatus] = useState<Status>('idle');
   const [tracks, setTracks] = useState<Track[]>([]);
