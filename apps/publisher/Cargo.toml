@@ -17,3 +17,11 @@ ffmpeg-next = "8.1.0"
 tokio-util = "0.7"
 serde_json = "1"
 base64 = "0.22"
+
+[features]
+default = []
+# Enable VA-API HEVC hardware encoding on AMD GPUs (Linux).
+# Requires FFmpeg ≥ 5.0 headers (for the unified `AV_PIX_FMT_VAAPI` binding) and
+# libva. Activated at runtime only when the DRM render node reports AMD
+# (PCI vendor 0x1002); Intel VA-API devices fall through to libx265.
+vaapi = []
