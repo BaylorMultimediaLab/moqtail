@@ -11,7 +11,7 @@ Complete setup guide for running the MOQtail stack natively on **Windows** or **
   - [Clone and Install (Linux)](#4-clone-and-install)
   - [TLS Certificates (Linux)](#5-tls-certificate-setup)
   - [Build and Run (Linux)](#6-build-and-run)
-  - [AMD GPU Hardware Encoding](#amd-gpu-hardware-encoding)
+  - [AMD GPU Hardware Encoding (VAAPI)](#amd-gpu-hardware-encoding-vaapi)
 - [Windows Setup](#windows-setup)
   - [Prerequisites](#prerequisites)
   - [Install Dependencies via vcpkg](#install-dependencies-via-vcpkg)
@@ -117,10 +117,15 @@ Then enable WebTransport in Chrome:
 
 ### 6. Build and Run
 
+Build the TypeScript client library first — `apps/client-js` imports `moqtail` from `libs/moqtail-ts/dist/`, and Vite will fail with `Failed to resolve entry for package "moqtail"` if `dist/` is missing:
+
 ```bash
+npm --prefix libs/moqtail-ts run build
 cargo build --release
 ./scripts/run-stack.sh
 ```
+
+> You only need to rerun `npm --prefix libs/moqtail-ts run build` after changes inside `libs/moqtail-ts/src/`.
 
 To use a custom video file:
 
@@ -139,15 +144,61 @@ To stop the stack:
 | Relay     | https://localhost:4433 |
 | Client-JS | http://localhost:5173  |
 
-### AMD GPU Hardware Encoding
+### AMD GPU Hardware Encoding (VAAPI)
 
-Ubuntu 24.04's packaged FFmpeg does not include AMF (AMD's proprietary hardware encoder). Software encoding via `libx265` works out of the box with no extra setup. If you want open-source AMD hardware encoding via VAAPI:
+Ubuntu's packaged FFmpeg does not include AMF (AMD's proprietary hardware encoder). Software encoding via `libx265` works out of the box with no extra setup. The publisher can optionally use open-source AMD hardware encoding via VAAPI (`hevc_vaapi`).
+
+#### 1. Install VA-API runtime and driver
 
 ```bash
-sudo apt install -y mesa-va-drivers vainfo
+sudo apt install -y \
+  libva2 libva-drm2 libva-x11-2 \
+  mesa-va-drivers \
+  vainfo
 ```
 
-VAAPI encoders (`hevc_vaapi`, `h264_vaapi`) are included in the system FFmpeg and work with any AMD GPU running the `amdgpu` kernel driver. The publisher currently uses the default encoder selection, so no additional flags are needed unless you modify the encoder configuration.
+| Package           | Purpose                                                        |
+| ----------------- | -------------------------------------------------------------- |
+| `libva2`          | VA-API runtime dispatch library                                |
+| `libva-drm2`      | DRM backend used to talk to `/dev/dri/renderD*`                |
+| `mesa-va-drivers` | AMD backend (radeonsi/r600) — the actual encode implementation |
+| `vainfo`          | Diagnostic CLI used to verify HEVC encode profiles are exposed |
+
+#### 2. Grant render-node access
+
+The publisher needs to open `/dev/dri/renderD128` (or similar). Add your user to the `render` group (some distros use `video`):
+
+```bash
+sudo usermod -aG render "$USER"
+# log out and back in, or run `newgrp render`
+```
+
+#### 3. Verify HEVC encode is available on your GPU
+
+```bash
+vainfo 2>&1 | grep -iE 'hevc|h265'
+```
+
+You must see at least one line ending in `VAEntrypointEncSlice` (encode) — for example:
+
+```
+VAProfileHEVCMain               : VAEntrypointEncSlice
+VAProfileHEVCMain10             : VAEntrypointEncSlice
+```
+
+Older AMD GPUs (pre-Vega / pre-VCN) expose HEVC **decode** but not encode. If `vainfo` shows only `VAEntrypointVLD` entries, your card cannot run `hevc_vaapi` and you should stick with software encoding.
+
+#### 4. Build the publisher with the `vaapi` feature
+
+VAAPI is **opt-in at build time** (Cargo feature) and **gated to AMD GPUs at runtime**:
+
+```bash
+cargo build --release -p publisher --features vaapi
+```
+
+At startup the publisher scans `/dev/dri/renderD*` and only activates VAAPI when `/sys/class/drm/renderD*/device/vendor` reports AMD (`0x1002`). Intel iGPUs (`0x8086`) and NVIDIA (`0x10de`) are skipped even if they expose a VAAPI device — NVIDIA systems use NVENC, Intel falls through to libx265.
+
+> The `vaapi` feature is off by default because older FFmpeg (< 5.0) gates the `Pixel::VAAPI` Rust binding behind a version flag. The publisher sets the pixel format via raw FFI so the feature builds on FFmpeg 4.x too, but for best results use FFmpeg with `libavcodec` ≥ 59.18 (FFmpeg 5.0+).
 
 ---
 

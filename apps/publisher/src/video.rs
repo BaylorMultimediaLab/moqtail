@@ -11,6 +11,7 @@ pub struct VideoInfo {
 /// NV12 has the same Y plane as YUV420P but interleaves U and V into a single
 /// UV plane (UVUVUV…) instead of separate planes.  VAAPI on AMD requires NV12
 /// surfaces — YUV420P surfaces are rejected at encode time.
+#[cfg(feature = "vaapi")]
 pub fn yuv420p_to_nv12_frame(data: &[u8], width: u32, height: u32) -> ffmpeg_next::frame::Video {
   let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, width, height);
 
