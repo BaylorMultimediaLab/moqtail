@@ -14,25 +14,39 @@
  * limitations under the License.
  */
 
-import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
+import { useState, useRef, useCallback, useEffect, useEffect } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
 import { Tuple, type CMSF } from 'moqtail';
 import MSEBuffer from '@/lib/buffer';
-
-import * as cocossd from '@tensorflow-models/coco-ssd';
-
-import * as tf from '@tensorflow/tfjs';
-// Make sure the WebGPU backend is imported so it registers itself
-import '@tensorflow/tfjs-backend-webgpu';
-
-import { initializeObjectDetection, runBenchmark } from './lib/inference';
+import { AbrController, AbrRulesCollection, DEFAULT_ABR_SETTINGS } from '@/lib/abr';
+import type { AbrMetrics, AbrSettings } from '@/lib/abr';
+import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
+import type { MetricsSnapshot } from '@/lib/metrics/types';
+import { SettingsPanel } from '@/components/SettingsPanel';
+import { MetricsPanel } from '@/components/MetricsPanel';
 
 type Track = CMSF['tracks'][number];
 type Status = 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
 
-type BlurMode = 'none' | 'global' | 'localized';
+export type BlurMode = 'none' | 'global' | 'localized';
+export interface BlurRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+export interface BlurSettings {
+  mode: BlurMode;
+  strength: number;
+  rect: BlurRect;
+}
+export const DEFAULT_BLUR_SETTINGS: BlurSettings = {
+  mode: 'none',
+  strength: 25,
+  rect: { x: 100, y: 100, w: 300, h: 200 },
+};
 
 const GITHUB_REPO = 'moqtail/moqtail';
 
@@ -215,134 +229,94 @@ function TrackGroup({
 }
 
 export function App() {
-  const [relayUrl, setRelayUrl] = useState('https://ord.abr.moqtail.dev');
+  const [relayUrl, setRelayUrl] = useState('https://localhost:4433');
   const [namespace, setNamespace] = useState('moqtail');
   const [status, setStatus] = useState<Status>('idle');
   const [tracks, setTracks] = useState<Track[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [optionsPanelOpen, setOptionsPanelOpen] = useState(false);
 
-  const [blurMode, setBlurMode] = useState<BlurMode>('none');
+  const [blurSettings, setBlurSettings] = useState<BlurSettings>(DEFAULT_BLUR_SETTINGS);
 
   const playerRef = useRef<Player | null>(null);
   const bufferRef = useRef<MSEBuffer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-
-  // Example detection rects, for real localized blurring (these come from your MoQ metadata)
-  const [localRects] = useState([{ x: 100, y: 100, w: 300, h: 200 }]);
-
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const requestRef = useRef<number>();
+  const blurRafRef = useRef<number | null>(null);
 
-  // --- RESEARCH DATA: Local AI Benchmarking (The "Comparison" Source) ---
-  const [model, setModel] = useState<cocossd.ObjectDetection | null>(null);
-  const [isHighAccuracy, setIsHighAccuracy] = useState(false);
-  const [metrics, setMetrics] = useState({ 
-    inferenceTime: 0, fps: 0, objectCount: 0, resolution: '0x0' 
-  });
+  const [abrSettings, setAbrSettings] = useState<AbrSettings>(DEFAULT_ABR_SETTINGS);
+  const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
+  const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const abrRef = useRef<AbrController | null>(null);
+  const rulesRef = useRef<AbrRulesCollection | null>(null);
+  const metricsRef = useRef<MetricsCollector | null>(null);
 
-// --- RESEARCH DATA: Local AI Benchmarking ---
-const [isModelReady, setIsModelReady] = useState(false);
-useEffect(() => {
-  const loadModel = async () => {
-    setIsModelReady(false);
-    try {
-      // 1. Wait for TFJS to be ready
-      await tf.ready(); 
-      
-      // 2. Explicitly set and double-check the backend
-      try {
-        await tf.setBackend('webgpu');
-      } catch (e) {
-        console.warn("WebGPU not available, falling back to WebGL");
-        await tf.setBackend('webgl');
-      }
-
-      // 3. Now call your custom init and load the model
-      const loadedModel = await initializeObjectDetection(); 
-      
-      setModel(loadedModel);
-      setIsModelReady(true);
-    } catch (err) {
-      console.error("AI Initialization failed:", err);
-    }
-  };
-  loadModel();
-}, [isHighAccuracy]);
-
-  //localized blur code
-  // --- UI THREAD: Localized Blur (MoQ Relay Metadata) ---
-  const renderFrame = useCallback(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || blurMode !== 'localized') return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    if (canvas.width !== video.videoWidth) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-    }
-
-    // This logic is now purely for the "Official" Relay visual
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    localRects.forEach(rect => {
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(rect.x, rect.y, rect.w, rect.h);
-      ctx.clip();
-      ctx.filter = 'blur(40px)'; 
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      ctx.restore();
-    });
-
-    requestRef.current = requestAnimationFrame(renderFrame);
-  }, [blurMode, localRects]);
-
-  // --- RESEARCH THREAD: Independent AI Benchmarking ---
   useEffect(() => {
-    let active = true;
-
-    const benchmarkLoop = async () => {
-      if (!active) return;
-
+    if (blurSettings.mode !== 'localized') {
+      if (blurRafRef.current !== null) {
+        cancelAnimationFrame(blurRafRef.current);
+        blurRafRef.current = null;
+      }
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
+    }
+    const tick = () => {
       const video = videoRef.current;
-      // readyState 4 means enough data is available to play
-      if (model && video && video.readyState === 4 && !video.paused) {
-        
-        // Use the pure measurement pipeline
-        const result = await runBenchmark(
-          model, 
-          video, 
-          isHighAccuracy ? 'MobileNetV2' : 'Lite'
-        );
-
-        setMetrics({
-          inferenceTime: result.metrics.inferenceTime,
-          fps: result.metrics.fps,
-          objectCount: result.detections.length,
-          resolution: `${video.videoWidth}x${video.videoHeight}`
-        });
+      const canvas = canvasRef.current;
+      if (!video || !canvas) {
+        blurRafRef.current = requestAnimationFrame(tick);
+        return;
       }
-
-      // Run as fast as the CPU allows for maximum data gathering
-      setTimeout(benchmarkLoop, 0); 
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      if (video.videoWidth && video.videoHeight) {
+        if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
+        if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const { rect, strength } = blurSettings;
+      const rx = Math.max(0, Math.min(canvas.width, rect.x));
+      const ry = Math.max(0, Math.min(canvas.height, rect.y));
+      const rw = Math.max(0, Math.min(canvas.width - rx, rect.w));
+      const rh = Math.max(0, Math.min(canvas.height - ry, rect.h));
+      if (rw > 0 && rh > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(rx, ry, rw, rh);
+        ctx.clip();
+        ctx.filter = `blur(${Math.max(0, strength)}px)`;
+        ctx.drawImage(video, rx, ry, rw, rh, rx, ry, rw, rh);
+        ctx.restore();
+      }
+      blurRafRef.current = requestAnimationFrame(tick);
     };
-
-    benchmarkLoop();
-    return () => { active = false; };
-  }, [model, isHighAccuracy]);
-
-  useEffect(() => {
-    if (blurMode === 'localized') {
-      requestRef.current = requestAnimationFrame(renderFrame);
-    }
-    return () => cancelAnimationFrame(requestRef.current!);
-  }, [blurMode, renderFrame]);
+    blurRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (blurRafRef.current !== null) {
+        cancelAnimationFrame(blurRafRef.current);
+        blurRafRef.current = null;
+      }
+    };
+  }, [blurSettings]);
 
   const disposePlayer = useCallback(async () => {
+    if (abrRef.current) {
+      abrRef.current.stop();
+      abrRef.current = null;
+    }
+    if (metricsRef.current) {
+      metricsRef.current.stop();
+      metricsRef.current = null;
+    }
+    rulesRef.current = null;
+    setAbrMetrics(null);
+    setMetricsSnapshot(null);
     if (playerRef.current) {
       try {
         await playerRef.current.dispose();
@@ -379,14 +353,56 @@ useEffect(() => {
       const allTracks = catalog.getTracks();
       setTracks(allTracks);
 
-      const firstVideo = allTracks.find(t => t.role === 'video');
+      // Pick startup video track: use WebTransport bandwidth estimate if available,
+      // fall back to lowest-bitrate track when no estimate is possible.
+      const videoTracksAll = allTracks.filter(t => t.role === 'video');
+      const sortedVideoTracks = [...videoTracksAll].sort(
+        (a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0),
+      );
+      let firstVideo = sortedVideoTracks[0]; // default: lowest bitrate
+      const initialBw = await player.estimateInitialBandwidth();
+      if (initialBw > 0 && sortedVideoTracks.length > 0) {
+        const safetyFactor = abrSettings.bandwidthSafetyFactor;
+        const effectiveBw = initialBw * safetyFactor;
+        // Pick highest track that fits within the estimated bandwidth
+        for (const track of sortedVideoTracks) {
+          if ((track.bitrate ?? 0) <= effectiveBw) {
+            firstVideo = track;
+          }
+        }
+      }
       if (firstVideo) {
         setSelectedVideo(firstVideo.name);
         setStatus('restarting');
         await player.attachMedia(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current);
         await player.addMediaTrack(firstVideo.name);
         await player.startMedia();
         setStatus('playing');
+        const videoTracks = allTracks.filter(t => t.role === 'video');
+        const rulesCollection = new AbrRulesCollection(abrSettings);
+        rulesRef.current = rulesCollection;
+        const abr = new AbrController(
+          player,
+          rulesCollection,
+          videoTracks,
+          abrSettings,
+          setAbrMetrics,
+        );
+        abrRef.current = abr;
+        player.setOnTrackSwitched(trackName => {
+          abrRef.current?.releaseSwitchingGuard();
+          setSelectedVideo(trackName);
+        });
+        abr.start();
+
+        const bitrateMap: Record<string, number> = {};
+        for (const t of videoTracks) {
+          if (t.bitrate) bitrateMap[t.name] = Math.round(t.bitrate / 1000);
+        }
+        const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
+        metricsRef.current = mc;
+        mc.start();
       } else {
         setStatus('ready');
       }
@@ -395,7 +411,7 @@ useEffect(() => {
       setStatus('error');
       await disposePlayer();
     }
-  }, [relayUrl, namespace, disposePlayer]);
+  }, [relayUrl, namespace, disposePlayer, abrSettings]);
 
   const startPlayback = useCallback(
     async (videoTrack: string | null, audioTrack: string | null) => {
@@ -428,35 +444,70 @@ useEffect(() => {
 
         await player.startMedia();
         setStatus('playing');
+        const videoTracksForAbr = catalog.getTracks().filter(t => t.role === 'video');
+        const rulesCollection = new AbrRulesCollection(abrSettings);
+        rulesRef.current = rulesCollection;
+        const abr = new AbrController(
+          player,
+          rulesCollection,
+          videoTracksForAbr,
+          abrSettings,
+          setAbrMetrics,
+        );
+        abrRef.current = abr;
+        player.setOnTrackSwitched(trackName => {
+          abrRef.current?.releaseSwitchingGuard();
+          setSelectedVideo(trackName);
+        });
+        abr.start();
+
+        const bitrateMap: Record<string, number> = {};
+        for (const t of videoTracksForAbr) {
+          if (t.bitrate) bitrateMap[t.name] = Math.round(t.bitrate / 1000);
+        }
+        const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
+        metricsRef.current = mc;
+        mc.start();
       } catch (err) {
         setError((err as Error).message);
         setStatus('error');
         await disposePlayer();
       }
     },
-    [relayUrl, namespace, disposePlayer],
+    [relayUrl, namespace, disposePlayer, abrSettings],
   );
 
   const handleTrackChange = useCallback(
     (track: Track, checked: boolean) => {
       if (track.role !== 'video' && track.role !== 'audio') return;
 
-      let newVideo = selectedVideo;
-      let newAudio = selectedAudio;
-
       if (track.role === 'video') {
-        // clicking the active track unchecks it; clicking any other switches to it
-        newVideo = track.name === selectedVideo && !checked ? null : track.name;
+        if (abrSettings.videoAutoSwitch) return; // auto mode: track rows are read-only
+        if (abrRef.current?.isSwitching()) return; // switch in-flight: wait for it
+        const newTrackName = track.name === selectedVideo && !checked ? null : track.name;
+        if (!newTrackName) return;
+        setSelectedVideo(newTrackName);
+        abrRef.current?.manualSwitch(newTrackName);
       } else {
+        // Audio tracks still do full restarts (no seamless switch for audio)
+        let newAudio = selectedAudio;
         newAudio = track.name === selectedAudio && !checked ? null : track.name;
+        setSelectedAudio(newAudio);
+        startPlayback(selectedVideo, newAudio);
       }
-
-      setSelectedVideo(newVideo);
-      setSelectedAudio(newAudio);
-      startPlayback(newVideo, newAudio);
     },
-    [selectedVideo, selectedAudio, startPlayback],
+    [selectedVideo, selectedAudio, abrSettings, startPlayback],
   );
+
+  const handleSettingsChange = useCallback((newSettings: AbrSettings) => {
+    setAbrSettings(newSettings);
+    abrRef.current?.updateSettings(newSettings);
+    if (rulesRef.current) {
+      for (const [name, config] of Object.entries(newSettings.rules)) {
+        rulesRef.current.setRuleActive(name, config.active);
+      }
+    }
+  }, []);
 
   const isBusy = status === 'connecting' || status === 'restarting';
 
@@ -478,6 +529,24 @@ useEffect(() => {
           >
             MOQtail Player
           </a>
+          <button
+            onClick={() => setOptionsPanelOpen(o => !o)}
+            className={cn(
+              'flex items-center gap-1 rounded-md px-1.5 py-1 text-xs transition-colors',
+              optionsPanelOpen
+                ? 'text-blue-400 hover:text-blue-300'
+                : 'text-neutral-500 hover:text-neutral-300',
+            )}
+            title="Options"
+          >
+            <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">
+              <path
+                fillRule="evenodd"
+                d="M7.84 1.804A1 1 0 018.82 1h2.36a1 1 0 01.98.804l.331 1.652a6.993 6.993 0 011.929 1.115l1.598-.54a1 1 0 011.186.447l1.18 2.044a1 1 0 01-.205 1.251l-1.267 1.113a7.047 7.047 0 010 2.228l1.267 1.113a1 1 0 01.206 1.25l-1.18 2.045a1 1 0 01-1.187.447l-1.598-.54a6.993 6.993 0 01-1.929 1.115l-.33 1.652a1 1 0 01-.98.804H8.82a1 1 0 01-.98-.804l-.331-1.652a6.993 6.993 0 01-1.929-1.115l-1.598.54a1 1 0 01-1.186-.447l-1.18-2.044a1 1 0 01.205-1.251l1.267-1.114a7.05 7.05 0 010-2.227L1.821 7.773a1 1 0 01-.206-1.25l1.18-2.045a1 1 0 011.187-.447l1.598.54A6.993 6.993 0 017.51 3.456l.33-1.652zM10 13a3 3 0 100-6 3 3 0 000 6z"
+                clipRule="evenodd"
+              />
+            </svg>
+          </button>
           <span className="text-neutral-700 select-none">·</span>
           <StatusDot status={status} />
         </div>
@@ -500,6 +569,15 @@ useEffect(() => {
           </a>
         </div>
       </header>
+
+      {/* Options panel — horizontal cards (dash.js style) */}
+      <SettingsPanel
+        open={optionsPanelOpen}
+        settings={abrSettings}
+        onSettingsChange={handleSettingsChange}
+        blurSettings={blurSettings}
+        onBlurSettingsChange={setBlurSettings}
+      />
 
       {/* Body */}
       <div className="flex h-full min-h-0 w-full flex-1 grow flex-col md:flex-row">
@@ -541,65 +619,67 @@ useEffect(() => {
             )}
           </div>
 
+          {/* Blur Effects — quick toggle (detailed controls in options panel) */}
           <div className="border-b border-white/6 p-4">
             <Field label="Blur Effects">
               <div className="mt-2 flex flex-col gap-2">
                 <button
-                  onClick={() => setBlurMode(blurMode === 'global' ? 'none' : 'global')}
+                  onClick={() =>
+                    setBlurSettings(s => ({
+                      ...s,
+                      mode: s.mode === 'global' ? 'none' : 'global',
+                    }))
+                  }
                   disabled={!hasTracks}
                   className={cn(
-                    "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
-                    blurMode === 'global' ? "bg-blue-600/20 ring-1 ring-blue-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
+                    'flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all disabled:cursor-not-allowed disabled:opacity-40',
+                    blurSettings.mode === 'global'
+                      ? 'bg-blue-600/20 ring-1 ring-blue-500/50'
+                      : 'bg-neutral-900/50 hover:bg-neutral-800',
                   )}
                 >
-                  <div className={cn("h-2 w-2 rounded-full", blurMode === 'global' ? "bg-blue-400" : "bg-neutral-600")} />
-                  <span className={blurMode === 'global' ? "text-blue-100" : "text-neutral-400"}>Full Video Blur</span>
+                  <span
+                    className={cn(
+                      'h-2 w-2 rounded-full',
+                      blurSettings.mode === 'global' ? 'bg-blue-400' : 'bg-neutral-600',
+                    )}
+                  />
+                  <span
+                    className={
+                      blurSettings.mode === 'global' ? 'text-blue-100' : 'text-neutral-400'
+                    }
+                  >
+                    Full Video Blur
+                  </span>
                 </button>
-
                 <button
-                  onClick={() => setBlurMode(blurMode === 'localized' ? 'none' : 'localized')}
+                  onClick={() =>
+                    setBlurSettings(s => ({
+                      ...s,
+                      mode: s.mode === 'localized' ? 'none' : 'localized',
+                    }))
+                  }
                   disabled={!hasTracks}
                   className={cn(
-                    "flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all",
-                    blurMode === 'localized' ? "bg-violet-600/20 ring-1 ring-violet-500/50" : "bg-neutral-900/50 hover:bg-neutral-800"
+                    'flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all disabled:cursor-not-allowed disabled:opacity-40',
+                    blurSettings.mode === 'localized'
+                      ? 'bg-violet-600/20 ring-1 ring-violet-500/50'
+                      : 'bg-neutral-900/50 hover:bg-neutral-800',
                   )}
                 >
-                  <div className={cn("h-2 w-2 rounded-full", blurMode === 'localized' ? "bg-violet-400" : "bg-neutral-600")} />
-                  <span className={blurMode === 'localized' ? "text-violet-100" : "text-neutral-400"}>Area Redaction</span>
-                </button>
-              </div>
-            </Field>
-          </div>
-
-          {/* AI Benchmarking & Metrics Section */}
-          <div className="border-b border-white/6 p-4 space-y-4">
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] font-semibold tracking-widest text-neutral-500 uppercase">Benchmarking</span>
-              <button 
-                onClick={() => setIsHighAccuracy(!isHighAccuracy)}
-                className={cn("text-[10px] px-2 py-0.5 rounded border transition-colors", 
-                  isHighAccuracy ? "border-violet-500 text-violet-400" : "border-neutral-700 text-neutral-500")}
-              >
-                {isHighAccuracy ? "High Accuracy (V2)" : "High Speed (Lite)"}
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2">
-              <div className="rounded-lg bg-neutral-900/50 p-2 border border-white/5">
-                <div className="text-[10px] text-neutral-500 uppercase">Latency</div>
-                <div className="text-sm font-mono text-emerald-400">{metrics.inferenceTime}ms</div>
-              </div>
-              <div className="rounded-lg bg-neutral-900/50 p-2 border border-white/5">
-                <div className="text-[10px] text-neutral-500 uppercase">AI FPS</div>
-                <div className="text-sm font-mono text-blue-400">{metrics.fps}</div>
-              </div>
-            </div>
-
-            <Field label="Visual Mode">
-              <div className="mt-2 flex flex-col gap-2">
-                <button onClick={() => setBlurMode(blurMode === 'localized' ? 'none' : 'localized')} className={cn("flex items-center gap-3 rounded-lg px-3 py-2 text-xs", blurMode === 'localized' ? "bg-violet-600/20 ring-1 ring-violet-500/50" : "bg-neutral-900/50")}>
-                  <div className={cn("h-2 w-2 rounded-full", blurMode === 'localized' ? "bg-violet-400" : "bg-neutral-600")} />
-                  <span>MoQ Relay Redaction</span>
+                  <span
+                    className={cn(
+                      'h-2 w-2 rounded-full',
+                      blurSettings.mode === 'localized' ? 'bg-violet-400' : 'bg-neutral-600',
+                    )}
+                  />
+                  <span
+                    className={
+                      blurSettings.mode === 'localized' ? 'text-violet-100' : 'text-neutral-400'
+                    }
+                  >
+                    Area Redaction
+                  </span>
                 </button>
               </div>
             </Field>
@@ -614,7 +694,7 @@ useEffect(() => {
                 tracks={videoTracks}
                 selectedVideo={selectedVideo}
                 selectedAudio={selectedAudio}
-                disabled={isBusy}
+                disabled={isBusy || abrSettings.videoAutoSwitch || (abrMetrics?.switching ?? false)}
                 onChange={handleTrackChange}
               />
               <TrackGroup
@@ -632,42 +712,28 @@ useEffect(() => {
 
         {/* Main — video */}
         <main className="relative flex flex-1 flex-col items-center justify-center overflow-hidden bg-neutral-950 p-4 md:p-6">
-          <div 
+          <div
             className={cn(
-              "relative w-full overflow-hidden rounded-xl bg-black shadow-2xl shadow-black/60 transition-opacity duration-300",
-              hasTracks ? 'opacity-100' : 'pointer-events-none opacity-0'
+              'relative overflow-hidden rounded-xl bg-black shadow-2xl shadow-black/60',
+              hasTracks ? 'inline-flex' : 'hidden',
             )}
-            style={{ aspectRatio: '16/9' }}
           >
             <video
               ref={videoRef}
               controls
               className={cn(
-                'h-full w-full object-cover transition-all duration-300',
-                blurMode === 'global' ? 'blur-3xl scale-110' : 'blur-0 scale-100'
+                'block max-h-[calc(100dvh-9rem)] max-w-full transition-[filter,transform] duration-300',
+                blurSettings.mode === 'global' ? 'scale-110 blur-3xl' : 'blur-0 scale-100',
               )}
             />
-            
-            {/* Localized Blur Overlay */}
             <canvas
               ref={canvasRef}
               className={cn(
-                "absolute inset-0 h-full w-full pointer-events-none transition-opacity duration-300",
-                blurMode === 'localized' ? "opacity-100" : "opacity-0"
+                'pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-300',
+                blurSettings.mode === 'localized' ? 'opacity-100' : 'opacity-0',
               )}
             />
-
-            {/* full blur overlay */}
-            {blurMode !== 'none' && hasTracks && (
-              <div className="absolute top-4 right-4 flex items-center gap-2 rounded-full bg-black/40 px-3 py-1.5 border border-white/10 backdrop-blur-md">
-                <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-400" />
-                <span className="text-[10px] font-bold uppercase tracking-tighter text-white/80">
-                  {blurMode === 'global' ? 'Full Blur Active' : 'Object Redaction Active'}
-                </span>
-              </div>
-            )}
           </div>
-
           {!hasTracks && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 px-6 text-center select-none">
               {/* Icon */}
@@ -761,6 +827,11 @@ useEffect(() => {
                   </a>
                 </div>
               </div>
+            </div>
+          )}
+          {abrMetrics && (
+            <div className="mt-4 w-full max-w-3xl overflow-auto rounded-xl border border-white/6 bg-neutral-900/60 p-4">
+              <MetricsPanel metrics={abrMetrics} snapshot={metricsSnapshot} tracks={videoTracks} />
             </div>
           )}
         </main>

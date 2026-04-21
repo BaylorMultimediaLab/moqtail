@@ -158,8 +158,8 @@ function validateTrack(track: unknown): CMSFTrack {
     throw new Error("codec is required when packaging is 'cmaf'")
   }
 
-  if (packaging === 'timeline' && mimeType !== 'text/csv') {
-    throw new Error("mimeType must be 'text/csv' when packaging is 'timeline'")
+  if (packaging === 'timeline' && mimeType !== 'application/json') {
+    throw new Error("mimeType must be 'application/json' when packaging is 'timeline'")
   }
 
   if (packaging === 'timeline' && (!depends || depends.length === 0)) {

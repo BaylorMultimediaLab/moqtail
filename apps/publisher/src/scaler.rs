@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::decoder::RawGop;
@@ -26,8 +26,8 @@ pub async fn scale(
   source_height: u32,
   target_width: u16,
   target_height: u16,
-  mut raw_rx: broadcast::Receiver<RawGop>,
-  scaled_tx: tokio::sync::mpsc::Sender<ScaledGop>,
+  mut raw_rx: mpsc::Receiver<RawGop>,
+  scaled_tx: mpsc::Sender<ScaledGop>,
 ) -> Result<()> {
   let dst_w = target_width as u32;
   let dst_h = target_height as u32;
@@ -39,42 +39,31 @@ pub async fn scale(
       dst_w, dst_h
     );
 
-    loop {
-      match raw_rx.recv().await {
-        Ok(raw_gop) => {
-          let scaled = ScaledGop {
-            gop_id: raw_gop.gop_id,
-            frames: raw_gop.frames,
-          };
-          if scaled_tx.send(scaled).await.is_err() {
-            warn!("Encoder dropped, stopping scaler");
-            return Ok(());
-          }
-        }
-        Err(broadcast::error::RecvError::Lagged(n)) => {
-          warn!("Scaler {}x{}: lagged, skipped {} GOPs", dst_w, dst_h, n);
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-          info!("Scaler {}x{}: decoder finished", dst_w, dst_h);
-          return Ok(());
-        }
+    while let Some(raw_gop) = raw_rx.recv().await {
+      let scaled = ScaledGop {
+        gop_id: raw_gop.gop_id,
+        frames: raw_gop.frames,
+      };
+      if scaled_tx.send(scaled).await.is_err() {
+        warn!("Encoder dropped, stopping scaler");
+        return Ok(());
       }
     }
+    info!("Scaler {}x{}: decoder finished", dst_w, dst_h);
+    Ok(())
   } else {
     info!(
       "Scaler {}x{} → {}x{}",
       source_width, source_height, dst_w, dst_h
     );
 
-    // Feed GOPs to a blocking task that reuses a single scaling context,
-    // and stream results back via a std::sync::mpsc channel.
-    let (block_tx, block_rx) = std::sync::mpsc::channel::<RawGop>();
-    let (result_tx, result_rx) = std::sync::mpsc::channel::<ScaledGop>();
+    let (block_tx, mut block_rx) = mpsc::channel::<RawGop>(1);
+    let (result_tx, mut result_rx) = mpsc::channel::<ScaledGop>(1);
 
     let scale_loop = tokio::task::spawn_blocking(move || {
       scale_loop_blocking(
-        block_rx,
-        result_tx,
+        &mut block_rx,
+        &result_tx,
         source_width,
         source_height,
         dst_w,
@@ -84,7 +73,7 @@ pub async fn scale(
 
     // Forward scaled GOPs from the blocking thread to the async encoder channel.
     let forward_handle = tokio::spawn(async move {
-      while let Ok(scaled) = tokio::task::block_in_place(|| result_rx.recv()) {
+      while let Some(scaled) = result_rx.recv().await {
         if scaled_tx.send(scaled).await.is_err() {
           warn!("Encoder dropped, stopping scaler {}x{}", dst_w, dst_h);
           return;
@@ -92,19 +81,9 @@ pub async fn scale(
       }
     });
 
-    loop {
-      match raw_rx.recv().await {
-        Ok(raw_gop) => {
-          if block_tx.send(raw_gop).is_err() {
-            break;
-          }
-        }
-        Err(broadcast::error::RecvError::Lagged(n)) => {
-          warn!("Scaler {}x{}: lagged, skipped {} GOPs", dst_w, dst_h, n);
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-          break;
-        }
+    while let Some(raw_gop) = raw_rx.recv().await {
+      if block_tx.send(raw_gop).await.is_err() {
+        break;
       }
     }
 
@@ -125,8 +104,8 @@ pub async fn scale(
 
 /// Runs the scaling loop on a blocking thread, reusing a single scaling context.
 fn scale_loop_blocking(
-  rx: std::sync::mpsc::Receiver<RawGop>,
-  result_tx: std::sync::mpsc::Sender<ScaledGop>,
+  rx: &mut mpsc::Receiver<RawGop>,
+  result_tx: &mpsc::Sender<ScaledGop>,
   src_w: u32,
   src_h: u32,
   dst_w: u32,
@@ -143,7 +122,7 @@ fn scale_loop_blocking(
   )
   .context("failed to create scaler")?;
 
-  while let Ok(raw_gop) = rx.recv() {
+  while let Some(raw_gop) = rx.blocking_recv() {
     let mut scaled_frames = Vec::with_capacity(raw_gop.frames.len());
 
     for frame_data in &raw_gop.frames {
@@ -154,7 +133,7 @@ fn scale_loop_blocking(
     }
 
     if result_tx
-      .send(ScaledGop {
+      .blocking_send(ScaledGop {
         gop_id: raw_gop.gop_id,
         frames: scaled_frames,
       })

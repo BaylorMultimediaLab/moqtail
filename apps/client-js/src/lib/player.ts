@@ -29,11 +29,21 @@ import {
 import { MOQtailClient } from 'moqtail/client';
 import { CMSFCatalog } from 'moqtail/model';
 import { logger } from '@/lib/logger';
+import { GoodputTracker } from '@/lib/goodput';
+
+interface PendingSwitch {
+  trackName: string;
+  initData: ArrayBuffer;
+  mimeType: string;
+}
 
 interface MOQStreamStruct {
   trackName: string;
   source: ReadableStream<MoqtObject>;
   requestId: bigint;
+  tracker: GoodputTracker;
+  lastGroupId: bigint;
+  pendingSwitch: PendingSwitch | null;
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -54,14 +64,18 @@ export interface PlayerOptions {
   receiveCatalogViaSubscribe?: boolean;
   /** Catalog location (default: group 0, object 1) */
   catalogLocation?: [Location, Location];
+  /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
+  onTrackSwitched?: (trackName: string) => void;
 }
 
-const DefaultOptions: Required<PlayerOptions> = {
+const DefaultOptions = {
   relayUrl: 'https://relay.moqtail.dev',
   namespace: Tuple.fromUtf8Path('/moqtail'),
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
-};
+  onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
+} satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
+  Pick<PlayerOptions, 'onTrackSwitched'>;
 
 export class Player {
   catalog: CMSFCatalog | null = null;
@@ -70,7 +84,8 @@ export class Player {
   #element: HTMLVideoElement | null = null;
   #mse?: MediaSource;
   #streams: MOQStreamStruct[] = [];
-  #options: Required<PlayerOptions>;
+  #options: Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
+    Pick<PlayerOptions, 'onTrackSwitched'>;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -100,6 +115,37 @@ export class Player {
     }
 
     return this.catalog;
+  }
+
+  /**
+   * Estimate initial bandwidth from WebTransport.getStats().
+   *
+   * By the time initialize() returns, the QUIC handshake + catalog fetch have
+   * already transferred data. We take two getStats() snapshots 200ms apart
+   * and derive throughput from the bytesReceived delta. Returns 0 if the
+   * browser doesn't support getStats() or the measurement is too noisy.
+   */
+  async estimateInitialBandwidth(): Promise<number> {
+    const transport = this.client?.webTransport;
+    if (!transport || typeof (transport as { getStats?: unknown }).getStats !== 'function')
+      return 0;
+
+    type StatsResult = { bytesReceived?: number };
+    const getStats = (
+      transport as unknown as { getStats: () => Promise<StatsResult> }
+    ).getStats.bind(transport);
+
+    const s1 = await getStats();
+    const t1 = Date.now();
+    await new Promise(r => setTimeout(r, 200));
+    const s2 = await getStats();
+    const t2 = Date.now();
+
+    const deltaBytes = (s2.bytesReceived ?? 0) - (s1.bytesReceived ?? 0);
+    const deltaMs = t2 - t1;
+    if (deltaMs < 50 || deltaBytes <= 0) return 0;
+
+    return (deltaBytes * 8 * 1000) / deltaMs;
   }
 
   async dispose() {
@@ -134,10 +180,10 @@ export class Player {
     if (!this.catalog?.getByTrackName(trackName))
       throw new Error(`Track not found in catalog: ${trackName}`);
 
-    // Verify packaging is 'cmaf' or 'chunk-per-object'
+    // Verify packaging is playable by this player ('loc', 'cmaf', or 'chunk-per-object').
     if (!this.catalog.isCMAF(trackName))
       throw new Error(
-        `Unsupported packaging type for track ${trackName}, only 'cmaf' and 'chunk-per-object' are supported`,
+        `Unsupported packaging type for track ${trackName}, only 'loc', 'cmaf', and 'chunk-per-object' are supported`,
       );
 
     // Get the stream struct
@@ -161,18 +207,28 @@ export class Player {
         sourceBuffer.addEventListener('updateend', () => resolve(), { once: true }),
       );
 
-    // Seek to buffer end
+    // Seek behind the live edge so the player starts with buffer runway.
+    // Without this offset the player lands on the live edge (0 s buffer),
+    // immediately stalls, recovers for a moment, then stalls again —
+    // creating the "video gets stuck" symptom.
+    const LIVE_EDGE_STARTUP_OFFSET = 1.0; // seconds behind the live edge
+
     let gotNotification = 0;
     let target = 0;
     const bufferNotification = (end: number) => {
       if (gotNotification >= this.#streams.length) return false;
 
-      // For live, seek to the max end, for VOD seek to the min start
-      target = Math.max(target, end);
+      // Start behind the live edge so there is buffer to consume while
+      // new data continues arriving. The MSEBuffer module then fine-tunes
+      // the distance via playback-rate adjustments (catchup / catchdown).
+      target = Math.max(target, end - LIVE_EDGE_STARTUP_OFFSET);
 
       gotNotification++;
       if (gotNotification === this.#streams.length) {
-        console.log('All buffers ready, seeking to', target);
+        logger.info(
+          'media',
+          `All buffers ready, seeking to ${target.toFixed(2)}s (live edge ${end.toFixed(2)}s)`,
+        );
         this.#element!.currentTime = target;
         this.#element!.play();
       }
@@ -231,6 +287,63 @@ export class Player {
               return;
             }
 
+            // Init segment re-injection after a seamless track switch.
+            // Detect the transition by comparing the object's fullTrackName
+            // (resolved from the wire's track_alias) against the target track.
+            // The previous approach (group !== lastGroupId) fired too early —
+            // the relay may continue sending old-track groups after the SWITCH
+            // is acknowledged, so a group boundary change does NOT imply a track
+            // transition. Checking the actual track name is authoritative.
+            const objectTrackName = struct.pendingSwitch
+              ? new TextDecoder().decode(object.fullTrackName.name)
+              : null;
+
+            // During rapid ABR switching (A→B→C) the relay may deliver data
+            // for intermediate tracks whose pendingSwitch was overwritten.
+            // Appending that data without a changeType/init-segment would
+            // corrupt the SourceBuffer. Drop anything that doesn't belong
+            // to either the current track or the pending switch target.
+            if (
+              objectTrackName !== null &&
+              objectTrackName !== struct.trackName &&
+              objectTrackName !== struct.pendingSwitch?.trackName
+            ) {
+              logger.info(
+                'media',
+                `Dropping intermediate track data (${objectTrackName}) while switching to ${struct.pendingSwitch?.trackName}`,
+              );
+              return;
+            }
+
+            if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
+              const { initData, mimeType, trackName: newTrackName } = struct.pendingSwitch;
+              struct.trackName = newTrackName;
+              struct.pendingSwitch = null;
+
+              // changeType() must not be called while the SourceBuffer is updating
+              if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+              try {
+                sourceBuffer.changeType(mimeType);
+                sourceBuffer.appendBuffer(initData);
+                await waitForBufferUpdate(sourceBuffer);
+              } catch (switchError) {
+                logger.error(
+                  'media',
+                  `switchTrack: failed to apply init segment for ${newTrackName}:`,
+                  switchError,
+                );
+                // Release the guard and abort the write stream — the source buffer
+                // may be in an inconsistent state after a partial changeType/append.
+                this.#options.onTrackSwitched?.(newTrackName);
+                controller.error(switchError);
+                return;
+              }
+
+              // NOW release the ABR switching guard — the relay has completed the
+              // transition and delivered data on the new track. Safe to switch again.
+              this.#options.onTrackSwitched?.(newTrackName);
+            }
+
             // Append the data
             let maxRetries = 5;
             while (maxRetries--) {
@@ -261,6 +374,11 @@ export class Player {
               const bufferDuration = maxEnd - minStart;
               if (bufferDuration > 1.0) bufferNotification(maxEnd);
             }
+
+            // Record goodput sample — tracker uses internal windowed byte counter
+            struct.tracker.recordObject(object.payload.byteLength, 0);
+            // Track last seen group for switch boundary detection
+            struct.lastGroupId = object.location.group;
           } catch (error) {
             logger.error('media', 'Error processing media object:', error);
             controller.error(error);
@@ -271,14 +389,133 @@ export class Player {
       // Pipe to the writable stream
       const promise = struct.source.pipeTo(writable, { signal: ac.signal });
 
-      // Cleanup stream
-      promise
-        .catch(error => {
-          if (!['AbortError', 'InternalError'].includes(error.name)) throw error;
-        })
-        .finally(async () => {
-          if (this.#mse!.readyState === 'open') this.#mse!.endOfStream();
-        });
+      // Cleanup stream — for live streams, do NOT call endOfStream() when the
+      // pipe ends. The readable stream can close transiently (e.g., during a
+      // SWITCH, relay reconnection, or subscription update). Calling endOfStream()
+      // permanently seals the MediaSource, preventing any further data from being
+      // appended. Only call endOfStream() when the player is being disposed.
+      promise.catch(error => {
+        if (!['AbortError', 'InternalError'].includes(error.name)) {
+          logger.error('media', 'Stream pipe error:', error);
+        }
+      });
+    }
+  }
+
+  getMetrics(): {
+    bandwidthBps: number;
+    fastEmaBps: number;
+    slowEmaBps: number;
+    bufferSeconds: number;
+    activeTrack: string | null;
+    droppedFrames: number;
+    totalFrames: number;
+    playbackRate: number;
+    deliveryTimeMs: number;
+    lastObjectBytes: number;
+  } {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    const buffered = this.#element?.buffered;
+    const bufferSeconds =
+      buffered && buffered.length > 0 && this.#element
+        ? Math.max(0, buffered.end(buffered.length - 1) - this.#element.currentTime)
+        : 0;
+    const quality = this.#element?.getVideoPlaybackQuality?.();
+    return {
+      bandwidthBps: videoStruct?.tracker.getBandwidthBps() ?? 0,
+      fastEmaBps: videoStruct?.tracker.getFastEmaBps() ?? 0,
+      slowEmaBps: videoStruct?.tracker.getSlowEmaBps() ?? 0,
+      bufferSeconds,
+      activeTrack: videoStruct?.trackName ?? null,
+      droppedFrames: quality?.droppedVideoFrames ?? 0,
+      totalFrames: quality?.totalVideoFrames ?? 0,
+      playbackRate: this.#element?.playbackRate ?? 1,
+      deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
+      lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
+    };
+  }
+
+  setEmaAlphas(alphaFast: number, alphaSlow: number): void {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    videoStruct?.tracker.setAlphas(alphaFast, alphaSlow);
+  }
+
+  /** Poll WebTransport stats for the active video track's goodput tracker. */
+  async pollGoodput(): Promise<void> {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    await videoStruct?.tracker.poll();
+  }
+
+  /**
+   * Updates the onTrackSwitched callback post-construction.
+   * Called by app.tsx after creating the Player and AbrController,
+   * to wire the ABR switching guard release without a circular dependency.
+   */
+  setOnTrackSwitched(cb: (trackName: string) => void): void {
+    this.#options.onTrackSwitched = cb;
+  }
+
+  /**
+   * Seamlessly switches the active video track using the MoQ SWITCH message.
+   * The relay will complete delivery of the current group then begin sending
+   * the new track. The WritableStream.write handler detects the group boundary
+   * and re-injects the new init segment before appending the first new payload.
+   *
+   * Fire-and-forget from AbrController: do NOT await this externally.
+   * The #switching guard in AbrController is released via onTrackSwitched callback.
+   */
+  async switchTrack(trackName: string): Promise<void> {
+    if (!this.client) return;
+    if (!this.catalog) return;
+
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    if (!videoStruct) return;
+
+    const fullTrackName = getFullTrackName(this.#options.namespace, trackName);
+    const initData = this.catalog.getInitData(trackName);
+    const role = this.catalog.getRole(trackName);
+    const codec = this.catalog.getCodecString(trackName);
+
+    if (!initData || !role || !codec) {
+      logger.error('media', `switchTrack: missing catalog data for track ${trackName}`);
+      this.#options.onTrackSwitched?.(videoStruct.trackName);
+      return;
+    }
+
+    const mimeType = `${role}/mp4; codecs="${codec}"`;
+
+    try {
+      const result = await this.client.switch({
+        fullTrackName,
+        subscriptionRequestId: videoStruct.requestId,
+      });
+
+      if (result instanceof SubscribeError) {
+        logger.error(
+          'media',
+          `switchTrack: SWITCH rejected for ${trackName}:`,
+          result.errorReason.phrase,
+        );
+        this.#options.onTrackSwitched?.(videoStruct.trackName);
+        return;
+      }
+
+      // Success: update requestId, arm the write handler.
+      // Do NOT reset the tracker — the bandwidth estimate from the previous
+      // track is still a valid indicator of network capacity. Resetting it
+      // creates a blind spot where ABR rules see 0 bandwidth and can't
+      // downgrade if the new track is too aggressive. (dash.js doesn't reset
+      // throughput on quality switches either.)
+      videoStruct.requestId = result.requestId;
+      // Arm the write handler for init segment re-injection at the next group
+      // boundary. The onTrackSwitched callback (which releases the ABR switching
+      // guard) is NOT called here — it fires in the write handler AFTER the relay
+      // has actually delivered data on the new track. This prevents rapid
+      // consecutive SWITCH messages that corrupt the relay's switch context.
+      videoStruct.pendingSwitch = { trackName, initData: initData.buffer as ArrayBuffer, mimeType };
+    } catch (error) {
+      logger.error('media', 'switchTrack: unexpected error', error);
+      this.#options.onTrackSwitched?.(videoStruct.trackName);
     }
   }
 
@@ -342,14 +579,24 @@ export class Player {
       });
       if (result instanceof FetchError)
         throw new Error(`Error occured during catalog fetch: ${result.reasonPhrase.phrase}`);
+      const tracker = new GoodputTracker();
+      if (this.client) tracker.setTransport(this.client.webTransport);
       struct = {
         trackName: 'catalog',
         requestId: result.requestId,
         source: result.stream,
+        tracker,
+        lastGroupId: -1n,
+        pendingSwitch: null,
       };
     }
 
     // Pull the latest catalog object
+    if (!struct.source) {
+      throw new Error(
+        'Catalog stream unavailable — the publisher may have disconnected. Restart the relay and publisher, then reconnect.',
+      );
+    }
     const reader = struct.source.getReader();
     let buffer: ArrayBufferLike | undefined;
     while (!buffer) {
@@ -389,10 +636,15 @@ export class Player {
     });
     if (result instanceof SubscribeError)
       throw new Error(`Error occured during subscription: ${result.errorReason.phrase}`);
+    const tracker = new GoodputTracker();
+    if (this.client.webTransport) tracker.setTransport(this.client.webTransport);
     struct = {
       trackName: params.trackName,
       requestId: result.requestId,
       source: result.stream,
+      tracker,
+      lastGroupId: -1n,
+      pendingSwitch: null,
     };
 
     // Add the stream to the pool
