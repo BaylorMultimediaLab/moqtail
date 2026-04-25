@@ -19,9 +19,35 @@ import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
 import { Tuple, type CMSF } from 'moqtail';
-import MSEBuffer from '@/lib/buffer';
+import MSEBuffer, {
+  DEFAULT_BUFFER_CHECK_INTERVAL,
+  DEFAULT_CATCHUP_CONTROLLER_SETTINGS,
+  DEFAULT_CATCHUP_PLAYBACK_RATE,
+  DEFAULT_LIVE_EDGE_DELAY,
+  DEFAULT_LIVE_EDGE_TOLERANCE,
+  DEFAULT_STALL_THRESHOLD,
+  type CatchupControllerSettings,
+} from '@/lib/buffer';
 import { AbrController, AbrRulesCollection, DEFAULT_ABR_SETTINGS } from '@/lib/abr';
 import type { AbrMetrics, AbrSettings } from '@/lib/abr';
+import type { CatchupControllerMode } from '@/lib/buffer';
+
+export type AbrPreset = 'all' | 'throughput' | 'bola';
+
+/** Return a copy of base AbrSettings with only the chosen primary rule active. */
+function applyAbrPreset(preset: AbrPreset, base: AbrSettings): AbrSettings {
+  if (preset === 'all') return base;
+  const rules: AbrSettings['rules'] = {};
+  for (const key of Object.keys(base.rules)) {
+    rules[key] = { ...base.rules[key], active: false };
+  }
+  if (preset === 'throughput') {
+    rules.ThroughputRule = { ...rules.ThroughputRule, active: true };
+  } else {
+    rules.BolaRule = { ...rules.BolaRule, active: true };
+  }
+  return { ...base, rules };
+}
 import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
 import type { MetricsSnapshot } from '@/lib/metrics/types';
 import { SettingsPanel } from '@/components/SettingsPanel';
@@ -46,6 +72,24 @@ export const DEFAULT_BLUR_SETTINGS: BlurSettings = {
   mode: 'none',
   strength: 25,
   rect: { x: 100, y: 100, w: 300, h: 200 },
+};
+
+export interface LiveCatchupSettings {
+  liveEdgeDelay: number;
+  liveEdgeTolerance: number;
+  bufferCheckInterval: number;
+  stallThreshold: number;
+  catchupPlaybackRate: number;
+  catchup: CatchupControllerSettings;
+}
+
+export const DEFAULT_LIVE_CATCHUP_SETTINGS: LiveCatchupSettings = {
+  liveEdgeDelay: DEFAULT_LIVE_EDGE_DELAY,
+  liveEdgeTolerance: DEFAULT_LIVE_EDGE_TOLERANCE,
+  bufferCheckInterval: DEFAULT_BUFFER_CHECK_INTERVAL,
+  stallThreshold: DEFAULT_STALL_THRESHOLD,
+  catchupPlaybackRate: DEFAULT_CATCHUP_PLAYBACK_RATE,
+  catchup: DEFAULT_CATCHUP_CONTROLLER_SETTINGS,
 };
 
 const GITHUB_REPO = 'moqtail/moqtail';
@@ -239,6 +283,9 @@ export function App() {
   const [optionsPanelOpen, setOptionsPanelOpen] = useState(false);
 
   const [blurSettings, setBlurSettings] = useState<BlurSettings>(DEFAULT_BLUR_SETTINGS);
+  const [catchupSettings, setCatchupSettings] = useState<LiveCatchupSettings>(
+    DEFAULT_LIVE_CATCHUP_SETTINGS,
+  );
 
   const playerRef = useRef<Player | null>(null);
   const bufferRef = useRef<MSEBuffer | null>(null);
@@ -249,9 +296,49 @@ export function App() {
   const [abrSettings, setAbrSettings] = useState<AbrSettings>(DEFAULT_ABR_SETTINGS);
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const [experimentLabel, setExperimentLabel] = useState('');
   const abrRef = useRef<AbrController | null>(null);
   const rulesRef = useRef<AbrRulesCollection | null>(null);
   const metricsRef = useRef<MetricsCollector | null>(null);
+
+  useEffect(() => {
+    bufferRef.current?.updateConfig(catchupSettings);
+  }, [catchupSettings]);
+
+  // Sync experiment label into the active MetricsCollector whenever it changes.
+  useEffect(() => {
+    metricsRef.current?.setExperimentLabel(experimentLabel);
+  }, [experimentLabel]);
+
+  // Bootstrap settings from URL query params on first mount.
+  // Example: ?delay=3&mode=sigmoid&abr=bola&label=exp2-sigmoid
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search);
+    const delay = parseFloat(p.get('delay') ?? '');
+    const mode = p.get('mode') as CatchupControllerMode | null;
+    const abr = p.get('abr') as AbrPreset | null;
+    const label = p.get('label');
+    const validModes: CatchupControllerMode[] = [
+      'none',
+      'sigmoid',
+      'exponential',
+      'linear',
+      'step',
+      'pid',
+    ];
+    if (!isNaN(delay) && delay > 0) {
+      setCatchupSettings(prev => ({ ...prev, liveEdgeDelay: delay }));
+    }
+    if (mode && validModes.includes(mode)) {
+      setCatchupSettings(prev => ({ ...prev, catchup: { ...prev.catchup, mode } }));
+    }
+    if (abr && (['all', 'throughput', 'bola'] as AbrPreset[]).includes(abr)) {
+      setAbrSettings(prev => applyAbrPreset(abr, prev));
+    }
+    if (label) setExperimentLabel(label);
+    // Run once on mount only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (blurSettings.mode !== 'localized') {
@@ -375,7 +462,7 @@ export function App() {
         setSelectedVideo(firstVideo.name);
         setStatus('restarting');
         await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, catchupSettings);
         await player.addMediaTrack(firstVideo.name);
         await player.startMedia();
         setStatus('playing');
@@ -393,6 +480,7 @@ export function App() {
         player.setOnTrackSwitched(trackName => {
           abrRef.current?.releaseSwitchingGuard();
           setSelectedVideo(trackName);
+          metricsRef.current?.notifyTrackSwitch();
         });
         abr.start();
 
@@ -400,7 +488,13 @@ export function App() {
         for (const t of videoTracks) {
           if (t.bitrate) bitrateMap[t.name] = Math.round(t.bitrate / 1000);
         }
-        const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
+        const mc = new MetricsCollector(
+          player,
+          bitrateMap,
+          setMetricsSnapshot,
+          bufferRef.current ?? undefined,
+        );
+        mc.setExperimentLabel(experimentLabel);
         metricsRef.current = mc;
         mc.start();
       } else {
@@ -411,7 +505,7 @@ export function App() {
       setStatus('error');
       await disposePlayer();
     }
-  }, [relayUrl, namespace, disposePlayer, abrSettings]);
+  }, [relayUrl, namespace, disposePlayer, abrSettings, catchupSettings, experimentLabel]);
 
   const startPlayback = useCallback(
     async (videoTrack: string | null, audioTrack: string | null) => {
@@ -437,7 +531,7 @@ export function App() {
         setTracks(catalog.getTracks());
 
         await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, catchupSettings);
 
         if (videoTrack) await player.addMediaTrack(videoTrack);
         if (audioTrack) await player.addMediaTrack(audioTrack);
@@ -458,6 +552,7 @@ export function App() {
         player.setOnTrackSwitched(trackName => {
           abrRef.current?.releaseSwitchingGuard();
           setSelectedVideo(trackName);
+          metricsRef.current?.notifyTrackSwitch();
         });
         abr.start();
 
@@ -465,7 +560,13 @@ export function App() {
         for (const t of videoTracksForAbr) {
           if (t.bitrate) bitrateMap[t.name] = Math.round(t.bitrate / 1000);
         }
-        const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
+        const mc = new MetricsCollector(
+          player,
+          bitrateMap,
+          setMetricsSnapshot,
+          bufferRef.current ?? undefined,
+        );
+        mc.setExperimentLabel(experimentLabel);
         metricsRef.current = mc;
         mc.start();
       } catch (err) {
@@ -474,7 +575,7 @@ export function App() {
         await disposePlayer();
       }
     },
-    [relayUrl, namespace, disposePlayer, abrSettings],
+    [relayUrl, namespace, disposePlayer, abrSettings, catchupSettings, experimentLabel],
   );
 
   const handleTrackChange = useCallback(
@@ -508,6 +609,25 @@ export function App() {
       }
     }
   }, []);
+
+  const handleDownloadMetricsCsv = useCallback(() => {
+    if (!metricsRef.current) return;
+
+    const csv = metricsRef.current.exportCsv();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const label = experimentLabel.trim() || 'metrics';
+    const fileName = `${label}_${ts}.csv`;
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }, [experimentLabel]);
 
   const isBusy = status === 'connecting' || status === 'restarting';
 
@@ -575,8 +695,13 @@ export function App() {
         open={optionsPanelOpen}
         settings={abrSettings}
         onSettingsChange={handleSettingsChange}
+        catchupSettings={catchupSettings}
+        onCatchupSettingsChange={setCatchupSettings}
         blurSettings={blurSettings}
         onBlurSettingsChange={setBlurSettings}
+        experimentLabel={experimentLabel}
+        onExperimentLabelChange={setExperimentLabel}
+        onAbrPreset={preset => setAbrSettings(prev => applyAbrPreset(preset, prev))}
       />
 
       {/* Body */}
@@ -831,7 +956,12 @@ export function App() {
           )}
           {abrMetrics && (
             <div className="mt-4 w-full max-w-3xl overflow-auto rounded-xl border border-white/6 bg-neutral-900/60 p-4">
-              <MetricsPanel metrics={abrMetrics} snapshot={metricsSnapshot} tracks={videoTracks} />
+              <MetricsPanel
+                metrics={abrMetrics}
+                snapshot={metricsSnapshot}
+                tracks={videoTracks}
+                onDownloadCsv={handleDownloadMetricsCsv}
+              />
             </div>
           )}
         </main>

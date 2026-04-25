@@ -177,9 +177,10 @@ interface MetricsPanelProps {
   metrics: AbrMetrics | null;
   snapshot: MetricsSnapshot | null;
   tracks: Track[];
+  onDownloadCsv?: () => void;
 }
 
-export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
+export function MetricsPanel({ metrics, snapshot, tracks, onDownloadCsv }: MetricsPanelProps) {
   const [activeMetrics, setActiveMetrics] = useState<Set<string>>(DEFAULT_ACTIVE);
 
   if (!metrics) return null;
@@ -230,6 +231,17 @@ export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
 
   return (
     <div className="space-y-3 text-[11px]">
+      <div className="flex items-center justify-between border-b border-white/6 pb-2">
+        <p className="font-semibold tracking-widest text-neutral-500 uppercase">Metrics</p>
+        <button
+          onClick={onDownloadCsv}
+          disabled={!onDownloadCsv || samples.length === 0}
+          className="rounded border border-blue-500/30 bg-blue-500/10 px-2 py-1 text-[10px] font-medium text-blue-300 transition-colors hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:border-neutral-700/60 disabled:bg-neutral-800/30 disabled:text-neutral-500"
+        >
+          Download Metrics CSV
+        </button>
+      </div>
+
       {/* ── Video stats ── */}
       <div>
         <p className="mb-1 font-semibold tracking-widest text-neutral-500 uppercase">Video</p>
