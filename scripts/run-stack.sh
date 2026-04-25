@@ -106,7 +106,7 @@ sleep 2
 echo "[publisher] Starting publisher with: $(basename "$VIDEO_PATH")"
 cargo run --release --manifest-path "$ROOT_DIR/Cargo.toml" --bin publisher -- \
   --video-path "$VIDEO_PATH" \
-  --max-variants 2 \
+  --max-variants 4 \
   > "$LOG_DIR/publisher_${TIMESTAMP}.log" 2>&1 &
 PUB_PID=$!
 echo "publisher=$PUB_PID" >> "$PID_FILE"

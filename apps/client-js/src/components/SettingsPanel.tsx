@@ -16,11 +16,20 @@
 
 import { cn } from '@/lib/utils';
 import { type AbrSettings } from '@/lib/abr/types';
+import { type BlurSettings, type BlurMode, type LiveCatchupSettings, type AbrPreset } from '@/app';
+import type { CatchupControllerMode, CatchupControllerSettings } from '@/lib/buffer';
 
 export interface SettingsPanelProps {
   open: boolean;
   settings: AbrSettings;
   onSettingsChange: (settings: AbrSettings) => void;
+  catchupSettings: LiveCatchupSettings;
+  onCatchupSettingsChange: (settings: LiveCatchupSettings) => void;
+  blurSettings: BlurSettings;
+  onBlurSettingsChange: (settings: BlurSettings) => void;
+  experimentLabel: string;
+  onExperimentLabelChange: (label: string) => void;
+  onAbrPreset: (preset: AbrPreset) => void;
 }
 
 function SettingCheckbox({
@@ -106,8 +115,35 @@ const ABR_RULES = [
   'AbandonRequestsRule',
 ] as const;
 const LOW_LATENCY_RULES = ['L2ARule', 'LoLPRule'] as const;
+const CATCHUP_CONTROLLER_MODES: CatchupControllerMode[] = [
+  'sigmoid',
+  'exponential',
+  'linear',
+  'step',
+  'pid',
+];
 
-export function SettingsPanel({ open, settings, onSettingsChange }: SettingsPanelProps) {
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, n));
+}
+
+export function SettingsPanel({
+  open,
+  settings,
+  onSettingsChange,
+  catchupSettings,
+  onCatchupSettingsChange,
+  blurSettings,
+  onBlurSettingsChange,
+  experimentLabel,
+  onExperimentLabelChange,
+  onAbrPreset,
+}: SettingsPanelProps) {
+  const setBlurMode = (mode: BlurMode) => onBlurSettingsChange({ ...blurSettings, mode });
+  const setBlurStrength = (strength: number) => onBlurSettingsChange({ ...blurSettings, strength });
+  const setBlurRect = (patch: Partial<BlurSettings['rect']>) =>
+    onBlurSettingsChange({ ...blurSettings, rect: { ...blurSettings.rect, ...patch } });
+
   const updateRule = (ruleName: string, active: boolean) => {
     const updated = { ...settings };
     updated.rules = { ...updated.rules };
@@ -122,6 +158,16 @@ export function SettingsPanel({ open, settings, onSettingsChange }: SettingsPane
     onSettingsChange(updated);
   };
 
+  const updateCatchup = (patch: Partial<CatchupControllerSettings>) => {
+    onCatchupSettingsChange({
+      ...catchupSettings,
+      catchup: {
+        ...catchupSettings.catchup,
+        ...patch,
+      },
+    });
+  };
+
   return (
     <div
       className={cn(
@@ -132,6 +178,88 @@ export function SettingsPanel({ open, settings, onSettingsChange }: SettingsPane
       {/* Horizontal scroll wrapper */}
       <div className="relative">
         <div className="scrollbar-thin scrollbar-track-transparent scrollbar-thumb-neutral-700 flex snap-x snap-proximity gap-3 overflow-x-auto pb-2">
+          {/* Experiment Card */}
+          <OptionCard title="Experiment">
+            <SectionLabel>Condition Label</SectionLabel>
+            <input
+              type="text"
+              value={experimentLabel}
+              placeholder="e.g. exp1-delay-3s"
+              onInput={e => onExperimentLabelChange((e.target as HTMLInputElement).value)}
+              className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 placeholder-neutral-600 focus:border-blue-500 focus:outline-none"
+            />
+            <SectionLabel>ABR Preset</SectionLabel>
+            <div className="flex gap-1">
+              {(['all', 'throughput', 'bola'] as const).map(p => (
+                <button
+                  key={p}
+                  onClick={() => onAbrPreset(p)}
+                  className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[10px] text-neutral-400 capitalize hover:border-neutral-600 hover:text-neutral-200"
+                >
+                  {p === 'all' ? 'All' : p === 'throughput' ? 'Throughput' : 'BOLA'}
+                </button>
+              ))}
+            </div>
+            <SectionLabel>URL Params</SectionLabel>
+            <p className="text-[10px] leading-relaxed text-neutral-500">
+              ?delay=3&amp;mode=sigmoid
+              <br />
+              &amp;abr=bola&amp;label=cond-name
+            </p>
+          </OptionCard>
+
+          {/* Blur Card */}
+          <OptionCard title="Blur">
+            <SectionLabel>Mode</SectionLabel>
+            <div className="mb-1 flex gap-1">
+              {(['none', 'global', 'localized'] as const).map(m => (
+                <button
+                  key={m}
+                  onClick={() => setBlurMode(m)}
+                  className={cn(
+                    'flex-1 rounded border px-2 py-1 text-[10px] capitalize transition-colors',
+                    blurSettings.mode === m
+                      ? 'border-blue-500 bg-blue-500/20 text-blue-200'
+                      : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200',
+                  )}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+            <NumberInput
+              label="Strength (px)"
+              value={blurSettings.strength}
+              placeholder="25"
+              onChange={v => setBlurStrength(v === -1 ? 0 : v)}
+            />
+            <SectionLabel>Localized Rect (video px)</SectionLabel>
+            <NumberInput
+              label="X"
+              value={blurSettings.rect.x}
+              placeholder="0"
+              onChange={v => setBlurRect({ x: v === -1 ? 0 : v })}
+            />
+            <NumberInput
+              label="Y"
+              value={blurSettings.rect.y}
+              placeholder="0"
+              onChange={v => setBlurRect({ y: v === -1 ? 0 : v })}
+            />
+            <NumberInput
+              label="Width"
+              value={blurSettings.rect.w}
+              placeholder="300"
+              onChange={v => setBlurRect({ w: v === -1 ? 0 : v })}
+            />
+            <NumberInput
+              label="Height"
+              value={blurSettings.rect.h}
+              placeholder="200"
+              onChange={v => setBlurRect({ h: v === -1 ? 0 : v })}
+            />
+          </OptionCard>
+
           {/* ABR Card */}
           <OptionCard title="ABR">
             <SettingCheckbox
@@ -143,6 +271,138 @@ export function SettingsPanel({ open, settings, onSettingsChange }: SettingsPane
               label="Video Auto Switch"
               checked={settings.videoAutoSwitch}
               onChange={v => onSettingsChange({ ...settings, videoAutoSwitch: v })}
+            />
+          </OptionCard>
+
+          {/* Catchup Controller Card */}
+          <OptionCard title="Catchup Controller">
+            <SectionLabel>Latency Target</SectionLabel>
+            <NumberInput
+              label="Target Delay (s)"
+              value={catchupSettings.liveEdgeDelay}
+              placeholder="1.25"
+              onChange={v =>
+                onCatchupSettingsChange({
+                  ...catchupSettings,
+                  liveEdgeDelay: clamp(v === -1 ? 1.25 : v, 0.1, 30),
+                })
+              }
+            />
+            <NumberInput
+              label="Tolerance (s)"
+              value={catchupSettings.liveEdgeTolerance}
+              placeholder="0.1"
+              onChange={v =>
+                onCatchupSettingsChange({
+                  ...catchupSettings,
+                  liveEdgeTolerance: clamp(v === -1 ? 0.1 : v, 0.01, 5),
+                })
+              }
+            />
+
+            <SectionLabel>Algorithm</SectionLabel>
+            <div className="mb-2 grid grid-cols-2 gap-1">
+              {CATCHUP_CONTROLLER_MODES.map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => updateCatchup({ mode })}
+                  className={cn(
+                    'rounded border px-2 py-1 text-[10px] capitalize transition-colors',
+                    catchupSettings.catchup.mode === mode
+                      ? 'border-blue-500 bg-blue-500/20 text-blue-200'
+                      : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200',
+                  )}
+                >
+                  {mode}
+                </button>
+              ))}
+            </div>
+
+            <NumberInput
+              label="Max Rate Up (0..1)"
+              value={catchupSettings.catchup.maxRateUp}
+              placeholder="0.05"
+              onChange={v => updateCatchup({ maxRateUp: clamp(v === -1 ? 0.05 : v, 0, 1) })}
+            />
+            <NumberInput
+              label="Max Rate Down (0..0.5)"
+              value={catchupSettings.catchup.maxRateDown}
+              placeholder="0.05"
+              onChange={v => updateCatchup({ maxRateDown: clamp(v === -1 ? 0.05 : v, 0, 0.5) })}
+            />
+
+            <SectionLabel>Hard Overrides</SectionLabel>
+            <NumberInput
+              label="Max Drift Seek (s)"
+              value={catchupSettings.catchup.maxDriftSeconds}
+              placeholder="3"
+              onChange={v => updateCatchup({ maxDriftSeconds: clamp(v === -1 ? 3 : v, 0.1, 60) })}
+            />
+            <NumberInput
+              label="Live Threshold (s)"
+              value={catchupSettings.catchup.liveThresholdSeconds}
+              placeholder="6"
+              onChange={v =>
+                updateCatchup({ liveThresholdSeconds: clamp(v === -1 ? 6 : v, 0.1, 60) })
+              }
+            />
+            <NumberInput
+              label="Stall Lookback (s)"
+              value={catchupSettings.catchup.stallLookbackSeconds}
+              placeholder="1.5"
+              onChange={v =>
+                updateCatchup({ stallLookbackSeconds: clamp(v === -1 ? 1.5 : v, 0, 10) })
+              }
+            />
+            <NumberInput
+              label="Min Change Thresh"
+              value={
+                Number.isFinite(catchupSettings.catchup.minChangeThreshold)
+                  ? catchupSettings.catchup.minChangeThreshold
+                  : -1
+              }
+              placeholder="auto"
+              onChange={v => updateCatchup({ minChangeThreshold: v === -1 ? Number.NaN : v })}
+            />
+
+            <SectionLabel>Algorithm Params</SectionLabel>
+            <NumberInput
+              label="Linear Gain"
+              value={catchupSettings.catchup.linearGain}
+              placeholder="0.2"
+              onChange={v => updateCatchup({ linearGain: clamp(v === -1 ? 0.2 : v, 0, 10) })}
+            />
+            <NumberInput
+              label="Exp k"
+              value={catchupSettings.catchup.expK}
+              placeholder="1.6"
+              onChange={v => updateCatchup({ expK: clamp(v === -1 ? 1.6 : v, 0.01, 20) })}
+            />
+            <NumberInput
+              label="Step Delta (s)"
+              value={catchupSettings.catchup.stepDeltaSeconds}
+              placeholder="0.25"
+              onChange={v =>
+                updateCatchup({ stepDeltaSeconds: clamp(v === -1 ? 0.25 : v, 0.01, 10) })
+              }
+            />
+            <NumberInput
+              label="PID Kp"
+              value={catchupSettings.catchup.pidKp}
+              placeholder="0.2"
+              onChange={v => updateCatchup({ pidKp: clamp(v === -1 ? 0.2 : v, 0, 10) })}
+            />
+            <NumberInput
+              label="PID Ki"
+              value={catchupSettings.catchup.pidKi}
+              placeholder="0.05"
+              onChange={v => updateCatchup({ pidKi: clamp(v === -1 ? 0.05 : v, 0, 10) })}
+            />
+            <NumberInput
+              label="PID Kd"
+              value={catchupSettings.catchup.pidKd}
+              placeholder="0.1"
+              onChange={v => updateCatchup({ pidKd: clamp(v === -1 ? 0.1 : v, 0, 10) })}
             />
           </OptionCard>
 

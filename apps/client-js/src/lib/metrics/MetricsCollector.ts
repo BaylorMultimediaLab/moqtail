@@ -1,4 +1,5 @@
 import type { Player } from '@/lib/player';
+import type { CatchupTelemetry } from '@/lib/buffer';
 import type { MetricsSample, MetricsSnapshot } from './types';
 
 const MAX_SAMPLES = 240;
@@ -7,12 +8,13 @@ const INTERVAL_MS = 250;
 const LOG_FLUSH_INTERVAL = 4; // every 1 second (4 * 250ms)
 
 const CSV_HEADER =
-  'timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms,live_edge_s,playback_time_s,live_offset_s,current_video_group,pending_switch_track,metadata_ready,metadata_delay_ms,switch_outcome,switch_from_track,switch_to_track,switch_requested_at_ms,switch_settled_at_ms,switch_duration_ms,switch_from_playback_s,switch_to_playback_s,switch_playback_delta_s,switch_from_live_offset_s,switch_to_live_offset_s,switch_live_offset_delta_s,switch_from_group,switch_to_group,switch_group_delta,switch_alignment_error_s';
+  'experiment_label,timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms,live_edge_s,playback_time_s,live_offset_s,current_video_group,pending_switch_track,metadata_ready,metadata_delay_ms,switch_outcome,switch_from_track,switch_to_track,switch_requested_at_ms,switch_settled_at_ms,switch_duration_ms,switch_from_playback_s,switch_to_playback_s,switch_playback_delta_s,switch_from_live_offset_s,switch_to_live_offset_s,switch_live_offset_delta_s,switch_from_group,switch_to_group,switch_group_delta,switch_alignment_error_s,catchup_mode,target_delay_s,computed_rate,hard_override_fired,override_type,rate_reset_count,seek_for_recovery_count,track_switch_count';
 
 export class MetricsCollector {
   readonly #player: Player;
   readonly #bitrateMap: Record<string, number>;
   readonly #onSnapshot: (snapshot: MetricsSnapshot) => void;
+  readonly #buffer: { getCatchupTelemetry(): CatchupTelemetry } | undefined;
   readonly #samples: MetricsSample[] = [];
   readonly #allSamples: MetricsSample[] = [];
   /** Pending CSV rows not yet flushed to the log file. */
@@ -21,20 +23,25 @@ export class MetricsCollector {
   #sessionStartTs: number = 0;
   #sampleCount: number = 0;
   #headerSent: boolean = false;
+  #experimentLabel: string = '';
+  #trackSwitchCount: number = 0;
 
   constructor(
     player: Player,
     bitrateMap: Record<string, number>,
     onSnapshot: (snapshot: MetricsSnapshot) => void,
+    buffer?: { getCatchupTelemetry(): CatchupTelemetry },
   ) {
     this.#player = player;
     this.#bitrateMap = bitrateMap;
     this.#onSnapshot = onSnapshot;
+    this.#buffer = buffer;
   }
 
   start(): void {
     if (this.#intervalId !== null) return;
     this.#sessionStartTs = Date.now();
+    this.#trackSwitchCount = 0;
     this.#intervalId = setInterval(() => this.#sample(), INTERVAL_MS);
   }
 
@@ -42,6 +49,16 @@ export class MetricsCollector {
     if (this.#intervalId === null) return;
     clearInterval(this.#intervalId);
     this.#intervalId = null;
+  }
+
+  /** Update the experiment-condition label stamped on every CSV row. */
+  setExperimentLabel(label: string): void {
+    this.#experimentLabel = label;
+  }
+
+  /** Call once per ABR track switch to increment the cumulative counter. */
+  notifyTrackSwitch(): void {
+    this.#trackSwitchCount++;
   }
 
   getSnapshot(): MetricsSnapshot {
@@ -54,6 +71,7 @@ export class MetricsCollector {
 
   #sample(): void {
     const m = this.#player.getMetrics();
+    const catchup = this.#buffer?.getCatchupTelemetry();
     const sample: MetricsSample = {
       ts: Date.now(),
       bufferSeconds: m.bufferSeconds,
@@ -88,6 +106,16 @@ export class MetricsCollector {
       switchToGroup: m.switchToGroup,
       switchGroupDelta: m.switchGroupDelta,
       switchAlignmentErrorSeconds: m.switchAlignmentErrorSeconds,
+      catchupMode: catchup?.catchupMode ?? '',
+      targetDelayS: catchup?.targetDelayS ?? 0,
+      liveOffsetS: catchup?.liveOffsetS ?? 0,
+      computedRate: catchup?.computedRate ?? m.playbackRate,
+      hardOverrideFired: catchup?.hardOverrideFired ?? false,
+      overrideType: catchup?.overrideType ?? '',
+      rateResetCount: catchup?.rateResetCount ?? 0,
+      seekForRecoveryCount: catchup?.seekForRecoveryCount ?? 0,
+      experimentLabel: this.#experimentLabel,
+      trackSwitchCount: this.#trackSwitchCount,
     };
 
     this.#samples.push(sample);
@@ -109,6 +137,7 @@ export class MetricsCollector {
   #sampleToCsvRow(s: MetricsSample): string {
     const elapsed = ((s.ts - this.#sessionStartTs) / 1000).toFixed(3);
     return [
+      s.experimentLabel,
       new Date(s.ts).toISOString(),
       elapsed,
       s.bufferSeconds.toFixed(3),
@@ -143,6 +172,14 @@ export class MetricsCollector {
       s.switchToGroup ?? '',
       this.#formatOptionalNumber(s.switchGroupDelta, 0),
       this.#formatOptionalNumber(s.switchAlignmentErrorSeconds, 3),
+      s.catchupMode,
+      s.targetDelayS.toFixed(3),
+      s.computedRate.toFixed(4),
+      s.hardOverrideFired ? '1' : '0',
+      s.overrideType,
+      s.rateResetCount,
+      s.seekForRecoveryCount,
+      s.trackSwitchCount,
     ].join(',');
   }
 

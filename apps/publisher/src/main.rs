@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
       v.width as u32,
       v.height as u32,
       v.bitrate_kbps,
-      hw_encoder,
+      hw_encoder.clone(),
     )
     .await?;
     let init_seg = catalog::build_init_segment(&extra, v.width, v.height);
@@ -107,17 +107,13 @@ async fn main() -> Result<()> {
   let cancel = CancellationToken::new();
 
   // Per-pipeline bounded mpsc channels for decoder → scaler fan-out.
-  // Buffer size = 2 GOPs so the decoder can stay slightly ahead of each
-  // pipeline. Unlike broadcast, mpsc provides backpressure: when the
-  // slowest pipeline's buffer is full the decoder blocks, preventing
-  // unbounded memory growth (the dash.js "no unbounded queues" pattern).
   // Bytes inside RawGop::clone is O(1) — Arc ref bump, no data copy.
   let mut raw_txs: Vec<tokio::sync::mpsc::Sender<decoder::RawGop>> =
     Vec::with_capacity(variants.len());
   let mut raw_rxs: Vec<tokio::sync::mpsc::Receiver<decoder::RawGop>> =
     Vec::with_capacity(variants.len());
   for _ in 0..variants.len() {
-    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
     raw_txs.push(tx);
     raw_rxs.push(rx);
   }
@@ -165,13 +161,14 @@ async fn main() -> Result<()> {
     let conn = moq.connection.clone();
     let raw_rx = raw_rxs.remove(0);
     let cancel = cancel.clone();
+    let hw = hw_encoder.clone();
 
     // Priority: lower-quality variants get a lower number (higher delivery priority).
     let publisher_priority = (variant_count as u8).saturating_sub(i as u8);
 
     let task = tokio::spawn(async move {
-      let (scaled_tx, scaled_rx) = tokio::sync::mpsc::channel(2);
-      let (gop_tx, gop_rx) = tokio::sync::mpsc::channel(2);
+      let (scaled_tx, scaled_rx) = tokio::sync::mpsc::channel(1);
+      let (gop_tx, gop_rx) = tokio::sync::mpsc::channel(1);
 
       info!(
         "Starting pipeline: {} (alias={}, priority={})",
@@ -191,7 +188,7 @@ async fn main() -> Result<()> {
         variant.width as u32,
         variant.height as u32,
         variant.bitrate_kbps,
-        hw_encoder,
+        hw,
         scaled_rx,
         gop_tx,
       ));
