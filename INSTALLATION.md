@@ -108,10 +108,15 @@ Then enable WebTransport in Chrome:
 
 ### 6. Build and Run
 
+Build the TypeScript client library first — `apps/client-js` imports `moqtail` from `libs/moqtail-ts/dist/`, and Vite will fail with `Failed to resolve entry for package "moqtail"` if `dist/` is missing:
+
 ```bash
+npm --prefix libs/moqtail-ts run build
 cargo build --release
 ./scripts/run-stack.sh
 ```
+
+> You only need to rerun `npm --prefix libs/moqtail-ts run build` after changes inside `libs/moqtail-ts/src/`.
 
 To use a custom video file:
 
@@ -130,12 +135,17 @@ To stop the stack:
 | Relay     | https://localhost:4433 |
 | Client-JS | http://localhost:5173  |
 
-### AMD GPU Hardware Encoding
+### AMD GPU Hardware Encoding (VAAPI)
 
-Ubuntu 24.04's packaged FFmpeg does not include AMF (AMD's proprietary hardware encoder). Software encoding via `libx265` works out of the box with no extra setup. If you want open-source AMD hardware encoding via VAAPI:
+Ubuntu's packaged FFmpeg does not include AMF (AMD's proprietary hardware encoder). Software encoding via `libx265` works out of the box with no extra setup. The publisher can optionally use open-source AMD hardware encoding via VAAPI (`hevc_vaapi`).
+
+#### 1. Install VA-API runtime and driver
 
 ```bash
-sudo apt install -y mesa-va-drivers vainfo
+sudo apt install -y \
+  libva2 libva-drm2 libva-x11-2 \
+  mesa-va-drivers \
+  vainfo
 ```
 
 VAAPI encoders (`hevc_vaapi`, `h264_vaapi`) are included in the system FFmpeg and work with any AMD GPU running the `amdgpu` kernel driver. The publisher currently uses the default encoder selection, so no additional flags are needed unless you modify the encoder configuration.

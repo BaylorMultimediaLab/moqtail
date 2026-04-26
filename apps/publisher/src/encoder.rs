@@ -6,7 +6,9 @@ use tracing::{info, warn};
 
 use crate::cmaf;
 use crate::scaler::ScaledGop;
-use crate::video::{yuv420p_to_nv12_frame, yuv420p_to_video_frame};
+#[cfg(feature = "vaapi")]
+use crate::video::yuv420p_to_nv12_frame;
+use crate::video::yuv420p_to_video_frame;
 
 /// GOP size in frames so that each GOP holds exactly 1 second of video.
 pub fn gop_size(framerate: f64) -> u32 {
@@ -25,18 +27,22 @@ pub struct EncodedGop {
 /// Hardware encoder type detected on the system.
 #[derive(Debug, Clone)]
 pub enum HardwareEncoder {
-  Nvenc,         // NVIDIA NVENC
-  Amf,           // AMD AMF (Windows)
-  Qsv,           // Intel Quick Sync Video
-  Vaapi(String), // VA-API (AMD/Intel on Linux) — carries the render device path
-  VideoToolbox,  // Apple VideoToolbox
+  Nvenc, // NVIDIA NVENC
+  Amf,   // AMD AMF (Windows)
+  Qsv,   // Intel Quick Sync Video
+  #[cfg(feature = "vaapi")]
+  Vaapi(String), // VA-API (AMD on Linux) — carries the render device path
+  VideoToolbox, // Apple VideoToolbox
 }
 
 // ── RAII helpers ────────────────────────────────────────────────────────────
 
 /// Owns an AVBufferRef* and unrefs it on drop.
+#[cfg(feature = "vaapi")]
 struct AvBufRef(*mut ffmpeg_next::sys::AVBufferRef);
+#[cfg(feature = "vaapi")]
 unsafe impl Send for AvBufRef {}
+#[cfg(feature = "vaapi")]
 impl Drop for AvBufRef {
   fn drop(&mut self) {
     if !self.0.is_null() {
@@ -46,7 +52,9 @@ impl Drop for AvBufRef {
 }
 
 /// Owns an AVFrame* and frees it on drop.
+#[cfg(feature = "vaapi")]
 struct AvFramePtr(*mut ffmpeg_next::sys::AVFrame);
+#[cfg(feature = "vaapi")]
 impl Drop for AvFramePtr {
   fn drop(&mut self) {
     if !self.0.is_null() {
@@ -57,15 +65,36 @@ impl Drop for AvFramePtr {
 
 // ── Hardware detection ───────────────────────────────────────────────────────
 
-/// Returns the first /dev/dri/renderD* node that exists.
+/// Returns the first /dev/dri/renderD* node whose PCI vendor is AMD (0x1002).
+/// Intel (0x8086) and NVIDIA (0x10de) devices are skipped so VA-API only
+/// activates on AMD hardware, matching the runtime gate.
+#[cfg(feature = "vaapi")]
 fn find_vaapi_device() -> Option<String> {
+  const AMD_VENDOR_ID: &str = "0x1002";
+
   (128..=135u32)
-    .map(|i| format!("/dev/dri/renderD{}", i))
-    .find(|p| std::path::Path::new(p).exists())
+    .map(|i| (i, format!("/dev/dri/renderD{}", i)))
+    .filter(|(_, p)| std::path::Path::new(p).exists())
+    .find_map(|(i, path)| {
+      let vendor_path = format!("/sys/class/drm/renderD{}/device/vendor", i);
+      let vendor = std::fs::read_to_string(&vendor_path).ok()?;
+      let vendor = vendor.trim();
+      if vendor.eq_ignore_ascii_case(AMD_VENDOR_ID) {
+        info!("VAAPI: found AMD render node {} (vendor {})", path, vendor);
+        Some(path)
+      } else {
+        info!(
+          "VAAPI: skipping {} — vendor {} is not AMD ({})",
+          path, vendor, AMD_VENDOR_ID
+        );
+        None
+      }
+    })
 }
 
 /// Creates a VAAPI device context for the given render node.
 /// Returns the owned buffer ref on success.
+#[cfg(feature = "vaapi")]
 fn create_vaapi_device(device_path: &str) -> Option<AvBufRef> {
   unsafe {
     let mut raw: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
@@ -89,6 +118,7 @@ fn create_vaapi_device(device_path: &str) -> Option<AvBufRef> {
 /// device context and resolution. AMD VAAPI requires NV12 surfaces for HEVC
 /// encoding — YUV420P sw_format creates surfaces the driver rejects at encode
 /// time with VA_STATUS_ERROR_INVALID_SURFACE.
+#[cfg(feature = "vaapi")]
 fn create_vaapi_frames_ctx(
   device_ctx: *mut ffmpeg_next::sys::AVBufferRef,
   width: u32,
@@ -121,6 +151,7 @@ fn create_vaapi_frames_ctx(
 /// Full VAAPI probe: opens a real hw device + frames context and attempts to
 /// open hevc_vaapi. The simple probe_encoder() path fails for VAAPI because it
 /// uses YUV420P — VAAPI requires the vaapi pixel format and a hw_frames_ctx.
+#[cfg(feature = "vaapi")]
 fn probe_vaapi(device_path: &str) -> bool {
   let Some(dev) = create_vaapi_device(device_path) else {
     return false;
@@ -141,7 +172,10 @@ fn probe_vaapi(device_path: &str) -> bool {
 
   enc.set_width(320);
   enc.set_height(240);
-  enc.set_format(Pixel::VAAPI);
+  // Set pix_fmt via raw FFI: `Pixel::VAAPI` is gated behind ffmpeg ≥5.0 in the
+  // Rust binding but the underlying C constant (aliased to _VLD on 4.x) is
+  // always present, so this works across FFmpeg versions.
+  unsafe { (*enc.as_mut_ptr()).pix_fmt = ffmpeg_next::sys::AVPixelFormat::AV_PIX_FMT_VAAPI };
   enc.set_time_base((1, 30));
   enc.set_bit_rate(500_000);
   unsafe { (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg_next::sys::av_buffer_ref(frames.0) };
@@ -209,6 +243,8 @@ pub fn detect_hardware_encoder() -> Option<HardwareEncoder> {
   }
 
   // VAAPI requires a hardware device context for probing — handle separately.
+  // Only enabled when the `vaapi` feature is built in (AMD-only at runtime).
+  #[cfg(feature = "vaapi")]
   if let Some(device) = find_vaapi_device()
     && probe_vaapi(&device)
   {
@@ -245,6 +281,7 @@ fn get_extradata_blocking(
   bitrate_kbps: u32,
   hw_encoder: Option<HardwareEncoder>,
 ) -> Result<bytes::Bytes> {
+  #[cfg(feature = "vaapi")]
   if let Some(HardwareEncoder::Vaapi(ref device_path)) = hw_encoder {
     return get_extradata_vaapi(framerate, width, height, bitrate_kbps, device_path);
   }
@@ -284,6 +321,7 @@ fn get_extradata_blocking(
   read_extradata(&opened, encoder_name)
 }
 
+#[cfg(feature = "vaapi")]
 fn get_extradata_vaapi(
   framerate: f64,
   width: u32,
@@ -304,7 +342,7 @@ fn get_extradata_vaapi(
 
   enc.set_width(width);
   enc.set_height(height);
-  enc.set_format(Pixel::VAAPI);
+  unsafe { (*enc.as_mut_ptr()).pix_fmt = ffmpeg_next::sys::AVPixelFormat::AV_PIX_FMT_VAAPI };
   enc.set_time_base((1, framerate.ceil() as i32));
   let bitrate_bps = (bitrate_kbps as i64) * 1000;
   enc.set_bit_rate(bitrate_bps as usize);
@@ -372,6 +410,7 @@ fn encoder_name_for(hw_encoder: Option<&HardwareEncoder>) -> &'static str {
     Some(HardwareEncoder::Nvenc) => "hevc_nvenc",
     Some(HardwareEncoder::Amf) => "hevc_amf",
     Some(HardwareEncoder::Qsv) => "hevc_qsv",
+    #[cfg(feature = "vaapi")]
     Some(HardwareEncoder::Vaapi(_)) => "hevc_vaapi",
     Some(HardwareEncoder::VideoToolbox) => "hevc_videotoolbox",
     None => "libx265",
@@ -460,6 +499,7 @@ fn encode_blocking(
   scaled_rx: &mut tokio::sync::mpsc::Receiver<ScaledGop>,
   on_gop: &tokio::sync::mpsc::Sender<EncodedGop>,
 ) -> Result<()> {
+  #[cfg(feature = "vaapi")]
   if let Some(HardwareEncoder::Vaapi(ref device_path)) = hw_encoder {
     return encode_blocking_vaapi(
       framerate,
@@ -478,6 +518,7 @@ fn encode_blocking(
     Some(HardwareEncoder::Nvenc) => info!("Using NVIDIA NVENC HEVC hardware encoder"),
     Some(HardwareEncoder::Amf) => info!("Using AMD AMF HEVC hardware encoder"),
     Some(HardwareEncoder::Qsv) => info!("Using Intel QSV HEVC hardware encoder"),
+    #[cfg(feature = "vaapi")]
     Some(HardwareEncoder::Vaapi(_)) => unreachable!("dispatched above"),
     Some(HardwareEncoder::VideoToolbox) => info!("Using Apple VideoToolbox HEVC hardware encoder"),
     None => info!("No hardware encoder detected, using software libx265"),
@@ -524,6 +565,7 @@ fn encode_blocking(
 
 // ── VAAPI encode path ────────────────────────────────────────────────────────
 
+#[cfg(feature = "vaapi")]
 fn encode_blocking_vaapi(
   framerate: f64,
   width: u32,
@@ -550,7 +592,9 @@ fn encode_blocking_vaapi(
 
   encoder_ctx.set_width(width);
   encoder_ctx.set_height(height);
-  encoder_ctx.set_format(Pixel::VAAPI);
+  unsafe {
+    (*encoder_ctx.as_mut_ptr()).pix_fmt = ffmpeg_next::sys::AVPixelFormat::AV_PIX_FMT_VAAPI;
+  }
   encoder_ctx.set_time_base((1, framerate.ceil() as i32));
   let bitrate_bps = (bitrate_kbps as i64) * 1000;
   encoder_ctx.set_bit_rate(bitrate_bps as usize);
@@ -586,6 +630,7 @@ fn encode_blocking_vaapi(
 
 /// Uploads one YUV420P software frame to a VAAPI hardware surface and sends
 /// it to the encoder via raw FFI (avcodec_send_frame).
+#[cfg(feature = "vaapi")]
 fn upload_and_send_vaapi(
   encoder: &mut encoder::Video,
   sw_frame: &ffmpeg_next::frame::Video,
@@ -614,6 +659,7 @@ fn upload_and_send_vaapi(
   }
 }
 
+#[cfg(feature = "vaapi")]
 fn encode_gop_vaapi(
   encoder: &mut encoder::Video,
   gop: &ScaledGop,
