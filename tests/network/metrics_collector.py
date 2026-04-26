@@ -24,6 +24,13 @@ class ClientMetricsSample:
     playback_rate: float
     delivery_time_ms: float
     mode: str  # "auto" or "manual"
+    # MSE / video element wedge diagnostics.
+    ready_state: int = 0  # HTMLMediaElement.readyState (0–4)
+    paused: bool = False
+    current_time: float = 0.0
+    buffered_ranges: str = ""
+    mse_ready_state: str = ""  # "open" | "ended" | "closed"
+    video_error_code: int = 0  # 0 if no error, else MEDIA_ERR_*
 
 
 @dataclass
@@ -73,6 +80,12 @@ class MetricsCollector:
             playback_rate=abr.get("playbackRate", 1.0),
             delivery_time_ms=abr.get("deliveryTimeMs", 0.0),
             mode=abr.get("mode", "auto"),
+            ready_state=abr.get("readyState", 0),
+            paused=abr.get("paused", False),
+            current_time=abr.get("currentTime", 0.0),
+            buffered_ranges=abr.get("bufferedRanges", ""),
+            mse_ready_state=abr.get("mseReadyState", ""),
+            video_error_code=abr.get("videoErrorCode", 0),
         )
         self.samples.append(sample)
 
@@ -161,12 +174,16 @@ class MetricsCollector:
                 "timestamp", "active_track", "active_track_index", "buffer_seconds",
                 "bandwidth_bps", "fast_ema_bps", "slow_ema_bps", "dropped_frames",
                 "total_frames", "playback_rate", "delivery_time_ms", "mode",
+                "ready_state", "paused", "current_time", "buffered_ranges",
+                "mse_ready_state", "video_error_code",
             ])
             for s in self.samples:
                 writer.writerow([
                     s.timestamp, s.active_track, s.active_track_index, s.buffer_seconds,
                     s.bandwidth_bps, s.fast_ema_bps, s.slow_ema_bps, s.dropped_frames,
                     s.total_frames, s.playback_rate, s.delivery_time_ms, s.mode,
+                    s.ready_state, s.paused, s.current_time, s.buffered_ranges,
+                    s.mse_ready_state, s.video_error_code,
                 ])
 
     def save_switches_json(self, path: Path) -> None:

@@ -1,6 +1,6 @@
 from mininet.topo import Topo
 from mininet.net import Mininet
-from mininet.link import TCLink
+from mininet.link import TCLink, Link
 from mininet.log import setLogLevel
 
 
@@ -85,7 +85,16 @@ def create_network(
     relay.setIP("10.0.1.2/24", intf="relay-eth0")
     relay.setIP("10.0.2.2/24", intf="relay-eth1")
 
+    # Root-namespace host on s2 so pytest (which lives in the root netns) can
+    # reach services inside the client netns — notably Chromium's CDP port.
+    # Unshaped plain Link (TCLink here would throttle the control channel too).
+    root0 = net.addHost("root0", inNamespace=False)
+    s2 = net.get("s2")
+    root_link = net.addLink(root0, s2, cls=Link)
+
     net.start()
+
+    root0.setIP("10.0.2.100/24", intf=root_link.intf1)
 
     # Add routes after start so network namespaces are fully up
     client = net.get("client")

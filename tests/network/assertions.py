@@ -104,21 +104,29 @@ def assert_no_rebuffering(
     start_time: float,
     end_time: float,
 ) -> None:
-    """Assert that buffer never hit 0 during the time window.
+    """Assert that buffer never hit 0 during steady-state playback.
+
+    "Rebuffering" means buffer empties *after* playback has started. The
+    initial samples taken before the decoder produces its first frames
+    naturally have buffer=0 — those are startup, not stalls. We exclude
+    samples where total_frames is still 0 (no playback yet).
 
     Args:
         collector: MetricsCollector with collected data.
         start_time: Window start.
         end_time: Window end.
     """
-    min_buffer = collector.get_buffer_min(start_time, end_time)
-    if min_buffer <= 0:
-        # Find the exact time buffer hit 0
-        zero_samples = [
-            s for s in collector.samples
-            if start_time <= s.timestamp <= end_time and s.buffer_seconds <= 0
-        ]
+    in_window = [
+        s for s in collector.samples
+        if start_time <= s.timestamp <= end_time and s.total_frames > 0
+    ]
+    if not in_window:
+        return  # Playback never started in this window — separate failure mode
+
+    zero_samples = [s for s in in_window if s.buffer_seconds <= 0]
+    if zero_samples:
         zero_times = [f"{s.timestamp - start_time:.1f}s" for s in zero_samples[:5]]
+        min_buffer = min(s.buffer_seconds for s in in_window)
         raise AssertionError(
             f"Buffer hit 0 (rebuffering) at offsets: {zero_times}. "
             f"Min buffer in window: {min_buffer:.3f}s"

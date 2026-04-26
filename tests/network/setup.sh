@@ -60,22 +60,39 @@ else
     echo "  Mininet already installed."
 fi
 
-# 2. Install Xvfb
-echo "[2/7] Installing Xvfb..."
-if ! command -v Xvfb &>/dev/null; then
-    apt-get install -y xvfb
-    echo "  Xvfb installed."
+# 2. Install socat + NSS tools
+# socat bridges the CDP port from client netns loopback to the client IP so pytest
+# (root netns) can reach it. certutil is required to add the mkcert CA to
+# /root/.pki/nssdb (see step 9) so Chrome running as root trusts the relay cert.
+echo "[2/7] Installing socat + libnss3-tools + vainfo..."
+apt-get install -y socat libnss3-tools vainfo
+echo "  socat + certutil + vainfo installed."
+
+# 3. Install mkcert
+# We use mkcert for the relay's dev cert. Chromium rejects self-signed certs in
+# QUIC even with --ignore-certificate-errors, so a real CA (mkcert's) is easier.
+echo "[3/7] Installing mkcert..."
+if ! command -v mkcert &>/dev/null; then
+    apt-get install -y mkcert
+    echo "  mkcert installed."
 else
-    echo "  Xvfb already installed."
+    echo "  mkcert already installed."
 fi
 
-# 3. Install Chromium
-echo "[3/7] Installing Chromium..."
-if ! command -v chromium-browser &>/dev/null && ! command -v chromium &>/dev/null; then
-    apt-get install -y chromium-browser || apt-get install -y chromium
-    echo "  Chromium installed."
+# 3b. Install Google Chrome stable
+# Playwright's bundled Chromium omits HEVC decoders (H.265 is patent-encumbered).
+# The publisher emits hvc1-only variants, so headless Chromium fails with
+# "MIME type not supported: video/mp4; codecs=hvc1...". Google Chrome stable
+# ships HEVC support.
+echo "[3b/7] Installing Google Chrome stable..."
+if ! command -v google-chrome-stable &>/dev/null; then
+    CHROME_DEB=$(mktemp --suffix=.deb)
+    wget -q -O "$CHROME_DEB" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+    apt-get install -y "$CHROME_DEB"
+    rm -f "$CHROME_DEB"
+    echo "  google-chrome-stable installed."
 else
-    echo "  Chromium already installed."
+    echo "  google-chrome-stable already installed."
 fi
 
 # 4. Install uv (if not present) — runs as the invoking user
@@ -118,31 +135,70 @@ if [ -e /dev/dri/renderD128 ]; then
     if command -v vainfo &>/dev/null; then
         if vainfo 2>/dev/null | grep -qE 'HEVC|H265'; then
             [ -n "$AMD_NAME" ] && echo "  AMD GPU detected: $AMD_NAME"
-            echo "  VAAPI HEVC available for publisher."
+            echo "  VAAPI HEVC available (required for Chrome to decode hvc1 client-side)."
             GPU_OK=1
         else
-            echo "  Warning: VAAPI present but HEVC not supported on this device."
+            echo "  Warning: VAAPI present but HEVC not supported on this device. Tests will fail — Chrome cannot decode the publisher's hvc1 output without HW HEVC."
         fi
     else
         [ -n "$AMD_NAME" ] && echo "  AMD GPU detected: $AMD_NAME"
-        echo "  Warning: vainfo not installed; cannot verify VAAPI HEVC. Install with: apt-get install -y vainfo"
+        echo "  Warning: vainfo not installed; cannot verify VAAPI HEVC."
     fi
 fi
 if [ "$GPU_OK" -eq 0 ]; then
-    echo "  Warning: no NVIDIA/AMD GPU encoder detected. Publisher will fall back to software encoding (libx265)."
+    echo "  Warning: no GPU with HEVC decode detected. Chrome in tests will reject hvc1 MIME type and the fixture will fail at 'ABR pipeline never started'."
 fi
 
-# 9. Check for TLS certs
+# 9. TLS certs — regenerate if the cert is missing or lacks the Mininet IPs in its SAN.
+# Chrome in QUIC mode enforces both trust AND hostname match; without 10.0.2.2 in
+# the SAN the client sees QUIC_TLS_CERTIFICATE_UNKNOWN.
 echo ""
 echo "=== TLS Certificate Check ==="
-if [ -f "$REPO_ROOT/apps/relay/cert/cert.pem" ] && [ -f "$REPO_ROOT/apps/relay/cert/key.pem" ]; then
-    echo "  TLS certs found."
+CERT="$REPO_ROOT/apps/relay/cert/cert.pem"
+KEY="$REPO_ROOT/apps/relay/cert/key.pem"
+NEED_REGEN=0
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+    NEED_REGEN=1
+elif ! openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null | grep -q '10.0.2.2'; then
+    echo "  Existing cert does not include 10.0.2.2 in SAN — regenerating."
+    NEED_REGEN=1
+fi
+if [ "$NEED_REGEN" -eq 1 ]; then
+    user_run "mkcert -install"
+    mkdir -p "$(dirname "$CERT")"
+    user_run "mkcert -cert-file '$CERT' -key-file '$KEY' 10.0.2.2 10.0.1.2 localhost 127.0.0.1 ::1"
+    [ "$EUID" -eq 0 ] && [ "${SUDO_USER:-}" ] && chown -R "$(id -u "$RUN_USER"):$(id -g "$RUN_USER")" "$(dirname "$CERT")" || true
+    echo "  Regenerated relay cert with Mininet IPs in SAN."
 else
-    echo "  Warning: TLS certs not found at apps/relay/cert/. Generate with mkcert:"
-    echo "    mkcert -install"
-    echo "    mkcert -cert-file apps/relay/cert/cert.pem -key-file apps/relay/cert/key.pem localhost 127.0.0.1 10.0.1.2 10.0.2.2"
+    echo "  TLS cert has 10.0.2.2 in SAN."
+fi
+
+# 10. Trust the mkcert CA from root's NSS db so Chrome running under sudo trusts
+# the relay cert. `mkcert -install` as root still writes into $SUDO_USER's NSS db
+# (it honors $HOME), so we install it explicitly here.
+if [ "$EUID" -eq 0 ]; then
+    CAROOT=$(user_run "mkcert -CAROOT" | tail -1)
+    if [ -f "$CAROOT/rootCA.pem" ]; then
+        echo "=== Installing mkcert CA into /root/.pki/nssdb ==="
+        mkdir -p /root/.pki/nssdb
+        if ! certutil -d sql:/root/.pki/nssdb -L 2>/dev/null | grep -q mkcert; then
+            certutil -d sql:/root/.pki/nssdb -N --empty-password </dev/null 2>/dev/null || true
+            certutil -d sql:/root/.pki/nssdb -A -t "C,," -n "mkcert" -i "$CAROOT/rootCA.pem"
+            echo "  mkcert CA installed in root's NSS db."
+        else
+            echo "  mkcert CA already present in root's NSS db."
+        fi
+    else
+        echo "  Warning: $CAROOT/rootCA.pem not found. Run 'mkcert -install' as $RUN_USER first."
+    fi
+else
+    echo "  Warning: run setup.sh as root to install the mkcert CA into /root/.pki/nssdb."
 fi
 
 echo ""
 echo "=== Setup Complete ==="
-echo "Run tests with: sudo uv run --project tests/network pytest tests/network/scenarios/ -v"
+echo "Run tests with:"
+echo "  sudo -E '$SCRIPT_DIR/.venv/bin/pytest' tests/network/scenarios/ -v -s"
+echo ""
+echo "Note: if '/snap/bin/uv' is your uv, 'sudo uv run' will swallow stdout under"
+echo "snap confinement — invoke the venv's pytest directly as shown above."

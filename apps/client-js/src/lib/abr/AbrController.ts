@@ -23,6 +23,14 @@ export interface AbrMetrics {
   switchHistory: SwitchEvent[];
   mode: 'auto' | 'manual';
   switching: boolean;
+  // MSE / video element state — populated to diagnose playback wedges
+  // where total_frames stops advancing but buffer keeps growing.
+  readyState: number;
+  paused: boolean;
+  currentTime: number;
+  bufferedRanges: string;
+  mseReadyState: string;
+  videoErrorCode: number;
 }
 
 const MAX_HISTORY = 60;
@@ -38,6 +46,13 @@ export class AbrController {
   #switching = false;
   #usingBolaRule = false;
   #switchHistory: SwitchEvent[] = [];
+  // Snapshot of totalVideoFrames at the moment of the last switch; the guard
+  // is held until this counter has actually advanced (i.e. a new-track frame
+  // has been decoded), not just until the init segment was appended. Without
+  // this, rapid back-to-back switches leave MSE with a fragmented timeline
+  // (gaps between groups) and playback wedges with ready_state=2.
+  #framesAtSwitch = 0;
+  #pendingFrameAdvance = false;
 
   constructor(
     player: Pick<Player, 'getMetrics' | 'switchTrack' | 'pollGoodput'>,
@@ -71,7 +86,11 @@ export class AbrController {
   }
 
   releaseSwitchingGuard(): void {
-    this.#switching = false;
+    // Player fires this when the new track's init segment has been applied.
+    // Defer actually clearing #switching until totalVideoFrames advances past
+    // the snapshot — that's when MSE has decoded an actual frame from the new
+    // track. Prevents rapid switches from shredding the MSE timeline.
+    this.#pendingFrameAdvance = true;
   }
 
   isSwitching(): boolean {
@@ -81,8 +100,10 @@ export class AbrController {
   manualSwitch(trackName: string): void {
     if (this.#switching) return; // switch already in-flight
     this.#switching = true;
-    const fromTrack = this.#player.getMetrics().activeTrack ?? '';
-    this.#recordHistory(fromTrack, trackName, 'manual', 0, 0);
+    const m = this.#player.getMetrics();
+    this.#framesAtSwitch = m.totalFrames;
+    this.#pendingFrameAdvance = false;
+    this.#recordHistory(m.activeTrack ?? '', trackName, 'manual', 0, 0);
     void this.#player.switchTrack(trackName);
   }
 
@@ -105,6 +126,12 @@ export class AbrController {
       playbackRate,
       deliveryTimeMs,
       lastObjectBytes,
+      readyState,
+      paused,
+      currentTime,
+      bufferedRanges,
+      mseReadyState,
+      videoErrorCode,
     } = raw;
 
     // Find the active track index in the sorted tracks array
@@ -127,9 +154,23 @@ export class AbrController {
       switchHistory: [...this.#switchHistory],
       mode,
       switching: this.#switching,
+      readyState,
+      paused,
+      currentTime,
+      bufferedRanges,
+      mseReadyState,
+      videoErrorCode,
     };
 
     this.#onMetricsUpdate(metrics);
+
+    // Once the player signals the init segment landed, hold #switching until
+    // a real new-track frame is decoded (totalVideoFrames moved past the
+    // snapshot). Only then is it safe to consider another switch.
+    if (this.#pendingFrameAdvance && totalFrames > this.#framesAtSwitch) {
+      this.#switching = false;
+      this.#pendingFrameAdvance = false;
+    }
 
     // Manual mode — don't make automatic decisions
     if (!this.#settings.videoAutoSwitch) return;
@@ -183,6 +224,8 @@ export class AbrController {
 
     // Activate switching guard, record history, and switch
     this.#switching = true;
+    this.#framesAtSwitch = totalFrames;
+    this.#pendingFrameAdvance = false;
     this.#recordHistory(activeTrack ?? '', targetTrack.name, reason, bufferSeconds, fastEmaBps);
     void this.#player.switchTrack(targetTrack.name);
   }

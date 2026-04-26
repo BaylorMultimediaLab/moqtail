@@ -246,7 +246,27 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const blurRafRef = useRef<number | null>(null);
 
-  const [abrSettings, setAbrSettings] = useState<AbrSettings>(DEFAULT_ABR_SETTINGS);
+  const [abrSettings, setAbrSettings] = useState<AbrSettings>(() => {
+    // Allow tests to override numeric ABR settings via URL query params, e.g.
+    // ?bufferTimeDefault=60. Production defaults are unchanged.
+    const params = new URLSearchParams(window.location.search);
+    const overrides: Partial<AbrSettings> = {};
+    for (const key of [
+      'bufferTimeDefault',
+      'stableBufferTime',
+      'bandwidthSafetyFactor',
+      'initialBitrate',
+      'minBitrate',
+      'maxBitrate',
+    ] as const) {
+      const v = params.get(key);
+      if (v !== null && v !== '') {
+        const n = Number(v);
+        if (Number.isFinite(n)) (overrides as Record<string, number>)[key] = n;
+      }
+    }
+    return { ...DEFAULT_ABR_SETTINGS, ...overrides };
+  });
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
   const abrRef = useRef<AbrController | null>(null);

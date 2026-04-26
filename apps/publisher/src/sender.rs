@@ -5,7 +5,7 @@ use moqtail::model::data::subgroup_object::SubgroupObject;
 use moqtail::transport::data_stream_handler::{HeaderInfo, SendDataStream};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::encoder::EncodedGop;
 
@@ -35,38 +35,68 @@ const SINGLE_SUBGROUP_ID: u8 = 0;
 pub async fn send_track(
   connection: Arc<wtransport::Connection>,
   track_alias: u64,
+  label: String,
   publisher_priority: u8,
   mut gop_rx: tokio::sync::mpsc::Receiver<EncodedGop>,
+  emit_barrier: Arc<tokio::sync::Barrier>,
 ) -> Result<()> {
-  info!("Sender (alias={}): starting", track_alias);
+  info!("Sender ({} alias={}): starting", label, track_alias);
+
+  const RATE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
   let mut groups_sent = 0u64;
+  let mut first_group_logged = false;
+  let mut last_log = std::time::Instant::now();
+  let mut groups_at_last_log = 0u64;
 
   while let Some(gop) = gop_rx.recv().await {
+    // Pins all variants to the same group_id per wall-clock tick. Without this,
+    // the relay's Switch gate (new.group_id >= old.last_sent.group) never
+    // clears when switching to a higher bitrate whose pipeline fills slower.
+    emit_barrier.wait().await;
+
     match send_group(&connection, track_alias, publisher_priority, &gop).await {
       Ok(()) => {
         groups_sent += 1;
-        if groups_sent.is_multiple_of(30) {
-          debug!(
-            "Sender (alias={}): {} groups sent",
-            track_alias, groups_sent
+        if !first_group_logged {
+          info!(
+            "Sender ({} alias={}): first group sent (group_id={})",
+            label, track_alias, gop.group_id
           );
+          first_group_logged = true;
+        }
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(last_log);
+        if elapsed >= RATE_LOG_INTERVAL {
+          let delta = groups_sent - groups_at_last_log;
+          let rate = delta as f64 / elapsed.as_secs_f64();
+          info!(
+            "Sender ({} alias={}): {:.2} groups/sec over last {:.1}s (last_group_id={}, total={})",
+            label,
+            track_alias,
+            rate,
+            elapsed.as_secs_f64(),
+            gop.group_id,
+            groups_sent
+          );
+          last_log = now;
+          groups_at_last_log = groups_sent;
         }
       }
       Err(e) => {
         // A single failed group (e.g. a transient stream error) should not kill
         // the entire sender task for a live stream. Log and continue.
         warn!(
-          "Sender (alias={}): error sending group {}: {:#}",
-          track_alias, gop.group_id, e
+          "Sender ({} alias={}): error sending group {}: {:#}",
+          label, track_alias, gop.group_id, e
         );
       }
     }
   }
 
   info!(
-    "Sender (alias={}): finished, {} groups sent",
-    track_alias, groups_sent
+    "Sender ({} alias={}): finished, {} groups sent",
+    label, track_alias, groups_sent
   );
   Ok(())
 }

@@ -250,3 +250,6 @@ logs/*
 ### Superpowers ###
 docs/*
 apps/client-js/specs/
+apps/relay/cert/cert.pem.bak
+apps/relay/cert/key.pem.bak
+.claude/

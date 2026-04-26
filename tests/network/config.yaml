@@ -40,9 +40,21 @@ polling:
   relay_log_poll_ms: 1000
 
 chromium:
+  # Runs against weston's headless Wayland compositor (browser_page fixture).
+  # Weston wires up DRM/render nodes directly so VA-API HEVC decode can
+  # allocate dma-buf-backed SharedImages — the path Xvfb couldn't provide.
+  # https://chromium.googlesource.com/chromium/src/+/refs/heads/main/docs/gpu/vaapi.md
   flags:
-    - '--headless=new'
-    - '--disable-gpu'
     - '--no-sandbox'
+    - '--disable-dev-shm-usage'
     - '--ignore-certificate-errors'
+    - '--ignore-certificate-errors-spki-list=Z2ORKiEbMnhuPCInwfS+57ivf0Xboad1IbXXt9aUuUA='
     - '--origin-to-force-quic-on=10.0.2.2:4433'
+    - '--enable-features=AcceleratedVideoEncoder,AcceleratedVideoDecodeLinuxGL,PlatformHEVCDecoderSupport'
+    - '--ignore-gpu-blocklist'
+    - '--disable-gpu-driver-bug-workaround'
+    - '--enable-gpu'
+    - '--use-gl=angle'
+    - '--use-angle=gl'
+    - '--disable-software-rasterizer'
+    - '--ozone-platform=wayland'

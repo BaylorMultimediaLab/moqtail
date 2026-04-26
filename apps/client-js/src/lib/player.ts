@@ -86,6 +86,7 @@ export class Player {
   #streams: MOQStreamStruct[] = [];
   #options: Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
     Pick<PlayerOptions, 'onTrackSwitched'>;
+  #disposers: Array<() => void> = [];
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -149,6 +150,15 @@ export class Player {
   }
 
   async dispose() {
+    for (const d of this.#disposers) {
+      try {
+        d();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.#disposers = [];
+
     // Unsubscribe from all active streams
     await Promise.all(this.#streams.map(s => this.unsubscribe(s.requestId)));
 
@@ -200,6 +210,45 @@ export class Player {
     if (!this.client) throw new Error('MOQProcessor not initialized');
     if (!this.#element) throw new Error('Media element not attached');
     if (this.#streams.length === 0) throw new Error('No active media streams to start');
+
+    // Wedge watchdog. Each ABR switch leaves a ~1-frame gap in the MSE
+    // timeline (the relay activates the new track at the next group boundary,
+    // so a few frames at the boundary are dropped). When currentTime walks
+    // into one of those gaps, MSE goes ready_state=2 and stops advancing
+    // forever even though data is buffered on the far side. Detect that
+    // exact pattern (frames frozen, currentTime sitting at the end of a
+    // buffered range, with another range immediately after) and seek across
+    // the gap.
+    const el = this.#element;
+    let lastFrames = 0;
+    let frozenSince = 0;
+    const wedgeIntervalId = setInterval(() => {
+      const q = el.getVideoPlaybackQuality?.();
+      const frames = q?.totalVideoFrames ?? 0;
+      if (frames > lastFrames) {
+        lastFrames = frames;
+        frozenSince = 0;
+        return;
+      }
+      if (el.paused || el.ended) return;
+      frozenSince += 1;
+      if (frozenSince < 2) return; // wait ~1s of confirmed freeze
+      const buf = el.buffered;
+      for (let i = 0; i < buf.length - 1; i++) {
+        const end = buf.end(i);
+        const nextStart = buf.start(i + 1);
+        if (el.currentTime >= end - 0.05 && nextStart > end && nextStart - end < 1.5) {
+          logger.info(
+            'media',
+            `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
+          );
+          el.currentTime = nextStart + 0.001;
+          frozenSince = 0;
+          return;
+        }
+      }
+    }, 500);
+    this.#disposers.push(() => clearInterval(wedgeIntervalId));
 
     // Convenience function to wait for buffer updates
     const waitForBufferUpdate = (sourceBuffer: SourceBuffer) =>
@@ -287,30 +336,28 @@ export class Player {
               return;
             }
 
-            // Init segment re-injection after a seamless track switch.
-            // Detect the transition by comparing the object's fullTrackName
-            // (resolved from the wire's track_alias) against the target track.
-            // The previous approach (group !== lastGroupId) fired too early —
-            // the relay may continue sending old-track groups after the SWITCH
-            // is acknowledged, so a group boundary change does NOT imply a track
-            // transition. Checking the actual track name is authoritative.
-            const objectTrackName = struct.pendingSwitch
-              ? new TextDecoder().decode(object.fullTrackName.name)
-              : null;
+            // Resolve the incoming object's track name from its fullTrackName
+            // (wire-side truth). Always compute it — not just during pending
+            // switches — because the relay continues to flush in-flight
+            // old-track streams AFTER a switch completes. Those trailing
+            // packets have different HEVC SPS/PPS than the new init segment,
+            // so appending them would feed the SourceBuffer data it can't
+            // decode and stall MSE.
+            const objectTrackName = new TextDecoder().decode(object.fullTrackName.name);
 
-            // During rapid ABR switching (A→B→C) the relay may deliver data
-            // for intermediate tracks whose pendingSwitch was overwritten.
-            // Appending that data without a changeType/init-segment would
-            // corrupt the SourceBuffer. Drop anything that doesn't belong
-            // to either the current track or the pending switch target.
+            // Drop anything that isn't the current track or the pending
+            // switch target. Covers two cases:
+            //   1. Rapid ABR switching (A→B→C) where intermediate-track data
+            //      arrives after pendingSwitch was overwritten to C.
+            //   2. Old-track trailing packets delivered after a switch has
+            //      already activated and pendingSwitch was cleared.
             if (
-              objectTrackName !== null &&
               objectTrackName !== struct.trackName &&
               objectTrackName !== struct.pendingSwitch?.trackName
             ) {
               logger.info(
                 'media',
-                `Dropping intermediate track data (${objectTrackName}) while switching to ${struct.pendingSwitch?.trackName}`,
+                `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
               );
               return;
             }
@@ -359,9 +406,17 @@ export class Player {
                 if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
                 else if (lastMSEErrorLogged + 5000 < performance.now()) {
                   lastMSEErrorLogged = performance.now();
+                  const err = error as Error & { name?: string; code?: number };
+                  const vErr = this.#element?.error;
                   logger.error(
                     'media',
-                    `Error appending to SourceBuffer, retrying... (${maxRetries} attempts left)`,
+                    `Error appending to SourceBuffer, retrying... (${maxRetries} attempts left). ` +
+                      `err.name=${err?.name} err.message=${err?.message} ` +
+                      `sb.updating=${sourceBuffer.updating} ` +
+                      `mse.readyState=${this.#mse?.readyState} ` +
+                      `video.error.code=${vErr?.code} video.error.message=${vErr?.message} ` +
+                      `payload.byteLength=${object.payload.byteLength} ` +
+                      `track=${objectTrackName}`,
                   );
                 }
               }
@@ -413,14 +468,29 @@ export class Player {
     playbackRate: number;
     deliveryTimeMs: number;
     lastObjectBytes: number;
+    readyState: number;
+    paused: boolean;
+    currentTime: number;
+    bufferedRanges: string;
+    mseReadyState: string;
+    videoErrorCode: number;
   } {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    const buffered = this.#element?.buffered;
+    const el = this.#element;
+    const buffered = el?.buffered;
     const bufferSeconds =
-      buffered && buffered.length > 0 && this.#element
-        ? Math.max(0, buffered.end(buffered.length - 1) - this.#element.currentTime)
+      buffered && buffered.length > 0 && el
+        ? Math.max(0, buffered.end(buffered.length - 1) - el.currentTime)
         : 0;
-    const quality = this.#element?.getVideoPlaybackQuality?.();
+    const quality = el?.getVideoPlaybackQuality?.();
+    let bufferedRanges = '';
+    if (buffered) {
+      const parts: string[] = [];
+      for (let i = 0; i < buffered.length; i++) {
+        parts.push(`${buffered.start(i).toFixed(2)}-${buffered.end(i).toFixed(2)}`);
+      }
+      bufferedRanges = parts.join(',');
+    }
     return {
       bandwidthBps: videoStruct?.tracker.getBandwidthBps() ?? 0,
       fastEmaBps: videoStruct?.tracker.getFastEmaBps() ?? 0,
@@ -429,9 +499,15 @@ export class Player {
       activeTrack: videoStruct?.trackName ?? null,
       droppedFrames: quality?.droppedVideoFrames ?? 0,
       totalFrames: quality?.totalVideoFrames ?? 0,
-      playbackRate: this.#element?.playbackRate ?? 1,
+      playbackRate: el?.playbackRate ?? 1,
       deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
       lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
+      readyState: el?.readyState ?? 0,
+      paused: el?.paused ?? true,
+      currentTime: el?.currentTime ?? 0,
+      bufferedRanges,
+      mseReadyState: this.#mse?.readyState ?? 'closed',
+      videoErrorCode: el?.error?.code ?? 0,
     };
   }
 
