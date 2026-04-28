@@ -156,12 +156,15 @@ async fn main() -> Result<()> {
   // congestion) so that lower-quality tracks survive network stress.
   let variant_count = variants.len();
 
+  let emit_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(variant_count));
+
   for (i, variant) in variants.into_iter().enumerate() {
     let track_alias = track_aliases[i];
     let conn = moq.connection.clone();
     let raw_rx = raw_rxs.remove(0);
     let cancel = cancel.clone();
     let hw = hw_encoder.clone();
+    let barrier = emit_barrier.clone();
 
     // Priority: lower-quality variants get a lower number (higher delivery priority).
     let publisher_priority = (variant_count as u8).saturating_sub(i as u8);
@@ -195,8 +198,10 @@ async fn main() -> Result<()> {
       let send_handle = tokio::spawn(sender::send_track(
         conn,
         track_alias,
+        variant.quality.to_string(),
         publisher_priority,
         gop_rx,
+        barrier,
       ));
 
       let (scale_result, encode_result, send_result) =

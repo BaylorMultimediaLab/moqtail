@@ -15,187 +15,184 @@
  */
 
 /**
- * Dual Exponential Moving Average (DEWMA) goodput tracker backed by
- * WebTransport connection statistics.
+ * Bandwidth tracker — Sliding Window Moving Average (SWMA) over per-group
+ * throughput, as proposed for MoQ at IETF 119 (slides-119-moq-bandwidth-
+ * measurement-for-quic) and validated by Kuo, KTH MSc 2025
+ * "Evaluating Media over QUIC for Low-Latency Adaptive Streaming".
  *
- * When a WebTransport session is bound via {@link setTransport}, bandwidth
- * estimation is derived from the QUIC stack's `bytesReceived` counter
- * (polled via {@link https://developer.mozilla.org/docs/Web/API/WebTransport/getStats | WebTransport.getStats()}).
- * This replaces the previous application-layer byte-counting window with
- * a transport-level measurement that accounts for retransmissions and
- * QUIC framing — giving a more accurate picture of link capacity.
+ * Why SWMA on a single group rather than a continuous EWMA over a
+ * `bytesReceived` poll window:
  *
- * Falls back to manual application-layer byte counting when
- * WebTransport.getStats() is unavailable (e.g. Firefox, Safari).
+ *   The publisher (`apps/publisher/src/sender.rs::send_group`) bursts all
+ *   N objects of a GOP onto the QUIC stream back-to-back, then idles
+ *   between groups while the next GOP is encoded. A continuous EWMA
+ *   averages those idle gaps into the throughput estimate, so its reading
+ *   converges on the *source bitrate* — useless for detecting headroom
+ *   when the link is fatter than the active track. SWMA on a single
+ *   group's burst (objects 2..N divided by t_N − t_1) reads the link's
+ *   actual delivery rate during that burst — the closest analog to
+ *   dash.js's segment-download-rate that MoQ allows without QUIC-packet
+ *   visibility.
  *
- * Internal to Player — not re-exported from src/lib/index.ts.
+ *   The IETF slides describe SWMA on intra-frame fragments; in this
+ *   codebase one frame = one MoQ object so the same idea applies one
+ *   level up at the GOP/group boundary.
+ *
+ * The first object in a group only sets t_1 — its bytes are excluded from
+ * the numerator so a small init-segment-style first object can't bias the
+ * estimate.
  */
-/**
- * Extended WebTransport interface for browsers that support getStats()
- * (Chromium 114+). Not yet in TypeScript's lib.dom.d.ts.
- */
-interface WebTransportWithStats extends WebTransport {
-  getStats(): Promise<{ bytesReceived?: number; bytesSent?: number; smoothedRtt?: number }>;
-}
-
 export class GoodputTracker {
-  #emaFast: number = 0;
-  #emaSlow: number = 0;
-  #alphaFast: number;
-  #alphaSlow: number;
-  #hasData: boolean = false;
-  #lastDeliveryTimeMs = 0;
+  // SWMA window of per-group throughput samples (bps). Default size 5 ≈ 5s.
+  #swma: number[] = [];
+  readonly #swmaWindowSize = 5;
+
+  // Current-group accumulator. groupId is bigint to match MoqtObject.location.group.
+  #currentGroupId: bigint | null = null;
+  #currentGroupBytes = 0;
+  #currentGroupFirstObjBytes = 0;
+  #currentGroupFirstTs = 0;
+  #currentGroupLastTs = 0;
+  #currentGroupObjectCount = 0;
+
+  // Diagnostics
   #lastObjectBytes = 0;
+  #lastGroupDurationMs = 0;
   #sampleCount = 0;
+  // Monotonic counter of all bytes ever recorded. Used by the active
+  // probe (Kuo Algorithm 1) to compute v = video-track bytes received
+  // during the probe window — snapshot at probe start, snapshot at probe
+  // end, subtract.
+  #cumulativeBytes = 0;
 
-  // WebTransport stats-based throughput
-  #transport: WebTransportWithStats | null = null;
-  #prevBytesReceived = 0;
-  #prevTimestampMs = 0;
-  #useTransportStats = false;
+  // Time-weighted EMAs over per-group throughput samples. dash.js half-life
+  // defaults are 3s/8s; with one sample per group (~1s) those still smooth
+  // the signal but with the same asymmetry (Math.min picks the slower of
+  // the two, so spikes can't trigger an upswitch on their own).
+  #emaFast = 0;
+  #emaSlow = 0;
+  #halfLifeFastSec: number;
+  #halfLifeSlowSec: number;
+  #hasEmaData = false;
 
-  // Fallback: windowed throughput (used when getStats() is unavailable)
-  #windowBytes = 0;
-  #windowStartMs = 0;
-  #windowDurationMs = 3000; // 3-second sliding window
-
-  constructor(alphaFast: number = 0.5, alphaSlow: number = 0.1) {
-    this.#alphaFast = alphaFast;
-    this.#alphaSlow = alphaSlow;
+  constructor(halfLifeFastSec = 3, halfLifeSlowSec = 8) {
+    this.#halfLifeFastSec = halfLifeFastSec;
+    this.#halfLifeSlowSec = halfLifeSlowSec;
   }
 
   /**
-   * Bind to the WebTransport session for transport-level throughput estimation.
-   * Falls back to application-layer byte counting if getStats() is not supported.
+   * Record one MoQ object delivery. When `groupId` rolls over from the
+   * previous call, the previous group's accumulator is finalized into a
+   * single SWMA sample.
    */
-  setTransport(transport: WebTransport): void {
-    const hasGetStats = typeof (transport as WebTransportWithStats).getStats === 'function';
-    this.#transport = hasGetStats ? (transport as WebTransportWithStats) : null;
-    this.#useTransportStats = hasGetStats;
-  }
-
-  /**
-   * Poll WebTransport.getStats() and update EMAs from the bytesReceived delta.
-   * Call this on the ABR tick interval (e.g. every 250ms).
-   * No-op when transport stats are unavailable (fallback path uses recordObject).
-   */
-  async poll(): Promise<void> {
-    if (!this.#useTransportStats || !this.#transport) return;
-
-    const stats = await this.#transport.getStats();
-    const now = Date.now();
-    const bytesReceived = stats.bytesReceived ?? 0;
-
-    if (this.#prevTimestampMs === 0) {
-      // First poll — seed baseline, no EMA update yet
-      this.#prevBytesReceived = bytesReceived;
-      this.#prevTimestampMs = now;
-      return;
-    }
-
-    const deltaBytes = bytesReceived - this.#prevBytesReceived;
-    const deltaMs = now - this.#prevTimestampMs;
-    this.#prevBytesReceived = bytesReceived;
-    this.#prevTimestampMs = now;
-
-    if (deltaMs < 50) return; // too short to be meaningful
-
-    const instantBps = (deltaBytes * 8 * 1000) / deltaMs;
-
-    this.#updateEma(instantBps);
-  }
-
-  /**
-   * Record one object delivery.
-   *
-   * When transport stats are available this only tracks metadata
-   * (lastObjectBytes, sampleCount). When transport stats are NOT
-   * available this is the primary throughput source (fallback path).
-   */
-  recordObject(bytes: number, _durationMs: number): void {
+  recordObject(bytes: number, groupId: bigint): void {
     const now = Date.now();
     this.#lastObjectBytes = bytes;
-    this.#sampleCount++;
+    this.#cumulativeBytes += bytes;
 
-    // If we're using transport stats, skip application-layer throughput
-    if (this.#useTransportStats) return;
-
-    // --- Fallback: windowed byte counting ---
-    if (this.#windowStartMs === 0) {
-      this.#windowStartMs = now;
-      this.#windowBytes = bytes;
+    if (this.#currentGroupId === null || groupId !== this.#currentGroupId) {
+      this.#finalizeCurrentGroup();
+      this.#currentGroupId = groupId;
+      this.#currentGroupBytes = bytes;
+      this.#currentGroupFirstObjBytes = bytes;
+      this.#currentGroupFirstTs = now;
+      this.#currentGroupLastTs = now;
+      this.#currentGroupObjectCount = 1;
       return;
     }
 
-    this.#windowBytes += bytes;
-    const elapsed = now - this.#windowStartMs;
-    this.#lastDeliveryTimeMs = elapsed;
-
-    if (elapsed < 100) return;
-
-    const instantBps = (this.#windowBytes * 8 * 1000) / elapsed;
-    this.#updateEma(instantBps);
-
-    // Slide the window
-    if (elapsed >= this.#windowDurationMs) {
-      this.#windowBytes = 0;
-      this.#windowStartMs = now;
-    }
+    this.#currentGroupBytes += bytes;
+    this.#currentGroupLastTs = now;
+    this.#currentGroupObjectCount++;
   }
 
-  /** Conservative bandwidth estimate: min(fast EMA, slow EMA). Returns 0 until first sample. */
+  /** Conservative bandwidth: average of the SWMA window. 0 until first group completes. */
   getBandwidthBps(): number {
-    if (!this.#hasData) return 0;
-    return Math.min(this.#emaFast, this.#emaSlow);
+    if (this.#swma.length === 0) return 0;
+    const sum = this.#swma.reduce((a, b) => a + b, 0);
+    return sum / this.#swma.length;
   }
 
   getFastEmaBps(): number {
     return this.#emaFast;
   }
+
   getSlowEmaBps(): number {
     return this.#emaSlow;
-  }
-
-  /** Reset both EMAs to 0. */
-  reset(): void {
-    this.#emaFast = 0;
-    this.#emaSlow = 0;
-    this.#hasData = false;
-    this.#lastDeliveryTimeMs = 0;
-    this.#lastObjectBytes = 0;
-    this.#sampleCount = 0;
-    this.#windowBytes = 0;
-    this.#windowStartMs = 0;
-    this.#prevBytesReceived = 0;
-    this.#prevTimestampMs = 0;
-  }
-
-  /** Update smoothing factors without recreating the tracker. */
-  setAlphas(alphaFast: number, alphaSlow: number): void {
-    this.#alphaFast = alphaFast;
-    this.#alphaSlow = alphaSlow;
-  }
-
-  getLastDeliveryTimeMs(): number {
-    return this.#lastDeliveryTimeMs;
   }
 
   getLastObjectBytes(): number {
     return this.#lastObjectBytes;
   }
 
+  getLastDeliveryTimeMs(): number {
+    return this.#lastGroupDurationMs;
+  }
+
   getSampleCount(): number {
     return this.#sampleCount;
   }
 
-  #updateEma(instantBps: number): void {
-    if (!this.#hasData) {
+  /** Monotonic byte counter over all recorded objects. */
+  getCumulativeBytes(): number {
+    return this.#cumulativeBytes;
+  }
+
+  setHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
+    this.#halfLifeFastSec = halfLifeFastSec;
+    this.#halfLifeSlowSec = halfLifeSlowSec;
+  }
+
+  reset(): void {
+    this.#swma = [];
+    this.#currentGroupId = null;
+    this.#currentGroupBytes = 0;
+    this.#currentGroupFirstObjBytes = 0;
+    this.#currentGroupFirstTs = 0;
+    this.#currentGroupLastTs = 0;
+    this.#currentGroupObjectCount = 0;
+    this.#lastObjectBytes = 0;
+    this.#lastGroupDurationMs = 0;
+    this.#sampleCount = 0;
+    this.#emaFast = 0;
+    this.#emaSlow = 0;
+    this.#hasEmaData = false;
+    this.#cumulativeBytes = 0;
+  }
+
+  #finalizeCurrentGroup(): void {
+    if (this.#currentGroupObjectCount < 2) return;
+    const dtMs = this.#currentGroupLastTs - this.#currentGroupFirstTs;
+    if (dtMs <= 0) return;
+
+    // Exclude the first object's bytes from the numerator: it sets t_1 and
+    // contributes no inter-arrival information. Matches the IETF slides.
+    const bytes = this.#currentGroupBytes - this.#currentGroupFirstObjBytes;
+    if (bytes <= 0) return;
+
+    const dtSec = dtMs / 1000;
+    const groupBps = (bytes * 8) / dtSec;
+
+    this.#swma.push(groupBps);
+    if (this.#swma.length > this.#swmaWindowSize) this.#swma.shift();
+
+    this.#lastGroupDurationMs = dtMs;
+    this.#sampleCount++;
+
+    this.#updateEma(groupBps, dtMs);
+  }
+
+  #updateEma(instantBps: number, weightMs: number): void {
+    if (!this.#hasEmaData) {
       this.#emaFast = instantBps;
       this.#emaSlow = instantBps;
-      this.#hasData = true;
-    } else {
-      this.#emaFast = this.#alphaFast * instantBps + (1 - this.#alphaFast) * this.#emaFast;
-      this.#emaSlow = this.#alphaSlow * instantBps + (1 - this.#alphaSlow) * this.#emaSlow;
+      this.#hasEmaData = true;
+      return;
     }
+    const weightSec = weightMs / 1000;
+    const alphaFast = Math.pow(0.5, weightSec / this.#halfLifeFastSec);
+    const alphaSlow = Math.pow(0.5, weightSec / this.#halfLifeSlowSec);
+    this.#emaFast = (1 - alphaFast) * instantBps + alphaFast * this.#emaFast;
+    this.#emaSlow = (1 - alphaSlow) * instantBps + alphaSlow * this.#emaSlow;
   }
 }

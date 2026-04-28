@@ -6,8 +6,58 @@
 //! into that format.
 
 use bytes::Bytes;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Wraps a single encoded HEVC access unit in a CMAF chunk (moof + mdat).
+// NTP epoch (1900) is 70 years + 17 leap days = 2_208_988_800 seconds
+// before the UNIX epoch (1970). RFC 5905.
+const NTP_UNIX_DELTA_SECONDS: u64 = 2_208_988_800;
+
+/// PRFT (Producer Reference Time) box per ISO/IEC 14496-12 §8.16.5.
+///
+/// CMAF receivers use this box to learn the producer's wall-clock time at
+/// the moment a chunk was produced. The receiver reads `ntp_timestamp`,
+/// converts to local epoch, and computes per-frame end-to-end latency.
+///
+/// Layout (version 1, 32 bytes total):
+///   0..4   box size (32, big-endian)
+///   4..8   "prft"
+///   8      version (1 — 64-bit media_time)
+///   9..12  flags (0)
+///   12..16 reference_track_ID
+///   16..24 ntp_timestamp (64-bit NTP fixed point)
+///   24..32 media_time (u64, version=1)
+///
+/// `ntp_timestamp` is the NTP "short format": upper 32 bits = seconds
+/// since 1900-01-01 UTC, lower 32 bits = fractional seconds (×2^-32).
+fn prft_box(reference_track_id: u32, ntp_timestamp: u64, media_time: u64) -> [u8; 32] {
+  let mut buf = [0u8; 32];
+  buf[0..4].copy_from_slice(&32u32.to_be_bytes());
+  buf[4..8].copy_from_slice(b"prft");
+  buf[8] = 1; // version
+  // bytes 9..12 are flags, already zero
+  buf[12..16].copy_from_slice(&reference_track_id.to_be_bytes());
+  buf[16..24].copy_from_slice(&ntp_timestamp.to_be_bytes());
+  buf[24..32].copy_from_slice(&media_time.to_be_bytes());
+  buf
+}
+
+/// Convert the current UNIX wall clock to NTP fixed-point format.
+fn now_ntp_timestamp() -> u64 {
+  let d = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default();
+  let seconds = d.as_secs() + NTP_UNIX_DELTA_SECONDS;
+  // Fractional part of one second as Q32: (nanos / 1e9) * 2^32.
+  let nanos = d.subsec_nanos() as u64;
+  let fraction = (nanos << 32) / 1_000_000_000;
+  (seconds << 32) | (fraction & 0xFFFF_FFFF)
+}
+
+/// Wraps a single encoded HEVC access unit in a CMAF chunk (prft + moof + mdat).
+///
+/// A `prft` box is prepended so receivers can compute end-to-end latency
+/// per frame (see `LatencyTrendRule` on the client). PRFT is a top-level
+/// ISOBMFF box; CMAF receivers that don't care about it skip it cleanly.
 ///
 /// * `sequence_number` — increments per fragment (usually per frame).
 /// * `decode_time` — in timescale ticks (e.g. 90 000 Hz).
@@ -41,8 +91,12 @@ pub fn wrap_cmaf_chunk(
   // trun data_offset: bytes from the start of moof to the start of mdat payload
   let data_offset: i32 = moof_size as i32 + 8; // +8 for mdat box header
 
-  let total = moof_size as usize + mdat_size;
+  let prft = prft_box(1, now_ntp_timestamp(), decode_time);
+  let total = prft.len() + moof_size as usize + mdat_size;
   let mut buf = Vec::with_capacity(total);
+
+  // ---- prft (producer reference time, ISO/IEC 14496-12 §8.16.5) ----
+  buf.extend_from_slice(&prft);
 
   // ---- moof ----
   write_u32(&mut buf, moof_size);
@@ -192,10 +246,19 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_cmaf_chunk_starts_with_moof() {
+  fn test_cmaf_chunk_starts_with_prft() {
+    // PRFT box is prepended so receivers can compute per-frame latency.
     let chunk = wrap_cmaf_chunk(1, 0, 3000, true, &[0xAA; 16]);
-    assert!(chunk.len() > 8);
-    assert_eq!(&chunk[4..8], b"moof");
+    assert!(chunk.len() > 32);
+    assert_eq!(&chunk[0..4], &32u32.to_be_bytes());
+    assert_eq!(&chunk[4..8], b"prft");
+  }
+
+  #[test]
+  fn test_cmaf_chunk_moof_follows_prft() {
+    let chunk = wrap_cmaf_chunk(1, 0, 3000, true, &[0xAA; 16]);
+    // moof immediately follows the 32-byte prft box.
+    assert_eq!(&chunk[32 + 4..32 + 8], b"moof");
   }
 
   #[test]
@@ -204,6 +267,26 @@ mod tests {
     let chunk = wrap_cmaf_chunk(1, 0, 3000, true, &payload);
     // Last 32 bytes should be our payload
     assert_eq!(&chunk[chunk.len() - 32..], &payload);
+  }
+
+  #[test]
+  fn test_prft_box_layout() {
+    let b = prft_box(7, 0xABCD_1234_DEAD_BEEF, 0x1122_3344);
+    assert_eq!(&b[0..4], &32u32.to_be_bytes());
+    assert_eq!(&b[4..8], b"prft");
+    assert_eq!(b[8], 1); // version
+    assert_eq!(&b[12..16], &7u32.to_be_bytes());
+    assert_eq!(&b[16..24], &0xABCD_1234_DEAD_BEEFu64.to_be_bytes());
+    assert_eq!(&b[24..32], &0x1122_3344u64.to_be_bytes());
+  }
+
+  #[test]
+  fn test_ntp_timestamp_above_unix_epoch() {
+    // Sanity: produced NTP timestamp should be >> NTP_UNIX_DELTA (i.e., we're
+    // past 1970 in UNIX terms — which is always true on a real system).
+    let ntp = now_ntp_timestamp();
+    let seconds = ntp >> 32;
+    assert!(seconds > NTP_UNIX_DELTA_SECONDS);
   }
 
   #[test]

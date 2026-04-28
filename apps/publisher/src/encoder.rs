@@ -456,6 +456,7 @@ fn build_encoder_opts(encoder_name: &str, bitrate_kbps: u32) -> ffmpeg_next::Dic
   } else if encoder_name == "hevc_vaapi" {
     opts.set("rc_mode", "CBR");
     opts.set("bf", "0");
+    opts.set("async_depth", "1");
   } else if encoder_name == "hevc_videotoolbox" {
     opts.set("realtime", "1");
     opts.set("profile", "main");

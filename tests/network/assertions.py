@@ -1,0 +1,164 @@
+"""Reusable assertion functions for ABR network testing."""
+
+from metrics_collector import MetricsCollector, SwitchRecord
+
+
+def extract_resolution(track_name: str | None) -> str | None:
+    if track_name is None:
+        return None
+    for res in ["1080p", "720p", "480p", "360p"]:
+        if res in track_name:
+            return res
+    return track_name
+
+
+QUALITY_ORDER = ["360p", "480p", "720p", "1080p"]
+
+
+def quality_index(resolution: str) -> int:
+    try:
+        return QUALITY_ORDER.index(resolution)
+    except ValueError:
+        return -1
+
+
+def assert_downswitch_within(
+    collector: MetricsCollector,
+    change_time: float,
+    max_latency_s: float,
+    expected_quality: str,
+) -> None:
+    deadline = change_time + max_latency_s
+    switches = collector.get_switches_in_window(change_time, deadline)
+
+    for sw in switches:
+        sw_res = extract_resolution(sw.to_track)
+        if sw_res and quality_index(sw_res) <= quality_index(expected_quality):
+            return
+
+    quality_at_deadline = extract_resolution(collector.get_quality_at(deadline))
+    if quality_at_deadline and quality_index(quality_at_deadline) <= quality_index(expected_quality):
+        return
+
+    actual = extract_resolution(collector.get_quality_at(deadline))
+    raise AssertionError(
+        f"Expected client to reach {expected_quality} within {max_latency_s}s of bandwidth change. "
+        f"Actual quality at deadline: {actual}. "
+        f"Switches in window: {[(extract_resolution(s.to_track), s.timestamp - change_time) for s in switches]}"
+    )
+
+
+def assert_upswitch_within(
+    collector: MetricsCollector,
+    change_time: float,
+    max_latency_s: float,
+    expected_quality: str,
+) -> None:
+    deadline = change_time + max_latency_s
+    switches = collector.get_switches_in_window(change_time, deadline)
+
+    for sw in switches:
+        sw_res = extract_resolution(sw.to_track)
+        if sw_res and quality_index(sw_res) >= quality_index(expected_quality):
+            return
+
+    quality_at_deadline = extract_resolution(collector.get_quality_at(deadline))
+    if quality_at_deadline and quality_index(quality_at_deadline) >= quality_index(expected_quality):
+        return
+
+    actual = extract_resolution(collector.get_quality_at(deadline))
+    raise AssertionError(
+        f"Expected client to reach {expected_quality} within {max_latency_s}s of bandwidth restoration. "
+        f"Actual quality at deadline: {actual}. "
+        f"Switches in window: {[(extract_resolution(s.to_track), s.timestamp - change_time) for s in switches]}"
+    )
+
+
+def assert_no_rebuffering(
+    collector: MetricsCollector,
+    start_time: float,
+    end_time: float,
+) -> None:
+    # Pre-playback samples have buffer=0 because the decoder hasn't produced
+    # any frames yet — that's startup, not a stall. Exclude total_frames==0.
+    in_window = [
+        s for s in collector.samples
+        if start_time <= s.timestamp <= end_time and s.total_frames > 0
+    ]
+    if not in_window:
+        return
+
+    zero_samples = [s for s in in_window if s.buffer_seconds <= 0]
+    if zero_samples:
+        zero_times = [f"{s.timestamp - start_time:.1f}s" for s in zero_samples[:5]]
+        min_buffer = min(s.buffer_seconds for s in in_window)
+        raise AssertionError(
+            f"Buffer hit 0 (rebuffering) at offsets: {zero_times}. "
+            f"Min buffer in window: {min_buffer:.3f}s"
+        )
+
+
+def assert_buffer_above(
+    collector: MetricsCollector,
+    start_time: float,
+    end_time: float,
+    min_buffer_s: float,
+) -> None:
+    in_window = [
+        s for s in collector.samples
+        if start_time <= s.timestamp <= end_time and s.total_frames > 0
+    ]
+    if not in_window:
+        return
+    actual_min = min(s.buffer_seconds for s in in_window)
+    if actual_min < min_buffer_s:
+        raise AssertionError(
+            f"Buffer dropped to {actual_min:.3f}s, below minimum {min_buffer_s}s"
+        )
+
+
+def assert_quality_floor(
+    collector: MetricsCollector,
+    start_time: float,
+    end_time: float,
+    floor: str = "360p",
+) -> None:
+    floor_idx = quality_index(floor)
+    relevant = [s for s in collector.samples if start_time <= s.timestamp <= end_time]
+    for sample in relevant:
+        res = extract_resolution(sample.active_track)
+        if res and quality_index(res) < floor_idx:
+            raise AssertionError(
+                f"Quality dropped below floor {floor}: got {res} at "
+                f"offset {sample.timestamp - start_time:.1f}s"
+            )
+
+
+def assert_max_switches(
+    collector: MetricsCollector,
+    start_time: float,
+    end_time: float,
+    max_switches: int,
+) -> None:
+    switches = collector.get_switches_in_window(start_time, end_time)
+    if len(switches) > max_switches:
+        switch_details = [
+            f"{extract_resolution(s.from_track)}->{extract_resolution(s.to_track)} at +{s.timestamp - start_time:.1f}s"
+            for s in switches
+        ]
+        raise AssertionError(
+            f"Too many switches: {len(switches)} > {max_switches}. "
+            f"Switches: {switch_details}"
+        )
+
+
+def assert_no_crash(collector: MetricsCollector, start_time: float, end_time: float) -> None:
+    # Expect at least one sample every 2s.
+    duration = end_time - start_time
+    relevant = [s for s in collector.samples if start_time <= s.timestamp <= end_time]
+    expected_min_samples = max(1, int(duration / 2))
+    if len(relevant) < expected_min_samples:
+        raise AssertionError(
+            f"Client may have crashed or hung: only {len(relevant)} samples in {duration:.0f}s "
+            f"(expected at least {expected_min_samples})"
+        )

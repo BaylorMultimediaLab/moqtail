@@ -8,11 +8,7 @@ export type Track = {
   framerate?: number;
 };
 
-export type SwitchReason =
-  | 'auto-upgrade'
-  | 'auto-downgrade'
-  | 'auto-emergency'
-  | 'manual';
+export type SwitchReason = 'auto-upgrade' | 'auto-downgrade' | 'auto-emergency' | 'manual';
 
 export interface SwitchEvent {
   ts: number;
@@ -73,15 +69,36 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
   rules: {
     ThroughputRule: { active: true, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     BolaRule: { active: true, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
+    ProbeRule: {
+      active: true,
+      priority: SwitchRequestPriority.DEFAULT,
+      parameters: { safetyFactor: 0.8 },
+    },
     InsufficientBufferRule: {
       active: true,
       priority: SwitchRequestPriority.DEFAULT,
       parameters: { throughputSafetyFactor: 0.7, segmentIgnoreCount: 2 },
     },
+    BufferDrainRateRule: {
+      active: true,
+      priority: SwitchRequestPriority.STRONG,
+      parameters: {
+        windowMs: 1000,
+        minSamples: 3,
+        drainThreshold: 0.3,
+        safetyFactor: 0.7,
+        bufferTriggerThreshold: 2,
+      },
+    },
     SwitchHistoryRule: {
       active: true,
       priority: SwitchRequestPriority.DEFAULT,
       parameters: { sampleSize: 8, switchPercentageThreshold: 0.075 },
+    },
+    LatencyTrendRule: {
+      active: true,
+      priority: SwitchRequestPriority.STRONG,
+      parameters: { trendThreshold: 1.2 },
     },
     DroppedFramesRule: {
       active: false,
@@ -113,8 +130,31 @@ export interface RulesContext {
   totalFrames: number;
   segmentDurationS: number;
   isLowLatency: boolean;
+  /**
+   * Current HTMLMediaElement playbackRate. Used by BufferDrainRateRule
+   * to derive link rate from buffer drain via
+   * `linkRate = sourceRate · (playbackRate - drainRate)`. Typically
+   * 0.95–1.05 (the codebase nudges playback to track latency). 1.0 is a
+   * safe default if a caller doesn't have it.
+   */
+  playbackRate: number;
   switchHistory: SwitchEvent[];
   abrSettings: AbrSettings;
+  /**
+   * Most recent active-probe bandwidth, bps. 0 if no fresh probe is
+   * available. SWMA passive reads the publisher's push rate, so it never
+   * exceeds the active source bitrate; this signal lets BOLA-O distinguish
+   * "link saturated" from "publisher application-limited."
+   */
+  probeBandwidthBps: number;
+  /**
+   * Per-frame end-to-end latency trend, computed from PRFT (Producer
+   * Reference Time) box at the head of each CMAF chunk. Defined as
+   * mean(recent 50 samples) / mean(older 50 samples) over the last 100
+   * frames (≈ 4 s at 25 fps). 1.0 = no change; > 1.20 is the thesis
+   * downswitch trigger (Algorithm 1 lines 14-16).
+   */
+  latencyTrendRatio: number;
 }
 
 export interface AbrRule {

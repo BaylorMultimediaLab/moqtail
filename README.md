@@ -48,6 +48,32 @@ cargo run --bin relay -- --port 4433 --cert-file cert/cert.pem --key-file cert/k
 
 - **WebTransport**: Ensure your browser supports WebTransport and that you have trusted the local CA, see the [README.md](apps/relay/cert/README.md) of the relay for instructions.
 
+## Network Tests (Mininet ABR)
+
+End-to-end ABR scenarios under [tests/network/](tests/network/) run the publisher, relay, and a Chromium subscriber across a Mininet topology with configurable link shaping. Requires Linux with root (Mininet), `uv`, and the project's Rust/JS builds.
+
+### First-time setup
+
+```bash
+sudo ./tests/network/setup.sh
+```
+
+This installs Mininet, Open vSwitch, Xvfb, Chromium, `uv`, Python deps (via `uv sync` + Playwright Chromium), and builds the `relay`/`publisher` binaries and `client-js`.
+
+### Running the scenarios
+
+```bash
+# All scenarios
+sudo uv run --project tests/network pytest tests/network/scenarios/ -v
+
+# A single scenario
+sudo uv run --project tests/network pytest tests/network/scenarios/test_sudden_drop.py -v
+```
+
+Available scenarios: [test_bandwidth_recovery.py](tests/network/scenarios/test_bandwidth_recovery.py), [test_gradual_ramp_down.py](tests/network/scenarios/test_gradual_ramp_down.py), [test_high_latency.py](tests/network/scenarios/test_high_latency.py), [test_oscillation_resistance.py](tests/network/scenarios/test_oscillation_resistance.py), [test_packet_loss.py](tests/network/scenarios/test_packet_loss.py), [test_publisher_degradation.py](tests/network/scenarios/test_publisher_degradation.py), [test_sudden_drop.py](tests/network/scenarios/test_sudden_drop.py).
+
+Topology, link profiles, and run parameters live in [tests/network/config.yaml](tests/network/config.yaml).
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please open issues or submit pull requests for improvements, bug fixes, or documentation updates.

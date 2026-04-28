@@ -33,6 +33,9 @@ function makeContext(overrides: Partial<RulesContext> = {}): RulesContext {
     isLowLatency: false,
     switchHistory: [],
     abrSettings: makeSettings(),
+    probeBandwidthBps: 0,
+    latencyTrendRatio: 1,
+    playbackRate: 1,
     ...overrides,
   };
 }
@@ -229,33 +232,22 @@ describe('AbrRulesCollection', () => {
       const settings = settingsWithOnlyRules(['ThroughputRule', 'InsufficientBufferRule']);
       const collection = new AbrRulesCollection(settings);
 
-      // Warm up InsufficientBufferRule
+      // Warm up InsufficientBufferRule (skips first segmentIgnoreCount=2 calls)
       const warmupCtx = makeContext({
         abrSettings: settings,
-        bufferSeconds: 5, // low buffer → triggers insufficient buffer rule
-        bandwidthBps: 10_000_000,
+        bufferSeconds: 2,
+        bandwidthBps: 5_000_000,
         segmentDurationS: 4,
       });
       collection.getBestPossibleSwitchRequest(warmupCtx); // call 1
       collection.getBestPossibleSwitchRequest(warmupCtx); // call 2
 
-      // Call 3: InsufficientBufferRule fires with DEFAULT priority (bufferSeconds ≥ 0.5)
-      // cappedBps = 10M * 0.7 * (5/4) = 8.75M → bestIndex = 2 (4M fits)
-      // ThroughputRule: effectiveBandwidth = 10M * 0.9 = 9M → bestIndex = 2
-      // Both return index 2 at DEFAULT — min is 2.
-      // Let's use a lower bandwidth so they diverge:
-      // bandwidthBps = 1_600_000:
-      //   ThroughputRule: effective = 1.44M → index 1 (1.5M doesn't fit, 500k does) → index 0
-      //   Wait, 1.44M > 500k but < 1.5M → index 0
-      //   InsufficientBufferRule: cappedBps = 1.6M * 0.7 * (5/4) = 1.4M → index 0 (500k fits)
-      // Both would return index 0. Let's try bandwidthBps = 2_000_000:
-      //   ThroughputRule: effective = 1.8M → 500k fits, 1.5M fits, 4M no → index 1
-      //   InsufficientBufferRule: cappedBps = 2M * 0.7 * (5/4) = 1.75M → 500k fits, 1.5M fits → index 1
-      // Hmm, still the same. Try a different buffer level to make them diverge:
-      //   bufferSeconds = 2, bandwidthBps = 5_000_000:
-      //   ThroughputRule: effective = 4.5M → all fit → index 2
-      //   InsufficientBufferRule: cappedBps = 5M * 0.7 * (2/4) = 1.75M → index 1 (1.5M fits)
-      // They differ: ThroughputRule=2, InsufficientBufferRule=1 → min should be 1
+      // Pick a state where the two rules diverge under dash.js's
+      // InsufficientBufferRule formula (cap = bandwidth × 0.7 × buffer / segment):
+      //   buffer = 2, segment = 4, bandwidth = 5M
+      //   ThroughputRule: cap = 5M × 0.9 = 4.5M → all 3 tracks fit → index 2
+      //   InsufficientBufferRule: cap = 5M × 0.7 × 2/4 = 1.75M → 500k & 1.5M fit → index 1
+      // Min within DEFAULT tier = 1.
       const ctx = makeContext({
         abrSettings: settings,
         bufferSeconds: 2,
@@ -264,7 +256,6 @@ describe('AbrRulesCollection', () => {
       });
       const result = collection.getBestPossibleSwitchRequest(ctx);
       expect(result).not.toBeNull();
-      // Min of index 2 (throughput) and index 1 (insufficient buffer) = 1
       expect(result!.representationIndex).toBe(1);
       expect(result!.priority).toBe(SwitchRequestPriority.DEFAULT);
     });

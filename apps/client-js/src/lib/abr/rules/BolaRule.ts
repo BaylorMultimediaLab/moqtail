@@ -57,10 +57,7 @@ function utility(bitrate: number, bitrateMin: number): number {
  * gp = (utilityMax - 1) / (bufferTime / MINIMUM_BUFFER_S - 1)
  * Vp = MINIMUM_BUFFER_S / gp
  */
-function computeBolaParams(
-  bufferTime: number,
-  utilityMax: number,
-): { Vp: number; gp: number } {
+function computeBolaParams(bufferTime: number, utilityMax: number): { Vp: number; gp: number } {
   const gp = (utilityMax - 1) / (bufferTime / MINIMUM_BUFFER_S - 1);
   const Vp = MINIMUM_BUFFER_S / gp;
   return { Vp, gp };
@@ -156,11 +153,7 @@ export class BolaRule implements AbrRule {
           };
         }
 
-        const tpIdx = throughputIndex(
-          bitrates,
-          bandwidthBps,
-          abrSettings.bandwidthSafetyFactor,
-        );
+        const tpIdx = throughputIndex(bitrates, bandwidthBps, abrSettings.bandwidthSafetyFactor);
 
         // Grow placeholder buffer toward what STEADY state would need
         const tpBitrate = bitrates[tpIdx] ?? 1;
@@ -194,9 +187,11 @@ export class BolaRule implements AbrRule {
       }
     }
 
-    // BOLA-O: oscillation prevention cap.
-    // If the algorithm wants to go higher than both the throughput-sustainable level
-    // AND the current level, cap it at max(throughputIndex, currentRepIndex).
+    // BOLA-O oscillation prevention cap (Spiteri et al., dash.js
+    // `BolaRule.js`). If Lyapunov picks above the throughput-sustainable
+    // level AND above the current rep, cap at max(throughputIndex,
+    // currentRepIndex). Uses the passive SWMA `bandwidthBps` only —
+    // probe-driven upswitches live in `ProbeRule`, not here.
     const tpIdx = throughputIndex(bitrates, bandwidthBps, abrSettings.bandwidthSafetyFactor);
     if (bestIndex > currentRepIndex && bestIndex > tpIdx) {
       bestIndex = Math.max(tpIdx, currentRepIndex);
