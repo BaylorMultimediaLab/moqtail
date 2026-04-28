@@ -45,6 +45,9 @@ function makeContext(overrides: Partial<RulesContext> = {}): RulesContext {
     isLowLatency: false,
     switchHistory: [],
     abrSettings: DEFAULT_ABR_SETTINGS,
+    probeBandwidthBps: 0,
+    latencyTrendRatio: 1,
+    playbackRate: 1,
     ...overrides,
   };
 }
@@ -88,7 +91,9 @@ describe('BolaRule', () => {
       expect(result).not.toBeNull();
       // throughput cap = 2.25 Mbps, so 720p (2 Mbps) qualifies but 1080p (4 Mbps) doesn't
       const chosenTrack = TRACKS_MULTI[result!.representationIndex];
-      expect(chosenTrack?.bitrate).toBeLessThanOrEqual(bw * DEFAULT_ABR_SETTINGS.bandwidthSafetyFactor);
+      expect(chosenTrack?.bitrate).toBeLessThanOrEqual(
+        bw * DEFAULT_ABR_SETTINGS.bandwidthSafetyFactor,
+      );
     });
 
     it('returns lowest quality when no throughput data (bandwidthBps === 0)', () => {
@@ -101,7 +106,9 @@ describe('BolaRule', () => {
 
     it('transitions to STEADY after buffer >= segmentDurationS', () => {
       // First call: STARTUP
-      rule.getMaxIndex(makeContext({ bufferSeconds: 0.5, segmentDurationS: 2, bandwidthBps: 5_000_000 }));
+      rule.getMaxIndex(
+        makeContext({ bufferSeconds: 0.5, segmentDurationS: 2, bandwidthBps: 5_000_000 }),
+      );
 
       // Second call with sufficient buffer: should enter STEADY and pick based on Lyapunov score
       const highBufferCtx = makeContext({
@@ -144,7 +151,9 @@ describe('BolaRule', () => {
     it('selects highest quality with very high buffer and ample bandwidth', () => {
       const r = new BolaRule();
       // Transition through startup with high buffer
-      r.getMaxIndex(makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 20_000_000 }));
+      r.getMaxIndex(
+        makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 20_000_000 }),
+      );
       const result = r.getMaxIndex(
         makeContext({
           bufferSeconds: 17,
@@ -161,8 +170,12 @@ describe('BolaRule', () => {
 
     it('reason field is "BOLA steady" in steady state', () => {
       const r = new BolaRule();
-      r.getMaxIndex(makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }));
-      const result = r.getMaxIndex(makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }));
+      r.getMaxIndex(
+        makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
+      );
+      const result = r.getMaxIndex(
+        makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
+      );
       expect(result?.reason).toBe('BOLA steady');
     });
   });
@@ -184,10 +197,10 @@ describe('BolaRule', () => {
       // In steady state, Lyapunov might want higher quality, but BOLA-O should cap it
       const result = r.getMaxIndex(
         makeContext({
-          bufferSeconds: 17, // high buffer could push Lyapunov score toward higher quality
+          bufferSeconds: 17,
           segmentDurationS: 2,
           bandwidthBps: lowBw,
-          activeTrackIndex: 0, // currently on 360p
+          activeTrackIndex: 0,
         }),
       );
 
@@ -200,15 +213,13 @@ describe('BolaRule', () => {
     it('BOLA-O: will not jump above current track when throughput is only marginal', () => {
       const r = new BolaRule();
 
-      // Set bandwidth such that 720p (2 Mbps) is borderline.
       // cap = 2_200_000 * 0.9 = 1_980_000 — just below 720p (2 Mbps)
       const marginalBw = 2_200_000;
 
-      // Transition to STEADY
-      r.getMaxIndex(makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: marginalBw }));
+      r.getMaxIndex(
+        makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: marginalBw }),
+      );
 
-      // Suppose we're on 360p (index 0 in original array). With high buffer, Lyapunov
-      // might score 1080p highest, but BOLA-O should clamp to throughputIndex.
       const result = r.getMaxIndex(
         makeContext({
           bufferSeconds: 17,
@@ -220,8 +231,9 @@ describe('BolaRule', () => {
 
       expect(result).not.toBeNull();
       const chosenBitrate = TRACKS_MULTI[result!.representationIndex]?.bitrate ?? 0;
-      // throughput cap = 1.98 Mbps → only 360p (500 kbps) fits
-      expect(chosenBitrate).toBeLessThanOrEqual(marginalBw * DEFAULT_ABR_SETTINGS.bandwidthSafetyFactor);
+      expect(chosenBitrate).toBeLessThanOrEqual(
+        marginalBw * DEFAULT_ABR_SETTINGS.bandwidthSafetyFactor,
+      );
     });
   });
 
@@ -233,8 +245,12 @@ describe('BolaRule', () => {
       const r = new BolaRule();
 
       // Push into STEADY
-      r.getMaxIndex(makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }));
-      r.getMaxIndex(makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }));
+      r.getMaxIndex(
+        makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
+      );
+      r.getMaxIndex(
+        makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
+      );
 
       // Verify it is in STEADY (reason = 'BOLA steady')
       const beforeReset = r.getMaxIndex(

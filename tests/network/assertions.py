@@ -4,14 +4,8 @@ from metrics_collector import MetricsCollector, SwitchRecord
 
 
 def extract_resolution(track_name: str | None) -> str | None:
-    """Extract resolution label from a track name.
-
-    Track names follow the pattern: "video-{resolution}" (e.g., "video-1080p").
-    Returns the resolution part (e.g., "1080p") or None.
-    """
     if track_name is None:
         return None
-    # Handle formats like "video-1080p", "video-720p", etc.
     for res in ["1080p", "720p", "480p", "360p"]:
         if res in track_name:
             return res
@@ -22,7 +16,6 @@ QUALITY_ORDER = ["360p", "480p", "720p", "1080p"]
 
 
 def quality_index(resolution: str) -> int:
-    """Return numeric index for a resolution (higher = better)."""
     try:
         return QUALITY_ORDER.index(resolution)
     except ValueError:
@@ -35,27 +28,17 @@ def assert_downswitch_within(
     max_latency_s: float,
     expected_quality: str,
 ) -> None:
-    """Assert that the client switched to expected quality within max_latency_s of change_time.
-
-    Args:
-        collector: MetricsCollector with collected data.
-        change_time: Unix timestamp when bandwidth was changed.
-        max_latency_s: Maximum allowed seconds to switch.
-        expected_quality: Expected resolution (e.g., "720p").
-    """
     deadline = change_time + max_latency_s
     switches = collector.get_switches_in_window(change_time, deadline)
 
-    # Check if any switch landed on or below the expected quality
     for sw in switches:
         sw_res = extract_resolution(sw.to_track)
         if sw_res and quality_index(sw_res) <= quality_index(expected_quality):
-            return  # Success
+            return
 
-    # Also check if the client was already at or below the expected quality
     quality_at_deadline = extract_resolution(collector.get_quality_at(deadline))
     if quality_at_deadline and quality_index(quality_at_deadline) <= quality_index(expected_quality):
-        return  # Already at correct quality
+        return
 
     actual = extract_resolution(collector.get_quality_at(deadline))
     raise AssertionError(
@@ -71,21 +54,13 @@ def assert_upswitch_within(
     max_latency_s: float,
     expected_quality: str,
 ) -> None:
-    """Assert that the client switched up to expected quality within max_latency_s.
-
-    Args:
-        collector: MetricsCollector with collected data.
-        change_time: Unix timestamp when bandwidth was restored.
-        max_latency_s: Maximum allowed seconds to upswitch.
-        expected_quality: Expected resolution (e.g., "1080p").
-    """
     deadline = change_time + max_latency_s
     switches = collector.get_switches_in_window(change_time, deadline)
 
     for sw in switches:
         sw_res = extract_resolution(sw.to_track)
         if sw_res and quality_index(sw_res) >= quality_index(expected_quality):
-            return  # Success
+            return
 
     quality_at_deadline = extract_resolution(collector.get_quality_at(deadline))
     if quality_at_deadline and quality_index(quality_at_deadline) >= quality_index(expected_quality):
@@ -104,24 +79,14 @@ def assert_no_rebuffering(
     start_time: float,
     end_time: float,
 ) -> None:
-    """Assert that buffer never hit 0 during steady-state playback.
-
-    "Rebuffering" means buffer empties *after* playback has started. The
-    initial samples taken before the decoder produces its first frames
-    naturally have buffer=0 — those are startup, not stalls. We exclude
-    samples where total_frames is still 0 (no playback yet).
-
-    Args:
-        collector: MetricsCollector with collected data.
-        start_time: Window start.
-        end_time: Window end.
-    """
+    # Pre-playback samples have buffer=0 because the decoder hasn't produced
+    # any frames yet — that's startup, not a stall. Exclude total_frames==0.
     in_window = [
         s for s in collector.samples
         if start_time <= s.timestamp <= end_time and s.total_frames > 0
     ]
     if not in_window:
-        return  # Playback never started in this window — separate failure mode
+        return
 
     zero_samples = [s for s in in_window if s.buffer_seconds <= 0]
     if zero_samples:
@@ -139,15 +104,13 @@ def assert_buffer_above(
     end_time: float,
     min_buffer_s: float,
 ) -> None:
-    """Assert buffer stayed above a minimum threshold.
-
-    Args:
-        collector: MetricsCollector with collected data.
-        start_time: Window start.
-        end_time: Window end.
-        min_buffer_s: Minimum acceptable buffer in seconds.
-    """
-    actual_min = collector.get_buffer_min(start_time, end_time)
+    in_window = [
+        s for s in collector.samples
+        if start_time <= s.timestamp <= end_time and s.total_frames > 0
+    ]
+    if not in_window:
+        return
+    actual_min = min(s.buffer_seconds for s in in_window)
     if actual_min < min_buffer_s:
         raise AssertionError(
             f"Buffer dropped to {actual_min:.3f}s, below minimum {min_buffer_s}s"
@@ -160,14 +123,6 @@ def assert_quality_floor(
     end_time: float,
     floor: str = "360p",
 ) -> None:
-    """Assert that quality never went below the floor.
-
-    Args:
-        collector: MetricsCollector with collected data.
-        start_time: Window start.
-        end_time: Window end.
-        floor: Minimum acceptable quality (e.g., "360p").
-    """
     floor_idx = quality_index(floor)
     relevant = [s for s in collector.samples if start_time <= s.timestamp <= end_time]
     for sample in relevant:
@@ -185,14 +140,6 @@ def assert_max_switches(
     end_time: float,
     max_switches: int,
 ) -> None:
-    """Assert that the number of quality switches didn't exceed a maximum.
-
-    Args:
-        collector: MetricsCollector with collected data.
-        start_time: Window start.
-        end_time: Window end.
-        max_switches: Maximum allowed switches.
-    """
     switches = collector.get_switches_in_window(start_time, end_time)
     if len(switches) > max_switches:
         switch_details = [
@@ -206,15 +153,7 @@ def assert_max_switches(
 
 
 def assert_no_crash(collector: MetricsCollector, start_time: float, end_time: float) -> None:
-    """Assert that the client kept reporting metrics (didn't crash or hang).
-
-    Expects at least one sample per 2 seconds.
-
-    Args:
-        collector: MetricsCollector with collected data.
-        start_time: Window start.
-        end_time: Window end.
-    """
+    # Expect at least one sample every 2s.
     duration = end_time - start_time
     relevant = [s for s in collector.samples if start_time <= s.timestamp <= end_time]
     expected_min_samples = max(1, int(duration / 2))

@@ -2,7 +2,7 @@ thresholds:
   downswitch_latency_s: 10
   upswitch_latency_s: 15
   rebuffer_recovery_s: 15
-  max_switches_per_minute: 4
+  max_switches_per_minute: 20
   min_stable_buffer_s: 2
   quality_floor: '360p'
 

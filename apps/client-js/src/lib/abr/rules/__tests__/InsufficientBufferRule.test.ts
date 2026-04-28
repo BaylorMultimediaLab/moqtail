@@ -23,6 +23,9 @@ function makeContext(overrides: Partial<RulesContext> = {}): RulesContext {
     isLowLatency: false,
     switchHistory: [],
     abrSettings: DEFAULT_ABR_SETTINGS,
+    probeBandwidthBps: 0,
+    latencyTrendRatio: 1,
+    playbackRate: 1,
     ...overrides,
   };
 }
@@ -84,9 +87,10 @@ describe('InsufficientBufferRule', () => {
   });
 
   it('caps bitrate proportional to buffer level when buffer is low', () => {
-    // bufferSeconds=8, segmentDurationS=4, bandwidthBps=5_000_000, throughputSafetyFactor=0.7
-    // cappedBps = 5_000_000 * 0.7 * (8 / 4) = 5_000_000 * 0.7 * 2 = 7_000_000
-    // All three tracks (500k, 1.5M, 4M) fit within 7M → bestIndex = 2
+    // dash.js formula: cap = bandwidth × safetyFactor × buffer / segmentDuration.
+    //   buffer=8, segment=4, safetyFactor=0.7 → multiplier = 0.7 × 8/4 = 1.4
+    //   cap = 5_000_000 × 1.4 = 7_000_000.
+    // Tracks: 500K, 1.5M, 4M. All three fit → bestIndex=2 (4M).
     const ctx = makeContext({ bufferSeconds: 8, bandwidthBps: 5_000_000, segmentDurationS: 4 });
 
     rule.getMaxIndex(ctx);

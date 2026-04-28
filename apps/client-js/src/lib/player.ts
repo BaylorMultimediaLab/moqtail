@@ -30,6 +30,41 @@ import { MOQtailClient } from 'moqtail/client';
 import { CMSFCatalog } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
+import { LatencyTracker } from '@/lib/latencyTracker';
+
+// NTP epoch (1900) is 2_208_988_800 seconds before the UNIX epoch (1970).
+const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
+
+/**
+ * If the chunk starts with a PRFT (Producer Reference Time) box per
+ * ISO/IEC 14496-12 §8.16.5, return the publisher's wall-clock at chunk
+ * production as UNIX milliseconds. Returns null otherwise.
+ *
+ * PRFT layout (version 1, 32 bytes total):
+ *   0..4   box size (32, big-endian)
+ *   4..8   "prft"
+ *   8      version (1)
+ *   9..12  flags (0)
+ *   12..16 reference_track_ID
+ *   16..24 ntp_timestamp (NTP fixed point: seconds.fraction since 1900)
+ *   24..32 media_time (u64, version=1)
+ */
+function readPrftCaptureMs(buf: Uint8Array): number | null {
+  if (buf.byteLength < 32) return null;
+  // 'p'=0x70, 'r'=0x72, 'f'=0x66, 't'=0x74
+  if (buf[4] !== 0x70 || buf[5] !== 0x72 || buf[6] !== 0x66 || buf[7] !== 0x74) {
+    return null;
+  }
+  // DataView must respect the Uint8Array's byteOffset; otherwise we'd
+  // read from byte 0 of the underlying ArrayBuffer instead of the chunk's
+  // actual start.
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const ntpSeconds = view.getUint32(16, false);
+  const ntpFraction = view.getUint32(20, false);
+  const unixSeconds = ntpSeconds - NTP_UNIX_DELTA_SECONDS;
+  const fractionMs = (ntpFraction / 0x1_0000_0000) * 1000;
+  return unixSeconds * 1000 + fractionMs;
+}
 
 interface PendingSwitch {
   trackName: string;
@@ -87,6 +122,10 @@ export class Player {
   #options: Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
     Pick<PlayerOptions, 'onTrackSwitched'>;
   #disposers: Array<() => void> = [];
+  // Per-frame end-to-end latency window (last 100 samples ≈ 4 s at 25 fps).
+  // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
+  // `LatencyTrendRule` reads `getTrendRatio()` for downswitch decisions.
+  #latencyTracker = new LatencyTracker();
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -430,10 +469,23 @@ export class Player {
               if (bufferDuration > 1.0) bufferNotification(maxEnd);
             }
 
-            // Record goodput sample — tracker uses internal windowed byte counter
-            struct.tracker.recordObject(object.payload.byteLength, 0);
-            // Track last seen group for switch boundary detection
+            // Record goodput sample — SWMA on per-group object timing.
+            // The publisher bursts a GOP's objects back-to-back so the
+            // intra-group rate reflects link capacity, not source bitrate.
+            struct.tracker.recordObject(object.payload.byteLength, object.location.group);
             struct.lastGroupId = object.location.group;
+
+            // Read PRFT box (if any) at the head of the CMAF chunk.
+            // Publisher prepends `prft` per ISO/IEC 14496-12 §8.16.5 so the
+            // receiver can compute end-to-end latency per frame. MSE skips
+            // unknown top-level boxes, so the chunk is appended unchanged.
+            // `object.payload` is already a Uint8Array view at the right
+            // offset — pass it directly so we don't accidentally read from
+            // byte 0 of a shared underlying ArrayBuffer.
+            const captureMs = readPrftCaptureMs(object.payload);
+            if (captureMs !== null) {
+              this.#latencyTracker.record(Date.now() - captureMs);
+            }
           } catch (error) {
             logger.error('media', 'Error processing media object:', error);
             controller.error(error);
@@ -474,6 +526,8 @@ export class Player {
     bufferedRanges: string;
     mseReadyState: string;
     videoErrorCode: number;
+    latencyTrendRatio: number;
+    lastLatencyMs: number;
   } {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     const el = this.#element;
@@ -508,18 +562,92 @@ export class Player {
       bufferedRanges,
       mseReadyState: this.#mse?.readyState ?? 'closed',
       videoErrorCode: el?.error?.code ?? 0,
+      latencyTrendRatio: this.#latencyTracker.getTrendRatio(),
+      lastLatencyMs: this.#latencyTracker.getLastLatencyMs(),
     };
   }
 
-  setEmaAlphas(alphaFast: number, alphaSlow: number): void {
+  setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    videoStruct?.tracker.setAlphas(alphaFast, alphaSlow);
+    videoStruct?.tracker.setHalfLives(halfLifeFastSec, halfLifeSlowSec);
   }
 
-  /** Poll WebTransport stats for the active video track's goodput tracker. */
-  async pollGoodput(): Promise<void> {
+  /**
+   * Active bandwidth probe (per Kuo, KTH MSc 2025 §3.4.3.1 Algorithm 1;
+   * IETF 119 MoQ bandwidth-measurement slides).
+   *
+   * Subscribes to a synthetic `.probe:<size>:<priority>` track that the
+   * relay handles by generating one payload of the requested size and
+   * closing the stream. We measure both the **probe** bytes (p) and the
+   * **video-track** bytes (v) received during the same wall-clock window,
+   * matching Algorithm 1's `BWE = (v + p) / Δt`. Combining v + p
+   * estimates total link throughput rather than just the probe's
+   * residual capacity.
+   *
+   * Returns 0 on subscribe failure or no data.
+   */
+  async probeTrackBandwidth(trackName: string, durationMs: number): Promise<number> {
+    if (!this.client) return 0;
+    const fullTrackName = getFullTrackName(this.#options.namespace, trackName);
+
+    // Snapshot the active video tracker's cumulative bytes before the probe
+    // window opens. Diff at the end gives us v (real-track bytes received
+    // concurrently with the probe).
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    await videoStruct?.tracker.poll();
+    const vBytesStart = videoStruct?.tracker.getCumulativeBytes() ?? 0;
+    const tStart = Date.now();
+
+    const result = await this.client.subscribe({
+      fullTrackName,
+      groupOrder: GroupOrder.Original,
+      filterType: FilterType.LatestObject,
+      forward: true,
+      priority: 255,
+    });
+    if (result instanceof SubscribeError) return 0;
+
+    const reader = result.stream.getReader();
+    let pBytes = 0;
+    let count = 0;
+
+    try {
+      while (Date.now() - tStart < durationMs) {
+        const remaining = durationMs - (Date.now() - tStart);
+        const timeoutP = new Promise<{ done: true; value: undefined }>(resolve =>
+          setTimeout(() => resolve({ done: true, value: undefined }), remaining),
+        );
+        const readP = reader.read() as Promise<{
+          done: boolean;
+          value: typeof MoqtObject.prototype | undefined;
+        }>;
+        const r = await Promise.race([readP, timeoutP]);
+        if (r.done || !r.value) break;
+        if (r.value.isEndOfGroup()) continue;
+        const len = r.value.payload?.byteLength ?? 0;
+        if (len === 0) continue;
+        pBytes += len;
+        count++;
+      }
+    } catch {
+      /* swallow — return what we have */
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* ignore */
+      }
+      this.client.unsubscribe(result.requestId).catch(() => {});
+    }
+
+    const tEnd = Date.now();
+    const dtSec = (tEnd - tStart) / 1000;
+    if (count === 0 || dtSec <= 0) return 0;
+
+    const vBytesEnd = videoStruct?.tracker.getCumulativeBytes() ?? vBytesStart;
+    const vBytes = Math.max(0, vBytesEnd - vBytesStart);
+
+    // BWE = (v + p) × 8 / Δt — Algorithm 1 line 9.
+    return ((vBytes + pBytes) * 8) / dtSec;
   }
 
   /**
@@ -529,6 +657,21 @@ export class Player {
    */
   setOnTrackSwitched(cb: (trackName: string) => void): void {
     this.#options.onTrackSwitched = cb;
+  }
+
+  /**
+   * Abort an in-flight track switch. Called by AbrController when its
+   * switching-guard timeout fires — meaning the chosen target track is
+   * unfulfillable (typically: upswitch fired right before a regime change
+   * dropped the link below the target's source rate). Clearing
+   * `pendingSwitch` ensures any stale data arriving later on the abandoned
+   * track is dropped by the write handler's `objectTrackName !==
+   * struct.pendingSwitch?.trackName` filter rather than belatedly applied.
+   */
+  abortPendingSwitch(): void {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    if (!videoStruct) return;
+    videoStruct.pendingSwitch = null;
   }
 
   /**
@@ -656,7 +799,6 @@ export class Player {
       if (result instanceof FetchError)
         throw new Error(`Error occured during catalog fetch: ${result.reasonPhrase.phrase}`);
       const tracker = new GoodputTracker();
-      if (this.client) tracker.setTransport(this.client.webTransport);
       struct = {
         trackName: 'catalog',
         requestId: result.requestId,
@@ -713,7 +855,6 @@ export class Player {
     if (result instanceof SubscribeError)
       throw new Error(`Error occured during subscription: ${result.errorReason.phrase}`);
     const tracker = new GoodputTracker();
-    if (this.client.webTransport) tracker.setTransport(this.client.webTransport);
     struct = {
       trackName: params.trackName,
       requestId: result.requestId,

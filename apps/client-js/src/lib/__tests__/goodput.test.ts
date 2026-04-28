@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { GoodputTracker } from '../goodput';
 
-describe('GoodputTracker', () => {
+describe('GoodputTracker (SWMA on per-group object timing)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -9,184 +9,131 @@ describe('GoodputTracker', () => {
     vi.useRealTimers();
   });
 
-  // ---------------------------------------------------------------------------
-  // Fallback path (no WebTransport.getStats — same behaviour as before)
-  // ---------------------------------------------------------------------------
-
-  describe('fallback (no transport)', () => {
-    it('returns 0 before any samples', () => {
-      const t = new GoodputTracker();
-      expect(t.getBandwidthBps()).toBe(0);
-      expect(t.getFastEmaBps()).toBe(0);
-      expect(t.getSlowEmaBps()).toBe(0);
-    });
-
-    it('returns 0 during window warmup (< 100ms elapsed)', () => {
-      const t = new GoodputTracker(0.5, 0.1);
-      t.recordObject(10000, 0); // first sample seeds the window
-      vi.advanceTimersByTime(50);
-      t.recordObject(10000, 0); // 50ms in — still warming up
-      expect(t.getBandwidthBps()).toBe(0);
-    });
-
-    it('produces a throughput estimate after window warmup', () => {
-      const t = new GoodputTracker(0.5, 0.1);
-      t.recordObject(50000, 0); // first sample
-      vi.advanceTimersByTime(200);
-      t.recordObject(50000, 0); // 200ms later
-      // 100000 bytes in 200ms = 100000 * 8 * 1000 / 200 = 4,000,000 bps
-      expect(t.getBandwidthBps()).toBeGreaterThan(3_000_000);
-      expect(t.getBandwidthBps()).toBeLessThan(5_000_000);
-    });
-
-    it('returns min(fast, slow) as conservative estimate', () => {
-      const t = new GoodputTracker(0.5, 0.1);
-      // Fill first window
-      t.recordObject(50000, 0);
-      vi.advanceTimersByTime(1000);
-      t.recordObject(50000, 0);
-      // Second window with more data (higher throughput)
-      vi.advanceTimersByTime(3000);
-      t.recordObject(200000, 0);
-      vi.advanceTimersByTime(1000);
-      t.recordObject(200000, 0);
-      // min(fast, slow) — slow reacts less
-      expect(t.getBandwidthBps()).toBe(Math.min(t.getFastEmaBps(), t.getSlowEmaBps()));
-    });
-
-    it('resets both EMAs to 0 on reset()', () => {
-      const t = new GoodputTracker();
-      t.recordObject(10000, 0);
-      vi.advanceTimersByTime(1000);
-      t.recordObject(10000, 0);
-      t.reset();
-      expect(t.getBandwidthBps()).toBe(0);
-      expect(t.getFastEmaBps()).toBe(0);
-      expect(t.getSlowEmaBps()).toBe(0);
-    });
-
-    it('getSampleCount tracks number of recorded objects', () => {
-      const t = new GoodputTracker();
-      expect(t.getSampleCount()).toBe(0);
-      t.recordObject(1000, 0);
-      expect(t.getSampleCount()).toBe(1);
-      t.recordObject(2000, 0);
-      expect(t.getSampleCount()).toBe(2);
-    });
-
-    it('getLastObjectBytes returns last recorded size', () => {
-      const t = new GoodputTracker();
-      t.recordObject(5000, 0);
-      expect(t.getLastObjectBytes()).toBe(5000);
-      t.recordObject(12000, 0);
-      expect(t.getLastObjectBytes()).toBe(12000);
-    });
+  it('returns 0 before any sample', () => {
+    const t = new GoodputTracker();
+    expect(t.getBandwidthBps()).toBe(0);
+    expect(t.getFastEmaBps()).toBe(0);
+    expect(t.getSlowEmaBps()).toBe(0);
   });
 
-  // ---------------------------------------------------------------------------
-  // Transport stats path (WebTransport.getStats)
-  // ---------------------------------------------------------------------------
+  it('returns 0 while a single group is still in progress', () => {
+    const t = new GoodputTracker();
+    t.recordObject(10_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(10_000, 0n);
+    // Group 0 not finalized yet (still receiving its objects).
+    expect(t.getBandwidthBps()).toBe(0);
+  });
 
-  describe('transport stats path', () => {
-    function makeMockTransport(initialBytes = 0) {
-      let bytesReceived = initialBytes;
-      return {
-        transport: {
-          getStats: vi.fn().mockImplementation(() => Promise.resolve({ bytesReceived })),
-        } as unknown as WebTransport,
-        setBytesReceived(n: number) {
-          bytesReceived = n;
-        },
-      };
+  it('finalizes the previous group when a new groupId arrives', () => {
+    const t = new GoodputTracker();
+    // Group 0: first object sets t_1, two more objects of 10_000 bytes spaced
+    // 100ms apart → 20_000 bytes / 200ms = 800_000 bps.
+    t.recordObject(5_000, 0n); // first object — bytes excluded from numerator
+    vi.advanceTimersByTime(100);
+    t.recordObject(10_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(10_000, 0n);
+
+    // Group 1 starts → group 0 is finalized.
+    vi.advanceTimersByTime(900);
+    t.recordObject(5_000, 1n);
+
+    // (10_000 + 10_000) bytes * 8 bits / 0.2 s = 800_000 bps.
+    expect(t.getBandwidthBps()).toBe(800_000);
+  });
+
+  it('excludes the first object from the SWMA numerator', () => {
+    const t = new GoodputTracker();
+    // Group 0: huge first object (would inflate the average if counted) +
+    // small back-to-back objects.
+    t.recordObject(1_000_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(10_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(10_000, 0n);
+
+    t.recordObject(0, 1n); // trigger finalization
+
+    // (10_000 + 10_000) bytes * 8 / 0.2 s = 800_000 bps.
+    // If first-object bytes were counted, this would be much higher.
+    expect(t.getBandwidthBps()).toBe(800_000);
+  });
+
+  it('averages over a SWMA window of 5 group samples', () => {
+    const t = new GoodputTracker();
+    let groupId = 0n;
+    const throughputs = [1, 2, 3, 4, 5, 6].map(n => n * 1_000_000);
+    for (const tput of throughputs) {
+      // Each group: first object (1_000 B excluded from numerator), then a
+      // payload object 100ms later. payload * 8 / 0.1 = tput.
+      const payloadBytes = (tput * 0.1) / 8;
+      t.recordObject(1_000, groupId);
+      vi.advanceTimersByTime(100);
+      t.recordObject(payloadBytes, groupId);
+      groupId++;
+      vi.advanceTimersByTime(900);
     }
+    // Finalize the last group by emitting a stub object on the next groupId.
+    t.recordObject(0, groupId);
+    // 6 samples produced; window keeps last 5: 2,3,4,5,6 Mbps → mean = 4 Mbps.
+    expect(t.getBandwidthBps()).toBeCloseTo(4_000_000, -3);
+  });
 
-    it('poll() is a no-op when no transport is set', async () => {
-      const t = new GoodputTracker();
-      await t.poll(); // should not throw
-      expect(t.getBandwidthBps()).toBe(0);
-    });
+  it('feeds per-group throughputs into fast/slow EMAs', () => {
+    const t = new GoodputTracker(3, 8);
+    t.recordObject(1_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(125_000, 0n); // 125_000 B * 8 / 0.1 s = 10_000_000 bps
+    t.recordObject(0, 1n); // finalize group 0
 
-    it('seeds baseline on first poll without updating EMA', async () => {
-      const { transport } = makeMockTransport(1000);
-      const t = new GoodputTracker();
-      t.setTransport(transport);
+    expect(t.getFastEmaBps()).toBe(10_000_000);
+    expect(t.getSlowEmaBps()).toBe(10_000_000);
+  });
 
-      await t.poll();
-      expect(t.getBandwidthBps()).toBe(0); // no EMA update on first poll
-    });
+  it('reset() clears SWMA, EMAs, and current-group accumulator', () => {
+    const t = new GoodputTracker();
+    t.recordObject(1_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(10_000, 0n);
+    t.recordObject(0, 1n); // finalize group 0
+    expect(t.getBandwidthBps()).toBeGreaterThan(0);
 
-    it('computes throughput from bytesReceived delta', async () => {
-      const { transport, setBytesReceived } = makeMockTransport(0);
-      const t = new GoodputTracker(0.5, 0.1);
-      t.setTransport(transport);
+    t.reset();
+    expect(t.getBandwidthBps()).toBe(0);
+    expect(t.getFastEmaBps()).toBe(0);
+    expect(t.getSlowEmaBps()).toBe(0);
+    expect(t.getSampleCount()).toBe(0);
+  });
 
-      // First poll — seeds baseline
-      await t.poll();
+  it('getLastObjectBytes returns the most recent object size', () => {
+    const t = new GoodputTracker();
+    t.recordObject(5_000, 0n);
+    expect(t.getLastObjectBytes()).toBe(5_000);
+    t.recordObject(12_000, 0n);
+    expect(t.getLastObjectBytes()).toBe(12_000);
+  });
 
-      // Simulate 100ms passing and 50000 bytes received
-      vi.advanceTimersByTime(200);
-      setBytesReceived(50000);
-      await t.poll();
+  it('getSampleCount tracks the number of finalized groups, not raw objects', () => {
+    const t = new GoodputTracker();
+    expect(t.getSampleCount()).toBe(0);
 
-      // 50000 bytes in 200ms = 50000 * 8 * 1000 / 200 = 2,000,000 bps
-      expect(t.getBandwidthBps()).toBeGreaterThan(1_500_000);
-      expect(t.getBandwidthBps()).toBeLessThan(2_500_000);
-    });
+    // Group 0 with two objects → no finalization yet.
+    t.recordObject(1_000, 0n);
+    vi.advanceTimersByTime(50);
+    t.recordObject(2_000, 0n);
+    expect(t.getSampleCount()).toBe(0);
 
-    it('skips EMA update when delta is too short (< 50ms)', async () => {
-      const { transport, setBytesReceived } = makeMockTransport(0);
-      const t = new GoodputTracker();
-      t.setTransport(transport);
+    // Switching to group 1 finalizes group 0 → count = 1.
+    t.recordObject(1_000, 1n);
+    expect(t.getSampleCount()).toBe(1);
+  });
 
-      await t.poll(); // seed
-      vi.advanceTimersByTime(30); // only 30ms
-      setBytesReceived(100000);
-      await t.poll();
-
-      expect(t.getBandwidthBps()).toBe(0); // not enough elapsed time
-    });
-
-    it('recordObject only tracks metadata when transport stats are active', () => {
-      const { transport } = makeMockTransport(0);
-      const t = new GoodputTracker();
-      t.setTransport(transport);
-
-      t.recordObject(5000, 0);
-      t.recordObject(8000, 0);
-
-      // Metadata is tracked
-      expect(t.getLastObjectBytes()).toBe(8000);
-      expect(t.getSampleCount()).toBe(2);
-      // But no EMA from recordObject — only poll() feeds EMA
-      expect(t.getBandwidthBps()).toBe(0);
-    });
-
-    it('reset clears transport stats state', async () => {
-      const { transport, setBytesReceived } = makeMockTransport(0);
-      const t = new GoodputTracker(0.5, 0.1);
-      t.setTransport(transport);
-
-      await t.poll();
-      vi.advanceTimersByTime(200);
-      setBytesReceived(50000);
-      await t.poll();
-      expect(t.getBandwidthBps()).toBeGreaterThan(0);
-
-      t.reset();
-      expect(t.getBandwidthBps()).toBe(0);
-    });
-
-    it('falls back to manual counting when getStats is missing', () => {
-      const transport = {} as unknown as WebTransport; // no getStats
-      const t = new GoodputTracker(0.5, 0.1);
-      t.setTransport(transport);
-
-      // Should behave like fallback path
-      t.recordObject(50000, 0);
-      vi.advanceTimersByTime(200);
-      t.recordObject(50000, 0);
-
-      expect(t.getBandwidthBps()).toBeGreaterThan(3_000_000);
-    });
+  it('skips groups with only one object (no inter-arrival information)', () => {
+    const t = new GoodputTracker();
+    t.recordObject(10_000, 0n); // single object in group 0
+    t.recordObject(10_000, 1n); // moves to group 1; group 0 should NOT be finalized
+    expect(t.getSampleCount()).toBe(0);
+    expect(t.getBandwidthBps()).toBe(0);
   });
 });

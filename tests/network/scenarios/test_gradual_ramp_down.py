@@ -35,17 +35,14 @@ async def test_gradual_ramp_down(
     page = browser_page
     test_start = time.time()
 
-    # Let the stream stabilize at initial quality
     await collector.collect_for(page, duration_s=10)
 
     for bw_mbps, expected_quality in RAMP_STEPS:
         step_time = time.time()
         shape_link2(net, bw_mbps=bw_mbps)
 
-        # Collect metrics for the step duration
         await collector.collect_for(page, duration_s=STEP_DURATION_S)
 
-        # Assert downswitch happened within threshold
         assert_downswitch_within(
             collector,
             change_time=step_time,
@@ -53,11 +50,9 @@ async def test_gradual_ramp_down(
             expected_quality=expected_quality,
         )
 
-    # Assert no rebuffering across the entire test
     test_end = time.time()
     assert_no_rebuffering(collector, test_start, test_end)
     assert_quality_floor(collector, test_start, test_end, thresholds["quality_floor"])
 
-    # Save results
     collector.save_csv(results_dir / "metrics.csv")
     collector.save_switches_json(results_dir / "switches.json")

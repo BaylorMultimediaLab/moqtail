@@ -18,19 +18,16 @@ async def test_packet_loss(
     """
     page = browser_page
 
-    # Apply packet loss with full bandwidth
     shape_link2(net, bw_mbps=5.0, loss_pct=5.0)
 
     test_start = time.time()
     await collector.collect_for(page, duration_s=60)
     test_end = time.time()
 
-    # Client may downswitch but should stabilize — max 4 switches in 60s
     assert_max_switches(
         collector, test_start, test_end, thresholds["max_switches_per_minute"]
     )
 
-    # Quality floor
     assert_quality_floor(collector, test_start, test_end, thresholds["quality_floor"])
 
     collector.save_csv(results_dir / "metrics.csv")

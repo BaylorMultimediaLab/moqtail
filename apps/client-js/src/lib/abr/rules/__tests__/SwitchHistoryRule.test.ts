@@ -21,6 +21,9 @@ function makeContext(overrides: Partial<RulesContext> = {}): RulesContext {
     isLowLatency: false,
     switchHistory: [],
     abrSettings: { ...DEFAULT_ABR_SETTINGS },
+    probeBandwidthBps: 0,
+    latencyTrendRatio: 1,
+    playbackRate: 1,
     ...overrides,
   };
 }
@@ -107,10 +110,7 @@ describe('SwitchHistoryRule', () => {
 
   it('returns lowest safe index when multiple tracks are unsafe', () => {
     // Both 1080p and 720p have excessive drops → safe index should be 0 (360p)
-    const history = [
-      ...makeHistory('1080p', 8, 100),
-      ...makeHistory('720p', 8, 100, '360p'),
-    ];
+    const history = [...makeHistory('1080p', 8, 100), ...makeHistory('720p', 8, 100, '360p')];
     const ctx = makeContext({ switchHistory: history, activeTrackIndex: 2 });
     const result = rule.getMaxIndex(ctx);
     expect(result).not.toBeNull();

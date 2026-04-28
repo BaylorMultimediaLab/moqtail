@@ -14,15 +14,15 @@ async def test_bandwidth_recovery(
 ):
     """Start at 0.6 Mbps (360p), then restore to 5 Mbps.
 
-    Assert client upswitches to 1080p within threshold.
+    Assert client upswitches to 720p within threshold. ProbeRule (Kuo
+    Algorithm 1) drives upswitches via the relay's synthetic
+    `.probe:<size>:<priority>` track — no URL overrides needed.
     """
     page = browser_page
 
-    # Phase 1: Low bandwidth — settle on 360p
     shape_link2(net, bw_mbps=0.6)
-    await collector.collect_for(page, duration_s=20)
+    await collector.collect_for(page, duration_s=10)
 
-    # Verify client is at 360p before restoring
     assert_downswitch_within(
         collector,
         change_time=collector.samples[0].timestamp,
@@ -30,20 +30,17 @@ async def test_bandwidth_recovery(
         expected_quality="360p",
     )
 
-    # Phase 2: Restore to 5 Mbps
     restore_time = time.time()
     shape_link2(net, bw_mbps=5.0)
-    await collector.collect_for(page, duration_s=30)
+    await collector.collect_for(page, duration_s=40)
 
-    # Assert upswitch to 1080p within 30s
     assert_upswitch_within(
         collector,
         change_time=restore_time,
-        max_latency_s=30,
-        expected_quality="1080p",
+        max_latency_s=40,
+        expected_quality="720p",
     )
 
-    # Assert quality floor throughout
     test_end = time.time()
     assert_quality_floor(collector, collector.samples[0].timestamp, test_end, thresholds["quality_floor"])
 

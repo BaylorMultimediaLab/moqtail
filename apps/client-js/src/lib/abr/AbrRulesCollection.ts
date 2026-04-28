@@ -2,7 +2,10 @@ import type { AbrRule, AbrSettings, RulesContext, SwitchRequest } from './types'
 import { SwitchRequestPriority } from './types';
 import { ThroughputRule } from './rules/ThroughputRule';
 import { BolaRule } from './rules/BolaRule';
+import { ProbeRule } from './rules/ProbeRule';
 import { InsufficientBufferRule } from './rules/InsufficientBufferRule';
+import { BufferDrainRateRule } from './rules/BufferDrainRateRule';
+import { LatencyTrendRule } from './rules/LatencyTrendRule';
 import { SwitchHistoryRule } from './rules/SwitchHistoryRule';
 import { DroppedFramesRule } from './rules/DroppedFramesRule';
 import { AbandonRequestsRule } from './rules/AbandonRequestsRule';
@@ -22,7 +25,10 @@ export class AbrRulesCollection {
     const allRules: AbrRule[] = [
       new ThroughputRule(),
       new BolaRule(),
+      new ProbeRule(),
       new InsufficientBufferRule(),
+      new BufferDrainRateRule(),
+      new LatencyTrendRule(),
       new SwitchHistoryRule(),
       new DroppedFramesRule(),
       new AbandonRequestsRule(),
@@ -61,8 +67,7 @@ export class AbrRulesCollection {
   }
 
   getBestPossibleSwitchRequest(context: RulesContext): SwitchRequest | null {
-    const isLowLatencyMode =
-      this.isRuleActive('L2ARule') || this.isRuleActive('LoLPRule');
+    const isLowLatencyMode = this.isRuleActive('L2ARule') || this.isRuleActive('LoLPRule');
 
     const requests: SwitchRequest[] = [];
 

@@ -9,6 +9,7 @@ export default defineConfig({
   },
   format: ['cjs', 'esm'],
   dts: true,
+  tsconfig: './tsconfig.tsup.json',
   outDir: 'dist',
   splitting: false,
   sourcemap: false,

@@ -21,6 +21,9 @@ function makeContext(overrides: Partial<RulesContext> = {}): RulesContext {
     isLowLatency: false,
     switchHistory: [],
     abrSettings: { ...DEFAULT_ABR_SETTINGS },
+    probeBandwidthBps: 0,
+    latencyTrendRatio: 1,
+    playbackRate: 1,
     ...overrides,
   };
 }

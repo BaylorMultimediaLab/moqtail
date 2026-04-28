@@ -16,10 +16,15 @@ use crate::server::client::MOQTClient;
 use crate::server::client::switch_context::SwitchStatus;
 use crate::server::session::Session;
 use crate::server::session_context::SessionContext;
+use crate::server::stream_id::StreamId;
 use crate::server::track::{Track, TrackStatus};
+use bytes::Bytes;
 use core::result::Result;
+use moqtail::model::common::location::Location;
 use moqtail::model::control::constant::GroupOrder;
 use moqtail::model::control::subscribe::Subscribe;
+use moqtail::model::data::subgroup_header::SubgroupHeader;
+use moqtail::model::data::subgroup_object::SubgroupObject;
 use moqtail::model::error::TerminationCode;
 use moqtail::model::{
   common::reason_phrase::ReasonPhrase, control::control_message::ControlMessage,
@@ -27,7 +32,162 @@ use moqtail::model::{
 use moqtail::transport::control_stream_handler::ControlStreamHandler;
 use moqtail::transport::data_stream_handler::SubscribeRequest;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
+
+// Synthetic-probe track aliases live well above any plausible publisher-
+// assigned alias so they can't collide with real video tracks. Per IETF 119
+// MoQ bandwidth-measurement slides, a subscriber can request a one-shot
+// payload of arbitrary size by subscribing to `.probe:<size>:<priority>`.
+//
+// QUIC varints (RFC 9000 §16) can only encode values up to 2^62 - 1, so the
+// alias must stay below that. 2^60 is far above any plausible publisher
+// alias (publishers in this codebase use small u64 starting from 1) and
+// well within varint range.
+const PROBE_ALIAS_BASE: u64 = 1u64 << 60;
+static PROBE_ALIAS_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PROBE_MAX_SIZE: usize = 16 * 1024 * 1024;
+// Per-object chunk size. WebTransport's read() returns once per MoQ object,
+// so the receiver only sees inter-arrival timing if the probe is split into
+// multiple objects. 4 KB ≈ a few MTU-sized packets per object — small
+// enough to give SWMA-style timing samples, large enough that overhead
+// per object is negligible.
+const PROBE_CHUNK_SIZE: usize = 4096;
+
+/// Parse `.probe:<size>:<priority>` from a track-name byte slice.
+/// Returns `(size_bytes, priority_byte)` on match.
+fn parse_probe_track_name(name_bytes: &[u8]) -> Option<(usize, u8)> {
+  let s = std::str::from_utf8(name_bytes).ok()?;
+  let rest = s.strip_prefix(".probe:")?;
+  let mut parts = rest.splitn(3, ':');
+  let size: usize = parts.next()?.parse().ok()?;
+  let priority: u8 = parts.next()?.parse().ok()?;
+  if parts.next().is_some() {
+    return None;
+  }
+  if size == 0 || size > PROBE_MAX_SIZE {
+    return None;
+  }
+  Some((size, priority))
+}
+
+/// Synthesize one object of `size` bytes for a `.probe:` SUBSCRIBE.
+///
+/// Bypasses the normal publisher lookup, track_manager registration, and
+/// switch-context tracking — the probe is a pure relay-side artifact and
+/// must never collide with real-track state. The relay sends SubscribeOk
+/// (which teaches the client a synthetic track_alias), opens a uni stream
+/// with a SubgroupHeader, writes one SubgroupObject of `size` zero bytes,
+/// and closes the stream.
+async fn handle_probe_subscribe(
+  client: Arc<MOQTClient>,
+  control_stream_handler: &mut ControlStreamHandler,
+  sub: Subscribe,
+  size: usize,
+  probe_priority: u8,
+) -> Result<(), TerminationCode> {
+  info!(
+    "synthetic probe: request_id={} size={} priority={}",
+    sub.request_id, size, probe_priority
+  );
+
+  // Allocate a unique synthetic alias. PROBE_ALIAS_BASE puts these in a
+  // range no publisher would ever assign.
+  let track_alias = PROBE_ALIAS_BASE + PROBE_ALIAS_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+  // SubscribeOk first so the client maps track_alias before any data lands.
+  let subscribe_ok = moqtail::model::control::subscribe_ok::SubscribeOk::new_ascending_with_content(
+    sub.request_id,
+    track_alias,
+    0, // expires — irrelevant for one-shot
+    Some(Location::new(0, 0)),
+    None,
+  );
+  if let Err(e) = control_stream_handler.send_impl(&subscribe_ok).await {
+    warn!("probe: failed to send SubscribeOk: {:?}", e);
+    return Ok(());
+  }
+
+  // Translate slide convention (priority byte: 0=low, non-zero=high) to MoQ
+  // publisher_priority (lower numeric = higher priority). 0 → 255 (lowest).
+  let pub_priority: u8 = if probe_priority == 0 { 255 } else { 0 };
+
+  let header = SubgroupHeader::new_with_explicit_id(
+    track_alias,
+    0,            // group_id
+    0,            // subgroup_id
+    pub_priority, // publisher_priority
+    false,        // has_extensions
+    true,         // contains_end_of_group — single-object subgroup
+  );
+
+  let header_bytes = match header.serialize() {
+    Ok(b) => b,
+    Err(e) => {
+      warn!("probe: failed to serialize header: {:?}", e);
+      return Ok(());
+    }
+  };
+
+  let stream_id = StreamId::new_subgroup(track_alias, 0, Some(0));
+
+  // Stream-scheduling priority 0 — yield to real video under congestion.
+  let send_stream = match client.open_stream(&stream_id, header_bytes, 0).await {
+    Ok(s) => s,
+    Err(e) => {
+      warn!("probe: failed to open stream: {:?}", e);
+      return Ok(());
+    }
+  };
+
+  // Split the probe payload across multiple SubgroupObjects so the client
+  // sees several read() events on one stream and can compute inter-arrival
+  // throughput (SWMA-style) rather than a single point sample.
+  let mut bytes_remaining = size;
+  let mut object_id: u64 = 0;
+  let mut prev_object_id: Option<u64> = None;
+  while bytes_remaining > 0 {
+    let chunk = std::cmp::min(bytes_remaining, PROBE_CHUNK_SIZE);
+    let payload = Bytes::from(vec![0u8; chunk]);
+    let sub_object = SubgroupObject {
+      object_id,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(payload),
+    };
+    let object_bytes = match sub_object.serialize(prev_object_id, false) {
+      Ok(b) => b,
+      Err(e) => {
+        warn!("probe: failed to serialize chunk {}: {:?}", object_id, e);
+        let _ = client.close_stream(&stream_id).await;
+        return Ok(());
+      }
+    };
+    if let Err(e) = client
+      .write_stream_object(
+        &stream_id,
+        object_id,
+        object_bytes,
+        Some(send_stream.clone()),
+      )
+      .await
+    {
+      warn!("probe: failed to write chunk {}: {:?}", object_id, e);
+      break;
+    }
+    prev_object_id = Some(object_id);
+    object_id += 1;
+    bytes_remaining -= chunk;
+  }
+
+  let _ = client.close_stream(&stream_id).await;
+
+  info!(
+    "synthetic probe: completed alias={} size={} priority={}",
+    track_alias, size, pub_priority
+  );
+  Ok(())
+}
 
 async fn add_subscription(
   subscribe: Subscribe,
@@ -74,6 +234,15 @@ async fn handle_subscribe_message(
       );
       return Err(TerminationCode::TooManyRequests);
     }
+  }
+
+  // Synthetic-probe shortcut. A SUBSCRIBE for `.probe:<size>:<priority>` is
+  // not routed to any publisher; the relay generates one object of `size`
+  // bytes locally and ends. This intentionally skips track_manager
+  // registration and publisher lookup so probe traffic can never share a
+  // track_alias with real video and corrupt switch_context.
+  if let Some((size, priority)) = parse_probe_track_name(sub.track_name.as_bytes()) {
+    return handle_probe_subscribe(client, control_stream_handler, sub, size, priority).await;
   }
 
   // find who is the publisher

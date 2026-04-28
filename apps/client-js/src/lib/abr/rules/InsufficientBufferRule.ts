@@ -38,8 +38,25 @@ export class InsufficientBufferRule implements AbrRule {
       };
     }
 
-    // Buffer is low (0 < buffer < stableBufferTime) — cap bitrate proportional to buffer level
-    const cappedBps = bandwidthBps * throughputSafetyFactor * (bufferSeconds / segmentDurationS);
+    // dash.js formula (`InsufficientBufferRule.js`):
+    //   cap = bandwidth × safetyFactor × bufferLevel / fragmentDuration
+    //
+    // At healthy buffers (e.g. buffer=15, segment=1) the multiplier is 15 →
+    // cap is far above any track → the rule effectively yields control to
+    // ProbeRule/ThroughputRule. At critical buffers (buffer=0.2, segment=1)
+    // the multiplier is 0.2 → cap collapses → forces an emergency
+    // downswitch.
+    //
+    // We previously used `min(1, buffer/stableBufferTime)` to *cap* the
+    // multiplier at 1, because our passive `bandwidthBps` was push-rate-
+    // pinned and a 15× multiplier on push rate produced phantom upswitch
+    // permissions. Now that ProbeRule reads true link rate via the
+    // `.probe:` track and SWMA reads link burst rate (also above push
+    // rate), the dash.js multiplier is safe again — and the previous cap
+    // was wrongly suppressing 1080p upswitches throughout
+    // test_bandwidth_recovery's 6–16 s buffer window.
+    void stableBufferTime;
+    const cappedBps = (bandwidthBps * throughputSafetyFactor * bufferSeconds) / segmentDurationS;
 
     // Find the highest track index whose bitrate fits within the capped bandwidth
     let bestIndex = 0;

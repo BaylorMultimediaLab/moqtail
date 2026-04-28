@@ -12,7 +12,9 @@ import type { AbrSettings, Track } from '../types';
 type MockPlayer = {
   getMetrics: ReturnType<typeof vi.fn>;
   switchTrack: ReturnType<typeof vi.fn>;
-  pollGoodput: ReturnType<typeof vi.fn>;
+  setEmaHalfLives: ReturnType<typeof vi.fn>;
+  probeTrackBandwidth: ReturnType<typeof vi.fn>;
+  abortPendingSwitch: ReturnType<typeof vi.fn>;
 };
 
 function makeTracks(): Track[] {
@@ -43,6 +45,8 @@ function makePlayerMetrics(overrides: Partial<ReturnType<MockPlayer['getMetrics'
     playbackRate: 1,
     deliveryTimeMs: 50,
     lastObjectBytes: 8000,
+    latencyTrendRatio: 1,
+    lastLatencyMs: 0,
     ...overrides,
   };
 }
@@ -62,7 +66,9 @@ function makeController(
   const player: MockPlayer = {
     getMetrics: vi.fn().mockReturnValue(makePlayerMetrics(playerOverrides)),
     switchTrack: vi.fn().mockResolvedValue(undefined),
-    pollGoodput: vi.fn().mockResolvedValue(undefined),
+    setEmaHalfLives: vi.fn(),
+    probeTrackBandwidth: vi.fn().mockResolvedValue(0),
+    abortPendingSwitch: vi.fn(),
   };
   const capturedMetrics: AbrMetrics[] = [];
   const controller = new AbrController(player, collection, tracks, settings, m =>
@@ -176,8 +182,12 @@ describe('AbrController', () => {
       await controller._tick();
       expect(player.switchTrack).not.toHaveBeenCalled();
 
-      // Release guard
+      // Release guard (player signals new-track init segment landed) + advance
+      // totalFrames so the guard's frame-advance condition clears too.
       controller.releaseSwitchingGuard();
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '360p', totalFrames: 2000 }),
+      );
 
       // Next tick should be able to switch again
       await controller._tick();
@@ -281,12 +291,22 @@ describe('AbrController', () => {
       expect(h1).not.toBe(h2); // different array instances
     });
 
-    it('caps history at 60 entries', () => {
-      const { controller } = makeController({ activeTrack: '360p' }, { videoAutoSwitch: false });
+    it('caps history at 60 entries', async () => {
+      const { controller, player } = makeController(
+        { activeTrack: '360p' },
+        { videoAutoSwitch: false },
+      );
 
       for (let i = 0; i < 65; i++) {
         controller.manualSwitch('720p');
         controller.releaseSwitchingGuard();
+        // Simulate a decoded frame from the new track so the guard's
+        // frame-advance condition clears, allowing the next manualSwitch
+        // through. _tick() polls metrics and applies that condition.
+        player.getMetrics.mockReturnValue(
+          makePlayerMetrics({ activeTrack: '360p', totalFrames: 1000 + (i + 1) * 10 }),
+        );
+        await controller._tick();
       }
 
       expect(controller.getHistory()).toHaveLength(60);

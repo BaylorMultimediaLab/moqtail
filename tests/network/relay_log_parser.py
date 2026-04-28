@@ -8,35 +8,28 @@ from pathlib import Path
 
 @dataclass
 class SwitchEvent:
-    """A track switch event extracted from relay logs."""
-
-    timestamp: float  # Unix timestamp (seconds)
-    from_track: str | None  # Previous track name (None if first subscription)
-    to_track: str  # New track name
-    subscriber_id: int  # Connection ID of the subscriber
+    timestamp: float
+    from_track: str | None
+    to_track: str
+    subscriber_id: int
 
 
 @dataclass
 class ObjectRecord:
-    """A single object delivery record from per-subscriber log files."""
-
     group_id: int
     subgroup_id: int
     object_id: int
     payload_size: int
     send_status: bool
-    received_time: int  # Milliseconds since epoch
+    received_time: int
 
 
 @dataclass
 class RelayLogParser:
-    """Parses relay stdout for switch events and reads object log CSVs."""
-
     log_lines: list[str] = field(default_factory=list)
     switch_events: list[SwitchEvent] = field(default_factory=list)
 
-    # Pattern for: "received Switch message: Switch { ... }"
-    # Extracts track_namespace and track_name from the debug output
+    # Matches: "received Switch message: Switch { ... track_namespace: "..." ... track_name: "..." ... }"
     _switch_pattern: re.Pattern = field(
         default_factory=lambda: re.compile(
             r"received Switch message:.*track_namespace.*?\"([^\"]+)\".*track_name.*?\"([^\"]+)\""
@@ -45,14 +38,6 @@ class RelayLogParser:
     )
 
     def parse_stdout(self, stdout_text: str) -> list[SwitchEvent]:
-        """Parse relay stdout text for switch events.
-
-        Args:
-            stdout_text: Complete relay stdout output.
-
-        Returns:
-            List of SwitchEvent objects found.
-        """
         events = []
         for line in stdout_text.splitlines():
             match = self._switch_pattern.search(line)
@@ -62,7 +47,7 @@ class RelayLogParser:
                 full_track = f"{namespace}/{track_name}"
                 event = SwitchEvent(
                     timestamp=time.time(),
-                    from_track=None,  # Not available from this log line alone
+                    from_track=None,
                     to_track=full_track,
                     subscriber_id=0,
                 )
@@ -71,29 +56,12 @@ class RelayLogParser:
         return events
 
     def parse_incremental(self, new_lines: list[str]) -> list[SwitchEvent]:
-        """Parse newly-appended relay stdout lines (for live tailing).
-
-        Args:
-            new_lines: New lines since last call.
-
-        Returns:
-            List of new SwitchEvent objects.
-        """
         self.log_lines.extend(new_lines)
         return self.parse_stdout("\n".join(new_lines))
 
     @staticmethod
     def parse_object_log(log_path: Path) -> list[ObjectRecord]:
-        """Parse a per-subscriber object log CSV file.
-
-        File format: group_id,subgroup_id,object_id,payload_size,send_status,object_received_time
-
-        Args:
-            log_path: Path to the log file (e.g., sub_1_2.log).
-
-        Returns:
-            List of ObjectRecord objects.
-        """
+        # CSV: group_id,subgroup_id,object_id,payload_size,send_status,received_time
         records = []
         if not log_path.exists():
             return records
@@ -116,12 +84,4 @@ class RelayLogParser:
 
     @staticmethod
     def find_subscriber_logs(log_dir: Path) -> list[Path]:
-        """Find all subscriber log files in a directory.
-
-        Args:
-            log_dir: Directory to search.
-
-        Returns:
-            List of paths matching sub_*.log pattern.
-        """
         return sorted(log_dir.glob("sub_*.log"))

@@ -10,8 +10,6 @@ from pathlib import Path
 
 @dataclass
 class ClientMetricsSample:
-    """A single metrics sample from the browser client."""
-
     timestamp: float
     active_track: str | None
     active_track_index: int
@@ -23,45 +21,32 @@ class ClientMetricsSample:
     total_frames: int
     playback_rate: float
     delivery_time_ms: float
-    mode: str  # "auto" or "manual"
-    # MSE / video element wedge diagnostics.
-    ready_state: int = 0  # HTMLMediaElement.readyState (0–4)
+    mode: str
+    ready_state: int = 0
     paused: bool = False
     current_time: float = 0.0
     buffered_ranges: str = ""
-    mse_ready_state: str = ""  # "open" | "ended" | "closed"
-    video_error_code: int = 0  # 0 if no error, else MEDIA_ERR_*
+    mse_ready_state: str = ""
+    video_error_code: int = 0
 
 
 @dataclass
 class SwitchRecord:
-    """A switch event from the client's ABR switch history."""
-
     timestamp: float
     from_track: str
     to_track: str
-    reason: str  # "auto-upgrade", "auto-downgrade", "auto-emergency", "manual"
+    reason: str
     buffer_at_switch: float
     ema_at_switch: float
 
 
 @dataclass
 class MetricsCollector:
-    """Collects metrics from a Playwright page by polling window.__moqtailMetrics."""
-
     samples: list[ClientMetricsSample] = field(default_factory=list)
     switches: list[SwitchRecord] = field(default_factory=list)
     _seen_switch_count: int = field(default=0, init=False)
 
     async def poll_once(self, page) -> ClientMetricsSample | None:
-        """Poll the browser for current metrics.
-
-        Args:
-            page: Playwright page object.
-
-        Returns:
-            ClientMetricsSample if metrics are available, None otherwise.
-        """
         raw = await page.evaluate("() => window.__moqtailMetrics")
         if raw is None or raw.get("abr") is None:
             return None
@@ -89,18 +74,19 @@ class MetricsCollector:
         )
         self.samples.append(sample)
 
-        # Extract new switch events from history
         switch_history = abr.get("switchHistory", [])
         new_switches = switch_history[self._seen_switch_count :]
         for sw in new_switches:
+            ts_ms = sw.get("ts")
+            timestamp = ts_ms / 1000.0 if ts_ms is not None else time.time()
             self.switches.append(
                 SwitchRecord(
-                    timestamp=sw.get("timestamp", time.time()) / 1000.0,  # JS ms -> Python s
+                    timestamp=timestamp,
                     from_track=sw.get("fromTrack", ""),
                     to_track=sw.get("toTrack", ""),
                     reason=sw.get("reason", "unknown"),
                     buffer_at_switch=sw.get("bufferAtSwitch", 0.0),
-                    ema_at_switch=sw.get("emaAtSwitch", 0.0),
+                    ema_at_switch=sw.get("emaBwAtSwitch", 0.0),
                 )
             )
         self._seen_switch_count = len(switch_history)
@@ -108,65 +94,27 @@ class MetricsCollector:
         return sample
 
     async def collect_for(self, page, duration_s: float, interval_ms: int = 500) -> None:
-        """Collect metrics for a fixed duration.
-
-        Args:
-            page: Playwright page object.
-            duration_s: How long to collect in seconds.
-            interval_ms: Polling interval in milliseconds.
-        """
         end_time = time.time() + duration_s
         while time.time() < end_time:
             await self.poll_once(page)
             await asyncio.sleep(interval_ms / 1000.0)
 
     def get_quality_at(self, t: float) -> str | None:
-        """Get the active track name at a given timestamp.
-
-        Args:
-            t: Unix timestamp.
-
-        Returns:
-            Track name or None if no sample exists before that time.
-        """
         for sample in reversed(self.samples):
             if sample.timestamp <= t:
                 return sample.active_track
         return None
 
     def get_buffer_min(self, start_t: float, end_t: float) -> float:
-        """Get the minimum buffer level in a time window.
-
-        Args:
-            start_t: Start timestamp.
-            end_t: End timestamp.
-
-        Returns:
-            Minimum buffer level in seconds.
-        """
         relevant = [s for s in self.samples if start_t <= s.timestamp <= end_t]
         if not relevant:
             return 0.0
         return min(s.buffer_seconds for s in relevant)
 
     def get_switches_in_window(self, start_t: float, end_t: float) -> list[SwitchRecord]:
-        """Get switch events within a time window.
-
-        Args:
-            start_t: Start timestamp.
-            end_t: End timestamp.
-
-        Returns:
-            List of SwitchRecord objects in the window.
-        """
         return [sw for sw in self.switches if start_t <= sw.timestamp <= end_t]
 
     def save_csv(self, path: Path) -> None:
-        """Save collected samples to a CSV file.
-
-        Args:
-            path: Output file path.
-        """
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -187,11 +135,6 @@ class MetricsCollector:
                 ])
 
     def save_switches_json(self, path: Path) -> None:
-        """Save switch events to a JSON file.
-
-        Args:
-            path: Output file path.
-        """
         path.parent.mkdir(parents=True, exist_ok=True)
         data = [
             {

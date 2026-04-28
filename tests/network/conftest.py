@@ -30,7 +30,6 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="session")
 def config(request):
-    """Load test configuration from YAML."""
     config_path = request.config.getoption("--config")
     with open(config_path) as f:
         return yaml.safe_load(f)
@@ -38,13 +37,11 @@ def config(request):
 
 @pytest.fixture(scope="session")
 def project_root():
-    """Return the moqtail project root directory."""
     return Path(__file__).parent.parent.parent
 
 
 @pytest.fixture(scope="session")
 def results_base():
-    """Return the base results directory, creating it if needed."""
     base = Path(__file__).parent / "results"
     base.mkdir(exist_ok=True)
     return base
@@ -52,7 +49,6 @@ def results_base():
 
 @pytest.fixture
 def results_dir(results_base, request):
-    """Create a timestamped results directory for the current test."""
     test_name = request.node.name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     d = results_base / test_name / timestamp
@@ -62,7 +58,6 @@ def results_dir(results_base, request):
 
 @pytest.fixture
 def net(config):
-    """Create and start the Mininet network. Tears down after the test."""
     topo_cfg = config["topology"]
     network = create_network(
         link1_bw=topo_cfg["link1_default_bw"],
@@ -74,9 +69,8 @@ def net(config):
         yield network
     finally:
         network.stop()
-        # root0 lives in the root netns (inNamespace=False), so mininet.stop()
-        # leaves its veth behind. The next run's addLink would fail with
-        # "RTNETLINK answers: File exists". Delete it explicitly.
+        # root0 has inNamespace=False, so mininet.stop() leaves its veth behind
+        # and the next run's addLink fails with "RTNETLINK answers: File exists".
         subprocess.run(
             ["ip", "link", "del", "root0-eth0"],
             stdout=subprocess.DEVNULL,
@@ -87,7 +81,6 @@ def net(config):
 
 @pytest.fixture
 def relay_proc(net, config, project_root, results_dir):
-    """Start the relay process on h2. Returns (process, stdout_path)."""
     relay = net.get("relay")
     relay_bin = str(project_root / config["binaries"]["relay"])
     cert_file = str(project_root / config["binaries"]["relay_cert"])
@@ -101,7 +94,7 @@ def relay_proc(net, config, project_root, results_dir):
         stderr=subprocess.STDOUT,
     )
 
-    # Wait for relay to be ready (listening on UDP 4433 — MoQT runs over QUIC)
+    # MoQT is QUIC/UDP — `ss -tlnp` would never see it.
     for _ in range(30):
         result = relay.cmd("ss -ulnp | grep 4433")
         if "4433" in result:
@@ -120,7 +113,6 @@ def relay_proc(net, config, project_root, results_dir):
 
 @pytest.fixture
 def publisher_proc(net, config, project_root, relay_proc):
-    """Start the publisher process on h1. Depends on relay being up."""
     publisher = net.get("publisher")
     pub_bin = str(project_root / config["binaries"]["publisher"])
     video_path = str(project_root / config["binaries"]["video_path"])
@@ -138,7 +130,6 @@ def publisher_proc(net, config, project_root, relay_proc):
         stderr=subprocess.STDOUT,
     )
 
-    # Give the publisher time to connect and start encoding
     time.sleep(5)
 
     if proc.poll() is not None:
@@ -151,17 +142,10 @@ def publisher_proc(net, config, project_root, relay_proc):
 
 
 def _find_chrome_binary() -> str:
-    """Locate a Chrome/Chromium binary with HEVC (hvc1) support.
-
-    Prefers Google Chrome stable, which ships proprietary codecs; the Playwright
-    Chromium bundle does not include HEVC and the client-js catalog is hvc1-only.
-    Falls back to Playwright's bundled Chromium for environments without hvc1
-    media (not sufficient for this test suite, but useful for other fixtures).
-
-    Avoids the Ubuntu snap `chromium-browser`: snap confinement (AppArmor,
-    systemd slices) fights Mininet netns and the shim spawns helpers until
-    RAM is exhausted.
-    """
+    # Playwright's bundled Chromium omits HEVC (patent-encumbered) and the
+    # client-js catalog is hvc1-only, so prefer Google Chrome stable. Avoid
+    # the Ubuntu snap `chromium-browser`: snap confinement fights Mininet
+    # netns and forks helpers until OOM.
     for candidate in ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome"):
         if Path(candidate).exists():
             return candidate
@@ -176,17 +160,20 @@ def _find_chrome_binary() -> str:
     )
 
 
-@pytest.fixture
-async def browser_page(net, config, results_dir):
-    """Launch Chrome inside the client namespace on an Xvfb display via CDP.
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "abr_url_overrides(**kwargs): merge extra ABR settings into the page URL "
+        "for this test (e.g. throughputSlowHalfLifeSeconds=4).",
+    )
 
-    Runs headful under Xvfb, not --headless=new. With --headless=new on Linux +
-    AMD VA-API, the GPU process crashes when it tries to allocate a platform
-    GpuMemoryBuffer for decoded HEVC frames (SharedImageBackingFactory can't
-    find a backing for gmb_type=platform → GPU exits 8704 →
-    PIPELINE_ERROR_DISCONNECTED → the entire client spins in a retry loop that
-    leaks RAM). Xvfb gives chrome a real X display so the full GPU path works.
-    """
+
+@pytest.fixture
+async def browser_page(net, config, results_dir, request):
+    # Headful under Weston, not --headless=new. With --headless=new on Linux +
+    # AMD VA-API the GPU process exits 8704 trying to allocate a platform
+    # GpuMemoryBuffer for HEVC frames → PIPELINE_ERROR_DISCONNECTED → the
+    # client retries in a loop and leaks RAM.
     client = net.get("client")
     dist_path = str(Path(__file__).parent.parent.parent / config["client_js"]["dist_path"])
     chromium_flags = config["chromium"]["flags"]
@@ -210,9 +197,8 @@ async def browser_page(net, config, results_dir):
     weston_runtime_dir = None
 
     try:
-        # Serve client-js dist inside the client netns.
-        # Mininet's popen uses `mnexec -da`, which already calls setsid(),
-        # so we do NOT add start_new_session=True (double-setsid returns EPERM).
+        # mnexec -da already calls setsid(); double-setsid returns EPERM,
+        # so don't pass start_new_session=True here.
         http_proc = client.popen(
             ["python3", "-m", "http.server", "8080", "--directory", dist_path],
             stdout=http_log,
@@ -220,19 +206,16 @@ async def browser_page(net, config, results_dir):
         )
         await asyncio.sleep(1)
 
-        # Start a headless Weston compositor inside the client netns and
-        # point Chrome at its Wayland socket. Xvfb has no DRI3 support, so
-        # Chrome's HEVC decoder fails to allocate dma-buf-backed SharedImages
-        # and the GPU process exits 8704. Weston's headless backend wires up
-        # DRM/render nodes directly, giving Chrome a real GPU path.
+        # Xvfb has no DRI3 support, so Chrome's HEVC decoder can't allocate
+        # dma-buf-backed SharedImages and the GPU process exits 8704. Weston's
+        # headless backend wires up DRM/render nodes directly.
         weston_runtime_dir = Path(tempfile.mkdtemp(prefix="moqtail-weston-runtime-"))
         os.chmod(weston_runtime_dir, 0o700)
         wayland_socket = f"wayland-test-{os.getpid()}"
         weston_env = {**os.environ, "XDG_RUNTIME_DIR": str(weston_runtime_dir)}
-        # --renderer=gl is required so weston advertises zwp_linux_dmabuf_v1,
-        # which Chrome's GPU process needs to allocate dma-buf-backed
-        # SharedImages for HW-decoded HEVC frames. The default `noop` renderer
-        # is for protocol-level tests and doesn't expose those interfaces.
+        # --renderer=gl makes weston advertise zwp_linux_dmabuf_v1, which
+        # Chrome needs for HW-decoded HEVC frames. The default `noop` renderer
+        # doesn't expose it.
         weston_proc = client.popen(
             [
                 "weston",
@@ -256,9 +239,8 @@ async def browser_page(net, config, results_dir):
                 f"weston Wayland socket {wayland_socket_path} never appeared (see {weston_log_path})"
             )
 
-        # Launch Chrome headful on the Weston Wayland socket.
-        # Scrub WAYLAND_DISPLAY/DBUS from the user's desktop session and inject
-        # our test compositor's socket + runtime dir.
+        # Scrub the user's desktop Wayland/DBus env so Chrome attaches to our
+        # test compositor, not theirs.
         cdp_port = 9222
         scrubbed_env = {
             k: v
@@ -277,10 +259,9 @@ async def browser_page(net, config, results_dir):
         scrubbed_env["XDG_SESSION_TYPE"] = "wayland"
 
         # Chrome 147+ still reads the legacy `antialiasing` key from
-        # `org.gnome.settings-daemon.plugins.xsettings`. gnome-settings-daemon
-        # 43+ moved it to a `.deprecated` schema, so on a current Ubuntu
-        # GLib's g_error() (always-fatal) aborts Chrome at startup. Build a
-        # patched schema dir that puts the key back in the original schema.
+        # org.gnome.settings-daemon.plugins.xsettings, but gsd 43+ moved it
+        # to a .deprecated schema — GLib's g_error() then aborts Chrome at
+        # startup. Patch the schema so the key is back where Chrome expects.
         schema_dir = Path(tempfile.mkdtemp(prefix="moqtail-gschemas-"))
         for src in Path("/usr/share/glib-2.0/schemas").glob("*.gschema.xml"):
             (schema_dir / src.name).write_text(src.read_text())
@@ -288,7 +269,6 @@ async def browser_page(net, config, results_dir):
             (schema_dir / src.name).write_text(src.read_text())
         xs = schema_dir / "org.gnome.settings-daemon.plugins.xsettings.gschema.xml"
         xs_text = xs.read_text()
-        # Splice the deprecated `antialiasing` key into the live schema.
         injected_key = (
             '    <key name="antialiasing" '
             'enum="org.gnome.settings-daemon.GsdFontAntialiasingMode">\n'
@@ -326,12 +306,10 @@ async def browser_page(net, config, results_dir):
         )
         print(f"[browser_page] chrome_proc pid={chrome_proc.pid}", flush=True)
 
-        # Poll until the CDP port is listening (fail fast if chrome didn't start)
         for i in range(30):
             rc = chrome_proc.poll()
             listening = "9222" in client.cmd("ss -tlnp | grep 9222")
             if rc is not None and not listening:
-                # Chrome's main process exited without ever binding CDP — real failure.
                 raise RuntimeError(
                     f"Chromium exited with code {rc} before CDP was ready "
                     f"(see {chrome_log_path})"
@@ -344,10 +322,9 @@ async def browser_page(net, config, results_dir):
         else:
             raise RuntimeError("Chromium CDP port 9222 never came up")
 
-        # Chrome binds CDP to 127.0.0.1 only (recent versions ignore
-        # --remote-debugging-address=0.0.0.0 for security). Bridge with socat
-        # inside the client netns so pytest (root netns, reachable via root0)
-        # can connect via 10.0.2.1:9222.
+        # Chrome ignores --remote-debugging-address=0.0.0.0 and binds CDP to
+        # 127.0.0.1; socat inside the netns republishes it on client_ip so
+        # pytest (root netns, reaching via root0) can connect.
         socat_proc = client.popen(
             [
                 "socat",
@@ -371,8 +348,6 @@ async def browser_page(net, config, results_dir):
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else await context.new_page()
 
-            # Mirror browser console + page errors into a file so we can see
-            # why a Connect attempt failed (WebTransport errors, cert issues).
             console_log_path = results_dir / "browser_console.log"
             console_log = open(console_log_path, "w")
             page.on("console", lambda msg: console_log.write(
@@ -382,15 +357,10 @@ async def browser_page(net, config, results_dir):
                 f"[pageerror] {err}\n"
             ) or console_log.flush())
 
-            # Snapshot chrome://gpu in this Chrome session so we can audit the
-            # GPU init / HW decoder list under Xvfb (different from the user's
-            # desktop Chrome). Done in a throwaway tab so the main `page`
-            # continues unaffected.
             try:
                 gpu_page = await context.new_page()
                 await gpu_page.goto("chrome://gpu", wait_until="domcontentloaded")
-                # chrome://gpu populates asynchronously after the dom is ready;
-                # poll for a marker string before snapshotting.
+                # chrome://gpu populates async after DOM ready.
                 for _ in range(30):
                     txt = await gpu_page.evaluate("() => document.body.innerText")
                     if "Graphics Feature Status" in txt:
@@ -401,15 +371,18 @@ async def browser_page(net, config, results_dir):
             except Exception as e:
                 (results_dir / "chrome_gpu.txt").write_text(f"chrome://gpu dump failed: {e}\n")
 
-            # Chrome opened with the URL on argv, but the tab Playwright picks
-            # up via CDP can be a blank/new-tab depending on startup ordering.
-            # Navigate explicitly so the client-js app is guaranteed to load.
-            # bufferTimeDefault=300 keeps ABR's ThroughputRule active for the
-            # whole ramp run (buffer reaches ~95s at low-bitrate steps; BOLA
-            # would otherwise hold high quality once buffer crosses the
-            # default 18s threshold).
+            # bufferTimeDefault=300 keeps ThroughputRule active for the whole
+            # ramp run; BOLA would otherwise take over once buffer crosses
+            # the default 18s threshold. Tests can layer extra ABR settings via
+            # the @pytest.mark.abr_url_overrides(...) marker.
+            url_params = {"bufferTimeDefault": "300"}
+            override_marker = request.node.get_closest_marker("abr_url_overrides")
+            if override_marker:
+                for k, v in (override_marker.kwargs or {}).items():
+                    url_params[k] = str(v)
+            query = "&".join(f"{k}={v}" for k, v in url_params.items())
             await page.goto(
-                "http://localhost:8080/?bufferTimeDefault=300",
+                f"http://localhost:8080/?{query}",
                 wait_until="domcontentloaded",
             )
 
@@ -421,14 +394,12 @@ async def browser_page(net, config, results_dir):
             else:
                 raise RuntimeError("Client-JS never exposed __moqtailMetrics")
 
-            # Auto-connect: fill relay URL / namespace and click Connect.
-            # The client-js UI sits idle until the user clicks, so ABR metrics
-            # (window.__moqtailMetrics.abr) stay null.
+            # The client-js UI sits idle until Connect is clicked, so the ABR
+            # pipeline (and window.__moqtailMetrics.abr) stays null without this.
             await page.locator('input[type="url"]').fill(relay_url)
             await page.locator('input[type="text"]').first.fill("moqtail")
             await page.get_by_role("button", name="Connect").click()
 
-            # Wait until ABR pipeline is actually running (abr object populated).
             for _ in range(30):
                 has_abr = await page.evaluate(
                     "() => window.__moqtailMetrics?.abr != null"
@@ -464,10 +435,9 @@ async def browser_page(net, config, results_dir):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        # Chrome sometimes re-parents its main browser process to init before
-        # the fixture's SIGTERM reaches it — especially when the GPU process
-        # crashes during startup. Belt-and-suspenders: kill anything still
-        # pointing at this run's user_data_dir (uniquely named per fixture).
+        # Chrome can reparent its main process to init before SIGTERM reaches
+        # it (especially when the GPU process crashes early), so kill anything
+        # still pointing at this run's user_data_dir.
         subprocess.run(
             ["pkill", "-KILL", "-f", f"--user-data-dir={user_data_dir}"],
             stdout=subprocess.DEVNULL,
@@ -484,11 +454,7 @@ async def browser_page(net, config, results_dir):
 
 @pytest.fixture
 def collector(results_dir):
-    """Return a fresh MetricsCollector.
-
-    Always persists samples/switches to results_dir at teardown so a
-    failing assertion doesn't eat the data we need to debug it.
-    """
+    # Persist at teardown so a failing assertion doesn't eat the debug data.
     c = MetricsCollector()
     yield c
     try:
@@ -500,17 +466,14 @@ def collector(results_dir):
 
 @pytest.fixture
 def relay_parser():
-    """Return a fresh RelayLogParser."""
     return RelayLogParser()
 
 
 @pytest.fixture
 def thresholds(config):
-    """Return the threshold config for assertions."""
     return config["thresholds"]
 
 
 @pytest.fixture
 def quality_map(config):
-    """Return the bandwidth-to-quality mapping."""
     return config["quality_map"]
