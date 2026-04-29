@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { useState, useRef, useCallback, useEffect} from 'preact/hooks';
+import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
@@ -229,7 +229,7 @@ function TrackGroup({
 }
 
 export function App() {
-  const [relayUrl, setRelayUrl] = useState('https://ord.abr.moqtail.dev');
+  const [relayUrl, setRelayUrl] = useState('https://127.0.0.1:4433');
   const [namespace, setNamespace] = useState('moqtail');
   const [status, setStatus] = useState<Status>('idle');
   const [tracks, setTracks] = useState<Track[]>([]);

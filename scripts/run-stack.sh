@@ -84,6 +84,18 @@ cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tee "$LOG_DI
 echo "[build] Done."
 echo ""
 
+# --- Install JS dependencies ---
+echo "[npm] Installing JS dependencies..."
+(cd "$ROOT_DIR" && npm install) 2>&1 | tee -a "$LOG_DIR/build_${TIMESTAMP}.log"
+echo "[npm] Done."
+echo ""
+
+# --- Build client-js ---
+echo "[client-js build] Building client..."
+npm --prefix "$ROOT_DIR/apps/client-js" run build 2>&1 | tee -a "$LOG_DIR/build_${TIMESTAMP}.log"
+echo "[client-js build] Done."
+echo ""
+
 # Reset PID file
 > "$PID_FILE"
 

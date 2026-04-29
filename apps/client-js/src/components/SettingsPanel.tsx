@@ -103,7 +103,10 @@ function SectionLabel({ children }: { children: preact.ComponentChildren }) {
 const ABR_RULES = [
   'ThroughputRule',
   'BolaRule',
+  'ProbeRule',
   'InsufficientBufferRule',
+  'BufferDrainRateRule',
+  'LatencyTrendRule',
   'SwitchHistoryRule',
   'DroppedFramesRule',
   'AbandonRequestsRule',
