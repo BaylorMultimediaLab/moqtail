@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "publisher", author, version, about = "MOQtail publisher")]
@@ -27,4 +28,16 @@ pub struct Cli {
   /// always included; middle tiers are dropped first.
   #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(2..=4))]
   pub max_variants: u8,
+
+  /// Optional pre-encoded GOP cache directory.
+  ///
+  /// When the directory contains a finalized `meta.json`, the publisher reads
+  /// pre-encoded GOPs from disk and replays them at 1 GOP/sec — no decode,
+  /// no encode. When the directory is missing or has no `meta.json`, the
+  /// publisher runs the full pipeline once at full speed (no pacing, no MoQ
+  /// connection) and writes the encoded GOPs to disk; re-run the same command
+  /// to start replaying. Layout: `<dir>/<quality>/{NNNNNN.gop, variant.json}`
+  /// plus a top-level `meta.json` written atomically when prepare succeeds.
+  #[arg(long)]
+  pub encoded_dir: Option<PathBuf>,
 }
