@@ -22,7 +22,7 @@ use bytes::Bytes;
 use core::result::Result;
 use moqtail::model::common::location::Location;
 use moqtail::model::common::pair::KeyValuePair;
-use moqtail::model::control::constant::GroupOrder;
+use moqtail::model::control::constant::{FilterType, GroupOrder};
 use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::data::subgroup_header::SubgroupHeader;
 use moqtail::model::data::subgroup_object::SubgroupObject;
@@ -385,6 +385,64 @@ async fn handle_subscribe_message(
     .await;
 
   let track = track_arc.read().await;
+
+  // Delay-mode handling: filtered clients subscribe with DELAY_GROUPS asking
+  // the relay to start delivery `delay_groups` behind the live edge.
+  let mut sub = sub;
+  if let Some(delay_groups) = parse_delay_groups(&sub.subscribe_parameters) {
+    info!(
+      "Subscribe has DELAY_GROUPS={} (request_id={})",
+      delay_groups, sub.request_id
+    );
+    // Loop until we can resolve the requested start position.
+    // Mesa-style condition wait: arm the Notify *before* re-reading state
+    // to avoid lost-wakeup races (a notify_waiters between our compute and
+    // our await would otherwise be missed).
+    loop {
+      let notified = track.live_edge_advanced.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+
+      let largest = track.largest_location.read().await.clone();
+      let oldest_cached = track.cache.oldest_group_id().await;
+      let decision = compute_delayed_start(Some(largest.clone()), delay_groups, oldest_cached);
+
+      match decision {
+        DelayedStart::Ready(loc) | DelayedStart::ClampedToOldest(loc) => {
+          info!(
+            "Subscribe delay-mode resolved: request_id={} largest={:?} \
+             oldest_cached={:?} -> start_location={:?}",
+            sub.request_id, largest, oldest_cached, loc
+          );
+          sub.start_location = Some(loc);
+          sub.filter_type = FilterType::AbsoluteStart;
+          // Drain any holding-state record for this request (defensive;
+          // we registered while holding below).
+          let _ = track.holding_subscribes.write().await.try_resolve(largest);
+          break;
+        }
+        DelayedStart::Hold { delay_groups: dg } => {
+          info!(
+            "Subscribe delay-mode HOLD: request_id={} delay_groups={} \
+             largest={:?}; awaiting live edge advance",
+            sub.request_id, dg, largest
+          );
+          // Register the holding state (observability / future drain).
+          track
+            .holding_subscribes
+            .write()
+            .await
+            .register(sub.request_id, dg);
+          // Wait for the live edge to advance, then re-check.
+          notified.await;
+          // Loop again. The Notify arm we placed before the read still
+          // covers any notify_waiters that fired during the read; if
+          // such a notify already happened, this `.await` returns
+          // immediately, and we re-evaluate.
+        }
+      }
+    }
+  }
 
   add_subscription(sub.clone(), &track, client.clone(), is_switch).await;
 
