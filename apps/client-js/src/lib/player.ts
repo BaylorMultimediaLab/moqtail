@@ -235,6 +235,16 @@ export class Player {
       throw error;
     }
 
+    // Debug-only escape hatch: lets the network test harness force a SWITCH
+    // without going through the AbrController. Used by Slice C/Phase B E2Es
+    // (see tests/network/scenarios/test_naive_switch_discontinuity.py). Not
+    // for production use — direct switchTrack() calls bypass the ABR
+    // switching guard's bookkeeping.
+    if (typeof window !== 'undefined') {
+      (window as Window & { __forceSwitch?: (trackName: string) => Promise<void> }).__forceSwitch =
+        (trackName: string) => this.switchTrack(trackName);
+    }
+
     // Fetch the catalog
     try {
       this.catalog = await this.retrieveCatalog();
@@ -292,6 +302,11 @@ export class Player {
 
     // Close the client connection
     await this.client?.disconnect();
+
+    // Tear down the debug-only force-switch hook installed in initialize().
+    if (typeof window !== 'undefined') {
+      delete (window as Window & { __forceSwitch?: unknown }).__forceSwitch;
+    }
 
     // Reset state
     this.catalog = null;
