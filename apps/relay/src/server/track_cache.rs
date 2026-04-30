@@ -338,7 +338,12 @@ impl TrackCache {
   /// oldest available group when the requested target predates the cache window.
   #[allow(dead_code)]
   pub async fn oldest_group_id(&self) -> Option<u64> {
-    self.cache.iter().map(|(k, _)| k.group_id).min()
+    self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.track_alias == self.track_alias)
+      .map(|(k, _)| k.group_id)
+      .min()
   }
 }
 
