@@ -67,6 +67,40 @@ function readPrftCaptureMs(buf: Uint8Array): number | null {
   return unixSeconds * 1000 + fractionMs;
 }
 
+/**
+ * One record per track-switch (or, in C4, per filtered connect).
+ * Pushed to window.__moqtailMetrics.switchDiscontinuities for offline analysis.
+ */
+export interface DiscontinuityRecord {
+  eventType: 'connect' | 'switch';
+  switchSentAt: number;
+  switchAppliedAt: number;
+  fromTrack?: string;
+  toTrack: string;
+
+  // PTS-domain (headline)
+  oldEndPTS_ms?: number;
+  newStartPTS_ms: number;
+  ptsGapMs: number;
+
+  // wall-clock context
+  wallClockMs: number;
+  perceivedPauseMs?: number;
+
+  // connect-time clamp signal (Task C4)
+  expectedStartGroup?: number;
+  actualStartGroup?: number;
+  clampedByRelay?: boolean;
+
+  // miss signal (Task B5)
+  timeMapMiss?: boolean;
+
+  // mode context (every record)
+  switchMode: 'naive' | 'aligned';
+  clientMode: 'filtered' | 'unfiltered';
+  filterDelaySeconds: number;
+}
+
 interface PendingSwitch {
   trackName: string;
   initData: ArrayBuffer;
@@ -440,9 +474,18 @@ export class Player {
             }
 
             if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
-              const { initData, mimeType, trackName: newTrackName } = struct.pendingSwitch;
+              const {
+                initData,
+                mimeType,
+                trackName: newTrackName,
+                oldEndPTS_ms,
+                switchSentAt,
+                framesAtSwitch: _framesAtSwitch, // consumed by C5
+              } = struct.pendingSwitch;
+              const fromTrack = struct.trackName; // capture BEFORE overwriting
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
+              struct.firstFrameAfterSwitchSeen = false; // reset for C5
 
               // changeType() must not be called while the SourceBuffer is updating
               if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
@@ -461,6 +504,55 @@ export class Player {
                 this.#options.onTrackSwitched?.(newTrackName);
                 controller.error(switchError);
                 return;
+              }
+
+              // Compute and push the discontinuity record. PTS-gap is the headline
+              // metric: signed difference between the first appended frame's PTS on
+              // the new track and the last appended frame's end PTS on the old track.
+              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const newStartPTS_ms =
+                newTimescale && newTimescale > 0
+                  ? parseMoofBaseMediaDecodeTime(
+                      new Uint8Array(
+                        object.payload.buffer,
+                        object.payload.byteOffset,
+                        object.payload.byteLength,
+                      ),
+                      newTimescale,
+                    )
+                  : undefined;
+
+              if (newStartPTS_ms !== undefined) {
+                const ptsGapMs = oldEndPTS_ms !== undefined ? newStartPTS_ms - oldEndPTS_ms : 0;
+                const wallClockMs = performance.now() - switchSentAt;
+                const record: DiscontinuityRecord = {
+                  eventType: 'switch',
+                  switchSentAt,
+                  switchAppliedAt: performance.now(),
+                  fromTrack,
+                  toTrack: newTrackName,
+                  oldEndPTS_ms,
+                  newStartPTS_ms,
+                  ptsGapMs,
+                  wallClockMs,
+                  switchMode: 'naive', // Phase B will set this from #options
+                  clientMode: this.#options.clientMode,
+                  filterDelaySeconds: this.#options.filterDelaySeconds,
+                };
+                if (typeof window !== 'undefined') {
+                  const w = window as Window & {
+                    __moqtailMetrics?: {
+                      switchDiscontinuities?: DiscontinuityRecord[];
+                      [k: string]: unknown;
+                    };
+                  };
+                  w.__moqtailMetrics ??= {} as Window['__moqtailMetrics'] & object;
+                  const metrics = w.__moqtailMetrics as Window['__moqtailMetrics'] & {
+                    switchDiscontinuities?: DiscontinuityRecord[];
+                  };
+                  metrics.switchDiscontinuities ??= [];
+                  metrics.switchDiscontinuities.push(record);
+                }
               }
 
               // NOW release the ABR switching guard — the relay has completed the
