@@ -57,6 +57,9 @@ export enum VersionSpecificParameterType {
    * Behind-live offset in groups for filtered (delay-mode) clients.
    */
   DelayGroups = 0x70,
+  /** Project-local extension; non-MoQT-standard.
+   *  Absolute group_id where a Switch should start delivering the new track. */
+  StartLocationGroup = 0x72,
 }
 
 export function versionSpecificParameterTypeFromNumber(value: number): VersionSpecificParameterType {
@@ -69,6 +72,8 @@ export function versionSpecificParameterTypeFromNumber(value: number): VersionSp
       return VersionSpecificParameterType.MaxCacheDuration
     case 0x70:
       return VersionSpecificParameterType.DelayGroups
+    case 0x72:
+      return VersionSpecificParameterType.StartLocationGroup
     default:
       throw new InvalidTypeError('versionSpecificParameterTypeFromNumber', `Invalid version parameter type: ${value}`)
   }

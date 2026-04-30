@@ -59,6 +59,9 @@ pub enum VersionSpecificParameterType {
   /// Project-local extension; non-MoQT-standard.
   /// Behind-live offset in groups for filtered (delay-mode) clients.
   DelayGroups = 0x70,
+  /// Project-local extension; non-MoQT-standard.
+  /// Absolute group_id where a Switch should start delivering the new track.
+  StartLocationGroup = 0x72,
 }
 
 impl TryFrom<u64> for VersionSpecificParameterType {
@@ -70,6 +73,7 @@ impl TryFrom<u64> for VersionSpecificParameterType {
       0x03 => Ok(VersionSpecificParameterType::AuthorizationToken),
       0x04 => Ok(VersionSpecificParameterType::MaxCacheDuration),
       0x70 => Ok(VersionSpecificParameterType::DelayGroups),
+      0x72 => Ok(VersionSpecificParameterType::StartLocationGroup),
       _ => Err(ParseError::InvalidType {
         context: "VersionSpecificParameterType::try_from(u64)",
         details: format!("Invalid type, got {value}"),
