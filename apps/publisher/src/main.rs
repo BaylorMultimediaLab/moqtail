@@ -468,6 +468,7 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
         role: "video".to_owned(),
         target_latency_ms: cli.target_latency_ms,
         init_segment: init_seg,
+        gop_duration_ms: 1000,
       }
     })
     .collect();
@@ -649,6 +650,7 @@ fn build_catalog_tracks(
         role: "video".to_owned(),
         target_latency_ms,
         init_segment: init_seg,
+        gop_duration_ms: 1000,
       }
     })
     .collect()
