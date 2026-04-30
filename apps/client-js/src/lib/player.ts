@@ -198,6 +198,10 @@ export class Player {
   // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
   // `LatencyTrendRule` reads `getTrendRatio()` for downswitch decisions.
   #latencyTracker = new LatencyTracker();
+  // Connect-time state (Task C4) for filtered-mode clamp detection.
+  // Captured in subscribe(); consumed once on the first received object.
+  #connectSentAt: number | undefined;
+  #expectedStartGroupId: number | undefined;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -630,7 +634,62 @@ export class Player {
               if (window.__moqtailMetrics === undefined) {
                 window.__moqtailMetrics = { abr: null, samples: null };
               }
-              window.__moqtailMetrics.firstReceivedGroupId ??= Number(object.location.group);
+              const isFirstObject = window.__moqtailMetrics.firstReceivedGroupId === undefined;
+              if (isFirstObject) {
+                window.__moqtailMetrics.firstReceivedGroupId = Number(object.location.group);
+
+                // Connect-time discontinuity record (Task C4): emit only if we
+                // were in filtered mode AND we have a known expected start
+                // group (i.e. the relay sent a SubscribeOk with largestLocation
+                // and delay_groups was non-zero).
+                if (
+                  this.#options.clientMode === 'filtered' &&
+                  this.#expectedStartGroupId !== undefined &&
+                  this.#connectSentAt !== undefined
+                ) {
+                  const expected = this.#expectedStartGroupId;
+                  const actual = Number(object.location.group);
+                  // Relay clamps when our requested target was older than the
+                  // oldest cached group: it returns a more-recent group instead.
+                  const clampedByRelay = actual > expected;
+
+                  const connectTimescale = this.catalog?.getTimescale(struct.trackName);
+                  const newStartPTS_ms =
+                    connectTimescale && connectTimescale > 0
+                      ? parseMoofBaseMediaDecodeTime(
+                          new Uint8Array(
+                            object.payload.buffer,
+                            object.payload.byteOffset,
+                            object.payload.byteLength,
+                          ),
+                          connectTimescale,
+                        )
+                      : undefined;
+
+                  const connectGopDurationMs =
+                    this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
+                  const ptsGapMs = (actual - expected) * connectGopDurationMs;
+                  const wallClockMs = performance.now() - this.#connectSentAt;
+
+                  const record: DiscontinuityRecord = {
+                    eventType: 'connect',
+                    switchSentAt: this.#connectSentAt,
+                    switchAppliedAt: performance.now(),
+                    toTrack: struct.trackName,
+                    newStartPTS_ms: newStartPTS_ms ?? 0,
+                    ptsGapMs,
+                    wallClockMs,
+                    expectedStartGroup: expected,
+                    actualStartGroup: actual,
+                    clampedByRelay,
+                    switchMode: 'naive', // Phase B will source this from #options
+                    clientMode: this.#options.clientMode,
+                    filterDelaySeconds: this.#options.filterDelaySeconds,
+                  };
+                  window.__moqtailMetrics.switchDiscontinuities ??= [];
+                  window.__moqtailMetrics.switchDiscontinuities.push(record);
+                }
+              }
             }
 
             // Read PRFT box (if any) at the head of the CMAF chunk.
@@ -1034,6 +1093,25 @@ export class Player {
     });
     if (result instanceof SubscribeError)
       throw new Error(`Error occured during subscription: ${result.errorReason.phrase}`);
+
+    // Capture connect-time state for media tracks (not catalog) so C4 can emit
+    // a connect-time discontinuity record on the first arriving object. We only
+    // populate #expectedStartGroupId for filtered mode with a non-zero
+    // delay_groups; otherwise the relay does not clamp and we have nothing to
+    // detect against.
+    if (params.trackName !== 'catalog' && this.catalog) {
+      const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
+      const largest = result.largestLocation;
+      this.#connectSentAt = performance.now();
+      if (this.#options.clientMode === 'filtered' && largest !== undefined) {
+        const delayGroups = Math.round((this.#options.filterDelaySeconds * 1000) / gopDurationMs);
+        if (delayGroups > 0) {
+          // expected = largest - delay_groups (saturating at 0)
+          this.#expectedStartGroupId = Math.max(0, Number(largest.group) - delayGroups);
+        }
+      }
+    }
+
     const tracker = new GoodputTracker();
     struct = {
       trackName: params.trackName,

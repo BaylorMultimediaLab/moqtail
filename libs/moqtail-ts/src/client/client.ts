@@ -85,6 +85,7 @@ import {
   FetchOptions,
   MOQtailClientOptions,
   SwitchOptions,
+  SubscribeResult,
 } from './types'
 import { SendDatagramStream } from './datagram_stream'
 
@@ -906,9 +907,7 @@ export class MOQtailClient {
    * });
    * ```
    */
-  async subscribe(
-    args: SubscribeOptions,
-  ): Promise<SubscribeError | { requestId: bigint; stream: ReadableStream<MoqtObject> }> {
+  async subscribe(args: SubscribeOptions): Promise<SubscribeError | SubscribeResult> {
     this.#ensureActive()
     try {
       let { fullTrackName, priority, groupOrder, forward, filterType, parameters, startLocation, endGroup } = args
@@ -987,7 +986,7 @@ export class MOQtailClient {
         this.subscriptions.set(response.trackAlias, request)
         this.subscriptionAliasMap.set(request.requestId, response.trackAlias)
         this.aliasFullTrackNameMap.set(response.trackAlias, fullTrackName)
-        return { requestId: msg.requestId, stream: request.stream }
+        return { requestId: msg.requestId, stream: request.stream, largestLocation: response.largestLocation }
       }
     } catch (error) {
       await this.disconnect(
@@ -1161,9 +1160,7 @@ export class MOQtailClient {
    * await client.switch({ subscriptionRequestId, fullTrackName: newTrackName });
    * ```
    */
-  async switch(
-    args: SwitchOptions,
-  ): Promise<SubscribeError | { requestId: bigint; stream: ReadableStream<MoqtObject> }> {
+  async switch(args: SwitchOptions): Promise<SubscribeError | SubscribeResult> {
     this.#ensureActive()
     let { fullTrackName, subscriptionRequestId, parameters } = args
     try {
@@ -1208,7 +1205,7 @@ export class MOQtailClient {
           return true
         })
 
-        return { requestId, stream: subscription.stream }
+        return { requestId, stream: subscription.stream, largestLocation: response.largestLocation }
       } else {
         this.requestIdMap.removeMappingByRequestId(requestId)
         this.requests.delete(requestId)
