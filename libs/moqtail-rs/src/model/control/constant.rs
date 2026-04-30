@@ -137,6 +137,10 @@ impl From<FilterType> for u64 {
   }
 }
 
+/// Custom subscribe parameter: behind-live offset in groups.
+/// Even type_value = VarInt encoding. Project-local extension; non-MoQT-standard.
+pub const DELAY_GROUPS: u64 = 0x70;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u64)]
 pub enum FetchType {

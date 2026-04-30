@@ -216,6 +216,9 @@ export function filterTypeFromBigInt(v: bigint): FilterType {
   }
 }
 
+/** Custom subscribe parameter: behind-live offset in groups. */
+export const DELAY_GROUPS = 0x70n
+
 /**
  * @public
  * Fetch request types for MOQT protocol.
