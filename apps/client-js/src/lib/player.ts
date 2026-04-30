@@ -124,6 +124,19 @@ interface MOQStreamStruct {
   lastAppendedEndPTS_ms: number | undefined;
   /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
   firstFrameAfterSwitchSeen?: boolean;
+  /**
+   * When a switch is in progress, this holds the totalVideoFrames count at
+   * switchTrack time. Once totalVideoFrames > this value, the first new-track
+   * frame has rendered and perceivedPauseMs is computed.
+   *
+   * Set in the write handler when the new init segment is applied; consumed
+   * (and cleared) by the rVFC poll.
+   */
+  postSwitchFrameTarget?: number;
+  /** Snapshot of pendingSwitch.switchSentAt at the moment of init-segment application. */
+  postSwitchSentAt?: number;
+  /** Track name to attach perceivedPauseMs to in switchDiscontinuities. */
+  postSwitchToTrack?: string;
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -395,6 +408,10 @@ export class Player {
         );
         this.#element!.currentTime = target;
         this.#element!.play();
+        // Install the rVFC poll that detects first-frame-rendered post-switch
+        // and computes perceivedPauseMs (Task C5). Safe to install once playback
+        // has started — the element is non-null and ready to render frames.
+        this.#installPerceivedPausePoll();
       }
       return true;
     };
@@ -484,12 +501,18 @@ export class Player {
                 trackName: newTrackName,
                 oldEndPTS_ms,
                 switchSentAt,
-                framesAtSwitch: _framesAtSwitch, // consumed by C5
+                framesAtSwitch,
               } = struct.pendingSwitch;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
               struct.firstFrameAfterSwitchSeen = false; // reset for C5
+              // Stash C5 state on sibling struct fields that survive the
+              // pendingSwitch clear. The rVFC poll consumes these to compute
+              // perceivedPauseMs and attach it to the discontinuity record.
+              struct.postSwitchFrameTarget = framesAtSwitch;
+              struct.postSwitchSentAt = switchSentAt;
+              struct.postSwitchToTrack = newTrackName;
 
               // changeType() must not be called while the SourceBuffer is updating
               if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
@@ -787,6 +810,64 @@ export class Player {
   setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     videoStruct?.tracker.setHalfLives(halfLifeFastSec, halfLifeSlowSec);
+  }
+
+  /**
+   * Recurring requestVideoFrameCallback poll that detects the first new-track
+   * frame actually rendering after a track switch (Task C5).
+   *
+   * Each fired callback fires on every rendered frame. For each stream struct
+   * in the post-switch awaiting state (sibling fields stashed by the write
+   * handler when the new init segment was applied), check whether
+   * totalVideoFrames has advanced past the snapshot taken at switchTrack()
+   * time. If so, the first new-track frame has rendered: compute
+   * perceivedPauseMs = performance.now() - switchSentAt and attach it to the
+   * most recent matching switch record in window.__moqtailMetrics.switchDiscontinuities.
+   *
+   * Re-arms each frame for the lifetime of the player — per-tick work is a
+   * cheap for-loop over streams.
+   */
+  #installPerceivedPausePoll(): void {
+    if (!this.#element) return;
+    const poll = () => {
+      if (!this.#element) return;
+      const total = this.#element.getVideoPlaybackQuality().totalVideoFrames;
+      for (const struct of this.#streams) {
+        if (
+          struct.firstFrameAfterSwitchSeen !== true &&
+          struct.postSwitchFrameTarget !== undefined &&
+          struct.postSwitchSentAt !== undefined &&
+          struct.postSwitchToTrack !== undefined &&
+          total > struct.postSwitchFrameTarget
+        ) {
+          struct.firstFrameAfterSwitchSeen = true;
+          const perceivedPauseMs = performance.now() - struct.postSwitchSentAt;
+          const targetTrack = struct.postSwitchToTrack;
+
+          // Find the most recent matching switch record and attach.
+          if (typeof window !== 'undefined' && window.__moqtailMetrics) {
+            const records = window.__moqtailMetrics.switchDiscontinuities;
+            if (records) {
+              for (let i = records.length - 1; i >= 0; i--) {
+                const r = records[i];
+                if (r && r.eventType === 'switch' && r.toTrack === targetTrack) {
+                  r.perceivedPauseMs = perceivedPauseMs;
+                  break;
+                }
+              }
+            }
+          }
+
+          // Clean up — switch transition complete.
+          struct.postSwitchFrameTarget = undefined;
+          struct.postSwitchSentAt = undefined;
+          struct.postSwitchToTrack = undefined;
+        }
+      }
+      // Re-arm for next frame.
+      this.#element.requestVideoFrameCallback(poll);
+    };
+    this.#element.requestVideoFrameCallback(poll);
   }
 
   /**
