@@ -57,7 +57,7 @@ fn parse_delay_groups(params: &[KeyValuePair]) -> Option<u64> {
 /// The relay's decision after applying a `DELAY_GROUPS` parameter to a SUBSCRIBE.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
-pub enum DelayedStart {
+pub(crate) enum DelayedStart {
   /// The requested target is in-window; deliver from this location.
   Ready(Location),
   /// The requested target predates the cache; deliver from the oldest available.
@@ -74,7 +74,7 @@ pub enum DelayedStart {
 /// (`delay_groups`), and the oldest group currently in the cache (or None
 /// if the relay hasn't started caching yet).
 #[allow(dead_code)]
-pub fn compute_delayed_start(
+pub(crate) fn compute_delayed_start(
   largest: Option<Location>,
   delay_groups: u64,
   oldest_cached_group: Option<u64>,
@@ -1022,6 +1022,15 @@ mod tests_compute_delayed_start {
     // largest=1, delay=5 -> can't subtract -> Hold{delay=5}
     let result = compute_delayed_start(Some(loc(1, 0)), 5, Some(0));
     assert_eq!(result, DelayedStart::Hold { delay_groups: 5 });
+  }
+
+  #[test]
+  fn ready_when_largest_exactly_equals_delay() {
+    // Boundary case: largest.group == delay_groups → target_group = 0,
+    // which is in-window when oldest=0. Pins the hold/release pivot at
+    // exact equality (would catch a regression to `<=` in the Hold check).
+    let result = compute_delayed_start(Some(loc(5, 0)), 5, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(0, 0)));
   }
 
   #[test]
