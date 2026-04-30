@@ -44,12 +44,16 @@ class SwitchRecord:
 class MetricsCollector:
     samples: list[ClientMetricsSample] = field(default_factory=list)
     switches: list[SwitchRecord] = field(default_factory=list)
+    last_discontinuities: list[dict] = field(default_factory=list)
     _seen_switch_count: int = field(default=0, init=False)
 
     async def poll_once(self, page) -> ClientMetricsSample | None:
         raw = await page.evaluate("() => window.__moqtailMetrics")
         if raw is None or raw.get("abr") is None:
             return None
+
+        disc = raw.get("switchDiscontinuities", []) if raw else []
+        self.last_discontinuities = list(disc) if disc else []
 
         abr = raw["abr"]
         sample = ClientMetricsSample(
@@ -148,3 +152,36 @@ class MetricsCollector:
             for sw in self.switches
         ]
         path.write_text(json.dumps(data, indent=2))
+
+    def save_discontinuities_csv(self, path: Path, discontinuities: list[dict]) -> None:
+        """Dump window.__moqtailMetrics.switchDiscontinuities to CSV.
+
+        Records carry both 'switch' (Slice C3) and 'connect' (Slice C4) event
+        types, with overlapping but distinct field sets. We emit a uniform
+        column layout — fields not relevant to a given event type are blank.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        columns = [
+            "eventType",
+            "switchSentAt",
+            "switchAppliedAt",
+            "fromTrack",
+            "toTrack",
+            "oldEndPTS_ms",
+            "newStartPTS_ms",
+            "ptsGapMs",
+            "wallClockMs",
+            "perceivedPauseMs",
+            "expectedStartGroup",
+            "actualStartGroup",
+            "clampedByRelay",
+            "timeMapMiss",
+            "switchMode",
+            "clientMode",
+            "filterDelaySeconds",
+        ]
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=columns)
+            writer.writeheader()
+            for d in discontinuities:
+                writer.writerow({c: d.get(c) for c in columns})

@@ -460,6 +460,10 @@ def collector(results_dir):
     try:
         c.save_csv(results_dir / "metrics.csv")
         c.save_switches_json(results_dir / "switches.json")
+        c.save_discontinuities_csv(
+            results_dir / "switch_discontinuities.csv",
+            c.last_discontinuities,
+        )
     except Exception:
         pass
 
