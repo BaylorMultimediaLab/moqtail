@@ -31,6 +31,7 @@ import { CMSFCatalog, VersionSpecificParameters } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
+import { parseMoofBaseMediaDecodeTime } from '@/lib/util/MoofParser';
 
 // NTP epoch (1900) is 2_208_988_800 seconds before the UNIX epoch (1970).
 const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
@@ -70,6 +71,12 @@ interface PendingSwitch {
   trackName: string;
   initData: ArrayBuffer;
   mimeType: string;
+  /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
+  oldEndPTS_ms: number | undefined;
+  /** performance.now() at switchTrack() call — for wallClockMs and perceivedPauseMs. */
+  switchSentAt: number;
+  /** videoElement.getVideoPlaybackQuality().totalVideoFrames at switch time — for perceivedPauseMs (Task C5). */
+  framesAtSwitch: number;
 }
 
 interface MOQStreamStruct {
@@ -79,6 +86,10 @@ interface MOQStreamStruct {
   tracker: GoodputTracker;
   lastGroupId: bigint;
   pendingSwitch: PendingSwitch | null;
+  /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
+  lastAppendedEndPTS_ms: number | undefined;
+  /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
+  firstFrameAfterSwitchSeen?: boolean;
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -457,6 +468,25 @@ export class Player {
               this.#options.onTrackSwitched?.(newTrackName);
             }
 
+            // Update lastAppendedEndPTS_ms before appending. C3 will read this for the
+            // "old end PTS" half of the discontinuity calculation.
+            const timescale = this.catalog?.getTimescale(struct.trackName);
+            if (timescale && timescale > 0) {
+              const decodeTimeMs = parseMoofBaseMediaDecodeTime(
+                new Uint8Array(
+                  object.payload.buffer,
+                  object.payload.byteOffset,
+                  object.payload.byteLength,
+                ),
+                timescale,
+              );
+              if (decodeTimeMs !== undefined) {
+                // Approximate end PTS as decode time + GOP duration (one moof per GOP in our pipeline).
+                const gopDurationMs = this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
+                struct.lastAppendedEndPTS_ms = decodeTimeMs + gopDurationMs;
+              }
+            }
+
             // Append the data
             let maxRetries = 5;
             while (maxRetries--) {
@@ -767,7 +797,15 @@ export class Player {
       // guard) is NOT called here — it fires in the write handler AFTER the relay
       // has actually delivered data on the new track. This prevents rapid
       // consecutive SWITCH messages that corrupt the relay's switch context.
-      videoStruct.pendingSwitch = { trackName, initData: initData.buffer as ArrayBuffer, mimeType };
+      videoStruct.pendingSwitch = {
+        trackName,
+        initData: initData.buffer as ArrayBuffer,
+        mimeType,
+        oldEndPTS_ms: videoStruct.lastAppendedEndPTS_ms,
+        switchSentAt: performance.now(),
+        framesAtSwitch: this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0,
+      };
+      videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
       this.#options.onTrackSwitched?.(videoStruct.trackName);
@@ -842,6 +880,7 @@ export class Player {
         tracker,
         lastGroupId: -1n,
         pendingSwitch: null,
+        lastAppendedEndPTS_ms: undefined,
       };
     }
 
@@ -911,6 +950,7 @@ export class Player {
       tracker,
       lastGroupId: -1n,
       pendingSwitch: null,
+      lastAppendedEndPTS_ms: undefined,
     };
 
     // Add the stream to the pool
