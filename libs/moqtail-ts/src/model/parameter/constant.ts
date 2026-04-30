@@ -52,6 +52,11 @@ export enum VersionSpecificParameterType {
   AuthorizationToken = 0x01,
   DeliveryTimeout = 0x02,
   MaxCacheDuration = 0x04,
+  /**
+   * Project-local extension; non-MoQT-standard.
+   * Behind-live offset in groups for filtered (delay-mode) clients.
+   */
+  DelayGroups = 0x70,
 }
 
 export function versionSpecificParameterTypeFromNumber(value: number): VersionSpecificParameterType {
@@ -62,6 +67,8 @@ export function versionSpecificParameterTypeFromNumber(value: number): VersionSp
       return VersionSpecificParameterType.DeliveryTimeout
     case 0x04:
       return VersionSpecificParameterType.MaxCacheDuration
+    case 0x70:
+      return VersionSpecificParameterType.DelayGroups
     default:
       throw new InvalidTypeError('versionSpecificParameterTypeFromNumber', `Invalid version parameter type: ${value}`)
   }

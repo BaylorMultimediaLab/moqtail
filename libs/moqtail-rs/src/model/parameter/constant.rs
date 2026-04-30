@@ -56,6 +56,9 @@ pub enum VersionSpecificParameterType {
   DeliveryTimeout = 0x02,
   AuthorizationToken = 0x03,
   MaxCacheDuration = 0x04,
+  /// Project-local extension; non-MoQT-standard.
+  /// Behind-live offset in groups for filtered (delay-mode) clients.
+  DelayGroups = 0x70,
 }
 
 impl TryFrom<u64> for VersionSpecificParameterType {
@@ -66,6 +69,7 @@ impl TryFrom<u64> for VersionSpecificParameterType {
       0x02 => Ok(VersionSpecificParameterType::DeliveryTimeout),
       0x03 => Ok(VersionSpecificParameterType::AuthorizationToken),
       0x04 => Ok(VersionSpecificParameterType::MaxCacheDuration),
+      0x70 => Ok(VersionSpecificParameterType::DelayGroups),
       _ => Err(ParseError::InvalidType {
         context: "VersionSpecificParameterType::try_from(u64)",
         details: format!("Invalid type, got {value}"),
