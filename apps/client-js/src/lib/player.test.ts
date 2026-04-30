@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSubscribeParameters, buildSwitchParameters } from './player';
+import { buildSubscribeParameters, buildSwitchParameters, computeStartupTarget } from './player';
 
 describe('buildSubscribeParameters', () => {
   it('returns undefined for unfiltered mode', () => {
@@ -79,5 +79,29 @@ describe('buildSwitchParameters', () => {
     const r = buildSwitchParameters({ switchMode: 'naive', targetGroup: undefined });
     expect(r.params).toBeUndefined();
     expect(r.timeMapMiss).toBe(false);
+  });
+});
+
+describe('computeStartupTarget', () => {
+  it('subtracts 1.0s from end for unfiltered mode', () => {
+    const t = computeStartupTarget({ end: 10, baseTarget: 0, clientMode: 'unfiltered' });
+    expect(t).toBeCloseTo(9.0);
+  });
+
+  it('does not subtract anything for filtered mode (already behind live)', () => {
+    const t = computeStartupTarget({ end: 10, baseTarget: 0, clientMode: 'filtered' });
+    expect(t).toBeCloseTo(10.0);
+  });
+
+  it('preserves baseTarget when it exceeds the offset-adjusted end (unfiltered)', () => {
+    // baseTarget 9.5 > end-1 (9.0) -> max wins
+    const t = computeStartupTarget({ end: 10, baseTarget: 9.5, clientMode: 'unfiltered' });
+    expect(t).toBeCloseTo(9.5);
+  });
+
+  it('preserves baseTarget when it exceeds end in filtered mode', () => {
+    // shouldn't happen in practice, but max() semantic is preserved
+    const t = computeStartupTarget({ end: 10, baseTarget: 11, clientMode: 'filtered' });
+    expect(t).toBeCloseTo(11);
   });
 });

@@ -225,6 +225,25 @@ export function buildSwitchParameters(opts: {
   };
 }
 
+/**
+ * Compute the seek target for playback startup. Unfiltered clients seek
+ * 1.0s behind the live edge so MSE has buffer runway; filtered clients
+ * are already `filterDelaySeconds` behind live and don't need the extra
+ * offset.
+ *
+ * Exported for unit testing.
+ */
+export const LIVE_EDGE_STARTUP_OFFSET_SECONDS = 1.0;
+
+export function computeStartupTarget(opts: {
+  end: number;
+  baseTarget: number;
+  clientMode: 'filtered' | 'unfiltered';
+}): number {
+  const offset = opts.clientMode === 'filtered' ? 0 : LIVE_EDGE_STARTUP_OFFSET_SECONDS;
+  return Math.max(opts.baseTarget, opts.end - offset);
+}
+
 export class Player {
   catalog: CMSFCatalog | null = null;
   client: MOQtailClient | null = null;
@@ -447,7 +466,6 @@ export class Player {
     // Without this offset the player lands on the live edge (0 s buffer),
     // immediately stalls, recovers for a moment, then stalls again —
     // creating the "video gets stuck" symptom.
-    const LIVE_EDGE_STARTUP_OFFSET = 1.0; // seconds behind the live edge
 
     let gotNotification = 0;
     let target = 0;
@@ -457,7 +475,11 @@ export class Player {
       // Start behind the live edge so there is buffer to consume while
       // new data continues arriving. The MSEBuffer module then fine-tunes
       // the distance via playback-rate adjustments (catchup / catchdown).
-      target = Math.max(target, end - LIVE_EDGE_STARTUP_OFFSET);
+      target = computeStartupTarget({
+        end,
+        baseTarget: target,
+        clientMode: this.#options.clientMode,
+      });
 
       gotNotification++;
       if (gotNotification === this.#streams.length) {
