@@ -17,6 +17,7 @@
 import { KeyValuePair } from '../common/pair'
 import { MaxCacheDuration, DeliveryTimeout } from './version'
 import { AuthorizationToken } from './common'
+import { VersionSpecificParameterType } from './constant'
 
 export type VersionSpecificParameter = MaxCacheDuration | DeliveryTimeout | AuthorizationToken
 export namespace VersionSpecificParameter {
@@ -55,6 +56,11 @@ export class VersionSpecificParameters {
 
   addAuthorizationToken(auth: AuthorizationToken): this {
     this.kvps.push(auth.toKeyValuePair())
+    return this
+  }
+
+  addDelayGroups(delayGroups: bigint | number): this {
+    this.kvps.push(KeyValuePair.tryNewVarInt(VersionSpecificParameterType.DelayGroups as number, BigInt(delayGroups)))
     return this
   }
 
@@ -101,6 +107,16 @@ if (import.meta.vitest) {
       const kvps = new VersionSpecificParameters().addRaw(unknown).build()
       const parsed = VersionSpecificParameters.fromKeyValuePairs(kvps)
       expect(parsed.length).toBe(0)
+    })
+    test('addDelayGroups builds a varint kvp with type 0x70', () => {
+      const kvps = new VersionSpecificParameters().addDelayGroups(5n).build()
+      expect(kvps.length).toBe(1)
+      expect(kvps[0]!.typeValue).toBe(0x70n)
+      expect(kvps[0]!.value).toBe(5n)
+    })
+    test('addDelayGroups accepts number type', () => {
+      const kvps = new VersionSpecificParameters().addDelayGroups(2).build()
+      expect(kvps[0]!.value).toBe(2n)
     })
   })
 }

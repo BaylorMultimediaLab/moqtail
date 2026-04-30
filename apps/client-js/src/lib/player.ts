@@ -27,7 +27,7 @@ import {
   Tuple,
 } from 'moqtail';
 import { MOQtailClient } from 'moqtail/client';
-import { CMSFCatalog } from 'moqtail/model';
+import { CMSFCatalog, VersionSpecificParameters } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
@@ -101,6 +101,10 @@ export interface PlayerOptions {
   catalogLocation?: [Location, Location];
   /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
   onTrackSwitched?: (trackName: string) => void;
+  /** Pre-connect: 'filtered' clients subscribe behind live by `filterDelaySeconds`; 'unfiltered' is today's behavior. */
+  clientMode?: 'filtered' | 'unfiltered';
+  /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
+  filterDelaySeconds?: number;
 }
 
 const DefaultOptions = {
@@ -109,8 +113,31 @@ const DefaultOptions = {
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
+  clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
+  filterDelaySeconds: 0,
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
+
+/**
+ * Builds the `parameters` field for a media-track SUBSCRIBE.
+ *
+ * - For unfiltered mode: returns `undefined` (no parameters added — today's behavior).
+ * - For filtered mode: returns a `VersionSpecificParameters` carrying
+ *   `DELAY_GROUPS = round(filterDelaySeconds * 1000 / gopDurationMs)`.
+ *
+ * The relay reads `DELAY_GROUPS` and starts delivery `delay_groups` behind the live edge.
+ */
+export function buildSubscribeParameters(opts: {
+  clientMode: 'filtered' | 'unfiltered';
+  filterDelaySeconds: number;
+  gopDurationMs: number;
+}): VersionSpecificParameters | undefined {
+  if (opts.clientMode !== 'filtered') return undefined;
+  if (opts.filterDelaySeconds <= 0) return undefined;
+  const delayGroups = Math.round((opts.filterDelaySeconds * 1000) / opts.gopDurationMs);
+  if (delayGroups <= 0) return undefined;
+  return new VersionSpecificParameters().addDelayGroups(delayGroups);
+}
 
 export class Player {
   catalog: CMSFCatalog | null = null;
@@ -843,6 +870,18 @@ export class Player {
   private async subscribe(params: SubscribeOptions): Promise<MOQStreamStruct> {
     if (!this.client) throw new Error('MOQProcessor not initialized');
 
+    // Build delay-mode parameters only for non-catalog tracks. The catalog
+    // is fetched at startup and has no notion of "live edge"; never delay it.
+    let parameters: VersionSpecificParameters | undefined;
+    if (params.trackName !== 'catalog' && this.catalog) {
+      const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
+      parameters = buildSubscribeParameters({
+        clientMode: this.#options.clientMode,
+        filterDelaySeconds: this.#options.filterDelaySeconds,
+        gopDurationMs,
+      });
+    }
+
     // Send the appropriate control message
     let struct: MOQStreamStruct;
     const result = await this.client.subscribe({
@@ -851,6 +890,7 @@ export class Player {
       filterType: FilterType.LatestObject,
       forward: true,
       priority: params.priority ?? 0,
+      parameters,
     });
     if (result instanceof SubscribeError)
       throw new Error(`Error occured during subscription: ${result.errorReason.phrase}`);
