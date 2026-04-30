@@ -54,6 +54,53 @@ fn parse_delay_groups(params: &[KeyValuePair]) -> Option<u64> {
   })
 }
 
+/// The relay's decision after applying a `DELAY_GROUPS` parameter to a SUBSCRIBE.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DelayedStart {
+  /// The requested target is in-window; deliver from this location.
+  Ready(Location),
+  /// The requested target predates the cache; deliver from the oldest available.
+  ClampedToOldest(Location),
+  /// `largest_location.group < delay_groups` (stream too young) — register the
+  /// subscribe in a pending state and resolve once the live edge advances.
+  Hold { delay_groups: u64 },
+}
+
+/// Decide what start_location a delayed (filtered) SUBSCRIBE should use.
+///
+/// Pure function: no I/O, no async, no side effects. Inputs are the relay's
+/// current view of the live edge (`largest`), the delay the client requested
+/// (`delay_groups`), and the oldest group currently in the cache (or None
+/// if the relay hasn't started caching yet).
+#[allow(dead_code)]
+pub fn compute_delayed_start(
+  largest: Option<Location>,
+  delay_groups: u64,
+  oldest_cached_group: Option<u64>,
+) -> DelayedStart {
+  let Some(largest_loc) = largest else {
+    return DelayedStart::Hold { delay_groups };
+  };
+  if largest_loc.group < delay_groups {
+    return DelayedStart::Hold { delay_groups };
+  }
+  let target_group = largest_loc.group - delay_groups;
+  let target = Location {
+    group: target_group,
+    object: 0,
+  };
+  if let Some(oldest) = oldest_cached_group
+    && target_group < oldest
+  {
+    return DelayedStart::ClampedToOldest(Location {
+      group: oldest,
+      object: 0,
+    });
+  }
+  DelayedStart::Ready(target)
+}
+
 // Synthetic-probe track aliases live well above any plausible publisher-
 // assigned alias so they can't collide with real video tracks. Per IETF 119
 // MoQ bandwidth-measurement slides, a subscriber can request a one-shot
@@ -951,5 +998,65 @@ mod tests_parse_delay_groups {
       value: Bytes::from_static(b"oops"),
     }];
     assert_eq!(parse_delay_groups(&params), None);
+  }
+}
+
+#[cfg(test)]
+mod tests_compute_delayed_start {
+  use super::*;
+  use moqtail::model::common::location::Location;
+
+  fn loc(group: u64, object: u64) -> Location {
+    Location { group, object }
+  }
+
+  #[test]
+  fn ready_when_largest_is_well_above_delay_and_target_in_cache() {
+    // largest=100, delay=2 -> target=98; oldest=0 (deep cache) -> Ready(98,0)
+    let result = compute_delayed_start(Some(loc(100, 0)), 2, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(98, 0)));
+  }
+
+  #[test]
+  fn hold_when_largest_below_delay() {
+    // largest=1, delay=5 -> can't subtract -> Hold{delay=5}
+    let result = compute_delayed_start(Some(loc(1, 0)), 5, Some(0));
+    assert_eq!(result, DelayedStart::Hold { delay_groups: 5 });
+  }
+
+  #[test]
+  fn hold_when_largest_is_none() {
+    // No live edge known yet -> Hold
+    let result = compute_delayed_start(None, 5, None);
+    assert_eq!(result, DelayedStart::Hold { delay_groups: 5 });
+  }
+
+  #[test]
+  fn clamped_to_oldest_when_target_below_cache_window() {
+    // largest=100, delay=80 -> target=20; oldest=50 -> Clamp to (50,0)
+    let result = compute_delayed_start(Some(loc(100, 0)), 80, Some(50));
+    assert_eq!(result, DelayedStart::ClampedToOldest(loc(50, 0)));
+  }
+
+  #[test]
+  fn ready_when_delay_is_zero() {
+    // delay=0 means "behave like LatestObject" -> target equals largest
+    let result = compute_delayed_start(Some(loc(100, 0)), 0, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(100, 0)));
+  }
+
+  #[test]
+  fn ready_when_target_exactly_equals_oldest_cached() {
+    // largest=100, delay=50 -> target=50; oldest=50 -> not below, so Ready (not Clamp)
+    let result = compute_delayed_start(Some(loc(100, 0)), 50, Some(50));
+    assert_eq!(result, DelayedStart::Ready(loc(50, 0)));
+  }
+
+  #[test]
+  fn ready_when_oldest_cached_is_none() {
+    // No cache info -> trust the target. (Conservative: if we don't know
+    // the cache window, don't preemptively clamp.)
+    let result = compute_delayed_start(Some(loc(100, 0)), 80, None);
+    assert_eq!(result, DelayedStart::Ready(loc(20, 0)));
   }
 }
