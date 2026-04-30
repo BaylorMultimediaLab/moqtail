@@ -291,6 +291,13 @@ class CMSFCatalog {
     return track?.timescale
   }
 
+  /**
+   * Returns the track's GOP duration in ms. If the field is absent from the
+   * catalog or the track is unknown, returns the project default
+   * (DEFAULT_GOP_DURATION_MS) and emits console.warn. Always returns a number
+   * so callers can use it in arithmetic without nullish handling — this is the
+   * intentional asymmetry with getTimescale, which returns number | undefined.
+   */
   getGopDurationMs(trackName: string): number {
     const track = this.#catalog.tracks.find((track) => track.name === this.extractTrackName(trackName))
     if (track?.gopDurationMs === undefined) {

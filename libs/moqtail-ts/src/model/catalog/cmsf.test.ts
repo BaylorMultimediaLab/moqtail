@@ -44,7 +44,7 @@ describe('CMSFCatalog gopDurationMs', () => {
     expect(() => CMSFCatalog.from(payload)).toThrow(/gopDurationMs/)
   })
 
-  it('returns undefined-style default for unknown track', () => {
+  it('defaults and warns when track is not in the catalog', () => {
     const payload = makeCatalogPayload({
       name: 'video-720p',
       packaging: 'cmaf',
@@ -53,10 +53,8 @@ describe('CMSFCatalog gopDurationMs', () => {
       gopDurationMs: 1000,
     })
     const cat = CMSFCatalog.from(payload)
-    // Asking for a track that doesn't exist: also defaults to 1000 + warns
-    // (match the getTimescale pattern of returning undefined? — see step 2 note)
-    // For getGopDurationMs we choose to return 1000 with warning so callers
-    // never have to handle undefined.
+    // Unknown track name: still defaults to 1000 with warn, so callers
+    // never have to branch on undefined.
     expect(cat.getGopDurationMs('nonexistent')).toBe(1000)
   })
 })
