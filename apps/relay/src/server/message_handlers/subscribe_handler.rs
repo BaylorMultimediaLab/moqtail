@@ -398,6 +398,7 @@ async fn handle_subscribe_message(
     // Mesa-style condition wait: arm the Notify *before* re-reading state
     // to avoid lost-wakeup races (a notify_waiters between our compute and
     // our await would otherwise be missed).
+    let mut registered = false;
     loop {
       let notified = track.live_edge_advanced.notified();
       tokio::pin!(notified);
@@ -416,23 +417,29 @@ async fn handle_subscribe_message(
           );
           sub.start_location = Some(loc);
           sub.filter_type = FilterType::AbsoluteStart;
-          // Drain any holding-state record for this request (defensive;
-          // we registered while holding below).
-          let _ = track.holding_subscribes.write().await.try_resolve(largest);
+          // Drain any holding-state record for this request (we may have
+          // registered earlier; try_resolve also clears any other now-Ready
+          // entries from concurrent subscribers, which is fine — informational).
+          if registered {
+            let _ = track.holding_subscribes.write().await.try_resolve(largest);
+          }
           break;
         }
         DelayedStart::Hold { delay_groups: dg } => {
-          info!(
-            "Subscribe delay-mode HOLD: request_id={} delay_groups={} \
-             largest={:?}; awaiting live edge advance",
-            sub.request_id, dg, largest
-          );
-          // Register the holding state (observability / future drain).
-          track
-            .holding_subscribes
-            .write()
-            .await
-            .register(sub.request_id, dg);
+          if !registered {
+            info!(
+              "Subscribe delay-mode HOLD: request_id={} delay_groups={} \
+               largest={:?}; awaiting live edge advance",
+              sub.request_id, dg, largest
+            );
+            // Register the holding state (observability / future drain).
+            track
+              .holding_subscribes
+              .write()
+              .await
+              .register(sub.request_id, dg);
+            registered = true;
+          }
           // Wait for the live edge to advance, then re-check.
           notified.await;
           // Loop again. The Notify arm we placed before the read still
