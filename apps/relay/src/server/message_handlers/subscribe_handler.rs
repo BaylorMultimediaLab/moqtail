@@ -40,8 +40,8 @@ use tracing::{debug, error, info, warn};
 /// Search a SUBSCRIBE message's parameters for the project-local DELAY_GROUPS
 /// (VarInt). Returns the first match's value, or None if not present.
 ///
-/// Used by the SUBSCRIBE handler (Task A8) to put a filtered client `delay_groups`
-/// behind the live edge.
+/// Used by the SUBSCRIBE handler when computing a delay-mode start location:
+/// the relay puts a filtered client `delay_groups` behind the live edge.
 #[allow(dead_code)]
 fn parse_delay_groups(params: &[KeyValuePair]) -> Option<u64> {
   params.iter().find_map(|p| match p {
@@ -905,8 +905,6 @@ pub async fn handle(
 #[cfg(test)]
 mod tests_parse_delay_groups {
   use super::*;
-  use moqtail::model::common::pair::KeyValuePair;
-  use moqtail::model::parameter::constant::VersionSpecificParameterType;
 
   fn delay_groups_kvp(value: u64) -> KeyValuePair {
     KeyValuePair::VarInt {
@@ -937,7 +935,7 @@ mod tests_parse_delay_groups {
   }
 
   #[test]
-  fn parse_delay_groups_returns_first_match_if_duplicated() {
+  fn parse_delay_groups_tolerates_duplicate_returns_first() {
     // Defensive: if a peer sends two DELAY_GROUPS entries, return the first.
     let params = vec![delay_groups_kvp(7), delay_groups_kvp(11)];
     assert_eq!(parse_delay_groups(&params), Some(7));
