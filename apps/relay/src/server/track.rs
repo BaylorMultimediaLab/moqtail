@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::holding_subscribes::HoldingSubscribes;
 use super::track_cache::TrackCache;
 use crate::server::client::MOQTClient;
 use crate::server::config::AppConfig;
@@ -85,6 +86,11 @@ pub struct Track {
   pub status_notify: Arc<Notify>,
   /// Subscribers waiting for track confirmation: (request_id, connection_id).
   pub pending_subscribers: Arc<RwLock<Vec<(u64, usize)>>>,
+  /// SUBSCRIBEs in delay-mode "holding" state, waiting for the live edge to
+  /// advance past their `delay_groups`. Drained by Task A8 when the publisher
+  /// emits new objects.
+  #[allow(dead_code)]
+  pub(crate) holding_subscribes: Arc<RwLock<HoldingSubscribes>>,
 }
 
 // TODO: this track implementation should be static? At least
@@ -115,6 +121,7 @@ impl Track {
       status: Arc::new(RwLock::new(initial_status)),
       status_notify: Arc::new(Notify::new()),
       pending_subscribers: Arc::new(RwLock::new(Vec::new())),
+      holding_subscribes: Arc::new(RwLock::new(HoldingSubscribes::default())),
     }
   }
 
