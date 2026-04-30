@@ -54,6 +54,21 @@ fn parse_delay_groups(params: &[KeyValuePair]) -> Option<u64> {
   })
 }
 
+/// Search a SWITCH message's parameters for the project-local
+/// START_LOCATION_GROUP (VarInt). Returns the first match's value, or None
+/// if not present. Used by handle_switch_message to start the new track at
+/// an absolute group_id rather than at the live edge.
+fn parse_start_location_group(params: &[KeyValuePair]) -> Option<u64> {
+  params.iter().find_map(|p| match p {
+    KeyValuePair::VarInt { type_value, value }
+      if *type_value == VersionSpecificParameterType::StartLocationGroup as u64 =>
+    {
+      Some(*value)
+    }
+    _ => None,
+  })
+}
+
 /// The relay's decision after applying a `DELAY_GROUPS` parameter to a SUBSCRIBE.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -939,15 +954,39 @@ async fn handle_switch_message(
     return Err(TerminationCode::ProtocolViolation);
   }
 
-  let subscribe = Subscribe::new_latest_object(
-    switch_message.request_id,
-    switch_message.track_namespace.clone(),
-    switch_message.track_name.clone(),
-    0,
-    GroupOrder::Original,
-    true,
-    switch_message.subscribe_parameters.clone(),
-  );
+  // Inspect for START_LOCATION_GROUP: when present, start the new track at
+  // the requested absolute group (aligned switch). Otherwise default to the
+  // existing live-edge ("naive switch") semantic.
+  let subscribe = match parse_start_location_group(&switch_message.subscribe_parameters) {
+    Some(start_group) => {
+      info!(
+        "Switch has START_LOCATION_GROUP={}; using new_absolute_start (request_id={})",
+        start_group, switch_message.request_id
+      );
+      Subscribe::new_absolute_start(
+        switch_message.request_id,
+        switch_message.track_namespace.clone(),
+        switch_message.track_name.clone(),
+        0,
+        GroupOrder::Original,
+        true,
+        Location {
+          group: start_group,
+          object: 0,
+        },
+        switch_message.subscribe_parameters.clone(),
+      )
+    }
+    None => Subscribe::new_latest_object(
+      switch_message.request_id,
+      switch_message.track_namespace.clone(),
+      switch_message.track_name.clone(),
+      0,
+      GroupOrder::Original,
+      true,
+      switch_message.subscribe_parameters.clone(),
+    ),
+  };
 
   let new_full_track_name = subscribe.get_full_track_name();
 
@@ -1132,5 +1171,50 @@ mod tests_compute_delayed_start {
     // the cache window, don't preemptively clamp.)
     let result = compute_delayed_start(Some(loc(100, 0)), 80, None);
     assert_eq!(result, DelayedStart::Ready(loc(20, 0)));
+  }
+}
+
+#[cfg(test)]
+mod tests_parse_start_location_group {
+  use super::*;
+  use moqtail::model::common::pair::KeyValuePair;
+  use moqtail::model::parameter::constant::VersionSpecificParameterType;
+
+  fn start_location_kvp(value: u64) -> KeyValuePair {
+    KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::StartLocationGroup as u64,
+      value,
+    }
+  }
+
+  #[test]
+  fn parse_returns_some_when_present() {
+    let params = vec![start_location_kvp(42)];
+    assert_eq!(parse_start_location_group(&params), Some(42));
+  }
+
+  #[test]
+  fn parse_returns_none_when_absent() {
+    let params: Vec<KeyValuePair> = vec![];
+    assert_eq!(parse_start_location_group(&params), None);
+  }
+
+  #[test]
+  fn parse_ignores_other_params() {
+    let params = vec![KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::DelayGroups as u64,
+      value: 99,
+    }];
+    assert_eq!(parse_start_location_group(&params), None);
+  }
+
+  #[test]
+  fn parse_ignores_bytes_kvp_with_same_type_id() {
+    use bytes::Bytes;
+    let params = vec![KeyValuePair::Bytes {
+      type_value: VersionSpecificParameterType::StartLocationGroup as u64,
+      value: Bytes::from_static(b"oops"),
+    }];
+    assert_eq!(parse_start_location_group(&params), None);
   }
 }
