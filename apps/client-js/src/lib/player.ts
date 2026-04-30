@@ -32,6 +32,7 @@ import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
 import { parseMoofBaseMediaDecodeTime } from '@/lib/util/MoofParser';
+import { TimeMap } from '@/lib/abr/TimeMap';
 
 // NTP epoch (1900) is 2_208_988_800 seconds before the UNIX epoch (1970).
 const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
@@ -215,6 +216,9 @@ export class Player {
   // Captured in subscribe(); consumed once on the first received object.
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
+  // B4: PTS <-> group lookup populated from incoming object decode times.
+  // Consumed by B5 (aligned switch) to compute START_LOCATION_GROUP.
+  #timeMap: TimeMap | undefined;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -251,6 +255,15 @@ export class Player {
     } catch (error) {
       logger.error('media', 'Failed to retrieve catalog', (error as Error).message);
       throw error;
+    }
+
+    // B4: construct the TimeMap once, anchored on the video track's GOP duration.
+    // Quality variants share a TimeMap — gopDurationMs is equal across them in practice.
+    const videoTracks = this.catalog?.getTracks('video');
+    const videoTrack = videoTracks?.[0];
+    if (videoTrack) {
+      const gopDurationMs = this.catalog!.getGopDurationMs(videoTrack.name);
+      this.#timeMap = new TimeMap(gopDurationMs);
     }
 
     return this.catalog;
@@ -618,6 +631,11 @@ export class Player {
                 // Approximate end PTS as decode time + GOP duration (one moof per GOP in our pipeline).
                 const gopDurationMs = this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
                 struct.lastAppendedEndPTS_ms = decodeTimeMs + gopDurationMs;
+                // B4: feed the TimeMap so aligned switch (B5) can resolve playhead -> group.
+                // Record the START PTS of this group, NOT the end PTS.
+                if (this.#timeMap) {
+                  this.#timeMap.recordGroupBoundary(Number(object.location.group), decodeTimeMs);
+                }
               }
             }
 
