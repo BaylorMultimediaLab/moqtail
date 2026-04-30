@@ -590,7 +590,7 @@ mod tests {
   }
 
   #[test]
-  fn catalog_includes_gop_duration_ms() {
+  fn test_catalog_includes_gop_duration_ms() {
     let track = CatalogTrack {
       name: "video/720p/2500k".to_string(),
       codec: "hev1.1.6.L120.B0".to_string(),
@@ -603,8 +603,12 @@ mod tests {
       init_segment: vec![],
       gop_duration_ms: 1000,
     };
-    let json = build_catalog_json(&[track]).unwrap();
-    let json_str = std::str::from_utf8(&json).unwrap();
-    assert!(json_str.contains("\"gopDurationMs\":1000"));
+    let json_bytes = build_catalog_json(&[track]).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+    assert_eq!(v["tracks"][0]["gopDurationMs"], 1000);
+    assert!(
+      v["tracks"][0]["gopDurationMs"].is_u64(),
+      "must be integer, not float"
+    );
   }
 }

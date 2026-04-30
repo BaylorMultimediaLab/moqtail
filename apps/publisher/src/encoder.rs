@@ -15,6 +15,12 @@ pub fn gop_size(framerate: f64) -> u32 {
   framerate.ceil() as u32
 }
 
+/// GOP duration in milliseconds at the given framerate.
+/// Derived from `gop_size` so the catalog always advertises the encoder's actual policy.
+pub fn gop_duration_ms(framerate: f64) -> u32 {
+  (gop_size(framerate) as f64 * 1000.0 / framerate).round() as u32
+}
+
 /// A single encoded GOP (Group of Pictures), representing one second of video.
 /// Each GOP maps to one MoQ group.
 #[derive(Debug)]
