@@ -232,6 +232,18 @@ export function App() {
   const [relayUrl, setRelayUrl] = useState('https://127.0.0.1:4433');
   const [namespace, setNamespace] = useState('moqtail');
   const [status, setStatus] = useState<Status>('idle');
+  const [clientMode, setClientMode] = useState<'filtered' | 'unfiltered'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const cm = params.get('clientMode');
+    return cm === 'filtered' || cm === 'unfiltered' ? cm : 'unfiltered';
+  });
+  const [filterDelaySeconds, setFilterDelaySeconds] = useState<number>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const fd = params.get('filterDelay');
+    if (!fd) return 2;
+    const n = parseFloat(fd);
+    return Number.isFinite(n) && n >= 0 ? n : 2;
+  });
   const [tracks, setTracks] = useState<Track[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
@@ -373,6 +385,8 @@ export function App() {
         relayUrl,
         namespace: Tuple.fromUtf8Path(namespace),
         receiveCatalogViaSubscribe: true,
+        clientMode,
+        filterDelaySeconds,
       });
       playerRef.current = player;
 
@@ -438,7 +452,7 @@ export function App() {
       setStatus('error');
       await disposePlayer();
     }
-  }, [relayUrl, namespace, disposePlayer, abrSettings]);
+  }, [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds]);
 
   const startPlayback = useCallback(
     async (videoTrack: string | null, audioTrack: string | null) => {
@@ -457,6 +471,8 @@ export function App() {
           relayUrl,
           namespace: Tuple.fromUtf8Path(namespace),
           receiveCatalogViaSubscribe: true,
+          clientMode,
+          filterDelaySeconds,
         });
         playerRef.current = player;
 
@@ -501,7 +517,7 @@ export function App() {
         await disposePlayer();
       }
     },
-    [relayUrl, namespace, disposePlayer, abrSettings],
+    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds],
   );
 
   const handleTrackChange = useCallback(
@@ -604,6 +620,11 @@ export function App() {
         onSettingsChange={handleSettingsChange}
         blurSettings={blurSettings}
         onBlurSettingsChange={setBlurSettings}
+        clientMode={clientMode}
+        onClientModeChange={setClientMode}
+        filterDelaySeconds={filterDelaySeconds}
+        onFilterDelaySecondsChange={setFilterDelaySeconds}
+        connectStatus={status}
       />
 
       {/* Body */}
