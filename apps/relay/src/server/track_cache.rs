@@ -332,4 +332,77 @@ impl TrackCache {
     let cache_key = CacheKey::new(self.track_alias, group_id);
     self.cache.contains_key(&cache_key)
   }
+
+  /// Returns the smallest group_id currently in the cache, or None if empty.
+  /// Used by the SUBSCRIBE handler to clamp delay-mode start_locations to the
+  /// oldest available group when the requested target predates the cache window.
+  #[allow(dead_code)]
+  pub async fn oldest_group_id(&self) -> Option<u64> {
+    self.cache.iter().map(|(k, _)| k.group_id).min()
+  }
+}
+
+#[cfg(test)]
+mod tests_oldest_group {
+  use super::*;
+  use bytes::Bytes;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      initial_max_request_id: 100,
+    }
+  }
+
+  fn fetch_object(group_id: u64, object_id: u64) -> FetchObject {
+    FetchObject {
+      group_id,
+      subgroup_id: 0,
+      object_id,
+      publisher_priority: 0,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    }
+  }
+
+  #[tokio::test]
+  async fn oldest_group_id_returns_none_when_empty() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    assert_eq!(cache.oldest_group_id().await, None);
+  }
+
+  #[tokio::test]
+  async fn oldest_group_id_returns_smallest_present_group() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(7, 0)).await;
+    cache.add_object(fetch_object(5, 0)).await;
+    cache.add_object(fetch_object(9, 0)).await;
+    // moka inserts may be eventually-consistent; force pending tasks
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.oldest_group_id().await, Some(5));
+  }
+
+  #[tokio::test]
+  async fn oldest_group_id_handles_single_group() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(42, 0)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.oldest_group_id().await, Some(42));
+  }
 }
