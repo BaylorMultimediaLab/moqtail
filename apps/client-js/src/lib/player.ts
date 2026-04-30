@@ -502,6 +502,15 @@ export class Player {
             struct.tracker.recordObject(object.payload.byteLength, object.location.group);
             struct.lastGroupId = object.location.group;
 
+            // First-received-group export for E2E smoke + connect-time metrics (Phase C).
+            // Only set once across all streams to capture the earliest received group.
+            if (typeof window !== 'undefined') {
+              if (window.__moqtailMetrics === undefined) {
+                window.__moqtailMetrics = { abr: null, samples: null };
+              }
+              window.__moqtailMetrics.firstReceivedGroupId ??= Number(object.location.group);
+            }
+
             // Read PRFT box (if any) at the head of the CMAF chunk.
             // Publisher prepends `prft` per ISO/IEC 14496-12 §8.16.5 so the
             // receiver can compute end-to-end latency per frame. MSE skips

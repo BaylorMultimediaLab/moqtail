@@ -6,6 +6,7 @@ declare global {
     __moqtailMetrics?: {
       abr: AbrMetrics | null;
       samples: MetricsSnapshot | null;
+      firstReceivedGroupId?: number;
     };
   }
 }

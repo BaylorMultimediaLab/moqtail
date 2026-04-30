@@ -338,9 +338,13 @@ export function App() {
   }, [blurSettings]);
 
   useEffect(() => {
+    // Preserve fields populated outside React (e.g. firstReceivedGroupId,
+    // written once from player.ts on the first arriving media object).
+    const prev = window.__moqtailMetrics;
     window.__moqtailMetrics = {
       abr: abrMetrics,
       samples: metricsSnapshot,
+      firstReceivedGroupId: prev?.firstReceivedGroupId,
     };
   }, [abrMetrics, metricsSnapshot]);
 
