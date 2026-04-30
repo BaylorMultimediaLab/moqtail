@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSubscribeParameters } from './player';
+import { buildSubscribeParameters, buildSwitchParameters } from './player';
 
 describe('buildSubscribeParameters', () => {
   it('returns undefined for unfiltered mode', () => {
@@ -49,5 +49,35 @@ describe('buildSubscribeParameters', () => {
       gopDurationMs: 500,
     });
     expect(params!.build()[0]!.value).toBe(4n);
+  });
+});
+
+describe('buildSwitchParameters', () => {
+  it('returns undefined params for naive mode', () => {
+    const r = buildSwitchParameters({ switchMode: 'naive', targetGroup: 42 });
+    expect(r.params).toBeUndefined();
+    expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('encodes START_LOCATION_GROUP for aligned mode with a target', () => {
+    const r = buildSwitchParameters({ switchMode: 'aligned', targetGroup: 42 });
+    expect(r.params).toBeDefined();
+    const kvps = r.params!.build();
+    expect(kvps).toHaveLength(1);
+    expect(kvps[0]!.typeValue).toBe(0x72n);
+    expect(kvps[0]!.value).toBe(42n);
+    expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('flags timeMapMiss when aligned but no target', () => {
+    const r = buildSwitchParameters({ switchMode: 'aligned', targetGroup: undefined });
+    expect(r.params).toBeUndefined();
+    expect(r.timeMapMiss).toBe(true);
+  });
+
+  it("does NOT flag miss when naive + no target (naive doesn't need TimeMap)", () => {
+    const r = buildSwitchParameters({ switchMode: 'naive', targetGroup: undefined });
+    expect(r.params).toBeUndefined();
+    expect(r.timeMapMiss).toBe(false);
   });
 });

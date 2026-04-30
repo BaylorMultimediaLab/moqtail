@@ -64,6 +64,13 @@ export class VersionSpecificParameters {
     return this
   }
 
+  addStartLocationGroup(groupId: bigint | number): this {
+    this.kvps.push(
+      KeyValuePair.tryNewVarInt(VersionSpecificParameterType.StartLocationGroup as number, BigInt(groupId)),
+    )
+    return this
+  }
+
   addRaw(pair: KeyValuePair): this {
     this.kvps.push(pair)
     return this
@@ -117,6 +124,16 @@ if (import.meta.vitest) {
     test('addDelayGroups accepts number type', () => {
       const kvps = new VersionSpecificParameters().addDelayGroups(2).build()
       expect(kvps[0]!.value).toBe(2n)
+    })
+    test('addStartLocationGroup builds a varint kvp with type 0x72', () => {
+      const kvps = new VersionSpecificParameters().addStartLocationGroup(42n).build()
+      expect(kvps.length).toBe(1)
+      expect(kvps[0]!.typeValue).toBe(0x72n)
+      expect(kvps[0]!.value).toBe(42n)
+    })
+    test('addStartLocationGroup accepts number type', () => {
+      const kvps = new VersionSpecificParameters().addStartLocationGroup(7).build()
+      expect(kvps[0]!.value).toBe(7n)
     })
   })
 }

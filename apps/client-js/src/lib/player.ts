@@ -164,6 +164,8 @@ export interface PlayerOptions {
   clientMode?: 'filtered' | 'unfiltered';
   /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
   filterDelaySeconds?: number;
+  /** Quality-switch primitive: 'naive' = today (start at latest); 'aligned' = start at group containing player's current PTS. */
+  switchMode?: 'naive' | 'aligned';
 }
 
 const DefaultOptions = {
@@ -174,6 +176,7 @@ const DefaultOptions = {
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
   filterDelaySeconds: 0,
+  switchMode: 'naive' as 'naive' | 'aligned',
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -198,6 +201,30 @@ export function buildSubscribeParameters(opts: {
   return new VersionSpecificParameters().addDelayGroups(delayGroups);
 }
 
+/**
+ * Builds the `parameters` field for a SWITCH message based on the active
+ * switchMode and the player's current PTS.
+ *
+ * - 'naive' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
+ * - 'aligned' mode: looks up the group containing `currentTime` via the TimeMap
+ *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
+ *   switch fired before any object was received), returns `{ params: undefined,
+ *   timeMapMiss: true }` so the caller can record the miss.
+ *
+ * Exported for unit testing.
+ */
+export function buildSwitchParameters(opts: {
+  switchMode: 'naive' | 'aligned';
+  targetGroup: number | undefined;
+}): { params: VersionSpecificParameters | undefined; timeMapMiss: boolean } {
+  if (opts.switchMode !== 'aligned') return { params: undefined, timeMapMiss: false };
+  if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
+  return {
+    params: new VersionSpecificParameters().addStartLocationGroup(opts.targetGroup),
+    timeMapMiss: false,
+  };
+}
+
 export class Player {
   catalog: CMSFCatalog | null = null;
   client: MOQtailClient | null = null;
@@ -219,6 +246,10 @@ export class Player {
   // B4: PTS <-> group lookup populated from incoming object decode times.
   // Consumed by B5 (aligned switch) to compute START_LOCATION_GROUP.
   #timeMap: TimeMap | undefined;
+  // B5: latched at switchTrack() time; consumed by the next switch
+  // DiscontinuityRecord emission and reset to false afterwards so it doesn't
+  // leak across switches.
+  #lastSwitchHadTimeMapMiss: boolean = false;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -590,10 +621,13 @@ export class Player {
                   newStartPTS_ms,
                   ptsGapMs,
                   wallClockMs,
-                  switchMode: 'naive', // Phase B will set this from #options
+                  switchMode: this.#options.switchMode,
+                  timeMapMiss: this.#lastSwitchHadTimeMapMiss,
                   clientMode: this.#options.clientMode,
                   filterDelaySeconds: this.#options.filterDelaySeconds,
                 };
+                // Reset so the flag doesn't leak across switches.
+                this.#lastSwitchHadTimeMapMiss = false;
                 if (typeof window !== 'undefined') {
                   const w = window as Window & {
                     __moqtailMetrics?: {
@@ -738,7 +772,7 @@ export class Player {
                     expectedStartGroup: expected,
                     actualStartGroup: actual,
                     clampedByRelay,
-                    switchMode: 'naive', // Phase B will source this from #options
+                    switchMode: this.#options.switchMode,
                     clientMode: this.#options.clientMode,
                     filterDelaySeconds: this.#options.filterDelaySeconds,
                   };
@@ -1034,10 +1068,26 @@ export class Player {
 
     const mimeType = `${role}/mp4; codecs="${codec}"`;
 
+    // Compute aligned-switch target group from playhead via TimeMap.
+    let targetGroup: number | undefined;
+    if (this.#options.switchMode === 'aligned' && this.#timeMap && this.#element) {
+      const currentPTS_ms = this.#element.currentTime * 1000;
+      targetGroup = this.#timeMap.groupContainingPTS(currentPTS_ms);
+    }
+    const { params: switchParams, timeMapMiss } = buildSwitchParameters({
+      switchMode: this.#options.switchMode,
+      targetGroup,
+    });
+    if (timeMapMiss) {
+      logger.warn('media', 'aligned switch: TimeMap miss; falling through to naive');
+    }
+    this.#lastSwitchHadTimeMapMiss = timeMapMiss;
+
     try {
       const result = await this.client.switch({
         fullTrackName,
         subscriptionRequestId: videoStruct.requestId,
+        parameters: switchParams,
       });
 
       if (result instanceof SubscribeError) {
