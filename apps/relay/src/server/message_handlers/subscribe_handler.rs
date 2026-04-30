@@ -21,11 +21,13 @@ use crate::server::track::{Track, TrackStatus};
 use bytes::Bytes;
 use core::result::Result;
 use moqtail::model::common::location::Location;
+use moqtail::model::common::pair::KeyValuePair;
 use moqtail::model::control::constant::GroupOrder;
 use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::data::subgroup_header::SubgroupHeader;
 use moqtail::model::data::subgroup_object::SubgroupObject;
 use moqtail::model::error::TerminationCode;
+use moqtail::model::parameter::constant::VersionSpecificParameterType;
 use moqtail::model::{
   common::reason_phrase::ReasonPhrase, control::control_message::ControlMessage,
 };
@@ -34,6 +36,23 @@ use moqtail::transport::data_stream_handler::SubscribeRequest;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
+
+/// Search a SUBSCRIBE message's parameters for the project-local DELAY_GROUPS
+/// (VarInt). Returns the first match's value, or None if not present.
+///
+/// Used by the SUBSCRIBE handler (Task A8) to put a filtered client `delay_groups`
+/// behind the live edge.
+#[allow(dead_code)]
+fn parse_delay_groups(params: &[KeyValuePair]) -> Option<u64> {
+  params.iter().find_map(|p| match p {
+    KeyValuePair::VarInt { type_value, value }
+      if *type_value == VersionSpecificParameterType::DelayGroups as u64 =>
+    {
+      Some(*value)
+    }
+    _ => None,
+  })
+}
 
 // Synthetic-probe track aliases live well above any plausible publisher-
 // assigned alias so they can't collide with real video tracks. Per IETF 119
@@ -880,5 +899,59 @@ pub async fn handle(
       // no-op
       Ok(())
     }
+  }
+}
+
+#[cfg(test)]
+mod tests_parse_delay_groups {
+  use super::*;
+  use moqtail::model::common::pair::KeyValuePair;
+  use moqtail::model::parameter::constant::VersionSpecificParameterType;
+
+  fn delay_groups_kvp(value: u64) -> KeyValuePair {
+    KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::DelayGroups as u64,
+      value,
+    }
+  }
+
+  #[test]
+  fn parse_delay_groups_returns_some_when_present() {
+    let params = vec![delay_groups_kvp(5)];
+    assert_eq!(parse_delay_groups(&params), Some(5));
+  }
+
+  #[test]
+  fn parse_delay_groups_returns_none_when_absent() {
+    let params: Vec<KeyValuePair> = vec![];
+    assert_eq!(parse_delay_groups(&params), None);
+  }
+
+  #[test]
+  fn parse_delay_groups_ignores_other_params() {
+    let params = vec![KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::DeliveryTimeout as u64,
+      value: 99,
+    }];
+    assert_eq!(parse_delay_groups(&params), None);
+  }
+
+  #[test]
+  fn parse_delay_groups_returns_first_match_if_duplicated() {
+    // Defensive: if a peer sends two DELAY_GROUPS entries, return the first.
+    let params = vec![delay_groups_kvp(7), delay_groups_kvp(11)];
+    assert_eq!(parse_delay_groups(&params), Some(7));
+  }
+
+  #[test]
+  fn parse_delay_groups_ignores_bytes_kvp_with_same_type_id() {
+    // Defensive: 0x70 is even (varint), so a Bytes KVP with the same type
+    // would be malformed; we shouldn't extract a value from it.
+    use bytes::Bytes;
+    let params = vec![KeyValuePair::Bytes {
+      type_value: VersionSpecificParameterType::DelayGroups as u64,
+      value: Bytes::from_static(b"oops"),
+    }];
+    assert_eq!(parse_delay_groups(&params), None);
   }
 }
