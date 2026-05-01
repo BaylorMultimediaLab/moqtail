@@ -63,7 +63,15 @@ async fn run_live(cli: Cli) -> Result<()> {
   );
   info!("Catalog target latency: {} ms", cli.target_latency_ms);
 
-  let variants = adaptive::quality_variants(&video_info, cli.max_variants as usize)?;
+  let ladder_spec = adaptive::LadderSpec::parse(&cli.ladder_spec)
+    .map_err(|e| anyhow::anyhow!("invalid --ladder-spec: {}", e))?;
+  let variants = match &ladder_spec {
+    adaptive::LadderSpec::Default => {
+      adaptive::quality_variants(&video_info, cli.max_variants as usize)?
+    }
+    _ => adaptive::quality_variants_for_spec(&video_info, &ladder_spec)
+      .map_err(|e| anyhow::anyhow!("ladder generation failed: {}", e))?,
+  };
   log_variants(&variants);
 
   let extras = collect_extradata(&variants, video_info.framerate, hw_encoder.as_ref()).await?;

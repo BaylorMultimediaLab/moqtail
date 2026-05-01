@@ -40,4 +40,10 @@ pub struct Cli {
   /// plus a top-level `meta.json` written atomically when prepare succeeds.
   #[arg(long)]
   pub encoded_dir: Option<PathBuf>,
+
+  /// Ladder specification. Either `default` (legacy resolution-coupled ladder)
+  /// or `<height>p:<comma-list-of-bitrates-kbps>` (e.g. `720p:400,800,1200,2500,5000`).
+  /// Used by the paper experiment harness; production publisher leaves this at default.
+  #[arg(long, default_value = "default")]
+  pub ladder_spec: String,
 }
