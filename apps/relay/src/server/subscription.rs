@@ -216,88 +216,108 @@ impl Subscription {
           drop(state);
           if is_joining && start_location.is_some() {
             let start_location = start_location.unwrap_or_default();
-            if let Some(last_received_object_location) = last_received_object_location_opt {
+
+            // Determine the upper bound for cache replay:
+            //   - If last_received_object_location is set (e.g. reconnect after a
+            //     brief disconnect), replay up to it.
+            //   - Otherwise (initial subscribe — the common delay-mode case), replay
+            //     up to the cache's current newest group at this moment. Any object
+            //     newer than this snapshot will arrive via the live-forward path
+            //     (`instance.receive()`) after this block clears is_joining.
+            let replay_end = match last_received_object_location_opt {
+              Some(loc) => Some(loc),
+              None => cache.newest_group_id().await.map(|g| Location {
+                group: g,
+                object: u64::MAX,
+              }),
+            };
+
+            if let Some(end) = replay_end
+              && end > start_location
+            {
               info!(
-                "Joining state - subscriber: {} track: {} from location: {:?} to last received location: {:?}",
-                instance.client_connection_id,
-                track_alias,
-                start_location,
-                last_received_object_location
+                "Joining state - subscriber: {} track: {} from location: {:?} to end: {:?}",
+                instance.client_connection_id, track_alias, start_location, end
               );
-              if last_received_object_location > start_location {
-                let mut object_receiver = cache
-                  .read_objects(start_location, last_received_object_location, false)
-                  .await;
+              let mut object_receiver =
+                cache.read_objects(start_location, end.clone(), false).await;
 
-                let mut last_group: u64 = u64::MAX;
-                let mut last_stream_id: Option<StreamId> = None;
+              let mut last_group: u64 = u64::MAX;
+              let mut last_stream_id: Option<StreamId> = None;
 
-                loop {
-                  match object_receiver.recv().await {
-                    Some(event) => match event {
-                      CacheConsumeEvent::NoObject => {
-                        // there is no object found
-                        break;
-                      }
-                      CacheConsumeEvent::Object(object) => {
-                        let (header_info, stream_id) = if last_group == u64::MAX
-                          || object.group_id > last_group
-                        {
-                          // create a subgroup header and send a track event
-
-                          // TODO: check this. If is_some returns true, we may not need
-                          // to check the length.
-                          let has_extensions = object.extension_headers.as_ref().is_some();
-
-                          // create a fake subgroup header using the object attributes
-                          // TODO: It think contains_end_of_group should be checked by looking at
-                          // the last object. Need to look into the draft.
-                          let subgroup_header = HeaderInfo::Subgroup {
-                            header: SubgroupHeader::new_with_explicit_id(
-                              track_alias,
-                              object.group_id,
-                              object.subgroup_id,
-                              object.publisher_priority,
-                              has_extensions,
-                              false,
-                            ),
-                          };
-                          info!(
-                            "FROM CACHE: Joining state - subscriber: {} track: {} sending subgroup header: {:?}",
-                            instance.client_connection_id, track_alias, subgroup_header
-                          );
-                          last_group = object.group_id;
-                          let stream_id = instance.get_stream_id(&subgroup_header);
-                          last_stream_id = Some(stream_id);
-
-                          (Some(subgroup_header), last_stream_id.clone())
-                        } else {
-                          (None, last_stream_id.clone())
-                        };
-
-                        let the_object = Object::try_from_fetch(object, track_alias).unwrap();
-
-                        let track_event = TrackEvent::SubgroupObject {
-                          stream_id: stream_id.unwrap(),
-                          object: the_object,
-                          header_info,
-                        };
-                        info!(
-                          "Joining state - subscriber: {} track: {} sending object location: {:?}",
-                          instance.client_connection_id, track_alias, track_event
-                        );
-                        instance.handle_track_event(track_event).await;
-                      }
-                      CacheConsumeEvent::EndLocation(_) => {}
-                    },
-                    None => {
-                      warn!("handle_fetch_messages | No object.");
+              loop {
+                match object_receiver.recv().await {
+                  Some(event) => match event {
+                    CacheConsumeEvent::NoObject => {
+                      // there is no object found
                       break;
                     }
+                    CacheConsumeEvent::Object(object) => {
+                      let (header_info, stream_id) = if last_group == u64::MAX
+                        || object.group_id > last_group
+                      {
+                        // create a subgroup header and send a track event
+
+                        // TODO: check this. If is_some returns true, we may not need
+                        // to check the length.
+                        let has_extensions = object.extension_headers.as_ref().is_some();
+
+                        // create a fake subgroup header using the object attributes
+                        // TODO: It think contains_end_of_group should be checked by looking at
+                        // the last object. Need to look into the draft.
+                        let subgroup_header = HeaderInfo::Subgroup {
+                          header: SubgroupHeader::new_with_explicit_id(
+                            track_alias,
+                            object.group_id,
+                            object.subgroup_id,
+                            object.publisher_priority,
+                            has_extensions,
+                            false,
+                          ),
+                        };
+                        info!(
+                          "FROM CACHE: Joining state - subscriber: {} track: {} sending subgroup header: {:?}",
+                          instance.client_connection_id, track_alias, subgroup_header
+                        );
+                        last_group = object.group_id;
+                        let stream_id = instance.get_stream_id(&subgroup_header);
+                        last_stream_id = Some(stream_id);
+
+                        (Some(subgroup_header), last_stream_id.clone())
+                      } else {
+                        (None, last_stream_id.clone())
+                      };
+
+                      let the_object = Object::try_from_fetch(object, track_alias).unwrap();
+
+                      let track_event = TrackEvent::SubgroupObject {
+                        stream_id: stream_id.unwrap(),
+                        object: the_object,
+                        header_info,
+                      };
+                      info!(
+                        "Joining state - subscriber: {} track: {} sending object location: {:?}",
+                        instance.client_connection_id, track_alias, track_event
+                      );
+                      instance.handle_track_event(track_event).await;
+                    }
+                    CacheConsumeEvent::EndLocation(_) => {}
+                  },
+                  None => {
+                    warn!("handle_fetch_messages | No object.");
+                    break;
                   }
                 }
               }
+
+              // Record what we replayed up to so the live-forward path knows where
+              // to resume. Without this, live objects in the [start_location, end]
+              // range that arrive after the snapshot would be duplicates.
+              let mut state = instance.subscription_state.write().await;
+              state.last_received_object_location = Some(end);
+              drop(state);
             }
+
             let mut state = instance.subscription_state.write().await;
             state.is_joining = false;
             info!(
