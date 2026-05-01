@@ -43,7 +43,7 @@ if [[ "${1:-}" == "stop" ]]; then
   exit 0
 fi
 
-VIDEO_PATH="${1:-data/video/smoking_test_1080p.mp4}"
+VIDEO_PATH="${1:-data/video/smoking_test_1080p_ts.mp4}"
 
 cleanup() {
   echo ""
