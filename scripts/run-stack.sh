@@ -94,9 +94,32 @@ echo "  Logs:   $LOG_DIR/"
 echo ""
 
 # --- Build Rust components ---
-echo "[build] Building Rust components..."
-cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --features publisher/vaapi 2>&1 | tee "$LOG_DIR/build_${TIMESTAMP}.log"
+# Build every workspace member (apps/relay, apps/client, apps/publisher,
+# libs/moqtail-rs) so the binaries we run below are fresh. --workspace makes
+# this explicit; without it `cargo build` at the workspace root would still
+# build all members by default but it's easy to misread. The publisher's
+# vaapi feature is opt-in via --features.
+echo "[build] Building all Rust workspace members (--release, all apps + libs)..."
+cargo build --release \
+  --manifest-path "$ROOT_DIR/Cargo.toml" \
+  --workspace \
+  --features publisher/vaapi \
+  2>&1 | tee "$LOG_DIR/build_${TIMESTAMP}.log"
 echo "[build] Done."
+echo ""
+
+# --- Verify binaries exist + are newer than their source ---
+# Catches stale-binary-after-failed-build cases where cargo printed an error
+# but the script kept going. If any binary is missing we abort here rather
+# than at `cargo run` time.
+TARGET_DIR="$ROOT_DIR/target/release"
+for bin in relay publisher client; do
+  if [[ ! -x "$TARGET_DIR/$bin" ]]; then
+    echo "[build] ERROR: target/release/$bin not found after build. See $LOG_DIR/build_${TIMESTAMP}.log."
+    exit 1
+  fi
+done
+echo "[build] Verified binaries: relay, publisher, client"
 echo ""
 
 # --- Install JS dependencies ---
