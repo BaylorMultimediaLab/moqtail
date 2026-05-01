@@ -153,3 +153,13 @@ def pytest_configure(config):
         "markers",
         "publisher_ladder_spec(s): override --ladder-spec for the publisher",
     )
+    config.addinivalue_line(
+        "markers",
+        "abr_url_overrides(**kwargs): merge extra ABR settings into the page URL "
+        "for this test (e.g. throughputSlowHalfLifeSeconds=4).",
+    )
+    config.addinivalue_line(
+        "markers",
+        "abr_settings_override(settings): inject window.__abrSettingsOverride before "
+        "Connect click. Used by E6 to sweep ABR rule configurations.",
+    )
