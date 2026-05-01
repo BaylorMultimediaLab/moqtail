@@ -91,6 +91,14 @@ impl SubscriptionState {
 
 impl From<Subscribe> for SubscriptionState {
   fn from(subscribe: Subscribe) -> Self {
+    // When a SUBSCRIBE arrives with an explicit start_location (delay-mode,
+    // absolute-start, or switch with START_LOCATION_GROUP), we must replay
+    // any cached objects in [start_location, current_largest] before live
+    // objects start filtering through. The cache-replay path at lines
+    // 196-299 is gated on is_joining && start_location.is_some(); without
+    // is_joining=true here, those cached objects are silently dropped.
+    let is_joining = subscribe.start_location.is_some();
+
     Self {
       subscriber_priority: subscribe.subscriber_priority,
       _group_order: subscribe.group_order,
@@ -101,7 +109,7 @@ impl From<Subscribe> for SubscriptionState {
       subscribe_parameters: subscribe.subscribe_parameters,
       last_sent_max_location: None,
       last_received_object_location: None,
-      is_joining: false,
+      is_joining,
     }
   }
 }
@@ -1157,5 +1165,74 @@ impl Subscription {
     );
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests_from_subscribe_is_joining {
+  use super::*;
+  use moqtail::model::common::{
+    location::Location,
+    pair::KeyValuePair,
+    tuple::{Tuple, TupleField},
+  };
+  use moqtail::model::control::{constant::GroupOrder, subscribe::Subscribe};
+
+  fn dummy_namespace() -> Tuple {
+    Tuple::from_utf8_path("/test")
+  }
+
+  fn dummy_track_name() -> TupleField {
+    TupleField::from_utf8("video")
+  }
+
+  #[test]
+  fn is_joining_is_true_when_start_location_is_some() {
+    // Mirror what compute_delayed_start + the subscribe handler do for
+    // a filtered SUBSCRIBE: produce a Subscribe with start_location=Some(...).
+    let sub = Subscribe::new_absolute_start(
+      1, // request_id
+      dummy_namespace(),
+      dummy_track_name(),
+      0, // priority
+      GroupOrder::Original,
+      true, // forward
+      Location {
+        group: 50,
+        object: 0,
+      },
+      Vec::<KeyValuePair>::new(), // parameters
+    );
+    let state = SubscriptionState::from(sub);
+    assert_eq!(
+      state.start_location,
+      Some(Location {
+        group: 50,
+        object: 0
+      })
+    );
+    assert!(
+      state.is_joining,
+      "is_joining must be true when start_location is set, otherwise the \
+       cache-replay path at lines 196-299 silently drops cached objects"
+    );
+  }
+
+  #[test]
+  fn is_joining_is_false_when_start_location_is_none() {
+    // Today's default behavior: LatestObject SUBSCRIBE with no start_location
+    // should leave is_joining=false (no cache replay needed; live-only flow).
+    let sub = Subscribe::new_latest_object(
+      1,
+      dummy_namespace(),
+      dummy_track_name(),
+      0,
+      GroupOrder::Original,
+      true,
+      Vec::<KeyValuePair>::new(),
+    );
+    let state = SubscriptionState::from(sub);
+    assert_eq!(state.start_location, None);
+    assert!(!state.is_joining);
   }
 }
