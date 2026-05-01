@@ -286,6 +286,7 @@ export function App() {
   });
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const [catalogTracks, setCatalogTracks] = useState<CMSF['tracks'] | null>(null);
   const abrRef = useRef<AbrController | null>(null);
   const rulesRef = useRef<AbrRulesCollection | null>(null);
   const metricsRef = useRef<MetricsCollector | null>(null);
@@ -351,8 +352,9 @@ export function App() {
       samples: metricsSnapshot,
       firstReceivedGroupId: prev?.firstReceivedGroupId,
       switchDiscontinuities: prev?.switchDiscontinuities,
+      catalogTracks: catalogTracks ?? prev?.catalogTracks,
     };
-  }, [abrMetrics, metricsSnapshot]);
+  }, [abrMetrics, metricsSnapshot, catalogTracks]);
 
   const disposePlayer = useCallback(async () => {
     if (abrRef.current) {
@@ -404,6 +406,7 @@ export function App() {
       const catalog = await player.initialize();
       const allTracks = catalog.getTracks();
       setTracks(allTracks);
+      setCatalogTracks(allTracks);
 
       // Pick startup video track: use WebTransport bandwidth estimate if available,
       // fall back to lowest-bitrate track when no estimate is possible.
@@ -509,7 +512,9 @@ export function App() {
         playerRef.current = player;
 
         const catalog = await player.initialize();
-        setTracks(catalog.getTracks());
+        const allTracksForPlayback = catalog.getTracks();
+        setTracks(allTracksForPlayback);
+        setCatalogTracks(allTracksForPlayback);
 
         await player.attachMedia(videoRef.current);
         bufferRef.current = new MSEBuffer(videoRef.current, {
@@ -521,7 +526,7 @@ export function App() {
 
         await player.startMedia();
         setStatus('playing');
-        const videoTracksForAbr = catalog.getTracks().filter(t => t.role === 'video');
+        const videoTracksForAbr = allTracksForPlayback.filter(t => t.role === 'video');
         // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
         // before playback starts so we can sweep ABR rule configurations without
         // shipping a UI control. Production paths leave this undefined and the
