@@ -239,8 +239,15 @@ export function computeStartupTarget(opts: {
   end: number;
   baseTarget: number;
   clientMode: 'filtered' | 'unfiltered';
+  /** Seconds-behind-live-edge target for filtered mode. Ignored when unfiltered.
+   *  Defaults to 0 (today's broken behavior) only when not provided — callers
+   *  in filtered mode SHOULD pass this. */
+  filterDelaySeconds?: number;
 }): number {
-  const offset = opts.clientMode === 'filtered' ? 0 : LIVE_EDGE_STARTUP_OFFSET_SECONDS;
+  const offset =
+    opts.clientMode === 'filtered'
+      ? (opts.filterDelaySeconds ?? 0)
+      : LIVE_EDGE_STARTUP_OFFSET_SECONDS;
   return Math.max(opts.baseTarget, opts.end - offset);
 }
 
@@ -479,6 +486,7 @@ export class Player {
         end,
         baseTarget: target,
         clientMode: this.#options.clientMode,
+        filterDelaySeconds: this.#options.filterDelaySeconds,
       });
 
       gotNotification++;

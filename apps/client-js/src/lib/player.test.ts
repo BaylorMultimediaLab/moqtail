@@ -104,4 +104,63 @@ describe('computeStartupTarget', () => {
     const t = computeStartupTarget({ end: 10, baseTarget: 11, clientMode: 'filtered' });
     expect(t).toBeCloseTo(11);
   });
+
+  it('subtracts filterDelaySeconds for filtered mode when provided', () => {
+    // bufferEdge=30, delay=30 → target=0 (player starts already 30s behind buffer end)
+    expect(
+      computeStartupTarget({
+        end: 30,
+        baseTarget: 0,
+        clientMode: 'filtered',
+        filterDelaySeconds: 30,
+      }),
+    ).toBeCloseTo(0);
+  });
+
+  it('subtracts smaller filterDelaySeconds correctly', () => {
+    // bufferEdge=10, delay=2 → target=8 (player 2s behind buffer end)
+    expect(
+      computeStartupTarget({
+        end: 10,
+        baseTarget: 0,
+        clientMode: 'filtered',
+        filterDelaySeconds: 2,
+      }),
+    ).toBeCloseTo(8);
+  });
+
+  it('preserves baseTarget when it exceeds end - filterDelaySeconds', () => {
+    // baseTarget 5 > end-delay (30-30=0) → max wins
+    expect(
+      computeStartupTarget({
+        end: 30,
+        baseTarget: 5,
+        clientMode: 'filtered',
+        filterDelaySeconds: 30,
+      }),
+    ).toBeCloseTo(5);
+  });
+
+  it('falls back to 0 offset when filtered + filterDelaySeconds undefined', () => {
+    // Backward-compat: existing behavior when caller forgets to pass it.
+    expect(
+      computeStartupTarget({
+        end: 10,
+        baseTarget: 0,
+        clientMode: 'filtered',
+      }),
+    ).toBeCloseTo(10);
+  });
+
+  it('ignores filterDelaySeconds in unfiltered mode', () => {
+    // Even if caller passes filterDelaySeconds, unfiltered uses LIVE_EDGE_STARTUP_OFFSET_SECONDS.
+    expect(
+      computeStartupTarget({
+        end: 10,
+        baseTarget: 0,
+        clientMode: 'unfiltered',
+        filterDelaySeconds: 5,
+      }),
+    ).toBeCloseTo(9);
+  });
 });
