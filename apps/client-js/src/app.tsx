@@ -434,13 +434,31 @@ export function App() {
         await player.startMedia();
         setStatus('playing');
         const videoTracks = allTracks.filter(t => t.role === 'video');
-        const rulesCollection = new AbrRulesCollection(abrSettings);
+        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
+        // before playback starts so we can sweep ABR rule configurations without
+        // shipping a UI control. Production paths leave this undefined and the
+        // shallow merge becomes a no-op.
+        type AbrOverride = Partial<typeof abrSettings> & {
+          rules?: Partial<typeof abrSettings.rules>;
+        };
+        const override =
+          typeof window !== 'undefined'
+            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
+            : undefined;
+        const effectiveAbrSettings = override
+          ? {
+              ...abrSettings,
+              ...override,
+              rules: { ...abrSettings.rules, ...(override.rules ?? {}) },
+            }
+          : abrSettings;
+        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
         rulesRef.current = rulesCollection;
         const abr = new AbrController(
           player,
           rulesCollection,
           videoTracks,
-          abrSettings,
+          effectiveAbrSettings,
           setAbrMetrics,
         );
         abrRef.current = abr;
@@ -504,13 +522,31 @@ export function App() {
         await player.startMedia();
         setStatus('playing');
         const videoTracksForAbr = catalog.getTracks().filter(t => t.role === 'video');
-        const rulesCollection = new AbrRulesCollection(abrSettings);
+        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
+        // before playback starts so we can sweep ABR rule configurations without
+        // shipping a UI control. Production paths leave this undefined and the
+        // shallow merge becomes a no-op.
+        type AbrOverride = Partial<typeof abrSettings> & {
+          rules?: Partial<typeof abrSettings.rules>;
+        };
+        const override =
+          typeof window !== 'undefined'
+            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
+            : undefined;
+        const effectiveAbrSettings = override
+          ? {
+              ...abrSettings,
+              ...override,
+              rules: { ...abrSettings.rules, ...(override.rules ?? {}) },
+            }
+          : abrSettings;
+        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
         rulesRef.current = rulesCollection;
         const abr = new AbrController(
           player,
           rulesCollection,
           videoTracksForAbr,
-          abrSettings,
+          effectiveAbrSettings,
           setAbrMetrics,
         );
         abrRef.current = abr;
