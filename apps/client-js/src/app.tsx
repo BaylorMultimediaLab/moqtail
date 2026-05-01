@@ -440,7 +440,7 @@ export function App() {
         // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
         // before playback starts so we can sweep ABR rule configurations without
         // shipping a UI control. Production paths leave this undefined and the
-        // shallow merge becomes a no-op.
+        // deep merge becomes a no-op.
         type AbrOverride = Partial<typeof abrSettings> & {
           rules?: Partial<typeof abrSettings.rules>;
         };
@@ -452,7 +452,26 @@ export function App() {
           ? {
               ...abrSettings,
               ...override,
-              rules: { ...abrSettings.rules, ...(override.rules ?? {}) },
+              rules: Object.fromEntries(
+                Object.entries({
+                  ...abrSettings.rules,
+                  ...(override.rules ?? {}),
+                }).map(([name, cfg]) => {
+                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
+                  if (!base) return [name, cfg];
+                  return [
+                    name,
+                    {
+                      ...base,
+                      ...cfg,
+                      parameters: {
+                        ...(base.parameters ?? {}),
+                        ...(cfg.parameters ?? {}),
+                      },
+                    },
+                  ];
+                }),
+              ),
             }
           : abrSettings;
         const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
@@ -530,7 +549,7 @@ export function App() {
         // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
         // before playback starts so we can sweep ABR rule configurations without
         // shipping a UI control. Production paths leave this undefined and the
-        // shallow merge becomes a no-op.
+        // deep merge becomes a no-op.
         type AbrOverride = Partial<typeof abrSettings> & {
           rules?: Partial<typeof abrSettings.rules>;
         };
@@ -542,7 +561,26 @@ export function App() {
           ? {
               ...abrSettings,
               ...override,
-              rules: { ...abrSettings.rules, ...(override.rules ?? {}) },
+              rules: Object.fromEntries(
+                Object.entries({
+                  ...abrSettings.rules,
+                  ...(override.rules ?? {}),
+                }).map(([name, cfg]) => {
+                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
+                  if (!base) return [name, cfg];
+                  return [
+                    name,
+                    {
+                      ...base,
+                      ...cfg,
+                      parameters: {
+                        ...(base.parameters ?? {}),
+                        ...(cfg.parameters ?? {}),
+                      },
+                    },
+                  ];
+                }),
+              ),
             }
           : abrSettings;
         const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
