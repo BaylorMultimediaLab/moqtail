@@ -19,7 +19,7 @@ import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
 import { Tuple, type CMSF } from 'moqtail';
-import MSEBuffer from '@/lib/buffer';
+import MSEBuffer, { computeLiveEdgeDelay } from '@/lib/buffer';
 import { AbrController, AbrRulesCollection, DEFAULT_ABR_SETTINGS } from '@/lib/abr';
 import type { AbrMetrics, AbrSettings } from '@/lib/abr';
 import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
@@ -427,7 +427,9 @@ export function App() {
         setSelectedVideo(firstVideo.name);
         setStatus('restarting');
         await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, {
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+        });
         await player.addMediaTrack(firstVideo.name);
         await player.startMedia();
         setStatus('playing');
@@ -492,7 +494,9 @@ export function App() {
         setTracks(catalog.getTracks());
 
         await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, {
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+        });
 
         if (videoTrack) await player.addMediaTrack(videoTrack);
         if (audioTrack) await player.addMediaTrack(audioTrack);
