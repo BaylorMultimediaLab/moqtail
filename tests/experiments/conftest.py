@@ -126,7 +126,6 @@ def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec)
             f"https://{relay_ip}:4433",
             "--namespace", "moqtail",
             "--video-path", video_path,
-            "--max-variants", "5",
             "--ladder-spec", publisher_ladder_spec,
         ],
         stdout=subprocess.PIPE,
@@ -142,6 +141,15 @@ def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec)
     yield proc
     proc.terminate()
     proc.wait(timeout=10)
+
+
+@pytest.fixture(scope="session")
+def results_base():
+    """Override of tests/network's results_base. Experiment artifacts live under
+    tests/experiments/results/, not the regression suite's directory."""
+    base = Path(__file__).resolve().parent / "results"
+    base.mkdir(exist_ok=True)
+    return base
 
 
 def pytest_configure(config):
