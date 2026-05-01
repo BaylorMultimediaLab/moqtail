@@ -253,3 +253,7 @@ apps/client-js/specs/
 apps/relay/cert/cert.pem.bak
 apps/relay/cert/key.pem.bak
 .claude/
+
+### Paper Experiments ###
+data/video/tears_of_steel_*
+data/video/.cache/
