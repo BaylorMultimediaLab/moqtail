@@ -37,7 +37,7 @@ def build_run_summary(
         "mean_pts_gap_ms": (sum(pts_gaps) / len(pts_gaps)) if pts_gaps else 0.0,
         "dropped_frames": int(last_row.get("dropped_frames", 0) or 0),
         "total_frames": int(last_row.get("total_frames", 0) or 0),
-        "current_time_at_end_s": float(last_row.get("elapsed_s", 0) or 0),
+        "current_time_at_end_s": float(last_row.get("current_time", 0) or 0),
         "switch_records": switch_events,
     })
     if extra:
