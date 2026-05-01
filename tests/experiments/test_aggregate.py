@@ -4,26 +4,32 @@ from pathlib import Path
 from aggregate import build_aggregate, build_aggregate_summary
 
 
-def _write_run(dir_: Path, summary: dict) -> None:
+def _write_summary(dir_: Path, summary: dict) -> None:
     dir_.mkdir(parents=True, exist_ok=True)
     (dir_ / "summary.json").write_text(json.dumps(summary))
 
 
 def test_build_aggregate_collects_all_runs(tmp_path: Path):
-    exp_dir = tmp_path / "e2"
-    _write_run(exp_dir / "naive_offset5" / "run0_t1", {
+    # Flat layout: summary.json files can live at arbitrary subdirectories.
+    # build_aggregate walks recursively and filters by the 'experiment' field.
+    _write_summary(tmp_path / "run0", {
         "experiment": "e2", "cell_id": "naive_offset5", "run_index": 0,
         "n_switches": 2, "max_pts_gap_ms": 250.0, "n_discontinuities": 1, "success": True,
     })
-    _write_run(exp_dir / "naive_offset5" / "run1_t2", {
+    _write_summary(tmp_path / "run1", {
         "experiment": "e2", "cell_id": "naive_offset5", "run_index": 1,
         "n_switches": 2, "max_pts_gap_ms": 280.0, "n_discontinuities": 1, "success": True,
     })
-    _write_run(exp_dir / "naive_offset10" / "run0_t1", {
+    _write_summary(tmp_path / "run2", {
         "experiment": "e2", "cell_id": "naive_offset10", "run_index": 0,
         "n_switches": 1, "max_pts_gap_ms": 120.0, "n_discontinuities": 1, "success": True,
     })
-    rows = build_aggregate(exp_dir)
+    # A summary from a different experiment — must NOT be included.
+    _write_summary(tmp_path / "other_run", {
+        "experiment": "e3", "cell_id": "aligned_offset5", "run_index": 0,
+        "n_switches": 0, "max_pts_gap_ms": 0.0, "n_discontinuities": 0, "success": True,
+    })
+    rows = build_aggregate(tmp_path, "e2")
     assert len(rows) == 3
     assert {r["cell_id"] for r in rows} == {"naive_offset5", "naive_offset10"}
 

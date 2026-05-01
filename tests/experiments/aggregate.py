@@ -1,4 +1,4 @@
-"""Walk results/<experiment>/ and emit aggregate.csv + aggregate_summary.csv."""
+"""Walk results/ recursively and emit aggregate.csv + aggregate_summary.csv."""
 import argparse
 import csv
 import json
@@ -7,20 +7,21 @@ from pathlib import Path
 from typing import Any
 
 
-def build_aggregate(experiment_dir: Path) -> list[dict[str, Any]]:
-    """Walk experiment_dir/<cell_id>/run*/summary.json and return all summaries as a list.
+def build_aggregate(results_root: Path, experiment: str) -> list[dict[str, Any]]:
+    """Walk results_root recursively, find all summary.json with matching experiment.
 
-    Order is deterministic: cell dirs sorted alphabetically, run dirs sorted
-    alphabetically within each cell. Skips run dirs without summary.json (a
-    failed run that didn't produce one).
+    The directory layout doesn't matter: every summary.json carries its own
+    `experiment` field. We filter by that field instead of by path so the
+    function tolerates whatever layout pytest (or the user) writes.
     """
     rows = []
-    for cell_dir in sorted(p for p in experiment_dir.iterdir() if p.is_dir()):
-        for run_dir in sorted(p for p in cell_dir.iterdir() if p.is_dir()):
-            summary_path = run_dir / "summary.json"
-            if not summary_path.exists():
-                continue
-            rows.append(json.loads(summary_path.read_text()))
+    for summary_path in sorted(results_root.rglob("summary.json")):
+        try:
+            data = json.loads(summary_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("experiment") == experiment:
+            rows.append(data)
     return rows
 
 
@@ -89,12 +90,15 @@ def write_csv(rows: list[dict[str, Any]], dest: Path) -> None:
         writer.writerows(rows)
 
 
-def aggregate_experiment(experiment_dir: Path) -> tuple[Path, Path]:
-    """Walk an experiment results dir, write both aggregate CSVs. Returns the paths."""
-    rows = build_aggregate(experiment_dir)
+def aggregate_experiment(results_root: Path, experiment: str) -> tuple[Path, Path]:
+    """Walk results_root recursively for summaries matching experiment, write both
+    aggregate CSVs. Returns the paths."""
+    rows = build_aggregate(results_root, experiment)
     summary = build_aggregate_summary(rows)
-    agg_path = experiment_dir / "aggregate.csv"
-    summary_path = experiment_dir / "aggregate_summary.csv"
+    out_dir = results_root / experiment
+    out_dir.mkdir(parents=True, exist_ok=True)
+    agg_path = out_dir / "aggregate.csv"
+    summary_path = out_dir / "aggregate_summary.csv"
     write_csv(rows, agg_path)
     write_csv(summary, summary_path)
     return agg_path, summary_path
@@ -102,15 +106,17 @@ def aggregate_experiment(experiment_dir: Path) -> tuple[Path, Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("experiment", help="Experiment id (e1, e2, e3, e4, e6)")
     parser.add_argument(
-        "experiment",
-        help="Experiment subdirectory under tests/experiments/results/ (e.g. e2)",
+        "--results-root",
+        default=str(Path(__file__).resolve().parent / "results"),
+        help="Root directory containing run artifacts (default: tests/experiments/results/).",
     )
     args = parser.parse_args()
-    base = Path(__file__).resolve().parent / "results" / args.experiment
-    if not base.exists():
-        raise SystemExit(f"No results dir at {base}")
-    agg_path, summary_path = aggregate_experiment(base)
+    root = Path(args.results_root)
+    if not root.exists():
+        raise SystemExit(f"No results dir at {root}")
+    agg_path, summary_path = aggregate_experiment(root, args.experiment)
     print(f"Wrote {agg_path}")
     print(f"Wrote {summary_path}")
 
