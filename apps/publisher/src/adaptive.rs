@@ -1,5 +1,53 @@
 use crate::video::VideoInfo;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum LadderSpec {
+  /// Today's hardcoded resolution-coupled ladder.
+  Default,
+  /// All variants at the same resolution; bitrates explicit.
+  /// Mapping `720p` -> height=720, width chosen from 16:9 (1280).
+  SingleRes {
+    height: u16,
+    bitrates_kbps: Vec<u32>,
+  },
+}
+
+#[allow(dead_code)]
+impl LadderSpec {
+  pub fn parse(s: &str) -> Result<Self, String> {
+    if s == "default" {
+      return Ok(LadderSpec::Default);
+    }
+    let (res_part, bitrate_part) = s
+      .split_once(':')
+      .ok_or_else(|| format!("ladder-spec: missing ':' in '{}'", s))?;
+    if res_part.is_empty() || bitrate_part.is_empty() {
+      return Err(format!("ladder-spec: empty section in '{}'", s));
+    }
+    let height: u16 = res_part
+      .strip_suffix('p')
+      .ok_or_else(|| format!("ladder-spec: resolution must end in 'p' in '{}'", s))?
+      .parse()
+      .map_err(|e| format!("ladder-spec: bad height in '{}': {}", s, e))?;
+    let bitrates_kbps: Vec<u32> = bitrate_part
+      .split(',')
+      .map(|x| {
+        x.trim()
+          .parse::<u32>()
+          .map_err(|e| format!("ladder-spec: bad bitrate '{}': {}", x, e))
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+    if bitrates_kbps.is_empty() {
+      return Err(format!("ladder-spec: empty bitrate list in '{}'", s));
+    }
+    Ok(LadderSpec::SingleRes {
+      height,
+      bitrates_kbps,
+    })
+  }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
   Q360p,
@@ -189,5 +237,30 @@ mod tests {
     assert_eq!(variants[0].quality, Quality::Q1080p);
     assert_eq!(variants[1].quality, Quality::Q720p);
     assert_eq!(variants[2].quality, Quality::Q360p);
+  }
+
+  #[test]
+  fn ladder_spec_parses_default() {
+    assert_eq!(LadderSpec::parse("default").unwrap(), LadderSpec::Default);
+  }
+
+  #[test]
+  fn ladder_spec_parses_single_res_720p_five_rungs() {
+    let spec = LadderSpec::parse("720p:400,800,1200,2500,5000").unwrap();
+    assert_eq!(
+      spec,
+      LadderSpec::SingleRes {
+        height: 720,
+        bitrates_kbps: vec![400, 800, 1200, 2500, 5000],
+      }
+    );
+  }
+
+  #[test]
+  fn ladder_spec_rejects_garbage() {
+    assert!(LadderSpec::parse("nonsense").is_err());
+    assert!(LadderSpec::parse("720p:").is_err());
+    assert!(LadderSpec::parse("720p:abc").is_err());
+    assert!(LadderSpec::parse(":400,800").is_err());
   }
 }
