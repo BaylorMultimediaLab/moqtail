@@ -8,11 +8,20 @@ import re
 from typing import Iterable
 
 
-# Matches the relay log line:
-#   Subscribe delay-mode resolved: request_id=N largest=Location { group: G, object: O }
+# Matches:
+#   Subscribe delay-mode resolved Ready: request_id=N largest=Location { group: G, object: O }
 #   oldest_cached=(Some(C)|None) -> start_location=Location { group: S, object: 0 }
-_RESOLVED_RE = re.compile(
-    r"Subscribe delay-mode resolved:.*?"
+_RESOLVED_READY_RE = re.compile(
+    r"Subscribe delay-mode resolved Ready:.*?"
+    r"largest=Location \{ group: (\d+), object: \d+ \}.*?"
+    r"oldest_cached=(Some\((\d+)\)|None).*?"
+    r"-> start_location=Location \{ group: (\d+), object: \d+ \}"
+)
+# Matches:
+#   Subscribe delay-mode resolved ClampedToOldest: request_id=N largest=Location { group: G, object: O }
+#   oldest_cached=(Some(C)|None) -> start_location=Location { group: S, object: 0 }
+_RESOLVED_CLAMPED_RE = re.compile(
+    r"Subscribe delay-mode resolved ClampedToOldest:.*?"
     r"largest=Location \{ group: (\d+), object: \d+ \}.*?"
     r"oldest_cached=(Some\((\d+)\)|None).*?"
     r"-> start_location=Location \{ group: (\d+), object: \d+ \}"
@@ -31,10 +40,10 @@ def parse_relay_decisions(log_text: str) -> list[dict]:
     Returns list of dicts: {classification, largest_group, start_location_group,
     oldest_cached_group?, delay_groups?}
 
-    Classification logic:
-      - HOLD line -> 'Hold'
-      - resolved with start_location.group == oldest_cached -> 'ClampedToOldest'
-      - resolved otherwise -> 'Ready'
+    Classification is read directly from the relay log's explicit marker:
+      - 'resolved Ready:' line -> 'Ready'
+      - 'resolved ClampedToOldest:' line -> 'ClampedToOldest'
+      - 'HOLD:' line -> 'Hold'
     """
     decisions = []
     for line in log_text.splitlines():
@@ -49,21 +58,32 @@ def parse_relay_decisions(log_text: str) -> list[dict]:
                     "oldest_cached_group": None,
                 })
             continue
-        if "delay-mode resolved" in line:
-            m = _RESOLVED_RE.search(line)
+        if "delay-mode resolved Ready:" in line:
+            m = _RESOLVED_READY_RE.search(line)
             if not m:
                 continue
             largest_group = int(m.group(1))
             oldest_str = m.group(3)
             oldest_cached = int(oldest_str) if oldest_str else None
             start_group = int(m.group(4))
-            classification = (
-                "ClampedToOldest"
-                if oldest_cached is not None and start_group == oldest_cached
-                else "Ready"
-            )
             decisions.append({
-                "classification": classification,
+                "classification": "Ready",
+                "largest_group": largest_group,
+                "oldest_cached_group": oldest_cached,
+                "start_location_group": start_group,
+                "delay_groups": None,
+            })
+            continue
+        if "delay-mode resolved ClampedToOldest:" in line:
+            m = _RESOLVED_CLAMPED_RE.search(line)
+            if not m:
+                continue
+            largest_group = int(m.group(1))
+            oldest_str = m.group(3)
+            oldest_cached = int(oldest_str) if oldest_str else None
+            start_group = int(m.group(4))
+            decisions.append({
+                "classification": "ClampedToOldest",
                 "largest_group": largest_group,
                 "oldest_cached_group": oldest_cached,
                 "start_location_group": start_group,

@@ -424,9 +424,9 @@ async fn handle_subscribe_message(
       let decision = compute_delayed_start(Some(largest.clone()), delay_groups, oldest_cached);
 
       match decision {
-        DelayedStart::Ready(loc) | DelayedStart::ClampedToOldest(loc) => {
+        DelayedStart::Ready(loc) => {
           info!(
-            "Subscribe delay-mode resolved: request_id={} largest={:?} \
+            "Subscribe delay-mode resolved Ready: request_id={} largest={:?} \
              oldest_cached={:?} -> start_location={:?}",
             sub.request_id, largest, oldest_cached, loc
           );
@@ -435,6 +435,19 @@ async fn handle_subscribe_message(
           // Drain any holding-state record for this request (we may have
           // registered earlier; try_resolve also clears any other now-Ready
           // entries from concurrent subscribers, which is fine — informational).
+          if registered {
+            let _ = track.holding_subscribes.write().await.try_resolve(largest);
+          }
+          break;
+        }
+        DelayedStart::ClampedToOldest(loc) => {
+          info!(
+            "Subscribe delay-mode resolved ClampedToOldest: request_id={} largest={:?} \
+             oldest_cached={:?} -> start_location={:?}",
+            sub.request_id, largest, oldest_cached, loc
+          );
+          sub.start_location = Some(loc);
+          sub.filter_type = FilterType::AbsoluteStart;
           if registered {
             let _ = track.holding_subscribes.write().await.try_resolve(largest);
           }

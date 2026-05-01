@@ -4,9 +4,11 @@ from trace_helpers import (
 )
 
 
+# Sample log using the explicit Ready / ClampedToOldest markers emitted by the
+# relay after the subscribe_handler.rs split (Fix #4).
 SAMPLE_RELAY_LOG = """
-2026-04-30 21:09 INFO Subscribe delay-mode resolved: request_id=1 largest=Location { group: 50, object: 0 } oldest_cached=Some(0) -> start_location=Location { group: 30, object: 0 }
-2026-04-30 21:10 INFO Subscribe delay-mode resolved: request_id=2 largest=Location { group: 60, object: 0 } oldest_cached=Some(40) -> start_location=Location { group: 40, object: 0 }
+2026-04-30 21:09 INFO Subscribe delay-mode resolved Ready: request_id=1 largest=Location { group: 50, object: 0 } oldest_cached=Some(0) -> start_location=Location { group: 30, object: 0 }
+2026-04-30 21:10 INFO Subscribe delay-mode resolved ClampedToOldest: request_id=2 largest=Location { group: 60, object: 0 } oldest_cached=Some(40) -> start_location=Location { group: 40, object: 0 }
 2026-04-30 21:11 INFO Subscribe delay-mode HOLD: request_id=3 delay_groups=200 largest=Location { group: 5, object: 0 }; awaiting live edge advance
 """
 
@@ -18,6 +20,20 @@ def test_parse_relay_decisions_finds_ready_clamped_and_hold():
     assert decisions[0]["start_location_group"] == 30
     assert decisions[1]["start_location_group"] == 40
     assert decisions[2]["delay_groups"] == 200
+
+
+def test_parse_relay_decisions_ready_at_oldest_boundary():
+    """When start_location == oldest_cached the explicit marker disambiguates."""
+    log = (
+        "2026-04-30 22:00 INFO Subscribe delay-mode resolved Ready: request_id=5 "
+        "largest=Location { group: 100, object: 0 } oldest_cached=Some(80) "
+        "-> start_location=Location { group: 80, object: 0 }\n"
+    )
+    decisions = parse_relay_decisions(log)
+    assert len(decisions) == 1
+    # Even though start_group == oldest_cached (both 80), the explicit 'Ready'
+    # marker is what counts — not a numeric comparison.
+    assert decisions[0]["classification"] == "Ready"
 
 
 def test_detect_rebuffers_from_metrics_thresholds():

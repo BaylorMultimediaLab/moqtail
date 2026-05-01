@@ -7,7 +7,7 @@
 - Forces an upswitch from the lowest variant to the highest at t=30s
 - Parses the relay log for the resolved decision
 
-Expected boundary: delay <= 20 lands Ready; delay > 20 lands ClampedToOldest.
+Expected boundary: delay < 20 lands Ready; delay >= 20 lands ClampedToOldest.
 The aligned switch should produce a near-zero PTS gap in the Ready case;
 the ClampedToOldest case is the operating-boundary observation we measure.
 
@@ -103,7 +103,7 @@ async def test_e4_cache_boundary(
     }
     (results_dir / "cell_params.json").write_text(json.dumps(cell_params))
 
-    expected_ready = delay <= _CACHE_SIZE
+    expected_ready = delay < _CACHE_SIZE
     relay_decision = decision.get("classification", "Unknown")
     pts_gaps = [
         abs(r.get("ptsGapMs", 0))
