@@ -58,6 +58,19 @@ def results_dir(results_base, request):
 
 @pytest.fixture
 def net(config):
+    # Clean any leaked Mininet state from a prior run BEFORE creating the
+    # network. Without this, when a previous test errors during topology
+    # construction, its `try/finally` cleanup never runs and leaves veth
+    # pairs (client-eth0, s2-eth2, etc.) in the root namespace. The next
+    # `addLink` then fails with "RTNETLINK answers: File exists" and
+    # cascades through every subsequent test in the session.
+    subprocess.run(
+        ["mn", "-c"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
     topo_cfg = config["topology"]
     network = create_network(
         link1_bw=topo_cfg["link1_default_bw"],
