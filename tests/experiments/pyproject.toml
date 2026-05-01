@@ -1,0 +1,16 @@
+[project]
+name = "experiments"
+version = "0.1.0"
+description = "Paper-experiment harness for MoQ ABR/switching research"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.58.0",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pyyaml>=6.0.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["."]
+pythonpath = [".", "../network"]
