@@ -129,3 +129,64 @@ def e6_heatmap_matrix(metric: str) -> pd.DataFrame:
     summary["profile"] = parsed[1]
     pivot = summary.pivot(index="abr_config", columns="profile", values=metric)
     return pivot.reindex(index=E6_ROW_ORDER, columns=E6_COL_ORDER)
+
+
+def compute_avg_delivered_bitrate_kbps(run_dir: Path) -> float:
+    """Compute time-weighted mean delivered bitrate (kbps) for a single run.
+
+    Reads metrics.csv, parses the bitrate from `active_track` strings of the
+    form ``video-<height>p-<bitrate>k`` (e.g. ``video-720p-2500k`` -> 2500),
+    and weights each sample by the wall-clock interval to its successor.
+
+    Rows whose track name does not match the pattern are dropped (their
+    interval is not credited to any rung). Returns NaN if no rows remain.
+    """
+    import numpy as np
+
+    df = load_run_metrics(run_dir)
+    df = df.copy()
+    # active_track examples: "video-720p-400k", "video-720p-5000k".
+    df["bitrate_kbps"] = (
+        df["active_track"].astype(str).str.extract(r"-(\d+)k$")[0].astype(float)
+    )
+    # Time slice each row owns = gap to the next sample. Last sample has no
+    # successor, so it contributes 0 weight (drop it).
+    df["dt_s"] = df["wall_clock_s"].diff().shift(-1).fillna(0)
+    valid = df.dropna(subset=["bitrate_kbps"])
+    total_weight = valid["dt_s"].sum()
+    if total_weight == 0:
+        return float("nan")
+    return float((valid["bitrate_kbps"] * valid["dt_s"]).sum() / total_weight)
+
+
+def e6_avg_bitrate_matrix() -> pd.DataFrame:
+    """8x3 matrix of mean delivered bitrate (kbps) per (abr_config, profile).
+
+    Walks every E6 per-run directory, computes the time-weighted bitrate for
+    each run via compute_avg_delivered_bitrate_kbps, then averages across runs
+    per cell. Cells with no runs appear as NaN; the row/column order matches
+    E6_ROW_ORDER / E6_COL_ORDER (same as e6_heatmap_matrix).
+    """
+    rows = []
+    for summary_path in sorted(RESULTS_ROOT.rglob("summary.json")):
+        try:
+            data = json.loads(summary_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("experiment") != "e6":
+            continue
+        cell_id = data.get("cell_id")
+        if not cell_id:
+            continue
+        bitrate = compute_avg_delivered_bitrate_kbps(summary_path.parent)
+        rows.append({"cell_id": cell_id, "bitrate_kbps": bitrate})
+    if not rows:
+        return pd.DataFrame(index=E6_ROW_ORDER, columns=E6_COL_ORDER, dtype=float)
+    df = pd.DataFrame(rows)
+    parsed = df["cell_id"].str.split("_", n=1, expand=True)
+    df["abr_config"] = parsed[0]
+    df["profile"] = parsed[1]
+    pivot = df.pivot_table(
+        index="abr_config", columns="profile", values="bitrate_kbps", aggfunc="mean"
+    )
+    return pivot.reindex(index=E6_ROW_ORDER, columns=E6_COL_ORDER)

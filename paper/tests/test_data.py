@@ -89,3 +89,47 @@ def test_e6_heatmap_matrix_returns_8x3_grid():
         "dampened", "aggressive", "lolp", "l2a",
     ]
     assert list(matrix.columns) == ["stable1.5M", "step3M_500k", "sin600k_3M"]
+
+
+def test_compute_avg_delivered_bitrate_kbps_returns_positive_for_real_run():
+    from _data import compute_avg_delivered_bitrate_kbps, find_median_run_dir
+    # Use a known run from E6 (or fall back to E3 which definitely has data).
+    run_dir = find_median_run_dir(
+        experiment="e3", cell_id="aligned_offset20", metric="max_playhead_gap_ms"
+    )
+    bitrate = compute_avg_delivered_bitrate_kbps(run_dir)
+    # Bitrates are in [400, 5000] kbps for the 720p ladder; time-weighted
+    # average must land somewhere in that closed range.
+    assert 400 <= bitrate <= 5000, f"bitrate {bitrate} outside ladder range"
+
+
+def test_compute_avg_delivered_bitrate_kbps_handles_unknown_track_format():
+    """If active_track is missing or doesn't match the pattern, NaN rows are
+    excluded from the time-weighted mean (not propagated as NaN)."""
+    from _data import compute_avg_delivered_bitrate_kbps
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        # Synthetic metrics.csv: 3 rows, last row has unknown track.
+        csv_text = (
+            "timestamp,active_track,bandwidth_bps,current_time\n"
+            "0.0,video-720p-1200k,0,0.0\n"
+            "1.0,video-720p-2500k,0,1.0\n"
+            "2.0,unknown,0,2.0\n"
+        )
+        (tmp_dir / "metrics.csv").write_text(csv_text)
+        bitrate = compute_avg_delivered_bitrate_kbps(tmp_dir)
+        # Time-weighted across the 2 valid rows: 1s @ 1200 + 1s @ 2500 = 1850 kbps
+        # (the unknown row's dt=1s is dropped because its bitrate is NaN).
+        assert 1800 <= bitrate <= 1900, f"expected ~1850, got {bitrate}"
+
+
+def test_e6_avg_bitrate_matrix_returns_8x3_with_real_values():
+    from _data import E6_COL_ORDER, E6_ROW_ORDER, e6_avg_bitrate_matrix
+    matrix = e6_avg_bitrate_matrix()
+    assert matrix.shape == (8, 3)
+    assert list(matrix.index) == E6_ROW_ORDER
+    assert list(matrix.columns) == E6_COL_ORDER
+    # At least some cells must have non-NaN bitrates from completed runs.
+    assert matrix.notna().any(axis=None)
