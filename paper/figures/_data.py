@@ -9,6 +9,7 @@ tests/experiments/summary.py — match those exactly.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -54,8 +55,6 @@ def find_median_run_dir(experiment: str, cell_id: str, metric: str) -> Path:
     pytest's parametrized ID, e.g.
     ``test_e3_aligned_switch[run2-offset20]/<timestamp>/``.
     """
-    import json
-
     candidates: list[tuple[float, Path]] = []
     for summary_path in sorted(RESULTS_ROOT.rglob("summary.json")):
         try:
@@ -120,6 +119,11 @@ def e6_heatmap_matrix(metric: str) -> pd.DataFrame:
     Cell-ids in the summary are formatted "{config}_{profile}".
     """
     summary = load_aggregate_summary("e6")
+    if metric not in summary.columns:
+        raise KeyError(
+            f"metric {metric!r} not found in e6 aggregate_summary; "
+            f"available columns: {list(summary.columns)}"
+        )
     parsed = summary["cell_id"].str.split("_", n=1, expand=True)
     summary["abr_config"] = parsed[0]
     summary["profile"] = parsed[1]
