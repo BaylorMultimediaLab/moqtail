@@ -8,6 +8,8 @@ tests can assert on the side effect.
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 # ACM sigconf two-column geometry. Measured from the template's
 # \showthe\columnwidth / \showthe\textwidth output.
@@ -49,13 +51,13 @@ def apply_acm_style() -> None:
     })
 
 
-def fig_one_col(height_in: float):
+def fig_one_col(height_in: float) -> tuple[Figure, Axes]:
     """Return a (fig, ax) sized for a single ACM column."""
     fig, ax = plt.subplots(figsize=(COLUMN_WIDTH_IN, height_in), constrained_layout=True)
     return fig, ax
 
 
-def fig_two_col(height_in: float):
+def fig_two_col(height_in: float) -> tuple[Figure, Axes]:
     """Return a (fig, ax) sized for the full ACM textwidth (figure*)."""
     fig, ax = plt.subplots(figsize=(TEXT_WIDTH_IN, height_in), constrained_layout=True)
     return fig, ax
