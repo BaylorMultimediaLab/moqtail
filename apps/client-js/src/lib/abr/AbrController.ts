@@ -41,10 +41,7 @@ export interface AbrMetrics {
 const MAX_HISTORY = 60;
 
 export class AbrController {
-  #player: Pick<
-    Player,
-    'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth' | 'abortPendingSwitch'
-  >;
+  #player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>;
   #rulesCollection: AbrRulesCollection;
   #tracks: Track[];
   #settings: AbrSettings;
@@ -95,14 +92,7 @@ export class AbrController {
   #probeHorizonSec = 2;
 
   constructor(
-    player: Pick<
-      Player,
-      | 'getMetrics'
-      | 'switchTrack'
-      | 'setEmaHalfLives'
-      | 'probeTrackBandwidth'
-      | 'abortPendingSwitch'
-    >,
+    player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>,
     rulesCollection: AbrRulesCollection,
     tracks: Track[],
     settings: AbrSettings,
@@ -232,25 +222,25 @@ export class AbrController {
     }
 
     // Switching guard timeout: if #switching has been held longer than
-    // SWITCH_TIMEOUT_MS without releasing, the chosen target is unfulfillable
+    // SWITCH_TIMEOUT_MS without releasing, the chosen target may be unfulfillable
     // (typical case: upswitch fired right before a regime change drops the
-    // link below the new target's source rate). Force-release so ABR can
-    // re-evaluate; abort the dead pendingSwitch in the player so stale data
-    // arriving on the wedged track doesn't accidentally land later.
+    // link below the new target's source rate). Release the ABR guard so rules
+    // can re-evaluate.
     //
-    // Relay state on timeout: we only clear client-side state. The relay's
-    // `switch_context` (apps/relay/src/server/client/switch_context.rs) is
-    // a HashMap<track, Current|Next|None> with uniqueness enforced on each
-    // update. The next SWITCH ABR fires uses the same subscription_request_id
-    // and gets handled by handle_switch_message — the relay treats the
-    // abandoned target as the new switch-from track and overwrites the
-    // HashMap entries cleanly. Stale data still queued at the relay arrives
-    // after the new pendingSwitch is set; the write-handler's
-    // `objectTrackName !== struct.pendingSwitch?.trackName` filter drops it.
+    // Do NOT abort pendingSwitch here. dc82f32 ("remove switch timeout failsafe
+    // that corrupts track transitions") established that clearing pendingSwitch
+    // on timeout *is* the bug it's claimed to fix: when relay delivery is
+    // merely delayed (e.g. bandwidth-saturated joining-state replay still in
+    // flight), the new track's frames eventually arrive but the cleared
+    // pendingSwitch makes the writer drop them as stale, permanently breaking
+    // the transition. The "stale data lands on wrong track" worry the abort
+    // claimed to address is already handled: if ABR fires another switch in
+    // the cooldown, switchTrack overwrites pendingSwitch implicitly. If no new
+    // switch fires and the original target's frames eventually arrive,
+    // applying them is the correct outcome — the user did request that track.
     if (this.#switching && Date.now() - this.#switchingStartTs > AbrController.SWITCH_TIMEOUT_MS) {
       this.#switching = false;
       this.#pendingFrameAdvance = false;
-      this.#player.abortPendingSwitch?.();
       this.#switchBackoffUntil = Date.now() + AbrController.SWITCH_COOLDOWN_MS;
     }
 
