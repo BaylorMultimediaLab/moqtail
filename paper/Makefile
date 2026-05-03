@@ -18,7 +18,8 @@ NOTEBOOKS := \
 PDFS := \
   figures/fig1_architecture.pdf \
   figures/fig2_e2_e3_playhead_gap.pdf \
-  figures/fig3_trace_naive_vs_aligned.pdf \
+  figures/fig3a_trace_naive.pdf \
+  figures/fig3b_trace_aligned.pdf \
   figures/fig4_e4_cache_boundary.pdf \
   figures/fig5_e6_composability.pdf
 
@@ -29,7 +30,9 @@ all: $(PDFS)
 figures/fig2_e2_e3_playhead_gap.pdf: notebooks/fig2_e2_e3_playhead_gap.ipynb
 	.venv/bin/jupyter nbconvert --to notebook --execute --inplace $<
 
-figures/fig3_trace_naive_vs_aligned.pdf: notebooks/fig3_trace_naive_vs_aligned.ipynb
+# Both PDFs are emitted by the same notebook execution; declare each as a
+# target with the same recipe so make can request either by name.
+figures/fig3a_trace_naive.pdf figures/fig3b_trace_aligned.pdf: notebooks/fig3_trace_naive_vs_aligned.ipynb
 	.venv/bin/jupyter nbconvert --to notebook --execute --inplace $<
 
 figures/fig4_e4_cache_boundary.pdf: notebooks/fig4_e4_cache_boundary.ipynb
