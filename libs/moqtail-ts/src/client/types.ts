@@ -237,6 +237,15 @@ export type SwitchOptions = {
   subscriptionRequestId: bigint
   /** Optional additional {@link VersionSpecificParameters}; existing parameters persist if omitted. */
   parameters?: VersionSpecificParameters
+  /**
+   * Optional pre-allocated request id for the SWITCH itself. When provided, the
+   * client uses it instead of allocating internally — letting the caller update
+   * its own subscription-id state synchronously *before* awaiting, so concurrent
+   * `switch()` calls each pass a fresh `subscriptionRequestId` rather than racing
+   * on a stale one (which the relay rejects as ProtocolViolation).
+   * Allocate via {@link MOQtailClient.allocateNextRequestId}.
+   */
+  requestId?: bigint
 }
 
 /**

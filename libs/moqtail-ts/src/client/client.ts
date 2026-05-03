@@ -331,6 +331,19 @@ export class MOQtailClient {
   }
 
   /**
+   * Pre-allocate a client-originated request id for an outbound control message.
+   *
+   * Pass the result back via the matching options' `requestId` field (e.g.
+   * {@link SwitchOptions.requestId}). This lets the caller update its own
+   * subscription-id state synchronously *before* awaiting the operation —
+   * required when multiple concurrent calls would otherwise read a stale
+   * subscription_request_id and the relay would reject the racing message.
+   */
+  allocateNextRequestId(): bigint {
+    return this.#nextClientRequestId
+  }
+
+  /**
    * Gets the current server setup configuration.
    *
    * @returns The {@link ServerSetup} instance associated with this client.
@@ -1178,7 +1191,7 @@ export class MOQtailClient {
       if (!subscription) throw new InternalError('MOQtailClient.switch', 'Request exists but subscription does not')
 
       if (!parameters) parameters = new VersionSpecificParameters()
-      const requestId = this.#nextClientRequestId
+      const requestId = args.requestId ?? this.#nextClientRequestId
       this.requests.set(requestId, subscription)
 
       const msg = new Switch(requestId, fullTrackName, subscriptionRequestId, parameters.build())
@@ -1888,7 +1901,10 @@ export class MOQtailClient {
 
                 const fullTrackName = this.aliasFullTrackNameMap.get(header.trackAlias)
                 if (!fullTrackName) {
-                  throw new ProtocolViolationError('MOQtailClient', 'No full track name for received track alias')
+                  throw new ProtocolViolationError(
+                    'MOQtailClient',
+                    `No full track name for received track alias ${header.trackAlias} (groupId=${header.groupId})`,
+                  )
                 }
 
                 const moqtObject = MoqtObject.fromSubgroupObject(
@@ -1918,7 +1934,10 @@ export class MOQtailClient {
           return
         }
 
-        throw new ProtocolViolationError('MOQtailClient', 'No subscription for received track alias')
+        throw new ProtocolViolationError(
+          'MOQtailClient',
+          `No subscription for received track alias ${header.trackAlias} (groupId=${header.groupId})`,
+        )
       }
     } catch (error) {
       //this.disconnect()
