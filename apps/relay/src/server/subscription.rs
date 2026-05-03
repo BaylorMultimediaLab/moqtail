@@ -114,6 +114,67 @@ impl From<Subscribe> for SubscriptionState {
   }
 }
 
+/// Decide whether the new (Next-status) track should promote to Current right
+/// now, given OLD's progress and the new track's incoming object.
+///
+/// For naive switches the new sub was started with `LatestObject` and OLD has
+/// been catching up via cache; we wait until NEW's incoming live object passes
+/// OLD's `last_sent_max.group` before flipping the new track to Current and
+/// snapping its start to the next group boundary. That avoids a mid-GOP
+/// pre-OLD jump on the new track.
+///
+/// For aligned switches the new sub was started with `AbsoluteStart(player_target)`;
+/// the player explicitly chose where the new track should begin and *needs*
+/// every cached object from that target onward. The old "wait until NEW
+/// catches OLD's last_sent" gate silently drops those cached objects (NEW is
+/// in `forward=false` while waiting), so the new track effectively starts at
+/// OLD's buffer position regardless of `START_LOCATION_GROUP`. Honor the
+/// player by promoting immediately.
+fn should_promote_switch(
+  player_start: Option<&Location>,
+  last_sent_max: Option<&Location>,
+  object_location: &Location,
+) -> bool {
+  if player_start.is_some() {
+    return true;
+  }
+  match last_sent_max {
+    Some(last) => object_location.group >= last.group,
+    None => true,
+  }
+}
+
+/// Decide the new track's `start_location` once the relay has accepted that the
+/// switch boundary is crossed (`switch_at_next_group == true`).
+///
+/// Three inputs:
+/// - `player_start`: what the new subscription was created with. For aligned
+///   switches the SWITCH-handler set this from the player's `START_LOCATION_GROUP`
+///   (so it's `Some`); for naive switches it's `None` (`Subscribe::new_latest_object`).
+/// - `last_sent_next`: `OLD.last_sent_max_location.group + 1` if known, else `None`.
+/// - `object_location`: the location of the object that just triggered the
+///   switch_context check on the new track.
+///
+/// Aligned switches MUST honor `player_start`. Otherwise the new track silently
+/// degrades to starting at OLD's last-sent group, which on a filtered client is
+/// `delay_groups` ahead of the playhead — defeating the entire aligned switch.
+fn compute_switch_start_location(
+  player_start: Option<Location>,
+  last_sent_next: Option<Location>,
+  object_location: &Location,
+) -> Location {
+  if let Some(loc) = player_start {
+    loc
+  } else if let Some(loc) = last_sent_next {
+    loc
+  } else {
+    Location {
+      object: 0,
+      group: object_location.group + 1,
+    }
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct Subscription {
   pub request_id: u64,
@@ -518,42 +579,37 @@ impl Subscription {
 
     match status {
       SwitchStatus::Next => {
-        // check whether the group id of this track
-        // is equal to or greater than the one of
-        // the switch context's current track
-        // if so, set this track as current
-        let mut switch_at_next_group = false;
+        // Look up OLD's last_sent_max so we know whether to gate (naive) and
+        // where to snap the new start_location. For aligned switches the gate
+        // is bypassed in should_promote_switch — see its doc comment.
+        let mut last_sent_max_location = None;
         let mut new_start_location = None;
 
-        if let Some(current_track_name) = self.subscriber.switch_context.get_current().await {
-          let current_subscription_opt = self
+        if let Some(current_track_name) = self.subscriber.switch_context.get_current().await
+          && let Some(current_subscription_opt) = self
             .subscriber
             .subscriptions
             .get_subscription(&current_track_name)
-            .await;
-
-          if let Some(current_subscription) = current_subscription_opt
-            && let Some(current_subscription) = current_subscription.upgrade()
-          {
-            let current_subscription = current_subscription.read().await;
-            let current_state = current_subscription.subscription_state.read().await;
-            let last_sent_max_location = current_state.last_sent_max_location.clone();
-
-            if let Some(loc) = last_sent_max_location {
-              switch_at_next_group = object_location.group >= loc.group;
-              let mut loc_clone = loc.clone();
-              loc_clone.group += 1; // switch at the next group after the last sent max location of the current track
-              loc_clone.object = 0; // reset object id to 0 to read from the start of the group
-              new_start_location = Some(loc_clone);
-            } else {
-              // if there is no last sent location, we can switch
-              switch_at_next_group = true;
-            }
+            .await
+          && let Some(current_subscription) = current_subscription_opt.upgrade()
+        {
+          let current_subscription = current_subscription.read().await;
+          let current_state = current_subscription.subscription_state.read().await;
+          last_sent_max_location = current_state.last_sent_max_location.clone();
+          if let Some(loc) = &last_sent_max_location {
+            new_start_location = Some(Location {
+              group: loc.group + 1, // next group after OLD's last sent
+              object: 0,            // start of that group
+            });
           }
-        } else {
-          // no current track, we can switch
-          switch_at_next_group = true;
         }
+
+        let player_start = self.subscription_state.read().await.start_location.clone();
+        let switch_at_next_group = should_promote_switch(
+          player_start.as_ref(),
+          last_sent_max_location.as_ref(),
+          object_location,
+        );
 
         if switch_at_next_group {
           // set this track as current
@@ -578,14 +634,15 @@ impl Subscription {
 
           state.is_joining = true;
 
-          if new_start_location.is_some() {
-            state.start_location = new_start_location;
-          } else {
-            state.start_location = Some(Location {
-              object: 0,
-              group: object_location.group + 1,
-            });
-          }
+          // Aligned switches arrive with state.start_location already set from
+          // the player's START_LOCATION_GROUP; that target must win over the
+          // last_sent+1 fallback (see compute_switch_start_location).
+          let player_start = state.start_location.clone();
+          state.start_location = Some(compute_switch_start_location(
+            player_start,
+            new_start_location,
+            object_location,
+          ));
 
           state.end_group = 0; // remove end group limit
 
@@ -1254,5 +1311,184 @@ mod tests_from_subscribe_is_joining {
     let state = SubscriptionState::from(sub);
     assert_eq!(state.start_location, None);
     assert!(!state.is_joining);
+  }
+}
+
+#[cfg(test)]
+mod tests_compute_switch_start_location {
+  use super::*;
+  use moqtail::model::common::location::Location;
+
+  /// Aligned switch: the SWITCH-handler created the new subscription with
+  /// `Subscribe::new_absolute_start(group=17, object=0)` because the player sent
+  /// `START_LOCATION_GROUP=17`. Even if OLD has progressed far beyond 17 on the
+  /// relay side (filtered client buffered ahead of the playhead), the new
+  /// track's start_location must remain at the player's request.
+  #[test]
+  fn aligned_switch_preserves_player_start_location() {
+    let player_start = Some(Location {
+      group: 17,
+      object: 0,
+    });
+    let last_sent_next = Some(Location {
+      group: 24,
+      object: 0,
+    }); // OLD.last_sent (23, *) + 1
+    let object_location = Location {
+      group: 23,
+      object: 0,
+    };
+
+    let result = compute_switch_start_location(player_start, last_sent_next, &object_location);
+
+    assert_eq!(
+      result,
+      Location {
+        group: 17,
+        object: 0
+      },
+      "aligned switch must honor the player's START_LOCATION_GROUP; \
+       overriding it to OLD.last_sent+1 silently degrades the switch on \
+       filtered clients where last_sent is far ahead of the playhead"
+    );
+  }
+
+  /// Naive switch with prior OLD progress: `Subscribe::new_latest_object` so
+  /// player_start is None. Snap to OLD.last_sent.group + 1 for a clean
+  /// group-aligned splice.
+  #[test]
+  fn naive_switch_with_old_progress_uses_last_sent_next() {
+    let player_start = None;
+    let last_sent_next = Some(Location {
+      group: 24,
+      object: 0,
+    });
+    let object_location = Location {
+      group: 23,
+      object: 5,
+    };
+
+    let result = compute_switch_start_location(player_start, last_sent_next, &object_location);
+
+    assert_eq!(
+      result,
+      Location {
+        group: 24,
+        object: 0
+      }
+    );
+  }
+
+  /// Naive switch with no OLD progress (OLD never delivered anything):
+  /// fall back to the incoming object's group + 1.
+  #[test]
+  fn naive_switch_without_old_progress_uses_object_next_group() {
+    let player_start = None;
+    let last_sent_next = None;
+    let object_location = Location {
+      group: 7,
+      object: 3,
+    };
+
+    let result = compute_switch_start_location(player_start, last_sent_next, &object_location);
+
+    assert_eq!(
+      result,
+      Location {
+        group: 8,
+        object: 0
+      }
+    );
+  }
+}
+
+#[cfg(test)]
+mod tests_should_promote_switch {
+  use super::*;
+  use moqtail::model::common::location::Location;
+
+  /// Aligned switch: filtered client's playhead sits well behind OLD's relay-
+  /// side buffer position. The new sub starts at the player's target
+  /// (group 17), but cache replay's first object (17, 0) is far behind OLD's
+  /// last_sent (22, 23). The promotion gate must NOT wait for catch-up — that
+  /// would buffer-and-drop every cached object from 17..21 (NEW sits in
+  /// forward=false the whole time), and the new track would effectively start
+  /// at group 22 regardless of START_LOCATION_GROUP.
+  #[test]
+  fn aligned_switch_promotes_immediately_even_when_object_is_behind_old() {
+    let player_start = Some(Location {
+      group: 17,
+      object: 0,
+    });
+    let last_sent_max = Some(Location {
+      group: 22,
+      object: 23,
+    });
+    let object_location = Location {
+      group: 17,
+      object: 0,
+    };
+
+    assert!(
+      should_promote_switch(
+        player_start.as_ref(),
+        last_sent_max.as_ref(),
+        &object_location
+      ),
+      "aligned switch must promote on first object, otherwise cached objects \
+       in [player_start, last_sent_max] are dropped while waiting to catch up"
+    );
+  }
+
+  /// Naive switch (player_start=None, LatestObject) and the new sub's first
+  /// live object is still behind OLD's last_sent: defer promotion so the new
+  /// track doesn't begin earlier than OLD's progress.
+  #[test]
+  fn naive_switch_defers_promotion_when_object_is_behind_old() {
+    let last_sent_max = Some(Location {
+      group: 22,
+      object: 23,
+    });
+    let object_location = Location {
+      group: 17,
+      object: 0,
+    };
+
+    assert!(!should_promote_switch(
+      None,
+      last_sent_max.as_ref(),
+      &object_location
+    ));
+  }
+
+  /// Naive switch, NEW's incoming object has caught up to OLD: promote.
+  #[test]
+  fn naive_switch_promotes_when_object_meets_or_exceeds_old() {
+    let last_sent_max = Some(Location {
+      group: 22,
+      object: 23,
+    });
+    let object_location = Location {
+      group: 22,
+      object: 0,
+    };
+
+    assert!(should_promote_switch(
+      None,
+      last_sent_max.as_ref(),
+      &object_location
+    ));
+  }
+
+  /// Naive switch with no OLD progress (no current track or it never sent
+  /// anything): nothing to wait for.
+  #[test]
+  fn naive_switch_promotes_when_no_old_progress() {
+    let object_location = Location {
+      group: 5,
+      object: 0,
+    };
+
+    assert!(should_promote_switch(None, None, &object_location));
   }
 }
