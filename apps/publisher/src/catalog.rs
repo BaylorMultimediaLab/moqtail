@@ -13,6 +13,7 @@ pub struct CatalogTrack {
   pub role: String,
   pub target_latency_ms: u32,
   pub init_segment: Vec<u8>,
+  pub gop_duration_ms: u32,
 }
 
 /// Builds an MSF draft-00 catalog JSON payload.
@@ -40,7 +41,8 @@ pub fn build_catalog_json(tracks: &[CatalogTrack]) -> Result<Bytes> {
         "bitrate": t.bitrate_bps,
         "framerate": t.framerate,
         "timescale": 90000,
-        "initData": init_b64
+        "initData": init_b64,
+        "gopDurationMs": t.gop_duration_ms
       })
     })
     .collect();
@@ -569,6 +571,7 @@ mod tests {
       role: "video".to_owned(),
       target_latency_ms: 1500,
       init_segment: vec![0, 1, 2, 3],
+      gop_duration_ms: 1000,
     }];
     let json_bytes = build_catalog_json(&tracks).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
@@ -584,5 +587,28 @@ mod tests {
     assert_eq!(v["tracks"][0]["framerate"], 30.0);
     assert_eq!(v["tracks"][0]["timescale"], 90000);
     assert_eq!(v["tracks"][0]["initData"], "AAECAw==");
+  }
+
+  #[test]
+  fn test_catalog_includes_gop_duration_ms() {
+    let track = CatalogTrack {
+      name: "video/720p/2500k".to_string(),
+      codec: "hev1.1.6.L120.B0".to_string(),
+      width: 1280,
+      height: 720,
+      framerate: 30.0,
+      bitrate_bps: 2_500_000,
+      role: "video".to_string(),
+      target_latency_ms: 1000,
+      init_segment: vec![],
+      gop_duration_ms: 1000,
+    };
+    let json_bytes = build_catalog_json(&[track]).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+    assert_eq!(v["tracks"][0]["gopDurationMs"], 1000);
+    assert!(
+      v["tracks"][0]["gopDurationMs"].is_u64(),
+      "must be integer, not float"
+    );
   }
 }

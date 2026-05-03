@@ -4,6 +4,7 @@ use moqtail::model::data::subgroup_header::SubgroupHeader;
 use moqtail::model::data::subgroup_object::SubgroupObject;
 use moqtail::transport::data_stream_handler::{HeaderInfo, SendDataStream};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -32,6 +33,15 @@ const SINGLE_SUBGROUP_ID: u8 = 0;
 /// TRACK_STREAM format, which carries group_id per object and supports
 /// multi-group delivery on one stream, but the current library API does not
 /// expose that stream type yet.
+///
+/// `inter_object_delay`: if `Some`, sleep that long after each object send.
+/// Live mode passes `None` because the upstream encoder naturally paces
+/// packets ~ms apart (each frame is an encoder round-trip). Replay mode reads
+/// a whole GOP from disk in microseconds and would otherwise burst all 60
+/// objects at QUIC line rate, which races with the relay's
+/// per-subscriber stream-creation on the first object after a switch and
+/// leads to the relay dropping objects 1..N (see relay subscription.rs's
+/// `Send stream not found` path). 2 ms per object reproduces live's pacing.
 pub async fn send_track(
   connection: Arc<wtransport::Connection>,
   track_alias: u64,
@@ -39,6 +49,7 @@ pub async fn send_track(
   publisher_priority: u8,
   mut gop_rx: tokio::sync::mpsc::Receiver<EncodedGop>,
   emit_barrier: Arc<tokio::sync::Barrier>,
+  inter_object_delay: Option<Duration>,
 ) -> Result<()> {
   info!("Sender ({} alias={}): starting", label, track_alias);
 
@@ -55,7 +66,15 @@ pub async fn send_track(
     // clears when switching to a higher bitrate whose pipeline fills slower.
     emit_barrier.wait().await;
 
-    match send_group(&connection, track_alias, publisher_priority, &gop).await {
+    match send_group(
+      &connection,
+      track_alias,
+      publisher_priority,
+      &gop,
+      inter_object_delay,
+    )
+    .await
+    {
       Ok(()) => {
         groups_sent += 1;
         if !first_group_logged {
@@ -107,6 +126,7 @@ async fn send_group(
   track_alias: u64,
   publisher_priority: u8,
   gop: &EncodedGop,
+  inter_object_delay: Option<Duration>,
 ) -> Result<()> {
   let stream = connection
     .open_uni()
@@ -157,6 +177,10 @@ async fn send_group(
       .with_context(|| format!("failed to write object {}", object_id))?;
 
     prev_object_id = Some(object_id);
+
+    if let Some(delay) = inter_object_delay {
+      tokio::time::sleep(delay).await;
+    }
   }
 
   handler

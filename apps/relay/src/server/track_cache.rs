@@ -332,4 +332,168 @@ impl TrackCache {
     let cache_key = CacheKey::new(self.track_alias, group_id);
     self.cache.contains_key(&cache_key)
   }
+
+  /// Returns the smallest group_id currently in the cache, or None if empty.
+  /// Used by the SUBSCRIBE handler to clamp delay-mode start_locations to the
+  /// oldest available group when the requested target predates the cache window.
+  #[allow(dead_code)]
+  pub async fn oldest_group_id(&self) -> Option<u64> {
+    self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.track_alias == self.track_alias)
+      .map(|(k, _)| k.group_id)
+      .min()
+  }
+
+  /// Returns the largest group_id currently in the cache for this track,
+  /// or None if empty. Mirror of `oldest_group_id`.
+  ///
+  /// Used by the SUBSCRIBE/replay path: when a delay-mode subscribe has no
+  /// prior `last_received_object_location` (initial subscribe), this gives
+  /// the upper bound for cache replay so the subscriber receives objects in
+  /// the range [start_location, newest_group_id] before live forwarding takes
+  /// over.
+  #[allow(dead_code)]
+  pub async fn newest_group_id(&self) -> Option<u64> {
+    self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.track_alias == self.track_alias)
+      .map(|(k, _)| k.group_id)
+      .max()
+  }
+}
+
+#[cfg(test)]
+mod tests_oldest_group {
+  use super::*;
+  use bytes::Bytes;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      initial_max_request_id: 100,
+    }
+  }
+
+  fn fetch_object(group_id: u64, object_id: u64) -> FetchObject {
+    FetchObject {
+      group_id,
+      subgroup_id: 0,
+      object_id,
+      publisher_priority: 0,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    }
+  }
+
+  #[tokio::test]
+  async fn oldest_group_id_returns_none_when_empty() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    assert_eq!(cache.oldest_group_id().await, None);
+  }
+
+  #[tokio::test]
+  async fn oldest_group_id_returns_smallest_present_group() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(7, 0)).await;
+    cache.add_object(fetch_object(5, 0)).await;
+    cache.add_object(fetch_object(9, 0)).await;
+    // moka inserts may be eventually-consistent; force pending tasks
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.oldest_group_id().await, Some(5));
+  }
+
+  #[tokio::test]
+  async fn oldest_group_id_handles_single_group() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(42, 0)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.oldest_group_id().await, Some(42));
+  }
+}
+
+#[cfg(test)]
+mod tests_newest_group {
+  use super::*;
+  use bytes::Bytes;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      initial_max_request_id: 100,
+    }
+  }
+
+  fn fetch_object(group_id: u64, object_id: u64) -> FetchObject {
+    FetchObject {
+      group_id,
+      subgroup_id: 0,
+      object_id,
+      publisher_priority: 0,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    }
+  }
+
+  #[tokio::test]
+  async fn newest_group_id_returns_none_when_empty() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    assert_eq!(cache.newest_group_id().await, None);
+  }
+
+  #[tokio::test]
+  async fn newest_group_id_returns_largest_present_group() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(7, 0)).await;
+    cache.add_object(fetch_object(5, 0)).await;
+    cache.add_object(fetch_object(9, 0)).await;
+    // moka inserts may be eventually-consistent; force pending tasks
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.newest_group_id().await, Some(9));
+  }
+
+  #[tokio::test]
+  async fn newest_group_id_filters_by_track_alias() {
+    // Tracks have separate cache instances today, but the filter is a
+    // safety net for if the cache backing is ever shared. Mirror the
+    // tests_oldest_group regression check.
+    let cfg = test_config();
+    let cache_a = TrackCache::new(1, 100, &cfg);
+    cache_a.add_object(fetch_object(5, 0)).await;
+    cache_a.run_pending_tasks().await;
+    assert_eq!(cache_a.newest_group_id().await, Some(5));
+  }
 }

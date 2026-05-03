@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+use crate::pacing::pace_gop_emit;
 
 /// A batch of raw decoded frames representing one GOP (1 second of video).
 /// Frames are in YUV420P (planar) format at source resolution.
@@ -14,25 +17,36 @@ pub struct RawGop {
 /// Decodes the source video one GOP at a time and fans out each GOP
 /// to all encoder variant pipelines via bounded mpsc channels.
 ///
-/// Backpressure: when the slowest pipeline's channel is full the decoder
-/// blocks, preventing unbounded memory growth. This is the dash.js-style
-/// "no unbounded queues" pattern applied to the publisher side.
+/// Two modes:
+/// - **Live** (`single_pass = false`): wall-clock paced at one GOP per second
+///   of source content so a recorded file behaves like a real live camera, and
+///   the file is looped forever. Backpressure on the bounded channels makes
+///   the decoder block when downstream is slow.
+/// - **Prepare** (`single_pass = true`): no pacing, no looping — runs the
+///   source through once at full speed so the cache populates as quickly as
+///   the hardware allows, then returns `Ok(())`.
 pub async fn decode(
   video_path: String,
   framerate: f64,
   gop_txs: Vec<mpsc::Sender<RawGop>>,
+  single_pass: bool,
 ) -> Result<()> {
-  tokio::task::spawn_blocking(move || decode_blocking(&video_path, framerate, &gop_txs))
-    .await
-    .context("decoder task panicked")?
+  tokio::task::spawn_blocking(move || {
+    decode_blocking(&video_path, framerate, &gop_txs, single_pass)
+  })
+  .await
+  .context("decoder task panicked")?
 }
 
 fn decode_blocking(
   video_path: &str,
   framerate: f64,
   gop_txs: &[mpsc::Sender<RawGop>],
+  single_pass: bool,
 ) -> Result<()> {
   let gop_size = crate::encoder::gop_size(framerate) as usize;
+  let gop_duration_secs = gop_size as f64 / framerate;
+  let pacing_start = Instant::now();
   let mut gop_id: u64 = 0;
   let mut frame_buf: Vec<Bytes> = Vec::with_capacity(gop_size);
   let mut decoded_frame = ffmpeg_next::frame::Video::empty();
@@ -56,10 +70,15 @@ fn decode_blocking(
 
     if loop_count == 0 {
       info!(
-        "Decoding: {}x{}, gop_size={} (looping)",
+        "Decoding: {}x{}, gop_size={} ({})",
         decoder.width(),
         decoder.height(),
-        gop_size
+        gop_size,
+        if single_pass {
+          "single pass"
+        } else {
+          "looping"
+        }
       );
     } else {
       info!("Looping video (pass {}), gop_id={}", loop_count + 1, gop_id);
@@ -82,6 +101,9 @@ fn decode_blocking(
             frames: std::mem::replace(&mut frame_buf, Vec::with_capacity(gop_size)),
           };
 
+          if !single_pass {
+            pace_gop_emit(pacing_start, gop_duration_secs, gop_id);
+          }
           if !fanout_blocking(gop_txs, gop) {
             warn!("All receivers dropped, stopping decoder");
             return Ok(());
@@ -104,6 +126,9 @@ fn decode_blocking(
           frames: std::mem::replace(&mut frame_buf, Vec::with_capacity(gop_size)),
         };
 
+        if !single_pass {
+          pace_gop_emit(pacing_start, gop_duration_secs, gop_id);
+        }
         if !fanout_blocking(gop_txs, gop) {
           return Ok(());
         }
@@ -119,6 +144,9 @@ fn decode_blocking(
         gop_id,
         frames: std::mem::replace(&mut frame_buf, Vec::with_capacity(gop_size)),
       };
+      if !single_pass {
+        pace_gop_emit(pacing_start, gop_duration_secs, gop_id);
+      }
       if !fanout_blocking(gop_txs, gop) {
         return Ok(());
       }
@@ -126,6 +154,10 @@ fn decode_blocking(
     }
 
     loop_count += 1;
+    if single_pass {
+      info!("Decoder: single pass complete, {} GOPs emitted", gop_id);
+      return Ok(());
+    }
   }
 }
 

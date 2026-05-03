@@ -52,6 +52,14 @@ export enum VersionSpecificParameterType {
   AuthorizationToken = 0x01,
   DeliveryTimeout = 0x02,
   MaxCacheDuration = 0x04,
+  /**
+   * Project-local extension; non-MoQT-standard.
+   * Behind-live offset in groups for filtered (delay-mode) clients.
+   */
+  DelayGroups = 0x70,
+  /** Project-local extension; non-MoQT-standard.
+   *  Absolute group_id where a Switch should start delivering the new track. */
+  StartLocationGroup = 0x72,
 }
 
 export function versionSpecificParameterTypeFromNumber(value: number): VersionSpecificParameterType {
@@ -62,6 +70,10 @@ export function versionSpecificParameterTypeFromNumber(value: number): VersionSp
       return VersionSpecificParameterType.DeliveryTimeout
     case 0x04:
       return VersionSpecificParameterType.MaxCacheDuration
+    case 0x70:
+      return VersionSpecificParameterType.DelayGroups
+    case 0x72:
+      return VersionSpecificParameterType.StartLocationGroup
     default:
       throw new InvalidTypeError('versionSpecificParameterTypeFromNumber', `Invalid version parameter type: ${value}`)
   }

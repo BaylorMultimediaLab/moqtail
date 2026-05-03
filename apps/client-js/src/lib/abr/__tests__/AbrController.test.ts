@@ -14,7 +14,6 @@ type MockPlayer = {
   switchTrack: ReturnType<typeof vi.fn>;
   setEmaHalfLives: ReturnType<typeof vi.fn>;
   probeTrackBandwidth: ReturnType<typeof vi.fn>;
-  abortPendingSwitch: ReturnType<typeof vi.fn>;
 };
 
 function makeTracks(): Track[] {
@@ -68,7 +67,6 @@ function makeController(
     switchTrack: vi.fn().mockResolvedValue(undefined),
     setEmaHalfLives: vi.fn(),
     probeTrackBandwidth: vi.fn().mockResolvedValue(0),
-    abortPendingSwitch: vi.fn(),
   };
   const capturedMetrics: AbrMetrics[] = [];
   const controller = new AbrController(player, collection, tracks, settings, m =>

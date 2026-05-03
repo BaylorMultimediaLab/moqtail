@@ -42,7 +42,13 @@ fn prft_box(reference_track_id: u32, ntp_timestamp: u64, media_time: u64) -> [u8
 }
 
 /// Convert the current UNIX wall clock to NTP fixed-point format.
-fn now_ntp_timestamp() -> u64 {
+///
+/// Public so the replay path ([crate::replay]) can stamp pre-encoded chunks
+/// with the wall-clock time at which they're being emitted, instead of the
+/// (stale) encode-time NTP that was baked into the cached bytes — otherwise
+/// the receiver's per-frame latency metric reads "this was encoded hours ago"
+/// and the player drains its buffer.
+pub fn now_ntp_timestamp() -> u64 {
   let d = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .unwrap_or_default();
@@ -153,6 +159,24 @@ pub fn wrap_cmaf_chunk(
 
   debug_assert_eq!(buf.len(), total);
   Bytes::from(buf)
+}
+
+/// Replaces the 8-byte NTP timestamp inside the leading `prft` box of a
+/// CMAF chunk produced by [`wrap_cmaf_chunk`]. Returns the original `Bytes`
+/// unchanged if the input doesn't begin with a valid prft box (length and
+/// fourcc check). Tries to mutate in place when the `Bytes` is uniquely
+/// owned (the common case after reading a cached `.gop` file) to avoid a
+/// per-packet allocation.
+pub fn replace_prft_ntp(pkt: Bytes, ntp: u64) -> Bytes {
+  if pkt.len() < 32 || &pkt[4..8] != b"prft" {
+    return pkt;
+  }
+  let mut bm = match pkt.try_into_mut() {
+    Ok(bm) => bm,
+    Err(b) => bytes::BytesMut::from(b.as_ref()),
+  };
+  bm[16..24].copy_from_slice(&ntp.to_be_bytes());
+  bm.freeze()
 }
 
 /// Converts Annex B HEVC bitstream (start-code delimited) to HVCC/AVCC format
@@ -278,6 +302,25 @@ mod tests {
     assert_eq!(&b[12..16], &7u32.to_be_bytes());
     assert_eq!(&b[16..24], &0xABCD_1234_DEAD_BEEFu64.to_be_bytes());
     assert_eq!(&b[24..32], &0x1122_3344u64.to_be_bytes());
+  }
+
+  #[test]
+  fn test_replace_prft_ntp_patches_only_ntp_bytes() {
+    let pkt = wrap_cmaf_chunk(7, 0x1234, 1500, true, &[0xAA; 16]);
+    let original = pkt.clone();
+    let new_ntp: u64 = 0x4242_4242_4242_4242;
+    let patched = replace_prft_ntp(pkt, new_ntp);
+    assert_eq!(patched.len(), original.len());
+    assert_eq!(&patched[16..24], &new_ntp.to_be_bytes());
+    assert_eq!(&patched[0..16], &original[0..16]);
+    assert_eq!(&patched[24..], &original[24..]);
+  }
+
+  #[test]
+  fn test_replace_prft_ntp_passes_through_when_no_prft() {
+    let bogus = Bytes::from(vec![0u8; 32]);
+    let result = replace_prft_ntp(bogus.clone(), 0x12345678);
+    assert_eq!(result, bogus);
   }
 
   #[test]

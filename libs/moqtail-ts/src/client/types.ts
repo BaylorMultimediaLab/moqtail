@@ -25,6 +25,7 @@ import {
   ControlMessage,
   DatagramObject,
   DatagramStatus,
+  MoqtObject,
 } from '@/model'
 import { PublishNamespaceRequest } from './request/publish_namespace'
 import { FetchRequest } from './request/fetch'
@@ -32,6 +33,22 @@ import { SubscribeRequest } from './request/subscribe'
 import { SubscribeNamespaceRequest } from './request/subscribe_namespace'
 import { MOQtailClient } from './client'
 import { PublishRequest } from './request/publish'
+
+/**
+ * Successful return value from {@link MOQtailClient.subscribe} (and {@link MOQtailClient.switch}).
+ *
+ * Carries the request id, the object stream, and the relay's `largest_location`
+ * at SubscribeOk time (when known). `largestLocation` is `undefined` for tracks
+ * with no known live edge (e.g. a track that has not produced any object yet).
+ */
+export type SubscribeResult = {
+  /** Request id (bigint) for the SUBSCRIBE; pass to {@link MOQtailClient.unsubscribe} or {@link MOQtailClient.subscribeUpdate}. */
+  requestId: bigint
+  /** Decoded object stream — read with `for await (const obj of stream)`. */
+  stream: ReadableStream<MoqtObject>
+  /** Relay's `largest_location` at SubscribeOk time, or `undefined` if no live edge known. */
+  largestLocation?: Location | undefined
+}
 /**
  * Discriminated union of every in‑flight MOQ‑tail control request tracked by the {@link MOQtailClient}.
  *
@@ -220,6 +237,15 @@ export type SwitchOptions = {
   subscriptionRequestId: bigint
   /** Optional additional {@link VersionSpecificParameters}; existing parameters persist if omitted. */
   parameters?: VersionSpecificParameters
+  /**
+   * Optional pre-allocated request id for the SWITCH itself. When provided, the
+   * client uses it instead of allocating internally — letting the caller update
+   * its own subscription-id state synchronously *before* awaiting, so concurrent
+   * `switch()` calls each pass a fresh `subscriptionRequestId` rather than racing
+   * on a stale one (which the relay rejects as ProtocolViolation).
+   * Allocate via {@link MOQtailClient.allocateNextRequestId}.
+   */
+  requestId?: bigint
 }
 
 /**

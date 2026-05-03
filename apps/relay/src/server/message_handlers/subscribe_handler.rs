@@ -21,11 +21,13 @@ use crate::server::track::{Track, TrackStatus};
 use bytes::Bytes;
 use core::result::Result;
 use moqtail::model::common::location::Location;
-use moqtail::model::control::constant::GroupOrder;
+use moqtail::model::common::pair::KeyValuePair;
+use moqtail::model::control::constant::{FilterType, GroupOrder};
 use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::data::subgroup_header::SubgroupHeader;
 use moqtail::model::data::subgroup_object::SubgroupObject;
 use moqtail::model::error::TerminationCode;
+use moqtail::model::parameter::constant::VersionSpecificParameterType;
 use moqtail::model::{
   common::reason_phrase::ReasonPhrase, control::control_message::ControlMessage,
 };
@@ -34,6 +36,85 @@ use moqtail::transport::data_stream_handler::SubscribeRequest;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
+
+/// Search a SUBSCRIBE message's parameters for the project-local DELAY_GROUPS
+/// (VarInt). Returns the first match's value, or None if not present.
+///
+/// Used by the SUBSCRIBE handler when computing a delay-mode start location:
+/// the relay puts a filtered client `delay_groups` behind the live edge.
+#[allow(dead_code)]
+fn parse_delay_groups(params: &[KeyValuePair]) -> Option<u64> {
+  params.iter().find_map(|p| match p {
+    KeyValuePair::VarInt { type_value, value }
+      if *type_value == VersionSpecificParameterType::DelayGroups as u64 =>
+    {
+      Some(*value)
+    }
+    _ => None,
+  })
+}
+
+/// Search a SWITCH message's parameters for the project-local
+/// START_LOCATION_GROUP (VarInt). Returns the first match's value, or None
+/// if not present. Used by handle_switch_message to start the new track at
+/// an absolute group_id rather than at the live edge.
+fn parse_start_location_group(params: &[KeyValuePair]) -> Option<u64> {
+  params.iter().find_map(|p| match p {
+    KeyValuePair::VarInt { type_value, value }
+      if *type_value == VersionSpecificParameterType::StartLocationGroup as u64 =>
+    {
+      Some(*value)
+    }
+    _ => None,
+  })
+}
+
+/// The relay's decision after applying a `DELAY_GROUPS` parameter to a SUBSCRIBE.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum DelayedStart {
+  /// The requested target is in-window; deliver from this location.
+  Ready(Location),
+  /// The requested target predates the cache; deliver from the oldest available.
+  ClampedToOldest(Location),
+  /// `largest_location.group < delay_groups` (stream too young) — register the
+  /// subscribe in a pending state and resolve once the live edge advances.
+  Hold { delay_groups: u64 },
+}
+
+/// Decide what start_location a delayed (filtered) SUBSCRIBE should use.
+///
+/// Pure function: no I/O, no async, no side effects. Inputs are the relay's
+/// current view of the live edge (`largest`), the delay the client requested
+/// (`delay_groups`), and the oldest group currently in the cache (or None
+/// if the relay hasn't started caching yet).
+#[allow(dead_code)]
+pub(crate) fn compute_delayed_start(
+  largest: Option<Location>,
+  delay_groups: u64,
+  oldest_cached_group: Option<u64>,
+) -> DelayedStart {
+  let Some(largest_loc) = largest else {
+    return DelayedStart::Hold { delay_groups };
+  };
+  if largest_loc.group < delay_groups {
+    return DelayedStart::Hold { delay_groups };
+  }
+  let target_group = largest_loc.group - delay_groups;
+  let target = Location {
+    group: target_group,
+    object: 0,
+  };
+  if let Some(oldest) = oldest_cached_group
+    && target_group < oldest
+  {
+    return DelayedStart::ClampedToOldest(Location {
+      group: oldest,
+      object: 0,
+    });
+  }
+  DelayedStart::Ready(target)
+}
 
 // Synthetic-probe track aliases live well above any plausible publisher-
 // assigned alias so they can't collide with real video tracks. Per IETF 119
@@ -319,6 +400,84 @@ async fn handle_subscribe_message(
     .await;
 
   let track = track_arc.read().await;
+
+  // Delay-mode handling: filtered clients subscribe with DELAY_GROUPS asking
+  // the relay to start delivery `delay_groups` behind the live edge.
+  let mut sub = sub;
+  if let Some(delay_groups) = parse_delay_groups(&sub.subscribe_parameters) {
+    info!(
+      "Subscribe has DELAY_GROUPS={} (request_id={})",
+      delay_groups, sub.request_id
+    );
+    // Loop until we can resolve the requested start position.
+    // Mesa-style condition wait: arm the Notify *before* re-reading state
+    // to avoid lost-wakeup races (a notify_waiters between our compute and
+    // our await would otherwise be missed).
+    let mut registered = false;
+    loop {
+      let notified = track.live_edge_advanced.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+
+      let largest = track.largest_location.read().await.clone();
+      let oldest_cached = track.cache.oldest_group_id().await;
+      let decision = compute_delayed_start(Some(largest.clone()), delay_groups, oldest_cached);
+
+      match decision {
+        DelayedStart::Ready(loc) => {
+          info!(
+            "Subscribe delay-mode resolved Ready: request_id={} largest={:?} \
+             oldest_cached={:?} -> start_location={:?}",
+            sub.request_id, largest, oldest_cached, loc
+          );
+          sub.start_location = Some(loc);
+          sub.filter_type = FilterType::AbsoluteStart;
+          // Drain any holding-state record for this request (we may have
+          // registered earlier; try_resolve also clears any other now-Ready
+          // entries from concurrent subscribers, which is fine — informational).
+          if registered {
+            let _ = track.holding_subscribes.write().await.try_resolve(largest);
+          }
+          break;
+        }
+        DelayedStart::ClampedToOldest(loc) => {
+          info!(
+            "Subscribe delay-mode resolved ClampedToOldest: request_id={} largest={:?} \
+             oldest_cached={:?} -> start_location={:?}",
+            sub.request_id, largest, oldest_cached, loc
+          );
+          sub.start_location = Some(loc);
+          sub.filter_type = FilterType::AbsoluteStart;
+          if registered {
+            let _ = track.holding_subscribes.write().await.try_resolve(largest);
+          }
+          break;
+        }
+        DelayedStart::Hold { delay_groups: dg } => {
+          if !registered {
+            info!(
+              "Subscribe delay-mode HOLD: request_id={} delay_groups={} \
+               largest={:?}; awaiting live edge advance",
+              sub.request_id, dg, largest
+            );
+            // Register the holding state (observability / future drain).
+            track
+              .holding_subscribes
+              .write()
+              .await
+              .register(sub.request_id, dg);
+            registered = true;
+          }
+          // Wait for the live edge to advance, then re-check.
+          notified.await;
+          // Loop again. The Notify arm we placed before the read still
+          // covers any notify_waiters that fired during the read; if
+          // such a notify already happened, this `.await` returns
+          // immediately, and we re-evaluate.
+        }
+      }
+    }
+  }
 
   add_subscription(sub.clone(), &track, client.clone(), is_switch).await;
 
@@ -808,15 +967,39 @@ async fn handle_switch_message(
     return Err(TerminationCode::ProtocolViolation);
   }
 
-  let subscribe = Subscribe::new_latest_object(
-    switch_message.request_id,
-    switch_message.track_namespace.clone(),
-    switch_message.track_name.clone(),
-    0,
-    GroupOrder::Original,
-    true,
-    switch_message.subscribe_parameters.clone(),
-  );
+  // Inspect for START_LOCATION_GROUP: when present, start the new track at
+  // the requested absolute group (aligned switch). Otherwise default to the
+  // existing live-edge ("naive switch") semantic.
+  let subscribe = match parse_start_location_group(&switch_message.subscribe_parameters) {
+    Some(start_group) => {
+      info!(
+        "Switch has START_LOCATION_GROUP={}; using new_absolute_start (request_id={})",
+        start_group, switch_message.request_id
+      );
+      Subscribe::new_absolute_start(
+        switch_message.request_id,
+        switch_message.track_namespace.clone(),
+        switch_message.track_name.clone(),
+        0,
+        GroupOrder::Original,
+        true,
+        Location {
+          group: start_group,
+          object: 0,
+        },
+        switch_message.subscribe_parameters.clone(),
+      )
+    }
+    None => Subscribe::new_latest_object(
+      switch_message.request_id,
+      switch_message.track_namespace.clone(),
+      switch_message.track_name.clone(),
+      0,
+      GroupOrder::Original,
+      true,
+      switch_message.subscribe_parameters.clone(),
+    ),
+  };
 
   let new_full_track_name = subscribe.get_full_track_name();
 
@@ -880,5 +1063,171 @@ pub async fn handle(
       // no-op
       Ok(())
     }
+  }
+}
+
+#[cfg(test)]
+mod tests_parse_delay_groups {
+  use super::*;
+
+  fn delay_groups_kvp(value: u64) -> KeyValuePair {
+    KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::DelayGroups as u64,
+      value,
+    }
+  }
+
+  #[test]
+  fn parse_delay_groups_returns_some_when_present() {
+    let params = vec![delay_groups_kvp(5)];
+    assert_eq!(parse_delay_groups(&params), Some(5));
+  }
+
+  #[test]
+  fn parse_delay_groups_returns_none_when_absent() {
+    let params: Vec<KeyValuePair> = vec![];
+    assert_eq!(parse_delay_groups(&params), None);
+  }
+
+  #[test]
+  fn parse_delay_groups_ignores_other_params() {
+    let params = vec![KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::DeliveryTimeout as u64,
+      value: 99,
+    }];
+    assert_eq!(parse_delay_groups(&params), None);
+  }
+
+  #[test]
+  fn parse_delay_groups_tolerates_duplicate_returns_first() {
+    // Defensive: if a peer sends two DELAY_GROUPS entries, return the first.
+    let params = vec![delay_groups_kvp(7), delay_groups_kvp(11)];
+    assert_eq!(parse_delay_groups(&params), Some(7));
+  }
+
+  #[test]
+  fn parse_delay_groups_ignores_bytes_kvp_with_same_type_id() {
+    // Defensive: 0x70 is even (varint), so a Bytes KVP with the same type
+    // would be malformed; we shouldn't extract a value from it.
+    use bytes::Bytes;
+    let params = vec![KeyValuePair::Bytes {
+      type_value: VersionSpecificParameterType::DelayGroups as u64,
+      value: Bytes::from_static(b"oops"),
+    }];
+    assert_eq!(parse_delay_groups(&params), None);
+  }
+}
+
+#[cfg(test)]
+mod tests_compute_delayed_start {
+  use super::*;
+  use moqtail::model::common::location::Location;
+
+  fn loc(group: u64, object: u64) -> Location {
+    Location { group, object }
+  }
+
+  #[test]
+  fn ready_when_largest_is_well_above_delay_and_target_in_cache() {
+    // largest=100, delay=2 -> target=98; oldest=0 (deep cache) -> Ready(98,0)
+    let result = compute_delayed_start(Some(loc(100, 0)), 2, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(98, 0)));
+  }
+
+  #[test]
+  fn hold_when_largest_below_delay() {
+    // largest=1, delay=5 -> can't subtract -> Hold{delay=5}
+    let result = compute_delayed_start(Some(loc(1, 0)), 5, Some(0));
+    assert_eq!(result, DelayedStart::Hold { delay_groups: 5 });
+  }
+
+  #[test]
+  fn ready_when_largest_exactly_equals_delay() {
+    // Boundary case: largest.group == delay_groups → target_group = 0,
+    // which is in-window when oldest=0. Pins the hold/release pivot at
+    // exact equality (would catch a regression to `<=` in the Hold check).
+    let result = compute_delayed_start(Some(loc(5, 0)), 5, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(0, 0)));
+  }
+
+  #[test]
+  fn hold_when_largest_is_none() {
+    // No live edge known yet -> Hold
+    let result = compute_delayed_start(None, 5, None);
+    assert_eq!(result, DelayedStart::Hold { delay_groups: 5 });
+  }
+
+  #[test]
+  fn clamped_to_oldest_when_target_below_cache_window() {
+    // largest=100, delay=80 -> target=20; oldest=50 -> Clamp to (50,0)
+    let result = compute_delayed_start(Some(loc(100, 0)), 80, Some(50));
+    assert_eq!(result, DelayedStart::ClampedToOldest(loc(50, 0)));
+  }
+
+  #[test]
+  fn ready_when_delay_is_zero() {
+    // delay=0 means "behave like LatestObject" -> target equals largest
+    let result = compute_delayed_start(Some(loc(100, 0)), 0, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(100, 0)));
+  }
+
+  #[test]
+  fn ready_when_target_exactly_equals_oldest_cached() {
+    // largest=100, delay=50 -> target=50; oldest=50 -> not below, so Ready (not Clamp)
+    let result = compute_delayed_start(Some(loc(100, 0)), 50, Some(50));
+    assert_eq!(result, DelayedStart::Ready(loc(50, 0)));
+  }
+
+  #[test]
+  fn ready_when_oldest_cached_is_none() {
+    // No cache info -> trust the target. (Conservative: if we don't know
+    // the cache window, don't preemptively clamp.)
+    let result = compute_delayed_start(Some(loc(100, 0)), 80, None);
+    assert_eq!(result, DelayedStart::Ready(loc(20, 0)));
+  }
+}
+
+#[cfg(test)]
+mod tests_parse_start_location_group {
+  use super::*;
+  use moqtail::model::common::pair::KeyValuePair;
+  use moqtail::model::parameter::constant::VersionSpecificParameterType;
+
+  fn start_location_kvp(value: u64) -> KeyValuePair {
+    KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::StartLocationGroup as u64,
+      value,
+    }
+  }
+
+  #[test]
+  fn parse_returns_some_when_present() {
+    let params = vec![start_location_kvp(42)];
+    assert_eq!(parse_start_location_group(&params), Some(42));
+  }
+
+  #[test]
+  fn parse_returns_none_when_absent() {
+    let params: Vec<KeyValuePair> = vec![];
+    assert_eq!(parse_start_location_group(&params), None);
+  }
+
+  #[test]
+  fn parse_ignores_other_params() {
+    let params = vec![KeyValuePair::VarInt {
+      type_value: VersionSpecificParameterType::DelayGroups as u64,
+      value: 99,
+    }];
+    assert_eq!(parse_start_location_group(&params), None);
+  }
+
+  #[test]
+  fn parse_ignores_bytes_kvp_with_same_type_id() {
+    use bytes::Bytes;
+    let params = vec![KeyValuePair::Bytes {
+      type_value: VersionSpecificParameterType::StartLocationGroup as u64,
+      value: Bytes::from_static(b"oops"),
+    }];
+    assert_eq!(parse_start_location_group(&params), None);
   }
 }

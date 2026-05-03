@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+export const DEFAULT_GOP_DURATION_MS = 1000
+
 // Type definitions
 export interface CMSFTrack {
   name: string
@@ -27,6 +29,7 @@ export interface CMSFTrack {
   timescale?: number
   bitrate?: number
   initData?: string
+  gopDurationMs?: number
 }
 
 export interface CMSF {
@@ -142,6 +145,14 @@ function validateTrack(track: unknown): CMSFTrack {
     bitrate = t['bitrate']
   }
 
+  let gopDurationMs: number | undefined
+  if (t['gopDurationMs'] !== undefined) {
+    if (!isNumber(t['gopDurationMs'])) {
+      throw new Error('Track.gopDurationMs must be a number')
+    }
+    gopDurationMs = t['gopDurationMs']
+  }
+
   let initData: string | undefined
   if (t['initData'] !== undefined) {
     if (!isString(t['initData'])) {
@@ -180,6 +191,7 @@ function validateTrack(track: unknown): CMSFTrack {
   if (timescale !== undefined) result.timescale = timescale
   if (bitrate !== undefined) result.bitrate = bitrate
   if (initData !== undefined) result.initData = initData
+  if (gopDurationMs !== undefined) result.gopDurationMs = gopDurationMs
 
   return result
 }
@@ -277,6 +289,24 @@ class CMSFCatalog {
   getTimescale(trackName: string) {
     const track = this.#catalog.tracks.find((track) => track.name === this.extractTrackName(trackName))
     return track?.timescale
+  }
+
+  /**
+   * Returns the track's GOP duration in ms. If the field is absent from the
+   * catalog or the track is unknown, returns the project default
+   * (DEFAULT_GOP_DURATION_MS) and emits console.warn. Always returns a number
+   * so callers can use it in arithmetic without nullish handling — this is the
+   * intentional asymmetry with getTimescale, which returns number | undefined.
+   */
+  getGopDurationMs(trackName: string): number {
+    const track = this.#catalog.tracks.find((track) => track.name === this.extractTrackName(trackName))
+    if (track?.gopDurationMs === undefined) {
+      console.warn(
+        `Track "${trackName}" is missing gopDurationMs in catalog; defaulting to ${DEFAULT_GOP_DURATION_MS}ms`,
+      )
+      return DEFAULT_GOP_DURATION_MS
+    }
+    return track.gopDurationMs
   }
 
   getInitData(trackName: string) {

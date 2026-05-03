@@ -58,6 +58,19 @@ def results_dir(results_base, request):
 
 @pytest.fixture
 def net(config):
+    # Clean any leaked Mininet state from a prior run BEFORE creating the
+    # network. Without this, when a previous test errors during topology
+    # construction, its `try/finally` cleanup never runs and leaves veth
+    # pairs (client-eth0, s2-eth2, etc.) in the root namespace. The next
+    # `addLink` then fails with "RTNETLINK answers: File exists" and
+    # cascades through every subsequent test in the session.
+    subprocess.run(
+        ["mn", "-c"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
     topo_cfg = config["topology"]
     network = create_network(
         link1_bw=topo_cfg["link1_default_bw"],
@@ -165,6 +178,11 @@ def pytest_configure(config):
         "markers",
         "abr_url_overrides(**kwargs): merge extra ABR settings into the page URL "
         "for this test (e.g. throughputSlowHalfLifeSeconds=4).",
+    )
+    config.addinivalue_line(
+        "markers",
+        "abr_settings_override(settings): inject window.__abrSettingsOverride before "
+        "Connect click. Used by E6 to sweep ABR rule configurations.",
     )
 
 
@@ -394,6 +412,17 @@ async def browser_page(net, config, results_dir, request):
             else:
                 raise RuntimeError("Client-JS never exposed __moqtailMetrics")
 
+            # Test harness ABR override: experiment cells stamp this marker per
+            # parametric instance (E6 sweep). The hook in apps/client-js/src/app.tsx
+            # reads window.__abrSettingsOverride at AbrController construction; we
+            # set it after page.goto but before Connect click so it lands in time.
+            settings_marker = request.node.get_closest_marker("abr_settings_override")
+            if settings_marker and settings_marker.args:
+                settings = settings_marker.args[0]
+                await page.evaluate(
+                    "(s) => { window.__abrSettingsOverride = s; }", settings
+                )
+
             # The client-js UI sits idle until Connect is clicked, so the ABR
             # pipeline (and window.__moqtailMetrics.abr) stays null without this.
             await page.locator('input[type="url"]').fill(relay_url)
@@ -460,6 +489,10 @@ def collector(results_dir):
     try:
         c.save_csv(results_dir / "metrics.csv")
         c.save_switches_json(results_dir / "switches.json")
+        c.save_discontinuities_csv(
+            results_dir / "switch_discontinuities.csv",
+            c.last_discontinuities,
+        )
     except Exception:
         pass
 

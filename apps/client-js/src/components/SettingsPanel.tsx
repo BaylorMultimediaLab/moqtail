@@ -24,6 +24,15 @@ export interface SettingsPanelProps {
   onSettingsChange: (settings: AbrSettings) => void;
   blurSettings: BlurSettings;
   onBlurSettingsChange: (settings: BlurSettings) => void;
+  // Pre-connect client mode (immutable while connected).
+  clientMode: 'filtered' | 'unfiltered';
+  onClientModeChange: (mode: 'filtered' | 'unfiltered') => void;
+  filterDelaySeconds: number;
+  onFilterDelaySecondsChange: (seconds: number) => void;
+  /** When non-'idle', the Connection card is disabled. */
+  connectStatus: 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
+  switchMode: 'naive' | 'aligned';
+  onSwitchModeChange: (mode: 'naive' | 'aligned') => void;
 }
 
 function SettingCheckbox({
@@ -103,7 +112,10 @@ function SectionLabel({ children }: { children: preact.ComponentChildren }) {
 const ABR_RULES = [
   'ThroughputRule',
   'BolaRule',
+  'ProbeRule',
   'InsufficientBufferRule',
+  'BufferDrainRateRule',
+  'LatencyTrendRule',
   'SwitchHistoryRule',
   'DroppedFramesRule',
   'AbandonRequestsRule',
@@ -116,6 +128,13 @@ export function SettingsPanel({
   onSettingsChange,
   blurSettings,
   onBlurSettingsChange,
+  clientMode,
+  onClientModeChange,
+  filterDelaySeconds,
+  onFilterDelaySecondsChange,
+  connectStatus,
+  switchMode,
+  onSwitchModeChange,
 }: SettingsPanelProps) {
   const setBlurMode = (mode: BlurMode) => onBlurSettingsChange({ ...blurSettings, mode });
   const setBlurStrength = (strength: number) => onBlurSettingsChange({ ...blurSettings, strength });
@@ -146,6 +165,61 @@ export function SettingsPanel({
       {/* Horizontal scroll wrapper */}
       <div className="relative">
         <div className="scrollbar-thin scrollbar-track-transparent scrollbar-thumb-neutral-700 flex snap-x snap-proximity gap-3 overflow-x-auto pb-2">
+          {/* Connection Card (pre-connect only) */}
+          <OptionCard title="Connection">
+            <SectionLabel>Client Mode</SectionLabel>
+            <div className="mb-2 flex gap-1">
+              {(['unfiltered', 'filtered'] as const).map(m => (
+                <button
+                  key={m}
+                  disabled={connectStatus !== 'idle'}
+                  onClick={() => onClientModeChange(m)}
+                  className={cn(
+                    'flex-1 rounded border px-2 py-1 text-[10px] capitalize transition-colors',
+                    clientMode === m
+                      ? 'border-blue-500 bg-blue-500/20 text-blue-200'
+                      : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200',
+                    connectStatus !== 'idle' && 'cursor-not-allowed opacity-50',
+                  )}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+            {clientMode === 'filtered' && (
+              <>
+                <SectionLabel>Filter Delay (s)</SectionLabel>
+                <div className={cn(connectStatus !== 'idle' && 'pointer-events-none opacity-50')}>
+                  <NumberInput
+                    label="Seconds behind live"
+                    value={filterDelaySeconds}
+                    placeholder="2"
+                    onChange={v => onFilterDelaySecondsChange(v < 0 ? 0 : v)}
+                  />
+                </div>
+              </>
+            )}
+            <SectionLabel>Switch Mode</SectionLabel>
+            <div className="mb-2 flex gap-1">
+              {(['naive', 'aligned'] as const).map(m => (
+                <button
+                  key={m}
+                  disabled={connectStatus !== 'idle'}
+                  onClick={() => onSwitchModeChange(m)}
+                  className={cn(
+                    'flex-1 rounded border px-2 py-1 text-[10px] capitalize transition-colors',
+                    switchMode === m
+                      ? 'border-blue-500 bg-blue-500/20 text-blue-200'
+                      : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200',
+                    connectStatus !== 'idle' && 'cursor-not-allowed opacity-50',
+                  )}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </OptionCard>
+
           {/* Blur Card */}
           <OptionCard title="Blur">
             <SectionLabel>Mode</SectionLabel>

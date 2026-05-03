@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-import { useState, useRef, useCallback, useEffect} from 'preact/hooks';
+import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
 import { Tuple, type CMSF } from 'moqtail';
-import MSEBuffer from '@/lib/buffer';
+import MSEBuffer, { computeLiveEdgeDelay } from '@/lib/buffer';
 import { AbrController, AbrRulesCollection, DEFAULT_ABR_SETTINGS } from '@/lib/abr';
 import type { AbrMetrics, AbrSettings } from '@/lib/abr';
 import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
@@ -229,9 +229,26 @@ function TrackGroup({
 }
 
 export function App() {
-  const [relayUrl, setRelayUrl] = useState('https://ord.abr.moqtail.dev');
+  const [relayUrl, setRelayUrl] = useState('https://127.0.0.1:4433');
   const [namespace, setNamespace] = useState('moqtail');
   const [status, setStatus] = useState<Status>('idle');
+  const [clientMode, setClientMode] = useState<'filtered' | 'unfiltered'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const cm = params.get('clientMode');
+    return cm === 'filtered' || cm === 'unfiltered' ? cm : 'unfiltered';
+  });
+  const [filterDelaySeconds, setFilterDelaySeconds] = useState<number>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const fd = params.get('filterDelay');
+    if (!fd) return 2;
+    const n = parseFloat(fd);
+    return Number.isFinite(n) && n >= 0 ? n : 2;
+  });
+  const [switchMode, setSwitchMode] = useState<'naive' | 'aligned'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sm = params.get('switchMode');
+    return sm === 'aligned' || sm === 'naive' ? sm : 'naive';
+  });
   const [tracks, setTracks] = useState<Track[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
@@ -269,6 +286,7 @@ export function App() {
   });
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const [catalogTracks, setCatalogTracks] = useState<CMSF['tracks'] | null>(null);
   const abrRef = useRef<AbrController | null>(null);
   const rulesRef = useRef<AbrRulesCollection | null>(null);
   const metricsRef = useRef<MetricsCollector | null>(null);
@@ -326,11 +344,17 @@ export function App() {
   }, [blurSettings]);
 
   useEffect(() => {
+    // Preserve fields populated outside React (e.g. firstReceivedGroupId,
+    // switchDiscontinuities — written from player.ts as media objects arrive).
+    const prev = window.__moqtailMetrics;
     window.__moqtailMetrics = {
       abr: abrMetrics,
       samples: metricsSnapshot,
+      firstReceivedGroupId: prev?.firstReceivedGroupId,
+      switchDiscontinuities: prev?.switchDiscontinuities,
+      catalogTracks: catalogTracks ?? prev?.catalogTracks,
     };
-  }, [abrMetrics, metricsSnapshot]);
+  }, [abrMetrics, metricsSnapshot, catalogTracks]);
 
   const disposePlayer = useCallback(async () => {
     if (abrRef.current) {
@@ -373,12 +397,16 @@ export function App() {
         relayUrl,
         namespace: Tuple.fromUtf8Path(namespace),
         receiveCatalogViaSubscribe: true,
+        clientMode,
+        filterDelaySeconds,
+        switchMode,
       });
       playerRef.current = player;
 
       const catalog = await player.initialize();
       const allTracks = catalog.getTracks();
       setTracks(allTracks);
+      setCatalogTracks(allTracks);
 
       // Pick startup video track: use WebTransport bandwidth estimate if available,
       // fall back to lowest-bitrate track when no estimate is possible.
@@ -402,18 +430,57 @@ export function App() {
         setSelectedVideo(firstVideo.name);
         setStatus('restarting');
         await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, {
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+        });
         await player.addMediaTrack(firstVideo.name);
         await player.startMedia();
         setStatus('playing');
         const videoTracks = allTracks.filter(t => t.role === 'video');
-        const rulesCollection = new AbrRulesCollection(abrSettings);
+        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
+        // before playback starts so we can sweep ABR rule configurations without
+        // shipping a UI control. Production paths leave this undefined and the
+        // deep merge becomes a no-op.
+        type AbrOverride = Partial<typeof abrSettings> & {
+          rules?: Partial<typeof abrSettings.rules>;
+        };
+        const override =
+          typeof window !== 'undefined'
+            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
+            : undefined;
+        const effectiveAbrSettings = override
+          ? {
+              ...abrSettings,
+              ...override,
+              rules: Object.fromEntries(
+                Object.entries({
+                  ...abrSettings.rules,
+                  ...(override.rules ?? {}),
+                }).map(([name, cfg]) => {
+                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
+                  if (!base) return [name, cfg];
+                  return [
+                    name,
+                    {
+                      ...base,
+                      ...cfg,
+                      parameters: {
+                        ...(base.parameters ?? {}),
+                        ...(cfg.parameters ?? {}),
+                      },
+                    },
+                  ];
+                }),
+              ),
+            }
+          : abrSettings;
+        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
         rulesRef.current = rulesCollection;
         const abr = new AbrController(
           player,
           rulesCollection,
           videoTracks,
-          abrSettings,
+          effectiveAbrSettings,
           setAbrMetrics,
         );
         abrRef.current = abr;
@@ -438,7 +505,7 @@ export function App() {
       setStatus('error');
       await disposePlayer();
     }
-  }, [relayUrl, namespace, disposePlayer, abrSettings]);
+  }, [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode]);
 
   const startPlayback = useCallback(
     async (videoTrack: string | null, audioTrack: string | null) => {
@@ -457,28 +524,72 @@ export function App() {
           relayUrl,
           namespace: Tuple.fromUtf8Path(namespace),
           receiveCatalogViaSubscribe: true,
+          clientMode,
+          filterDelaySeconds,
+          switchMode,
         });
         playerRef.current = player;
 
         const catalog = await player.initialize();
-        setTracks(catalog.getTracks());
+        const allTracksForPlayback = catalog.getTracks();
+        setTracks(allTracksForPlayback);
+        setCatalogTracks(allTracksForPlayback);
 
         await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, {
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+        });
 
         if (videoTrack) await player.addMediaTrack(videoTrack);
         if (audioTrack) await player.addMediaTrack(audioTrack);
 
         await player.startMedia();
         setStatus('playing');
-        const videoTracksForAbr = catalog.getTracks().filter(t => t.role === 'video');
-        const rulesCollection = new AbrRulesCollection(abrSettings);
+        const videoTracksForAbr = allTracksForPlayback.filter(t => t.role === 'video');
+        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
+        // before playback starts so we can sweep ABR rule configurations without
+        // shipping a UI control. Production paths leave this undefined and the
+        // deep merge becomes a no-op.
+        type AbrOverride = Partial<typeof abrSettings> & {
+          rules?: Partial<typeof abrSettings.rules>;
+        };
+        const override =
+          typeof window !== 'undefined'
+            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
+            : undefined;
+        const effectiveAbrSettings = override
+          ? {
+              ...abrSettings,
+              ...override,
+              rules: Object.fromEntries(
+                Object.entries({
+                  ...abrSettings.rules,
+                  ...(override.rules ?? {}),
+                }).map(([name, cfg]) => {
+                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
+                  if (!base) return [name, cfg];
+                  return [
+                    name,
+                    {
+                      ...base,
+                      ...cfg,
+                      parameters: {
+                        ...(base.parameters ?? {}),
+                        ...(cfg.parameters ?? {}),
+                      },
+                    },
+                  ];
+                }),
+              ),
+            }
+          : abrSettings;
+        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
         rulesRef.current = rulesCollection;
         const abr = new AbrController(
           player,
           rulesCollection,
           videoTracksForAbr,
-          abrSettings,
+          effectiveAbrSettings,
           setAbrMetrics,
         );
         abrRef.current = abr;
@@ -501,7 +612,7 @@ export function App() {
         await disposePlayer();
       }
     },
-    [relayUrl, namespace, disposePlayer, abrSettings],
+    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode],
   );
 
   const handleTrackChange = useCallback(
@@ -604,6 +715,13 @@ export function App() {
         onSettingsChange={handleSettingsChange}
         blurSettings={blurSettings}
         onBlurSettingsChange={setBlurSettings}
+        clientMode={clientMode}
+        onClientModeChange={setClientMode}
+        filterDelaySeconds={filterDelaySeconds}
+        onFilterDelaySecondsChange={setFilterDelaySeconds}
+        connectStatus={status}
+        switchMode={switchMode}
+        onSwitchModeChange={setSwitchMode}
       />
 
       {/* Body */}

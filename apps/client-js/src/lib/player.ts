@@ -27,10 +27,12 @@ import {
   Tuple,
 } from 'moqtail';
 import { MOQtailClient } from 'moqtail/client';
-import { CMSFCatalog } from 'moqtail/model';
+import { CMSFCatalog, VersionSpecificParameters } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
+import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
+import { TimeMap } from '@/lib/abr/TimeMap';
 
 // NTP epoch (1900) is 2_208_988_800 seconds before the UNIX epoch (1970).
 const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
@@ -66,10 +68,64 @@ function readPrftCaptureMs(buf: Uint8Array): number | null {
   return unixSeconds * 1000 + fractionMs;
 }
 
+/**
+ * One record per track-switch (or, in C4, per filtered connect).
+ * Pushed to window.__moqtailMetrics.switchDiscontinuities for offline analysis.
+ */
+export interface DiscontinuityRecord {
+  eventType: 'connect' | 'switch';
+  switchSentAt: number;
+  switchAppliedAt: number;
+  fromTrack?: string;
+  toTrack: string;
+
+  // PTS-domain (headline)
+  oldEndPTS_ms?: number;
+  newStartPTS_ms: number;
+  /** Buffer-end gap: newStartPTS_ms - oldEndPTS_ms. Diagnostic only — measures
+   *  buffered-region continuity, NOT user-visible discontinuity. With a fast
+   *  link the buffer reaches the live edge, so both naive and aligned modes
+   *  produce ~0 here. Use `playheadGapMs` for naive-vs-aligned differentiation. */
+  ptsGapMs: number;
+  /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
+  playheadPTS_ms?: number;
+  /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
+   *  jump introduced by the switch — naive on a filtered client lands ~filterDelay×1000
+   *  positive (relay delivers from live edge while playhead is filterDelay s behind);
+   *  aligned lands ~0. Undefined for `connect` records. */
+  playheadGapMs?: number;
+
+  // wall-clock context
+  wallClockMs: number;
+  perceivedPauseMs?: number;
+
+  // connect-time clamp signal (Task C4)
+  expectedStartGroup?: number;
+  actualStartGroup?: number;
+  clampedByRelay?: boolean;
+
+  // miss signal (Task B5)
+  timeMapMiss?: boolean;
+
+  // mode context (every record)
+  switchMode: 'naive' | 'aligned';
+  clientMode: 'filtered' | 'unfiltered';
+  filterDelaySeconds: number;
+}
+
 interface PendingSwitch {
   trackName: string;
   initData: ArrayBuffer;
   mimeType: string;
+  /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
+  oldEndPTS_ms: number | undefined;
+  /** Snapshot of video.currentTime * 1000 at switchTrack() call — used by the discontinuity
+   *  record's `playheadGapMs` (newStart − playhead) which is the headline naive-vs-aligned metric. */
+  playheadPTS_ms: number | undefined;
+  /** performance.now() at switchTrack() call — for wallClockMs and perceivedPauseMs. */
+  switchSentAt: number;
+  /** videoElement.getVideoPlaybackQuality().totalVideoFrames at switch time — for perceivedPauseMs (Task C5). */
+  framesAtSwitch: number;
 }
 
 interface MOQStreamStruct {
@@ -79,6 +135,23 @@ interface MOQStreamStruct {
   tracker: GoodputTracker;
   lastGroupId: bigint;
   pendingSwitch: PendingSwitch | null;
+  /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
+  lastAppendedEndPTS_ms: number | undefined;
+  /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
+  firstFrameAfterSwitchSeen?: boolean;
+  /**
+   * When a switch is in progress, this holds the totalVideoFrames count at
+   * switchTrack time. Once totalVideoFrames > this value, the first new-track
+   * frame has rendered and perceivedPauseMs is computed.
+   *
+   * Set in the write handler when the new init segment is applied; consumed
+   * (and cleared) by the rVFC poll.
+   */
+  postSwitchFrameTarget?: number;
+  /** Snapshot of pendingSwitch.switchSentAt at the moment of init-segment application. */
+  postSwitchSentAt?: number;
+  /** Track name to attach perceivedPauseMs to in switchDiscontinuities. */
+  postSwitchToTrack?: string;
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -101,6 +174,12 @@ export interface PlayerOptions {
   catalogLocation?: [Location, Location];
   /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
   onTrackSwitched?: (trackName: string) => void;
+  /** Pre-connect: 'filtered' clients subscribe behind live by `filterDelaySeconds`; 'unfiltered' is today's behavior. */
+  clientMode?: 'filtered' | 'unfiltered';
+  /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
+  filterDelaySeconds?: number;
+  /** Quality-switch primitive: 'naive' = today (start at latest); 'aligned' = start at group containing player's current PTS. */
+  switchMode?: 'naive' | 'aligned';
 }
 
 const DefaultOptions = {
@@ -109,8 +188,82 @@ const DefaultOptions = {
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
+  clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
+  filterDelaySeconds: 0,
+  switchMode: 'naive' as 'naive' | 'aligned',
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
+
+/**
+ * Builds the `parameters` field for a media-track SUBSCRIBE.
+ *
+ * - For unfiltered mode: returns `undefined` (no parameters added — today's behavior).
+ * - For filtered mode: returns a `VersionSpecificParameters` carrying
+ *   `DELAY_GROUPS = round(filterDelaySeconds * 1000 / gopDurationMs)`.
+ *
+ * The relay reads `DELAY_GROUPS` and starts delivery `delay_groups` behind the live edge.
+ */
+export function buildSubscribeParameters(opts: {
+  clientMode: 'filtered' | 'unfiltered';
+  filterDelaySeconds: number;
+  gopDurationMs: number;
+}): VersionSpecificParameters | undefined {
+  if (opts.clientMode !== 'filtered') return undefined;
+  if (opts.filterDelaySeconds <= 0) return undefined;
+  const delayGroups = Math.round((opts.filterDelaySeconds * 1000) / opts.gopDurationMs);
+  if (delayGroups <= 0) return undefined;
+  return new VersionSpecificParameters().addDelayGroups(delayGroups);
+}
+
+/**
+ * Builds the `parameters` field for a SWITCH message based on the active
+ * switchMode and the player's current PTS.
+ *
+ * - 'naive' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
+ * - 'aligned' mode: looks up the group containing `currentTime` via the TimeMap
+ *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
+ *   switch fired before any object was received), returns `{ params: undefined,
+ *   timeMapMiss: true }` so the caller can record the miss.
+ *
+ * Exported for unit testing.
+ */
+export function buildSwitchParameters(opts: {
+  switchMode: 'naive' | 'aligned';
+  targetGroup: number | undefined;
+}): { params: VersionSpecificParameters | undefined; timeMapMiss: boolean } {
+  if (opts.switchMode !== 'aligned') return { params: undefined, timeMapMiss: false };
+  if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
+  return {
+    params: new VersionSpecificParameters().addStartLocationGroup(opts.targetGroup),
+    timeMapMiss: false,
+  };
+}
+
+/**
+ * Compute the seek target for playback startup. Unfiltered clients seek
+ * 1.0s behind the live edge so MSE has buffer runway; filtered clients
+ * are already `filterDelaySeconds` behind live and don't need the extra
+ * offset.
+ *
+ * Exported for unit testing.
+ */
+export const LIVE_EDGE_STARTUP_OFFSET_SECONDS = 1.0;
+
+export function computeStartupTarget(opts: {
+  end: number;
+  baseTarget: number;
+  clientMode: 'filtered' | 'unfiltered';
+  /** Seconds-behind-live-edge target for filtered mode. Ignored when unfiltered.
+   *  Defaults to 0 (today's broken behavior) only when not provided — callers
+   *  in filtered mode SHOULD pass this. */
+  filterDelaySeconds?: number;
+}): number {
+  const offset =
+    opts.clientMode === 'filtered'
+      ? (opts.filterDelaySeconds ?? 0)
+      : LIVE_EDGE_STARTUP_OFFSET_SECONDS;
+  return Math.max(opts.baseTarget, opts.end - offset);
+}
 
 export class Player {
   catalog: CMSFCatalog | null = null;
@@ -126,6 +279,17 @@ export class Player {
   // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
   // `LatencyTrendRule` reads `getTrendRatio()` for downswitch decisions.
   #latencyTracker = new LatencyTracker();
+  // Connect-time state (Task C4) for filtered-mode clamp detection.
+  // Captured in subscribe(); consumed once on the first received object.
+  #connectSentAt: number | undefined;
+  #expectedStartGroupId: number | undefined;
+  // B4: PTS <-> group lookup populated from incoming object decode times.
+  // Consumed by B5 (aligned switch) to compute START_LOCATION_GROUP.
+  #timeMap: TimeMap | undefined;
+  // B5: latched at switchTrack() time; consumed by the next switch
+  // DiscontinuityRecord emission and reset to false afterwards so it doesn't
+  // leak across switches.
+  #lastSwitchHadTimeMapMiss: boolean = false;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -146,12 +310,31 @@ export class Player {
       throw error;
     }
 
+    // Debug-only escape hatch: lets the network test harness force a SWITCH
+    // without going through the AbrController. Used by Slice C/Phase B E2Es
+    // (see tests/network/scenarios/test_naive_switch_discontinuity.py). Not
+    // for production use — direct switchTrack() calls bypass the ABR
+    // switching guard's bookkeeping.
+    if (typeof window !== 'undefined') {
+      (window as Window & { __forceSwitch?: (trackName: string) => Promise<void> }).__forceSwitch =
+        (trackName: string) => this.switchTrack(trackName);
+    }
+
     // Fetch the catalog
     try {
       this.catalog = await this.retrieveCatalog();
     } catch (error) {
       logger.error('media', 'Failed to retrieve catalog', (error as Error).message);
       throw error;
+    }
+
+    // B4: construct the TimeMap once, anchored on the video track's GOP duration.
+    // Quality variants share a TimeMap — gopDurationMs is equal across them in practice.
+    const videoTracks = this.catalog?.getTracks('video');
+    const videoTrack = videoTracks?.[0];
+    if (videoTrack) {
+      const gopDurationMs = this.catalog!.getGopDurationMs(videoTrack.name);
+      this.#timeMap = new TimeMap(gopDurationMs);
     }
 
     return this.catalog;
@@ -203,6 +386,11 @@ export class Player {
 
     // Close the client connection
     await this.client?.disconnect();
+
+    // Tear down the debug-only force-switch hook installed in initialize().
+    if (typeof window !== 'undefined') {
+      delete (window as Window & { __forceSwitch?: unknown }).__forceSwitch;
+    }
 
     // Reset state
     this.catalog = null;
@@ -299,7 +487,6 @@ export class Player {
     // Without this offset the player lands on the live edge (0 s buffer),
     // immediately stalls, recovers for a moment, then stalls again —
     // creating the "video gets stuck" symptom.
-    const LIVE_EDGE_STARTUP_OFFSET = 1.0; // seconds behind the live edge
 
     let gotNotification = 0;
     let target = 0;
@@ -309,7 +496,12 @@ export class Player {
       // Start behind the live edge so there is buffer to consume while
       // new data continues arriving. The MSEBuffer module then fine-tunes
       // the distance via playback-rate adjustments (catchup / catchdown).
-      target = Math.max(target, end - LIVE_EDGE_STARTUP_OFFSET);
+      target = computeStartupTarget({
+        end,
+        baseTarget: target,
+        clientMode: this.#options.clientMode,
+        filterDelaySeconds: this.#options.filterDelaySeconds,
+      });
 
       gotNotification++;
       if (gotNotification === this.#streams.length) {
@@ -319,6 +511,10 @@ export class Player {
         );
         this.#element!.currentTime = target;
         this.#element!.play();
+        // Install the rVFC poll that detects first-frame-rendered post-switch
+        // and computes perceivedPauseMs (Task C5). Safe to install once playback
+        // has started — the element is non-null and ready to render frames.
+        this.#installPerceivedPausePoll();
       }
       return true;
     };
@@ -402,9 +598,25 @@ export class Player {
             }
 
             if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
-              const { initData, mimeType, trackName: newTrackName } = struct.pendingSwitch;
+              const {
+                initData,
+                mimeType,
+                trackName: newTrackName,
+                oldEndPTS_ms,
+                playheadPTS_ms,
+                switchSentAt,
+                framesAtSwitch,
+              } = struct.pendingSwitch;
+              const fromTrack = struct.trackName; // capture BEFORE overwriting
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
+              struct.firstFrameAfterSwitchSeen = false; // reset for C5
+              // Stash C5 state on sibling struct fields that survive the
+              // pendingSwitch clear. The rVFC poll consumes these to compute
+              // perceivedPauseMs and attach it to the discontinuity record.
+              struct.postSwitchFrameTarget = framesAtSwitch;
+              struct.postSwitchSentAt = switchSentAt;
+              struct.postSwitchToTrack = newTrackName;
 
               // changeType() must not be called while the SourceBuffer is updating
               if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
@@ -425,9 +637,94 @@ export class Player {
                 return;
               }
 
+              // Compute and push the discontinuity record. PTS-gap is the headline
+              // metric: signed difference between the first appended frame's PTS on
+              // the new track and the last appended frame's end PTS on the old track.
+              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const newStartPTS_ms =
+                newTimescale && newTimescale > 0
+                  ? parseMoofBaseMediaDecodeTime(
+                      new Uint8Array(
+                        object.payload.buffer,
+                        object.payload.byteOffset,
+                        object.payload.byteLength,
+                      ),
+                      newTimescale,
+                    )
+                  : undefined;
+
+              if (newStartPTS_ms !== undefined) {
+                const ptsGapMs = oldEndPTS_ms !== undefined ? newStartPTS_ms - oldEndPTS_ms : 0;
+                const playheadGapMs =
+                  playheadPTS_ms !== undefined ? newStartPTS_ms - playheadPTS_ms : undefined;
+                const wallClockMs = performance.now() - switchSentAt;
+                const record: DiscontinuityRecord = {
+                  eventType: 'switch',
+                  switchSentAt,
+                  switchAppliedAt: performance.now(),
+                  fromTrack,
+                  toTrack: newTrackName,
+                  oldEndPTS_ms,
+                  newStartPTS_ms,
+                  ptsGapMs,
+                  playheadPTS_ms,
+                  playheadGapMs,
+                  wallClockMs,
+                  switchMode: this.#options.switchMode,
+                  timeMapMiss: this.#lastSwitchHadTimeMapMiss,
+                  clientMode: this.#options.clientMode,
+                  filterDelaySeconds: this.#options.filterDelaySeconds,
+                };
+                // Reset so the flag doesn't leak across switches.
+                this.#lastSwitchHadTimeMapMiss = false;
+                if (typeof window !== 'undefined') {
+                  const w = window as Window & {
+                    __moqtailMetrics?: {
+                      switchDiscontinuities?: DiscontinuityRecord[];
+                      [k: string]: unknown;
+                    };
+                  };
+                  w.__moqtailMetrics ??= {} as Window['__moqtailMetrics'] & object;
+                  const metrics = w.__moqtailMetrics as Window['__moqtailMetrics'] & {
+                    switchDiscontinuities?: DiscontinuityRecord[];
+                  };
+                  metrics.switchDiscontinuities ??= [];
+                  metrics.switchDiscontinuities.push(record);
+                }
+              }
+
               // NOW release the ABR switching guard — the relay has completed the
               // transition and delivered data on the new track. Safe to switch again.
               this.#options.onTrackSwitched?.(newTrackName);
+            }
+
+            // Update lastAppendedEndPTS_ms before appending. C3 will read this for the
+            // "old end PTS" half of the discontinuity calculation.
+            // Publisher emits one moof+mdat per access unit (see apps/publisher/src/cmaf.rs),
+            // so each moof's tfdt is a per-frame decode time and the trun carries that
+            // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
+            const timescale = this.catalog?.getTimescale(struct.trackName);
+            if (timescale && timescale > 0) {
+              const info = parseMoofMediaInfo(
+                new Uint8Array(
+                  object.payload.buffer,
+                  object.payload.byteOffset,
+                  object.payload.byteLength,
+                ),
+                timescale,
+              );
+              if (info !== undefined) {
+                struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
+                // B4: feed the TimeMap so aligned switch (B5) can resolve playhead -> group.
+                // Only the first object of each group records (idempotent in TimeMap),
+                // and frame 0 of a group has decodeTime == group start PTS.
+                if (this.#timeMap) {
+                  this.#timeMap.recordGroupBoundary(
+                    Number(object.location.group),
+                    info.decodeTimeMs,
+                  );
+                }
+              }
             }
 
             // Append the data
@@ -474,6 +771,70 @@ export class Player {
             // intra-group rate reflects link capacity, not source bitrate.
             struct.tracker.recordObject(object.payload.byteLength, object.location.group);
             struct.lastGroupId = object.location.group;
+
+            // First-received-group export for E2E smoke + connect-time metrics (Phase C).
+            // Only set once across all streams to capture the earliest received group.
+            if (typeof window !== 'undefined') {
+              if (window.__moqtailMetrics === undefined) {
+                window.__moqtailMetrics = { abr: null, samples: null };
+              }
+              const isFirstObject = window.__moqtailMetrics.firstReceivedGroupId === undefined;
+              if (isFirstObject) {
+                window.__moqtailMetrics.firstReceivedGroupId = Number(object.location.group);
+
+                // Connect-time discontinuity record (Task C4): emit only if we
+                // were in filtered mode AND we have a known expected start
+                // group (i.e. the relay sent a SubscribeOk with largestLocation
+                // and delay_groups was non-zero).
+                if (
+                  this.#options.clientMode === 'filtered' &&
+                  this.#expectedStartGroupId !== undefined &&
+                  this.#connectSentAt !== undefined
+                ) {
+                  const expected = this.#expectedStartGroupId;
+                  const actual = Number(object.location.group);
+                  // Relay clamps when our requested target was older than the
+                  // oldest cached group: it returns a more-recent group instead.
+                  const clampedByRelay = actual > expected;
+
+                  const connectTimescale = this.catalog?.getTimescale(struct.trackName);
+                  const newStartPTS_ms =
+                    connectTimescale && connectTimescale > 0
+                      ? parseMoofBaseMediaDecodeTime(
+                          new Uint8Array(
+                            object.payload.buffer,
+                            object.payload.byteOffset,
+                            object.payload.byteLength,
+                          ),
+                          connectTimescale,
+                        )
+                      : undefined;
+
+                  const connectGopDurationMs =
+                    this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
+                  const ptsGapMs = (actual - expected) * connectGopDurationMs;
+                  const wallClockMs = performance.now() - this.#connectSentAt;
+
+                  const record: DiscontinuityRecord = {
+                    eventType: 'connect',
+                    switchSentAt: this.#connectSentAt,
+                    switchAppliedAt: performance.now(),
+                    toTrack: struct.trackName,
+                    newStartPTS_ms: newStartPTS_ms ?? 0,
+                    ptsGapMs,
+                    wallClockMs,
+                    expectedStartGroup: expected,
+                    actualStartGroup: actual,
+                    clampedByRelay,
+                    switchMode: this.#options.switchMode,
+                    clientMode: this.#options.clientMode,
+                    filterDelaySeconds: this.#options.filterDelaySeconds,
+                  };
+                  window.__moqtailMetrics.switchDiscontinuities ??= [];
+                  window.__moqtailMetrics.switchDiscontinuities.push(record);
+                }
+              }
+            }
 
             // Read PRFT box (if any) at the head of the CMAF chunk.
             // Publisher prepends `prft` per ISO/IEC 14496-12 §8.16.5 so the
@@ -570,6 +931,64 @@ export class Player {
   setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     videoStruct?.tracker.setHalfLives(halfLifeFastSec, halfLifeSlowSec);
+  }
+
+  /**
+   * Recurring requestVideoFrameCallback poll that detects the first new-track
+   * frame actually rendering after a track switch (Task C5).
+   *
+   * Each fired callback fires on every rendered frame. For each stream struct
+   * in the post-switch awaiting state (sibling fields stashed by the write
+   * handler when the new init segment was applied), check whether
+   * totalVideoFrames has advanced past the snapshot taken at switchTrack()
+   * time. If so, the first new-track frame has rendered: compute
+   * perceivedPauseMs = performance.now() - switchSentAt and attach it to the
+   * most recent matching switch record in window.__moqtailMetrics.switchDiscontinuities.
+   *
+   * Re-arms each frame for the lifetime of the player — per-tick work is a
+   * cheap for-loop over streams.
+   */
+  #installPerceivedPausePoll(): void {
+    if (!this.#element) return;
+    const poll = () => {
+      if (!this.#element) return;
+      const total = this.#element.getVideoPlaybackQuality().totalVideoFrames;
+      for (const struct of this.#streams) {
+        if (
+          struct.firstFrameAfterSwitchSeen !== true &&
+          struct.postSwitchFrameTarget !== undefined &&
+          struct.postSwitchSentAt !== undefined &&
+          struct.postSwitchToTrack !== undefined &&
+          total > struct.postSwitchFrameTarget
+        ) {
+          struct.firstFrameAfterSwitchSeen = true;
+          const perceivedPauseMs = performance.now() - struct.postSwitchSentAt;
+          const targetTrack = struct.postSwitchToTrack;
+
+          // Find the most recent matching switch record and attach.
+          if (typeof window !== 'undefined' && window.__moqtailMetrics) {
+            const records = window.__moqtailMetrics.switchDiscontinuities;
+            if (records) {
+              for (let i = records.length - 1; i >= 0; i--) {
+                const r = records[i];
+                if (r && r.eventType === 'switch' && r.toTrack === targetTrack) {
+                  r.perceivedPauseMs = perceivedPauseMs;
+                  break;
+                }
+              }
+            }
+          }
+
+          // Clean up — switch transition complete.
+          struct.postSwitchFrameTarget = undefined;
+          struct.postSwitchSentAt = undefined;
+          struct.postSwitchToTrack = undefined;
+        }
+      }
+      // Re-arm for next frame.
+      this.#element.requestVideoFrameCallback(poll);
+    };
+    this.#element.requestVideoFrameCallback(poll);
   }
 
   /**
@@ -703,10 +1122,49 @@ export class Player {
 
     const mimeType = `${role}/mp4; codecs="${codec}"`;
 
+    // Snapshot playhead + wall clock BEFORE sending the SWITCH so that
+    // playheadPTS_ms pairs with the targetGroup decision below. Capturing
+    // these after `await client.switch()` reads playhead AFTER the relay
+    // round-trip — the playhead can advance past a group boundary in that
+    // window (offset30 with mininet ~50ms RTT cleared one GOP, pushing
+    // |playheadGap| just above gopDurationMs even when alignment was
+    // correct at the moment of decision).
+    const playheadPTS_ms = this.#element !== null ? this.#element.currentTime * 1000 : undefined;
+    const switchSentAt = performance.now();
+    const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
+
+    // Compute aligned-switch target group from playhead via TimeMap.
+    let targetGroup: number | undefined;
+    if (this.#options.switchMode === 'aligned' && this.#timeMap && playheadPTS_ms !== undefined) {
+      targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
+    }
+    const { params: switchParams, timeMapMiss } = buildSwitchParameters({
+      switchMode: this.#options.switchMode,
+      targetGroup,
+    });
+    if (timeMapMiss) {
+      logger.warn('media', 'aligned switch: TimeMap miss; falling through to naive');
+    }
+    this.#lastSwitchHadTimeMapMiss = timeMapMiss;
+
+    // Pre-allocate the new request id and update videoStruct.requestId BEFORE
+    // awaiting client.switch(). If a second switchTrack call (ABR tick or
+    // force_switch) starts before this one completes, it will read the
+    // already-incremented requestId and pass it as subscriptionRequestId in
+    // its own SWITCH — preventing the stale-id chain that the relay rejects
+    // as ProtocolViolation and tears the WebTransport down. Concurrency on
+    // the wire is preserved; only the id-state read is moved to before the
+    // await.
+    const subscriptionRequestId = videoStruct.requestId;
+    const newRequestId = this.client.allocateNextRequestId();
+    videoStruct.requestId = newRequestId;
+
     try {
       const result = await this.client.switch({
+        requestId: newRequestId,
         fullTrackName,
-        subscriptionRequestId: videoStruct.requestId,
+        subscriptionRequestId,
+        parameters: switchParams,
       });
 
       if (result instanceof SubscribeError) {
@@ -715,25 +1173,35 @@ export class Player {
           `switchTrack: SWITCH rejected for ${trackName}:`,
           result.errorReason.phrase,
         );
+        // Roll back the optimistic id update so the next switchTrack attempt
+        // references the still-active subscription rather than the failed one.
+        videoStruct.requestId = subscriptionRequestId;
         this.#options.onTrackSwitched?.(videoStruct.trackName);
         return;
       }
 
-      // Success: update requestId, arm the write handler.
-      // Do NOT reset the tracker — the bandwidth estimate from the previous
-      // track is still a valid indicator of network capacity. Resetting it
-      // creates a blind spot where ABR rules see 0 bandwidth and can't
-      // downgrade if the new track is too aggressive. (dash.js doesn't reset
-      // throughput on quality switches either.)
-      videoStruct.requestId = result.requestId;
       // Arm the write handler for init segment re-injection at the next group
       // boundary. The onTrackSwitched callback (which releases the ABR switching
       // guard) is NOT called here — it fires in the write handler AFTER the relay
       // has actually delivered data on the new track. This prevents rapid
       // consecutive SWITCH messages that corrupt the relay's switch context.
-      videoStruct.pendingSwitch = { trackName, initData: initData.buffer as ArrayBuffer, mimeType };
+      // Tracker is intentionally not reset — the previous-track bandwidth
+      // estimate is still a valid indicator of network capacity. (dash.js
+      // doesn't reset throughput on quality switches either.)
+      videoStruct.pendingSwitch = {
+        trackName,
+        initData: initData.buffer as ArrayBuffer,
+        mimeType,
+        oldEndPTS_ms: videoStruct.lastAppendedEndPTS_ms,
+        playheadPTS_ms,
+        switchSentAt,
+        framesAtSwitch,
+      };
+      videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
+      // Roll back the optimistic id update on unexpected failure too.
+      videoStruct.requestId = subscriptionRequestId;
       this.#options.onTrackSwitched?.(videoStruct.trackName);
     }
   }
@@ -806,6 +1274,7 @@ export class Player {
         tracker,
         lastGroupId: -1n,
         pendingSwitch: null,
+        lastAppendedEndPTS_ms: undefined,
       };
     }
 
@@ -843,6 +1312,18 @@ export class Player {
   private async subscribe(params: SubscribeOptions): Promise<MOQStreamStruct> {
     if (!this.client) throw new Error('MOQProcessor not initialized');
 
+    // Build delay-mode parameters only for non-catalog tracks. The catalog
+    // is fetched at startup and has no notion of "live edge"; never delay it.
+    let parameters: VersionSpecificParameters | undefined;
+    if (params.trackName !== 'catalog' && this.catalog) {
+      const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
+      parameters = buildSubscribeParameters({
+        clientMode: this.#options.clientMode,
+        filterDelaySeconds: this.#options.filterDelaySeconds,
+        gopDurationMs,
+      });
+    }
+
     // Send the appropriate control message
     let struct: MOQStreamStruct;
     const result = await this.client.subscribe({
@@ -851,9 +1332,29 @@ export class Player {
       filterType: FilterType.LatestObject,
       forward: true,
       priority: params.priority ?? 0,
+      parameters,
     });
     if (result instanceof SubscribeError)
       throw new Error(`Error occured during subscription: ${result.errorReason.phrase}`);
+
+    // Capture connect-time state for media tracks (not catalog) so C4 can emit
+    // a connect-time discontinuity record on the first arriving object. We only
+    // populate #expectedStartGroupId for filtered mode with a non-zero
+    // delay_groups; otherwise the relay does not clamp and we have nothing to
+    // detect against.
+    if (params.trackName !== 'catalog' && this.catalog) {
+      const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
+      const largest = result.largestLocation;
+      this.#connectSentAt = performance.now();
+      if (this.#options.clientMode === 'filtered' && largest !== undefined) {
+        const delayGroups = Math.round((this.#options.filterDelaySeconds * 1000) / gopDurationMs);
+        if (delayGroups > 0) {
+          // expected = largest - delay_groups (saturating at 0)
+          this.#expectedStartGroupId = Math.max(0, Number(largest.group) - delayGroups);
+        }
+      }
+    }
+
     const tracker = new GoodputTracker();
     struct = {
       trackName: params.trackName,
@@ -862,6 +1363,7 @@ export class Player {
       tracker,
       lastGroupId: -1n,
       pendingSwitch: null,
+      lastAppendedEndPTS_ms: undefined,
     };
 
     // Add the stream to the pool
