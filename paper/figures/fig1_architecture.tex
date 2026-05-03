@@ -1,41 +1,54 @@
-\documentclass[border=2pt]{standalone}
+\documentclass[border=6pt]{standalone}
 \usepackage{tikz}
-\usetikzlibrary{positioning,shapes.geometric,arrows.meta,calc,fit,backgrounds}
+\usepackage{xcolor}
+\usetikzlibrary{positioning,shapes.geometric,arrows.meta,calc,fit,backgrounds,decorations.pathmorphing}
 
 \definecolor{naivered}{HTML}{E15759}
 \definecolor{alignedblue}{HTML}{4E79A7}
-\definecolor{cachegray}{HTML}{D0D0D0}
+\definecolor{readygreen}{HTML}{59A14F}
+\definecolor{paneltint}{HTML}{F5F5F5}
+\definecolor{cachegray}{HTML}{E8E8E8}
 
 \begin{document}
 \begin{tikzpicture}[
   font=\sffamily\small,
-  node distance=12mm,
-  box/.style={draw, rounded corners=2pt, minimum width=22mm, minimum height=14mm,
-              align=center, fill=white},
-  inner/.style={draw, dashed, rounded corners=1pt, fill=cachegray, inner sep=2pt,
-                align=center, font=\sffamily\scriptsize},
-  flow/.style={-{Stealth[length=2mm]}, thick},
+  box/.style={
+    draw, rounded corners=3pt,
+    minimum width=26mm, minimum height=16mm,
+    align=center, fill=white,
+    line width=0.6pt,
+    inner sep=3pt
+  },
+  inner/.style={
+    draw, dashed, rounded corners=2pt,
+    fill=cachegray, inner sep=3pt,
+    align=center, font=\sffamily\scriptsize\itshape,
+    line width=0.4pt
+  },
+  flow/.style={-{Stealth[length=3mm]}, line width=0.8pt},
 ]
 
-\node[box] (pub) {Publisher\\\scriptsize 5-rung 720p ladder};
-\node[box, right=18mm of pub] (relay) {Relay};
-\node[box, right=18mm of relay] (client) {Client\\\scriptsize behind-live};
+% Three main nodes with extra horizontal space.
+\node[box] (pub) {\textbf{Publisher}\\[1pt]\scriptsize 5-rung 720p ladder\\\scriptsize 400/800/1200/2500/5000 kbps};
+\node[box, right=30mm of pub] (relay) {\textbf{Relay}\\[1pt]\scriptsize MoQ session};
+\node[box, right=34mm of relay] (client) {\textbf{Client}\\[1pt]\scriptsize filtered\\\scriptsize (behind-live)};
 
-% Cache window inside relay.
-\node[inner, below=1mm of relay.south, anchor=north] (cache)
-  {GOP cache (size $N$)};
+% Inner annotations under each main node.
+\node[inner, below=3mm of relay.south, anchor=north] (cache)
+  {GOP cache (size $N$ groups)};
+\node[inner, below=3mm of client.south, anchor=north] (lag)
+  {playhead trails live edge\\by $\mathit{filterDelay}$ seconds};
 
-% Live edge / playhead inside client.
-\node[inner, below=1mm of client.south, anchor=north] (lag)
-  {playhead trails by\\filterDelay sec};
+% Pub -> Relay arrow with single-line label above.
+\draw[flow] (pub) -- node[above, font=\sffamily\scriptsize, midway]
+  {publishes groups} (relay);
 
-\draw[flow] (pub) -- node[above]{groups} (relay);
-\draw[flow, alignedblue] (relay) --
-  node[above, font=\sffamily\scriptsize, text=alignedblue]
-       {aligned-switch:}
-  node[below, font=\sffamily\scriptsize, text=alignedblue]
-       {start = group(playhead)}
-  (client);
+% Relay -> Client arrow: label is a SINGLE compact node ABOVE the
+% arrow midpoint so it doesn't bleed into the Client box.
+\draw[flow, alignedblue] (relay.east) --
+  node[above=1mm, midway, font=\sffamily\scriptsize, text=alignedblue, align=center]
+       {\textbf{aligned-switch primitive}\\start\,$=$\,group containing playhead}
+  (client.west);
 
 \end{tikzpicture}
 \end{document}
