@@ -106,8 +106,13 @@ async def test_e2_naive_switch(
             f"No switch fired in run; environment too stable. "
             f"{len(switch_records)} total records."
         )
-    # Naive failure mode: at least one switch produces > 100 ms forward jump.
-    assert summary["max_pts_gap_ms"] > 100, (
-        f"expected non-zero ptsGapMs (naive switch on filtered client), "
-        f"got max_pts_gap_ms={summary['max_pts_gap_ms']}"
+    # Naive failure mode: relay's LatestObject delivery jumps the new track to
+    # the live edge while the playhead is still `filterDelay` seconds behind,
+    # so newStartPTS − playheadPTS ≈ filterDelay × 1000 (positive, large).
+    # Buffer-end ptsGapMs is ~0 here because the buffer has caught up to live
+    # edge — so we assert on playhead-relative gap, not on ptsGapMs.
+    assert summary["max_playhead_gap_ms"] > 100, (
+        f"expected positive playheadGapMs (naive switch on filtered client), "
+        f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
+        f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
     )

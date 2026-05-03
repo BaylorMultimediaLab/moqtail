@@ -42,13 +42,24 @@ if [[ ! -f "$ASSET" ]]; then
   "$ROOT_DIR/scripts/prepare_tears_of_steel.sh"
 fi
 
-# Step 2: Ensure Rust binaries are present. Skip the build if relay+publisher
-# are already built — this lets you build as a regular user (whose rustup
-# toolchain supports edition2024) and then run the suite as root, where the
-# system cargo may be too old. Set MOQTAIL_FORCE_BUILD=1 to force rebuild.
+# Step 2: Ensure Rust binaries are present AND fresh. The freshness check
+# (find -newer) catches the "I edited subscription.rs but forgot to rebuild
+# release" footgun — without it, the script silently runs the OLD binary
+# against the NEW test expectations. We still skip the build when nothing
+# changed so the "build as user, run as root with old cargo" workflow keeps
+# working. Set MOQTAIL_FORCE_BUILD=1 to force rebuild.
 NEED_BUILD=0
 for bin in relay publisher; do
-  if [[ ! -x "$ROOT_DIR/target/release/$bin" ]]; then
+  bin_path="$ROOT_DIR/target/release/$bin"
+  if [[ ! -x "$bin_path" ]]; then
+    NEED_BUILD=1
+    break
+  fi
+  # Any Rust source newer than the binary? -quit stops at the first hit.
+  newer=$(find "$ROOT_DIR/apps/$bin" "$ROOT_DIR/libs/moqtail-rs" \
+    \( -name '*.rs' -o -name 'Cargo.toml' \) -newer "$bin_path" -print -quit 2>/dev/null)
+  if [[ -n "$newer" ]]; then
+    echo "[run-experiments] $bin is stale (newer source: $newer) — rebuilding."
     NEED_BUILD=1
     break
   fi

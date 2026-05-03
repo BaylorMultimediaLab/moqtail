@@ -27,7 +27,15 @@ def build_run_summary(
     switch_events = [s for s in switches if s.get("eventType") == "switch"]
 
     last_row = rows[-1] if rows else {}
+    # ptsGapMs is buffer-end (newStart − bufferEnd) — diagnostic only.
     pts_gaps = [abs(s.get("ptsGapMs", 0)) for s in switch_events]
+    # playheadGapMs is playhead-relative (newStart − currentTime at switchSentAt) —
+    # this is the headline naive-vs-aligned metric. Records emitted before the
+    # client carried `playheadGapMs` will be missing the field; skip those rather
+    # than treat them as zero, so an old run isn't silently mis-summarized.
+    playhead_gaps = [
+        abs(s["playheadGapMs"]) for s in switch_events if s.get("playheadGapMs") is not None
+    ]
 
     summary: dict[str, Any] = dict(cell_params)
     summary.update({
@@ -35,6 +43,8 @@ def build_run_summary(
         "n_discontinuities": sum(1 for g in pts_gaps if g > 50),
         "max_pts_gap_ms": max(pts_gaps) if pts_gaps else 0.0,
         "mean_pts_gap_ms": (sum(pts_gaps) / len(pts_gaps)) if pts_gaps else 0.0,
+        "max_playhead_gap_ms": max(playhead_gaps) if playhead_gaps else 0.0,
+        "mean_playhead_gap_ms": (sum(playhead_gaps) / len(playhead_gaps)) if playhead_gaps else 0.0,
         "dropped_frames": int(last_row.get("dropped_frames", 0) or 0),
         "total_frames": int(last_row.get("total_frames", 0) or 0),
         "current_time_at_end_s": float(last_row.get("current_time", 0) or 0),

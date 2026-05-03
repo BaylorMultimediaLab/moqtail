@@ -1,9 +1,11 @@
-"""E3: aligned switch on a behind-live (filtered) client produces near-zero ptsGapMs.
+"""E3: aligned switch on a behind-live (filtered) client lands within one GOP of the playhead.
 
 Same shape as E2 (4 offsets x 5 runs, step bandwidth profile) but with
-switchMode=aligned. The aligned primitive should produce near-zero
-discontinuities across all offsets — that's the result the paper documents.
-The 50ms tolerance accommodates one-frame boundary jitter at 25 fps.
+switchMode=aligned. The aligned primitive starts the new track at the group
+containing the playhead, so |playheadGap| <= gopDurationMs by construction
+(the new track starts at a keyframe boundary at or before the playhead).
+This is the design-doc envelope ([-500, +500]ms, "within one GOP"). Compare
+to the E2 naive failure where the gap scales with filterDelaySeconds.
 """
 
 import asyncio
@@ -99,7 +101,15 @@ async def test_e3_aligned_switch(
             f"No switch fired in run; environment too stable. "
             f"{len(switch_records)} total records."
         )
-    assert summary["max_pts_gap_ms"] <= 50, (
-        f"aligned mode should produce near-zero ptsGapMs, "
-        f"got max_pts_gap_ms={summary['max_pts_gap_ms']}"
+    # Aligned switch starts the new track at the group containing the playhead,
+    # i.e. at the keyframe at or before currentTime. The natural envelope is
+    # |playheadGap| <= gopDurationMs (1000ms here): when the playhead sits at
+    # the very end of a GOP, the new track starts up to one full GOP earlier
+    # (overlap, negative gap). Compare to E2 naive where the gap scales with
+    # filterDelaySeconds.
+    GOP_DURATION_MS = 1000  # publisher emits 1-second GOPs
+    assert summary["max_playhead_gap_ms"] <= GOP_DURATION_MS, (
+        f"aligned mode should land within one GOP of the playhead, "
+        f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
+        f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
     )

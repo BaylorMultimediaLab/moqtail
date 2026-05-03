@@ -7,7 +7,11 @@
 - Forces an upswitch from the lowest variant to the highest at t=30s
 - Parses the relay log for the resolved decision
 
-Expected boundary: delay < 20 lands Ready; delay >= 20 lands ClampedToOldest.
+Expected boundary: delay <= 20 lands Ready; delay > 20 lands ClampedToOldest.
+The relay's compute_delayed_start treats `target_group == oldest_cached` as
+in-window (Ready), so we test delay=21 to bracket the cache-miss side rather
+than delay=20, which sits on the soft-cap boundary itself and is fuzzy under
+Moka's `max_capacity` (the cache may briefly hold cache_size + a few groups).
 The aligned switch should produce a near-zero PTS gap in the Ready case;
 the ClampedToOldest case is the operating-boundary observation we measure.
 
@@ -34,7 +38,7 @@ from summary import build_run_summary, write_run_summary
 from trace_helpers import force_switch, parse_relay_decisions
 
 
-_DELAYS = [5, 10, 20, 30, 40]
+_DELAYS = [5, 10, 21, 30, 40]
 _RUNS_PER_CELL = 5
 _CACHE_SIZE = 20
 _TARGET_TRACK = "video-720p-5000k"
@@ -73,6 +77,12 @@ async def test_e4_cache_boundary(
     try:
         # Force the upswitch at t=30s into the collection window.
         await asyncio.sleep(30)
+        # Snapshot count immediately before force_switch so we can isolate
+        # the force_switch's discontinuity record from any earlier
+        # ABR-driven switches (Path B: videoAutoSwitch is not URL-disablable).
+        pre_force_record_count = await page.evaluate(
+            "() => (window.__moqtailMetrics?.switchDiscontinuities ?? []).length"
+        )
         await force_switch(page, _TARGET_TRACK)
         await collect_task
     finally:
@@ -105,12 +115,19 @@ async def test_e4_cache_boundary(
 
     expected_ready = delay < _CACHE_SIZE
     relay_decision = decision.get("classification", "Unknown")
-    pts_gaps = [
-        abs(r.get("ptsGapMs", 0))
-        for r in switch_records
-        if r.get("eventType") == "switch"
-    ]
-    pts_gap = max(pts_gaps) if pts_gaps else 0.0
+    # Isolate the force_switch's record: the first switch record produced
+    # after the pre-force snapshot whose toTrack matches the target.
+    # Earlier records belong to ABR auto-switches (Path B, see module docstring)
+    # and their ptsGapMs values do not reflect the force_switch behavior we test.
+    force_record = next(
+        (
+            r
+            for r in switch_records[pre_force_record_count:]
+            if r.get("eventType") == "switch" and r.get("toTrack") == _TARGET_TRACK
+        ),
+        None,
+    )
+    pts_gap = abs(force_record.get("ptsGapMs", 0)) if force_record else 0.0
 
     summary = build_run_summary(
         metrics_csv=metrics_csv,
