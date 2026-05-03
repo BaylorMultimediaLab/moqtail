@@ -1,0 +1,41 @@
+\documentclass[border=2pt]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{positioning,shapes.geometric,arrows.meta,calc,fit,backgrounds}
+
+\definecolor{naivered}{HTML}{E15759}
+\definecolor{alignedblue}{HTML}{4E79A7}
+\definecolor{cachegray}{HTML}{D0D0D0}
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\sffamily\small,
+  node distance=12mm,
+  box/.style={draw, rounded corners=2pt, minimum width=22mm, minimum height=14mm,
+              align=center, fill=white},
+  inner/.style={draw, dashed, rounded corners=1pt, fill=cachegray, inner sep=2pt,
+                align=center, font=\sffamily\scriptsize},
+  flow/.style={-{Stealth[length=2mm]}, thick},
+]
+
+\node[box] (pub) {Publisher\\\scriptsize 5-rung 720p ladder};
+\node[box, right=18mm of pub] (relay) {Relay};
+\node[box, right=18mm of relay] (client) {Client\\\scriptsize behind-live};
+
+% Cache window inside relay.
+\node[inner, below=1mm of relay.south, anchor=north] (cache)
+  {GOP cache (size $N$)};
+
+% Live edge / playhead inside client.
+\node[inner, below=1mm of client.south, anchor=north] (lag)
+  {playhead trails by\\filterDelay sec};
+
+\draw[flow] (pub) -- node[above]{groups} (relay);
+\draw[flow, alignedblue] (relay) --
+  node[above, font=\sffamily\scriptsize, text=alignedblue]
+       {aligned-switch:}
+  node[below, font=\sffamily\scriptsize, text=alignedblue]
+       {start = group(playhead)}
+  (client);
+
+\end{tikzpicture}
+\end{document}
