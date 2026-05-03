@@ -13,6 +13,17 @@ for the figure spec.
 Outputs land in `paper/figures/`. Sources read from
 `../tests/experiments/results/`.
 
+## Notebook hygiene
+
+Notebooks are committed without cell outputs to keep diffs small. Strip
+outputs before staging:
+
+    .venv/bin/nbstripout notebooks/<name>.ipynb
+
+Or install the git filter once per clone so it happens automatically:
+
+    .venv/bin/nbstripout --install
+
 ## Build a single figure
 
     make figures/fig2_e2_e3_playhead_gap.pdf

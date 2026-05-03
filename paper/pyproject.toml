@@ -17,6 +17,7 @@ dependencies = [
 dev = [
     "pytest>=9.0.0",
     "jupytext>=1.16.0",
+    "nbstripout>=0.7.0",
 ]
 
 [tool.pytest.ini_options]
