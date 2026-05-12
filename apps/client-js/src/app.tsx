@@ -415,14 +415,37 @@ export function App() {
         (a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0),
       );
       let firstVideo = sortedVideoTracks[0]; // default: lowest bitrate
-      const initialBw = await player.estimateInitialBandwidth();
-      if (initialBw > 0 && sortedVideoTracks.length > 0) {
-        const safetyFactor = abrSettings.bandwidthSafetyFactor;
-        const effectiveBw = initialBw * safetyFactor;
-        // Pick highest track that fits within the estimated bandwidth
-        for (const track of sortedVideoTracks) {
-          if ((track.bitrate ?? 0) <= effectiveBw) {
-            firstVideo = track;
+      // Experiment harness can pin the join rung deterministically by setting
+      // window.__abrSettingsOverride.initialBitrate (bps). The closest-bitrate
+      // track wins, bypassing the WebTransport estimate path.
+      const overridePeek =
+        typeof window !== 'undefined'
+          ? (
+              window as Window & {
+                __abrSettingsOverride?: { initialBitrate?: number };
+              }
+            ).__abrSettingsOverride
+          : undefined;
+      const forcedInitialBitrate =
+        overridePeek?.initialBitrate && overridePeek.initialBitrate > 0
+          ? overridePeek.initialBitrate
+          : 0;
+      if (forcedInitialBitrate > 0 && sortedVideoTracks.length > 0) {
+        firstVideo = sortedVideoTracks.reduce((best, t) => {
+          const dBest = Math.abs((best.bitrate ?? 0) - forcedInitialBitrate);
+          const dT = Math.abs((t.bitrate ?? 0) - forcedInitialBitrate);
+          return dT < dBest ? t : best;
+        }, sortedVideoTracks[0]);
+      } else {
+        const initialBw = await player.estimateInitialBandwidth();
+        if (initialBw > 0 && sortedVideoTracks.length > 0) {
+          const safetyFactor = abrSettings.bandwidthSafetyFactor;
+          const effectiveBw = initialBw * safetyFactor;
+          // Pick highest track that fits within the estimated bandwidth
+          for (const track of sortedVideoTracks) {
+            if ((track.bitrate ?? 0) <= effectiveBw) {
+              firstVideo = track;
+            }
           }
         }
       }

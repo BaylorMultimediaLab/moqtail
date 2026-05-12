@@ -1,8 +1,15 @@
 """E5: ABR composability under unfiltered + naive switching.
 
-Exact mirror of E6's parameter sweep (8 ABR configs × 3 bandwidth
-profiles × 5 runs) but with clientMode=unfiltered and switchMode=naive
-instead of E6's filtered+aligned.
+Exact mirror of E6's parameter sweep (12 ABR configs × 3 bandwidth
+profiles × 5 runs = 180 cells) but with clientMode=unfiltered and
+switchMode=naive instead of E6's filtered+aligned.
+
+Each config isolates a single rule (or, for `none`, no rule at all)
+and pins the join rung to the middle of the ladder (1200k) so
+guard-only cells start from a known, comparable position. Some cells
+will produce zero switches by design — `none` cannot switch, and a
+guard rule that never trips under a given profile leaves the player
+at the join rung.
 
 Headline finding (vs aligned): naive switching produces a playhead
 gap equal to the buffer occupancy at switch time, regardless of
@@ -13,21 +20,11 @@ delivers faster than the active variant's bitrate. The first naive
 switch on the new track delivers from the buffer-end (≈ live edge)
 while the playhead trails by however much the buffer is holding.
 
-Observed gaps from run0:
-  - stable1.5M:        1.8–5.0 s  (buffer drained by under-provisioned link)
-  - step3M_500k:       4.2–11.3 s (buffer accumulates during the 3 Mbps phase)
-  - sin600k_3M:        3.7–14.0 s (buffer accumulates during the high half-cycle)
-
-Every cell sits well above the 1-GOP envelope that aligned switching
-holds (E3/E6). The takeaway: naive switching is fundamentally unable
-to deliver continuous playback for any client carrying a buffer,
-whether that buffer comes from filterDelay (E2) or from normal player
-operation (E5). Aligned switching's 1-GOP bound is the only mechanism
-that severs the gap from buffer state.
-
 The assertion bound is 30 s — chosen to catch catastrophic regressions
 (e.g. an accidental filterDelay re-introduction would push the gap
-past 30 s) without false-flagging the genuine 4–14 s observations.
+past 30 s) without false-flagging genuine multi-second buffer-tail
+observations. Cells with zero switches satisfy the assertion trivially
+(gap = 0).
 
 Per-run output lands at:
   tests/experiments/results/test_e5_unfiltered_naive[runN-{cell_id}]/<timestamp>/
@@ -141,16 +138,13 @@ async def test_e5_unfiltered_naive(
     # variant's bitrate. The 30 s bound catches catastrophic regressions
     # (e.g. an accidental filterDelay re-introduction, which would push
     # the gap past 30 s) without false-flagging the genuine multi-second
-    # observations this experiment is designed to measure.
+    # observations this experiment is designed to measure. Cells with
+    # zero switches satisfy this trivially (gap = 0), which is legitimate
+    # for `none` and for guard-only configs whose trigger never fires.
     assert summary["max_playhead_gap_ms"] <= 30_000, (
         f"playheadGapMs catastrophically large for unfiltered + naive — "
         f"likely a regression in the unfiltered subscribe path or "
         f"accidental filterDelay re-introduction. "
         f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
         f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
-    )
-    # Sanity: a switch must have fired so the assertion above is meaningful.
-    assert summary["n_switches"] > 0, (
-        f"no switches fired; assertion trivially passed "
-        f"(playback ended at {summary['current_time_at_end_s']}s)"
     )

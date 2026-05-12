@@ -19,10 +19,15 @@ import pandas as pd
 # then descend.
 RESULTS_ROOT = (Path(__file__).resolve().parents[2] / "tests" / "experiments" / "results").resolve()
 
-# E6 row/column ordering for Fig 5. Matches the spec literally.
+# E6 row/column ordering for Fig 5. One row per ABR config; matches
+# tests/experiments/abr_configs.py exactly. Ordering groups configs by
+# family: no-adaptation baseline, quality drivers, buffer/latency/delivery
+# guards, then standalone algorithms.
 E6_ROW_ORDER = [
-    "none", "throughput-only", "bola-only", "default",
-    "dampened", "aggressive", "lolp", "l2a",
+    "none",
+    "thrpt", "bola", "probe",
+    "ins-buf", "drain", "latency", "abandon", "sw-hist", "drops",
+    "lolp", "l2a",
 ]
 E6_COL_ORDER = ["stable1.5M", "step3M_500k", "sin600k_3M"]
 
@@ -110,7 +115,7 @@ def e4_decision_counts() -> pd.DataFrame:
 
 
 def e6_heatmap_matrix(metric: str) -> pd.DataFrame:
-    """Reshape the E6 aggregate_summary into an 8x3 heat-map matrix.
+    """Reshape the E6 aggregate_summary into a 12x3 heat-map matrix.
 
     Rows are ABR configs in E6_ROW_ORDER; columns are bandwidth profiles
     in E6_COL_ORDER. Cells with no data appear as NaN (Fig 5 will draw
@@ -160,7 +165,7 @@ def compute_avg_delivered_bitrate_kbps(run_dir: Path) -> float:
 
 
 def e6_avg_bitrate_matrix() -> pd.DataFrame:
-    """8x3 matrix of mean delivered bitrate (kbps) per (abr_config, profile).
+    """12x3 matrix of mean delivered bitrate (kbps) per (abr_config, profile).
 
     Walks every E6 per-run directory, computes the time-weighted bitrate for
     each run via compute_avg_delivered_bitrate_kbps, then averages across runs

@@ -1,14 +1,22 @@
 """E6: ABR rule composability across bandwidth profiles.
 
-8 configs x 3 profiles x 5 runs = 120 cells. Each cell:
+12 configs x 3 profiles x 5 runs = 180 cells. Each cell:
 - Filtered client at filterDelay=10, switchMode=aligned (both fixed)
 - ABR config from ABR_CONFIGS injected via window.__abrSettingsOverride
 - Bandwidth profile (stable / step / sinusoidal) driven via tc/netem
 
-Aligned-mode invariant: max_playhead_gap_ms must be within one GOP across
-all cells. Failures of that assertion indicate a switching bug, not a bad
-ABR config. (n_discontinuities is buffer-end-relative and naturally
-~filterDelay in filtered mode — see player.ts ptsGapMs comment.)
+Each config isolates a single rule (or, for `none`, no rule at all) and
+pins the join rung to the middle of the ladder (1200k) so guard-only
+cells start from a known, comparable position. Some cells will produce
+zero switches by design — `none` cannot switch, and a guard rule that
+never trips under a given profile leaves the player at the join rung.
+
+Aligned-mode invariant: max_playhead_gap_ms must be within one GOP
+whenever a switch fires. Cells with zero switches satisfy the invariant
+trivially (gap = 0). Failures of that assertion indicate a switching
+bug, not a bad ABR config. (n_discontinuities is buffer-end-relative
+and naturally ~filterDelay in filtered mode — see player.ts ptsGapMs
+comment.)
 """
 
 import asyncio
@@ -114,19 +122,12 @@ async def test_e6_abr_composability(
     # Aligned-mode invariant: new track lands within one GOP of the playhead.
     # max_pts_gap_ms is buffer-end-relative and is ~filterDelay in filtered
     # mode by design (playhead seeks behind the buffer at startup), so it's
-    # diagnostic here, not assertive. Mirrors E3's invariant.
+    # diagnostic here, not assertive. Mirrors E3's invariant. Cells with
+    # zero switches satisfy this trivially (gap = 0), which is legitimate
+    # for `none` and for guard-only configs whose trigger never fires.
     GOP_DURATION_MS = 1000  # publisher emits 1-second GOPs
     assert summary["max_playhead_gap_ms"] <= GOP_DURATION_MS, (
         f"aligned mode should land within one GOP of the playhead, "
         f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
         f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
-    )
-    # Sanity: a switch must have fired so the aligned-mode invariant above is
-    # meaningful (max_playhead_gap_ms defaults to 0 with no switches). Some
-    # cells (e.g. abr_config="none" + stable1.5M) drive the player into 5000k
-    # on a 1.5Mbps link, where catch-up redelivery exhausts the 60s window —
-    # that's the test exercising ABR behavior, not a failure.
-    assert summary["n_switches"] > 0, (
-        f"no switches fired; alignment invariant trivially passed "
-        f"(playback ended at {summary['current_time_at_end_s']}s)"
     )
