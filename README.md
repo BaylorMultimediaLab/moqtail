@@ -1,79 +1,179 @@
 # MOQtail
 
-Draft 14-compliant MOQT protocol libraries for publisher, subscriber and relay components, featuring various live and on-demand demo applications using the LOC and CMSF formats.
+Reference implementation and experiment artifacts accompanying the MMSys 2026
+Special Session paper on Media-over-QUIC Transport (MOQT) ABR streaming with
+time-aligned switching, filtered/unfiltered client modes, and pluggable ABR
+composability.
 
-## moqtail-ts (MOQtail TypeScript Library)
+This repository contains everything needed to reproduce the paper's figures
+end-to-end: a Draft-14-compliant MOQT publisher / relay / subscriber stack, the
+Mininet-based network harness, the parametrized experiment suite (E1–E6), and
+the Jupyter notebooks that turn raw results into the published figures.
 
-The TypeScript client library for Media-over-QUIC (MoQ) applications, designed for seamless integration with WebTransport and MoQ relay servers.
+## What's in here
 
-### ✨ Features
+| Path                                     | Role                                                                               |
+| ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| [apps/publisher/](apps/publisher/)       | Rust live publisher (FFmpeg-encoded ABR ladder over MOQT)                          |
+| [apps/relay/](apps/relay/)               | Rust MOQT relay with bounded per-track cache                                       |
+| [apps/client-js/](apps/client-js/)       | Browser subscriber (TypeScript/Vite) — filtered & unfiltered modes, ABR controller |
+| [apps/client/](apps/client/)             | Native subscriber (Rust)                                                           |
+| [libs/moqtail-rs/](libs/moqtail-rs/)     | Rust MOQT protocol library                                                         |
+| [libs/moqtail-ts/](libs/moqtail-ts/)     | TypeScript MOQT protocol library                                                   |
+| [tests/network/](tests/network/)         | Mininet harness — single-relay topology, link shaping, Playwright-driven Chromium  |
+| [tests/experiments/](tests/experiments/) | Paper experiments E1–E6 (parametrized pytest, builds on `tests/network/`)          |
+| [paper/](paper/)                         | Figure notebooks, Makefile, and `figures/` outputs                                 |
 
-- 🛡️ **TypeScript**: Type-safe development
-- 🔗 **WebTransport**: Next-gen transport protocol support
-- 🔥 **Hot Module Reloading**: Instant feedback during development
+## Reproducing the paper
 
-README available at: [moqtail-ts/README.md](libs/moqtail-ts/README.md)
+The full pipeline is:
 
-## 🚀 Getting Started
-
-### Prerequisites
-
-- [Node.js](https://nodejs.org/) (v18+ recommended)
-- [npm](https://www.npmjs.com/)
-
-### Installation
-
-```bash
-# Clone the repository (if not already)
-git clone https://github.com/moqtail/moqtail.git
-cd moqtail
-
-# Install dependencies
-npm install
+```
+prepare asset  →  run experiments  →  build figures
+(once)            (~3.5 h on Linux)   (cd paper && make all)
 ```
 
-## moqtail-rs (MOQtail Rust Library)
+### 1. Install prerequisites
 
-The Rust library for Media-over-QUIC (MoQ) applications, providing core protocol functionalities and utilities.
+See [INSTALLATION.md](INSTALLATION.md) for the full Linux-native setup
+(Ubuntu 24.04 tested). It covers system packages (FFmpeg dev libs, mkcert,
+weston for the headless harness), Rust, Node.js v18+, TLS certificates for
+WebTransport, and optional VAAPI hardware encoding.
 
-## Relay
-
-The relay is a Rust application that forwards MoQ messages between publishers and subscribers.
-
-```bash
-cargo run --bin relay -- --port 4433 --cert-file cert/cert.pem --key-file cert/key.pem
-```
-
-### ⚙️ Configuration
-
-- **WebTransport**: Ensure your browser supports WebTransport and that you have trusted the local CA, see the [README.md](apps/relay/cert/README.md) of the relay for instructions.
-
-## Network Tests (Mininet ABR)
-
-End-to-end ABR scenarios under [tests/network/](tests/network/) run the publisher, relay, and a Chromium subscriber across a Mininet topology with configurable link shaping. Requires Linux with root (Mininet), `uv`, and the project's Rust/JS builds.
-
-### First-time setup
+The Mininet harness additionally requires Open vSwitch, Xvfb, Chromium, and
+`uv`. One-shot setup:
 
 ```bash
 sudo ./tests/network/setup.sh
 ```
 
-This installs Mininet, Open vSwitch, Xvfb, Chromium, `uv`, Python deps (via `uv sync` + Playwright Chromium), and builds the `relay`/`publisher` binaries and `client-js`.
+This also builds `relay` / `publisher` (release) and the `client-js` bundle.
 
-### Running the scenarios
+### 2. Prepare the source video
+
+All experiments use the first 60 s of _Tears of Steel_ re-encoded to 720p
+H.264 with 1 s GOPs (low-latency convention; matches LoL+/CMCD). The script
+is idempotent — safe to re-run.
 
 ```bash
-# All scenarios
-sudo uv run --project tests/network pytest tests/network/scenarios/ -v
-
-# A single scenario
-sudo uv run --project tests/network pytest tests/network/scenarios/test_sudden_drop.py -v
+./scripts/prepare_tears_of_steel.sh
 ```
 
-Available scenarios: [test_bandwidth_recovery.py](tests/network/scenarios/test_bandwidth_recovery.py), [test_gradual_ramp_down.py](tests/network/scenarios/test_gradual_ramp_down.py), [test_high_latency.py](tests/network/scenarios/test_high_latency.py), [test_oscillation_resistance.py](tests/network/scenarios/test_oscillation_resistance.py), [test_packet_loss.py](tests/network/scenarios/test_packet_loss.py), [test_publisher_degradation.py](tests/network/scenarios/test_publisher_degradation.py), [test_sudden_drop.py](tests/network/scenarios/test_sudden_drop.py).
+It downloads Blender's 1080p H.264 master, scales/encodes once, and prints
+the SHA-256 of the output for reproducibility. Cached at
+`data/video/.cache/`; output at `data/video/tears_of_steel_60s_720p.mp4`.
 
-Topology, link profiles, and run parameters live in [tests/network/config.yaml](tests/network/config.yaml).
+### 3. Run the experiments
 
-## 🤝 Contributing
+```bash
+./scripts/run-experiments.sh                 # all five experiments (~3.5 h)
+./scripts/run-experiments.sh e1 e2           # selected experiments
+```
 
-Contributions are welcome! Please open issues or submit pull requests for improvements, bug fixes, or documentation updates.
+The wrapper rebuilds stale Rust binaries, runs each experiment under `sudo`
+(Mininet requires root namespaces), and aggregates per-cell summaries.
+Per-run artifacts land at:
+
+```
+tests/experiments/results/<test_id>/<timestamp>/
+  ├── metrics.csv
+  ├── relay.log
+  ├── publisher.log
+  ├── switch_records.json
+  ├── abr_settings.json
+  ├── cell_params.json
+  └── summary.json
+```
+
+Aggregates land at `tests/experiments/results/<exp>/aggregate.csv` and
+`aggregate_summary.csv` — designed for `pd.read_csv(...).pipe(...)` workflows.
+
+### 4. Build the figures
+
+```bash
+cd paper
+uv sync
+make all
+```
+
+Notebook-driven figures execute against the aggregates from step 3; the
+TikZ architecture figure compiles from `figures/fig1_architecture.tex` via
+`pdflatex`. Outputs (PDF + PNG) land in `paper/figures/`.
+
+To rebuild a single figure:
+
+```bash
+make figures/fig2_e2_e3_playhead_gap.pdf
+```
+
+Notebooks are committed without cell outputs — strip with
+`.venv/bin/nbstripout notebooks/<name>.ipynb` before staging, or install
+the git filter once with `.venv/bin/nbstripout --install`.
+
+## Experiments
+
+| Exp    | What it measures                                                                                            | Cells × Runs | Wall time | Figure          |
+| ------ | ----------------------------------------------------------------------------------------------------------- | ------------ | --------- | --------------- |
+| **E1** | Baseline single-run smoke (5-rung 720p ladder, stable 10 Mbps, unfiltered live edge)                        | 1 × 1        | ~1.5 min  | — (sanity only) |
+| **E2** | Naive (immediate) switch — PTS discontinuity under bandwidth step-down at filter delays 5/10/20/30 s        | 4 × 5        | ~27 min   | Fig 2, Fig 3a   |
+| **E3** | Group-aligned switch — same conditions as E2, switching deferred to GOP boundary                            | 4 × 5        | ~27 min   | Fig 2, Fig 3b   |
+| **E4** | Cache-availability boundary — forced upswitch at filter delays 5/10/20/30/40 s with relay `--cache-size 20` | 5 × 5        | ~33 min   | Fig 4           |
+| **E5** | Unfiltered + naive ABR composability sweep (E5 was reserved at design time; added later)                    | —            | —         | Fig 6           |
+| **E6** | Filtered + aligned ABR composability — 8 ABR configs × 3 bandwidth profiles                                 | 24 × 5       | ~2.7 h    | Fig 5           |
+
+Full per-experiment specs (parameters, run flow, assertions, summary fields)
+live in [docs/superpowers/specs/2026-04-30-paper-experiments-design.md](docs/superpowers/specs/2026-04-30-paper-experiments-design.md).
+The figure spec (panel layout, axes, captions, page-budget choices) is in
+[docs/superpowers/specs/2026-05-03-paper-figures-design.md](docs/superpowers/specs/2026-05-03-paper-figures-design.md).
+
+## Running individual pieces
+
+### A specific experiment cell
+
+```bash
+sudo uv --project tests/experiments run pytest \
+  tests/experiments/test_e2_naive_switch.py -v
+```
+
+### Network regression scenarios (separate from paper experiments)
+
+```bash
+sudo uv run --project tests/network pytest tests/network/scenarios/ -v
+```
+
+Available: [test_bandwidth_recovery.py](tests/network/scenarios/test_bandwidth_recovery.py),
+[test_gradual_ramp_down.py](tests/network/scenarios/test_gradual_ramp_down.py),
+[test_high_latency.py](tests/network/scenarios/test_high_latency.py),
+[test_oscillation_resistance.py](tests/network/scenarios/test_oscillation_resistance.py),
+[test_packet_loss.py](tests/network/scenarios/test_packet_loss.py),
+[test_publisher_degradation.py](tests/network/scenarios/test_publisher_degradation.py),
+[test_sudden_drop.py](tests/network/scenarios/test_sudden_drop.py),
+[test_aligned_switch.py](tests/network/scenarios/test_aligned_switch.py),
+[test_naive_switch_discontinuity.py](tests/network/scenarios/test_naive_switch_discontinuity.py),
+[test_filtered_connect.py](tests/network/scenarios/test_filtered_connect.py).
+Topology, link profiles, and run parameters are in
+[tests/network/config.yaml](tests/network/config.yaml).
+
+### The stack interactively (no Mininet)
+
+```bash
+npm --prefix libs/moqtail-ts run build
+cargo build --release
+./scripts/run-stack.sh                       # default video
+./scripts/run-stack.sh data/video/my.mp4     # custom video
+./scripts/run-stack.sh stop
+```
+
+| Component | URL                    |
+| --------- | ---------------------- |
+| Relay     | https://localhost:4433 |
+| Client-JS | http://localhost:5173  |
+
+## Authors
+
+See [AUTHORS](AUTHORS).
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Bug
+reports, fixes, and documentation improvements via GitHub issues / PRs.
