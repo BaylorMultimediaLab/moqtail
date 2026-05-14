@@ -7,7 +7,7 @@ composability.
 
 This repository contains everything needed to reproduce the paper's figures
 end-to-end: a Draft-14-compliant MOQT publisher / relay / subscriber stack, the
-Mininet-based network harness, the parametrized experiment suite (E1–E6), and
+Mininet-based network harness, the parametrized experiment suite (E1–E4), and
 the Jupyter notebooks that turn raw results into the published figures.
 
 ## What's in here
@@ -21,7 +21,7 @@ the Jupyter notebooks that turn raw results into the published figures.
 | [libs/moqtail-rs/](libs/moqtail-rs/)     | Rust MOQT protocol library                                                         |
 | [libs/moqtail-ts/](libs/moqtail-ts/)     | TypeScript MOQT protocol library                                                   |
 | [tests/network/](tests/network/)         | Mininet harness — single-relay topology, link shaping, Playwright-driven Chromium  |
-| [tests/experiments/](tests/experiments/) | Paper experiments E1–E6 (parametrized pytest, builds on `tests/network/`)          |
+| [tests/experiments/](tests/experiments/) | Paper experiments E1–E4 (parametrized pytest, builds on `tests/network/`)          |
 | [paper/](paper/)                         | Figure notebooks, Makefile, and `figures/` outputs                                 |
 
 ## Reproducing the paper
@@ -66,7 +66,7 @@ the SHA-256 of the output for reproducibility. Cached at
 ### 3. Run the experiments
 
 ```bash
-./scripts/run-experiments.sh                 # all five experiments (~3.5 h)
+./scripts/run-experiments.sh                 # all experiments
 ./scripts/run-experiments.sh e1 e2           # selected experiments
 ```
 
@@ -103,7 +103,7 @@ TikZ architecture figure compiles from `figures/fig1_architecture.tex` via
 To rebuild a single figure:
 
 ```bash
-make figures/fig2_e2_e3_playhead_gap.pdf
+make figures/fig2_e1_e2_playhead_gap.pdf
 ```
 
 Notebooks are committed without cell outputs — strip with
@@ -112,14 +112,12 @@ the git filter once with `.venv/bin/nbstripout --install`.
 
 ## Experiments
 
-| Exp    | What it measures                                                                                            | Cells × Runs | Wall time | Figure          |
-| ------ | ----------------------------------------------------------------------------------------------------------- | ------------ | --------- | --------------- |
-| **E1** | Baseline single-run smoke (5-rung 720p ladder, stable 10 Mbps, unfiltered live edge)                        | 1 × 1        | ~1.5 min  | — (sanity only) |
-| **E2** | Naive (immediate) switch — PTS discontinuity under bandwidth step-down at filter delays 5/10/20/30 s        | 4 × 5        | ~27 min   | Fig 2, Fig 3a   |
-| **E3** | Group-aligned switch — same conditions as E2, switching deferred to GOP boundary                            | 4 × 5        | ~27 min   | Fig 2, Fig 3b   |
-| **E4** | Cache-availability boundary — forced upswitch at filter delays 5/10/20/30/40 s with relay `--cache-size 20` | 5 × 5        | ~33 min   | Fig 4           |
-| **E5** | Unfiltered + naive ABR composability sweep (E5 was reserved at design time; added later)                    | —            | —         | Fig 6           |
-| **E6** | Filtered + aligned ABR composability — 8 ABR configs × 3 bandwidth profiles                                 | 24 × 5       | ~2.7 h    | Fig 5           |
+| Exp    | What it measures                                                                                     | Cells × Runs | Wall time | Figure        |
+| ------ | ---------------------------------------------------------------------------------------------------- | ------------ | --------- | ------------- |
+| **E1** | Naive (immediate) switch — PTS discontinuity under bandwidth step-down at filter delays 5/10/20/30 s | 4 × 5        | ~27 min   | Fig 2, Fig 3a |
+| **E2** | Group-aligned switch — same conditions as E1, switching deferred to GOP boundary                     | 4 × 5        | ~27 min   | Fig 2, Fig 3b |
+| **E3** | Unfiltered + naive ABR composability sweep                                                           | 39 × 5       | ~2.9 h    | Fig 4         |
+| **E4** | Filtered + aligned ABR composability — 13 ABR configs × 3 bandwidth profiles                         | 39 × 5       | ~2.9 h    | Fig 5         |
 
 Full per-experiment specs (parameters, run flow, assertions, summary fields)
 live in [docs/superpowers/specs/2026-04-30-paper-experiments-design.md](docs/superpowers/specs/2026-04-30-paper-experiments-design.md).
@@ -132,7 +130,7 @@ The figure spec (panel layout, axes, captions, page-budget choices) is in
 
 ```bash
 sudo uv --project tests/experiments run pytest \
-  tests/experiments/test_e2_naive_switch.py -v
+  tests/experiments/test_e1_naive_switch.py -v
 ```
 
 ### Network regression scenarios (separate from paper experiments)

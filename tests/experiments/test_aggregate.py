@@ -13,32 +13,32 @@ def test_build_aggregate_collects_all_runs(tmp_path: Path):
     # Flat layout: summary.json files can live at arbitrary subdirectories.
     # build_aggregate walks recursively and filters by the 'experiment' field.
     _write_summary(tmp_path / "run0", {
-        "experiment": "e2", "cell_id": "naive_offset5", "run_index": 0,
+        "experiment": "e1", "cell_id": "naive_offset5", "run_index": 0,
         "n_switches": 2, "max_pts_gap_ms": 250.0, "n_discontinuities": 1, "success": True,
     })
     _write_summary(tmp_path / "run1", {
-        "experiment": "e2", "cell_id": "naive_offset5", "run_index": 1,
+        "experiment": "e1", "cell_id": "naive_offset5", "run_index": 1,
         "n_switches": 2, "max_pts_gap_ms": 280.0, "n_discontinuities": 1, "success": True,
     })
     _write_summary(tmp_path / "run2", {
-        "experiment": "e2", "cell_id": "naive_offset10", "run_index": 0,
+        "experiment": "e1", "cell_id": "naive_offset10", "run_index": 0,
         "n_switches": 1, "max_pts_gap_ms": 120.0, "n_discontinuities": 1, "success": True,
     })
     # A summary from a different experiment — must NOT be included.
     _write_summary(tmp_path / "other_run", {
-        "experiment": "e3", "cell_id": "aligned_offset5", "run_index": 0,
+        "experiment": "e2", "cell_id": "aligned_offset5", "run_index": 0,
         "n_switches": 0, "max_pts_gap_ms": 0.0, "n_discontinuities": 0, "success": True,
     })
-    rows = build_aggregate(tmp_path, "e2")
+    rows = build_aggregate(tmp_path, "e1")
     assert len(rows) == 3
     assert {r["cell_id"] for r in rows} == {"naive_offset5", "naive_offset10"}
 
 
 def test_build_aggregate_summary_groups_by_cell(tmp_path: Path):
     rows = [
-        {"cell_id": "naive_offset5", "experiment": "e2", "max_pts_gap_ms": 250.0, "n_switches": 2, "success": True},
-        {"cell_id": "naive_offset5", "experiment": "e2", "max_pts_gap_ms": 280.0, "n_switches": 2, "success": True},
-        {"cell_id": "naive_offset10", "experiment": "e2", "max_pts_gap_ms": 120.0, "n_switches": 1, "success": True},
+        {"cell_id": "naive_offset5", "experiment": "e1", "max_pts_gap_ms": 250.0, "n_switches": 2, "success": True},
+        {"cell_id": "naive_offset5", "experiment": "e1", "max_pts_gap_ms": 280.0, "n_switches": 2, "success": True},
+        {"cell_id": "naive_offset10", "experiment": "e1", "max_pts_gap_ms": 120.0, "n_switches": 1, "success": True},
     ]
     summary = build_aggregate_summary(rows)
     assert len(summary) == 2

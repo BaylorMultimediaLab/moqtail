@@ -1,11 +1,14 @@
-"""E3: aligned switch on a behind-live (filtered) client lands within one GOP of the playhead.
+"""E1: naive switch on a behind-live (filtered) client produces non-zero ptsGapMs.
 
-Same shape as E2 (4 offsets x 5 runs, step bandwidth profile) but with
-switchMode=aligned. The aligned primitive starts the new track at the group
-containing the playhead, so |playheadGap| <= gopDurationMs by construction
-(the new track starts at a keyframe boundary at or before the playhead).
-This is the design-doc envelope ([-500, +500]ms, "within one GOP"). Compare
-to the E2 naive failure where the gap scales with filterDelaySeconds.
+20 parametric cells: 4 offsets x 5 runs. Each run launches a filtered client
+at the offset, hits the network with a step bandwidth drop at t=30s and
+recovery at t=45s (relative to collection start), records all switch events,
+and asserts the maximum |ptsGapMs| across switches is > 100 ms — the failure
+mode this experiment documents.
+
+Per-run output lands at:
+  tests/experiments/results/test_e1_naive_switch[offset{N}-run{M}]/<timestamp>/
+    metrics.csv, relay.log, switch_records.json, cell_params.json, summary.json
 """
 
 import asyncio
@@ -28,7 +31,7 @@ def _offset_params():
             marks=pytest.mark.abr_url_overrides(
                 clientMode="filtered",
                 filterDelay=str(offset),
-                switchMode="aligned",
+                switchMode="naive",
             ),
         )
         for offset in _OFFSETS
@@ -38,14 +41,15 @@ def _offset_params():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("offset", _offset_params(), ids=[f"offset{o}" for o in _OFFSETS])
 @pytest.mark.parametrize("run_index", range(_RUNS_PER_CELL), ids=[f"run{i}" for i in range(_RUNS_PER_CELL)])
-async def test_e3_aligned_switch(
+async def test_e1_naive_switch(
     offset, run_index,
     net, relay_proc, publisher_proc, browser_page, collector, results_dir,
 ):
-    cell_id = f"aligned_offset{offset}"
+    cell_id = f"naive_offset{offset}"
     page = browser_page
     _, relay_log_path = relay_proc
 
+    # Wait for buffer >= 2.0s before starting the bandwidth profile (max 10s warmup).
     deadline = asyncio.get_event_loop().time() + 10
     while asyncio.get_event_loop().time() < deadline:
         buf = await page.evaluate(
@@ -55,6 +59,7 @@ async def test_e3_aligned_switch(
             break
         await asyncio.sleep(0.25)
 
+    # Step profile: 3 Mbps -> 500 kbps @ 30s -> 3 Mbps @ 45s, relative to collection start.
     profile_task = asyncio.create_task(
         apply_step(net, initial_mbps=3.0, drop_mbps=0.5, drop_at_s=30, recover_at_s=45)
     )
@@ -74,7 +79,7 @@ async def test_e3_aligned_switch(
     collector.save_csv(metrics_csv)
     (results_dir / "switch_records.json").write_text(json.dumps(switch_records))
     cell_params = {
-        "experiment": "e3",
+        "experiment": "e1",
         "cell_id": cell_id,
         "run_index": run_index,
         "filter_delay_s": offset,
@@ -101,15 +106,13 @@ async def test_e3_aligned_switch(
             f"No switch fired in run; environment too stable. "
             f"{len(switch_records)} total records."
         )
-    # Aligned switch starts the new track at the group containing the playhead,
-    # i.e. at the keyframe at or before currentTime. The natural envelope is
-    # |playheadGap| <= gopDurationMs (1000ms here): when the playhead sits at
-    # the very end of a GOP, the new track starts up to one full GOP earlier
-    # (overlap, negative gap). Compare to E2 naive where the gap scales with
-    # filterDelaySeconds.
-    GOP_DURATION_MS = 1000  # publisher emits 1-second GOPs
-    assert summary["max_playhead_gap_ms"] <= GOP_DURATION_MS, (
-        f"aligned mode should land within one GOP of the playhead, "
+    # Naive failure mode: relay's LatestObject delivery jumps the new track to
+    # the live edge while the playhead is still `filterDelay` seconds behind,
+    # so newStartPTS − playheadPTS ≈ filterDelay × 1000 (positive, large).
+    # Buffer-end ptsGapMs is ~0 here because the buffer has caught up to live
+    # edge — so we assert on playhead-relative gap, not on ptsGapMs.
+    assert summary["max_playhead_gap_ms"] > 100, (
+        f"expected positive playheadGapMs (naive switch on filtered client), "
         f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
         f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
     )

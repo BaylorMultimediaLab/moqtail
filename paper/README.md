@@ -26,4 +26,4 @@ Or install the git filter once per clone so it happens automatically:
 
 ## Build a single figure
 
-    make figures/fig2_e2_e3_playhead_gap.pdf
+    make figures/fig2_e1_e2_playhead_gap.pdf

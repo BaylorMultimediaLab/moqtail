@@ -19,17 +19,18 @@ import pandas as pd
 # then descend.
 RESULTS_ROOT = (Path(__file__).resolve().parents[2] / "tests" / "experiments" / "results").resolve()
 
-# E6 row/column ordering for Fig 5. One row per ABR config; matches
+# E4 row/column ordering for Fig 5. One row per ABR config; matches
 # tests/experiments/abr_configs.py exactly. Ordering groups configs by
 # family: no-adaptation baseline, quality drivers, buffer/latency/delivery
 # guards, then standalone algorithms.
-E6_ROW_ORDER = [
+E4_ROW_ORDER = [
     "none",
     "thrpt", "bola", "probe",
     "ins-buf", "drain", "latency", "abandon", "sw-hist", "drops",
+    "all",
     "lolp", "l2a",
 ]
-E6_COL_ORDER = ["stable1.5M", "step3M_500k", "sin600k_3M"]
+E4_COL_ORDER = ["stable1.5M", "step3M_500k", "sin600k_3M"]
 
 
 def load_aggregate(experiment: str) -> pd.DataFrame:
@@ -58,7 +59,7 @@ def find_median_run_dir(experiment: str, cell_id: str, metric: str) -> Path:
     Looks under RESULTS_ROOT for any directory whose summary.json carries
     matching {experiment, cell_id} fields. The directory name is
     pytest's parametrized ID, e.g.
-    ``test_e3_aligned_switch[run2-offset20]/<timestamp>/``.
+    ``test_e2_aligned_switch[run2-offset20]/<timestamp>/``.
     """
     candidates: list[tuple[float, Path]] = []
     for summary_path in sorted(RESULTS_ROOT.rglob("summary.json")):
@@ -94,46 +95,26 @@ def load_run_metrics(run_dir: Path) -> pd.DataFrame:
     return df
 
 
-def e4_decision_counts() -> pd.DataFrame:
-    """Return per-cell counts of Ready vs ClampedToOldest for E4 Fig 4(a).
+def e4_heatmap_matrix(metric: str) -> pd.DataFrame:
+    """Reshape the E4 aggregate_summary into a 12x3 heat-map matrix.
 
-    Output columns: cell_id, delay_s, ready, clamped, n_runs.
-    delay_s is parsed from cell_id ("cache20_delay21" -> 21).
-    """
-    df = load_aggregate("e4")
-    rows = []
-    for cell_id, grp in df.groupby("cell_id"):
-        delay_s = int(cell_id.split("delay")[-1])
-        rows.append({
-            "cell_id": cell_id,
-            "delay_s": delay_s,
-            "ready": int((grp["relay_decision"] == "Ready").sum()),
-            "clamped": int((grp["relay_decision"] == "ClampedToOldest").sum()),
-            "n_runs": len(grp),
-        })
-    return pd.DataFrame(rows).sort_values("delay_s").reset_index(drop=True)
-
-
-def e6_heatmap_matrix(metric: str) -> pd.DataFrame:
-    """Reshape the E6 aggregate_summary into a 12x3 heat-map matrix.
-
-    Rows are ABR configs in E6_ROW_ORDER; columns are bandwidth profiles
-    in E6_COL_ORDER. Cells with no data appear as NaN (Fig 5 will draw
+    Rows are ABR configs in E4_ROW_ORDER; columns are bandwidth profiles
+    in E4_COL_ORDER. Cells with no data appear as NaN (Fig 5 will draw
     them with a hatched mask).
 
     Cell-ids in the summary are formatted "{config}_{profile}".
     """
-    summary = load_aggregate_summary("e6")
+    summary = load_aggregate_summary("e4")
     if metric not in summary.columns:
         raise KeyError(
-            f"metric {metric!r} not found in e6 aggregate_summary; "
+            f"metric {metric!r} not found in e4 aggregate_summary; "
             f"available columns: {list(summary.columns)}"
         )
     parsed = summary["cell_id"].str.split("_", n=1, expand=True)
     summary["abr_config"] = parsed[0]
     summary["profile"] = parsed[1]
     pivot = summary.pivot(index="abr_config", columns="profile", values=metric)
-    return pivot.reindex(index=E6_ROW_ORDER, columns=E6_COL_ORDER)
+    return pivot.reindex(index=E4_ROW_ORDER, columns=E4_COL_ORDER)
 
 
 def compute_avg_delivered_bitrate_kbps(run_dir: Path) -> float:
@@ -164,13 +145,13 @@ def compute_avg_delivered_bitrate_kbps(run_dir: Path) -> float:
     return float((valid["bitrate_kbps"] * valid["dt_s"]).sum() / total_weight)
 
 
-def e6_avg_bitrate_matrix() -> pd.DataFrame:
+def e4_avg_bitrate_matrix() -> pd.DataFrame:
     """12x3 matrix of mean delivered bitrate (kbps) per (abr_config, profile).
 
-    Walks every E6 per-run directory, computes the time-weighted bitrate for
+    Walks every E4 per-run directory, computes the time-weighted bitrate for
     each run via compute_avg_delivered_bitrate_kbps, then averages across runs
     per cell. Cells with no runs appear as NaN; the row/column order matches
-    E6_ROW_ORDER / E6_COL_ORDER (same as e6_heatmap_matrix).
+    E4_ROW_ORDER / E4_COL_ORDER (same as e4_heatmap_matrix).
     """
     rows = []
     for summary_path in sorted(RESULTS_ROOT.rglob("summary.json")):
@@ -178,7 +159,7 @@ def e6_avg_bitrate_matrix() -> pd.DataFrame:
             data = json.loads(summary_path.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        if data.get("experiment") != "e6":
+        if data.get("experiment") != "e4":
             continue
         cell_id = data.get("cell_id")
         if not cell_id:
@@ -186,7 +167,7 @@ def e6_avg_bitrate_matrix() -> pd.DataFrame:
         bitrate = compute_avg_delivered_bitrate_kbps(summary_path.parent)
         rows.append({"cell_id": cell_id, "bitrate_kbps": bitrate})
     if not rows:
-        return pd.DataFrame(index=E6_ROW_ORDER, columns=E6_COL_ORDER, dtype=float)
+        return pd.DataFrame(index=E4_ROW_ORDER, columns=E4_COL_ORDER, dtype=float)
     df = pd.DataFrame(rows)
     parsed = df["cell_id"].str.split("_", n=1, expand=True)
     df["abr_config"] = parsed[0]
@@ -194,4 +175,4 @@ def e6_avg_bitrate_matrix() -> pd.DataFrame:
     pivot = df.pivot_table(
         index="abr_config", columns="profile", values="bitrate_kbps", aggfunc="mean"
     )
-    return pivot.reindex(index=E6_ROW_ORDER, columns=E6_COL_ORDER)
+    return pivot.reindex(index=E4_ROW_ORDER, columns=E4_COL_ORDER)

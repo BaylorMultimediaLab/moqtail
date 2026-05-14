@@ -262,7 +262,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "abr_settings_override(settings): inject window.__abrSettingsOverride before "
-        "Connect click. Used by E6 to sweep ABR rule configurations.",
+        "Connect click. Used by E4 to sweep ABR rule configurations.",
     )
     config.addinivalue_line(
         "markers",
@@ -505,7 +505,7 @@ async def browser_page(net, config, results_dir, request, worker_idx):
                 raise RuntimeError("Client-JS never exposed __moqtailMetrics")
 
             # Test harness ABR override: experiment cells stamp this marker per
-            # parametric instance (E6 sweep). The hook in apps/client-js/src/app.tsx
+            # parametric instance (E4 sweep). The hook in apps/client-js/src/app.tsx
             # reads window.__abrSettingsOverride at AbrController construction; we
             # set it after page.goto but before Connect click so it lands in time.
             settings_marker = request.node.get_closest_marker("abr_settings_override")
@@ -521,7 +521,7 @@ async def browser_page(net, config, results_dir, request, worker_idx):
             # the unshaped Mininet veth and feeds SWMA a phantom-high sample,
             # which fools bandwidth-EMA-driven rules (ThroughputRule,
             # InsufficientBufferRule, L2A, LoLP) into firing upswitches they
-            # cannot sustain on slow profiles (E5/E6 stable1.5M).
+            # cannot sustain on slow profiles (E3/E4 stable1.5M).
             initial_bw_marker = request.node.get_closest_marker("initial_bandwidth_mbps")
             if initial_bw_marker and initial_bw_marker.args:
                 shape_link2(net, bw_mbps=float(initial_bw_marker.args[0]))

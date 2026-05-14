@@ -14,11 +14,10 @@ NOTEBOOKS_DIR = PAPER_ROOT / "notebooks"
 FIGURES_DIR = PAPER_ROOT / "figures"
 
 NOTEBOOK_TO_PDF = {
-    "fig2_e2_e3_playhead_gap.ipynb": ("fig2_e2_e3_playhead_gap.pdf",),
+    "fig2_e1_e2_playhead_gap.ipynb": ("fig2_e1_e2_playhead_gap.pdf",),
     "fig3_trace_naive_vs_aligned.ipynb": ("fig3a_trace_naive.pdf", "fig3b_trace_aligned.pdf"),
-    "fig4_e4_cache_boundary.ipynb": ("fig4_e4_cache_boundary.pdf",),
-    "fig5_e6_composability.ipynb": ("fig5_e6_composability.pdf",),
-    "fig6_e5_unfiltered_naive.ipynb": ("fig6_e5_unfiltered_naive.pdf",),
+    "fig4_e3_unfiltered_naive.ipynb": ("fig4_e3_unfiltered_naive.pdf",),
+    "fig5_e4_composability.ipynb": ("fig5_e4_composability.pdf",),
 }
 
 

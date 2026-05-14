@@ -17,7 +17,7 @@ def build_run_summary(
     Reads the metrics CSV, switch_records.json, and (optionally) the relay log,
     and produces a flat dict combining cell parameters with derived metrics.
 
-    The discontinuity threshold (50ms) is the same as Task 4.3's E3 assertion:
+    The discontinuity threshold (50ms) is the same as Task 4.3's E2 assertion:
     aligned switching should never produce a >50ms PTS gap, so any switch
     above that line is counted as a discontinuity. Below threshold, switches
     are still counted (n_switches) but not flagged.

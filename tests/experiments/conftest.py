@@ -241,12 +241,12 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "abr_settings_override(settings): inject window.__abrSettingsOverride before "
-        "Connect click. Used by E6 to sweep ABR rule configurations.",
+        "Connect click. Used by E4 to sweep ABR rule configurations.",
     )
     config.addinivalue_line(
         "markers",
         "initial_bandwidth_mbps(value): apply tc/tbf shaping at the given rate to "
         "the relay-client link BEFORE the Connect click, so SWMA reads the "
-        "rate-limited link from the very first GOP. Required for E5/E6 cells "
+        "rate-limited link from the very first GOP. Required for E3/E4 cells "
         "whose profile's t=0 bandwidth is below the highest ladder rung.",
     )

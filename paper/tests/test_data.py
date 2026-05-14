@@ -12,8 +12,7 @@ import pytest
 
 from _data import (
     RESULTS_ROOT,
-    e4_decision_counts,
-    e6_heatmap_matrix,
+    e4_heatmap_matrix,
     find_median_run_dir,
     load_aggregate,
     load_run_metrics,
@@ -23,18 +22,17 @@ from _data import (
 def test_results_root_resolves_to_experiment_results():
     # The figures load from tests/experiments/results/, two levels up from paper/.
     assert RESULTS_ROOT.exists(), f"experiment results not at {RESULTS_ROOT}"
+    assert (RESULTS_ROOT / "e1" / "aggregate.csv").exists()
     assert (RESULTS_ROOT / "e2" / "aggregate.csv").exists()
-    assert (RESULTS_ROOT / "e3" / "aggregate.csv").exists()
-    assert (RESULTS_ROOT / "e4" / "aggregate.csv").exists()
 
 
 def test_load_aggregate_returns_dataframe_with_expected_columns():
-    df = load_aggregate("e2")
+    df = load_aggregate("e1")
     assert isinstance(df, pd.DataFrame)
     # cell_id and max_playhead_gap_ms are the keys Figs 2 & 5 group by.
     assert "cell_id" in df.columns
     assert "max_playhead_gap_ms" in df.columns
-    # E2 has 4 cells * 5 runs = 20 rows.
+    # E1 has 4 cells * 5 runs = 20 rows.
     assert len(df) == 20
 
 
@@ -43,10 +41,10 @@ def test_load_aggregate_unknown_experiment_raises():
         load_aggregate("e99")
 
 
-def test_find_median_run_dir_returns_existing_directory_for_e3():
+def test_find_median_run_dir_returns_existing_directory_for_e2():
     # Fig 3's source: pick the run from cell aligned_offset20 whose
     # max_playhead_gap_ms is closest to the cell's median.
-    run_dir = find_median_run_dir(experiment="e3", cell_id="aligned_offset20",
+    run_dir = find_median_run_dir(experiment="e2", cell_id="aligned_offset20",
                                   metric="max_playhead_gap_ms")
     assert run_dir.exists()
     assert (run_dir / "metrics.csv").exists()
@@ -54,7 +52,7 @@ def test_find_median_run_dir_returns_existing_directory_for_e3():
 
 
 def test_load_run_metrics_returns_timestamped_dataframe():
-    run_dir = find_median_run_dir(experiment="e3", cell_id="aligned_offset20",
+    run_dir = find_median_run_dir(experiment="e2", cell_id="aligned_offset20",
                                   metric="max_playhead_gap_ms")
     metrics = load_run_metrics(run_dir)
     assert "timestamp" in metrics.columns
@@ -65,37 +63,28 @@ def test_load_run_metrics_returns_timestamped_dataframe():
     assert metrics["wall_clock_s"].is_monotonic_increasing
 
 
-def test_e4_decision_counts_returns_one_row_per_cell():
-    counts = e4_decision_counts()
-    # 5 delays in E4: 5, 10, 21, 30, 40.
-    assert len(counts) == 5
-    assert set(counts["cell_id"]) == {
-        "cache20_delay5", "cache20_delay10", "cache20_delay21",
-        "cache20_delay30", "cache20_delay40",
-    }
-    # Counts sum to n_runs (5) per cell.
-    assert (counts["ready"] + counts["clamped"] == 5).all()
-
-
-def test_e6_heatmap_matrix_returns_8x3_grid():
-    # NOTE: avg_delivered_bitrate_kbps_mean is not yet in e6 summary.json;
+def test_e4_heatmap_matrix_returns_13x3_grid():
+    # NOTE: avg_delivered_bitrate_kbps_mean is not yet in e4 summary.json;
     # using n_switches_mean (a real column) until the metric is backfilled.
-    matrix = e6_heatmap_matrix(metric="n_switches_mean")
-    # 8 ABR configs (rows) x 3 bandwidth profiles (columns).
-    assert matrix.shape == (8, 3)
+    matrix = e4_heatmap_matrix(metric="n_switches_mean")
+    # 13 ABR configs (rows) x 3 bandwidth profiles (columns).
+    assert matrix.shape == (13, 3)
     # Row order is fixed: none -> l2a (matches Fig 5 spec).
     assert list(matrix.index) == [
-        "none", "throughput-only", "bola-only", "default",
-        "dampened", "aggressive", "lolp", "l2a",
+        "none",
+        "thrpt", "bola", "probe",
+        "ins-buf", "drain", "latency", "abandon", "sw-hist", "drops",
+        "all",
+        "lolp", "l2a",
     ]
     assert list(matrix.columns) == ["stable1.5M", "step3M_500k", "sin600k_3M"]
 
 
 def test_compute_avg_delivered_bitrate_kbps_returns_positive_for_real_run():
     from _data import compute_avg_delivered_bitrate_kbps, find_median_run_dir
-    # Use a known run from E6 (or fall back to E3 which definitely has data).
+    # Use a known run from E4 (or fall back to E2 which definitely has data).
     run_dir = find_median_run_dir(
-        experiment="e3", cell_id="aligned_offset20", metric="max_playhead_gap_ms"
+        experiment="e2", cell_id="aligned_offset20", metric="max_playhead_gap_ms"
     )
     bitrate = compute_avg_delivered_bitrate_kbps(run_dir)
     # Bitrates are in [400, 5000] kbps for the 720p ladder; time-weighted
@@ -125,11 +114,11 @@ def test_compute_avg_delivered_bitrate_kbps_handles_unknown_track_format():
         assert 1800 <= bitrate <= 1900, f"expected ~1850, got {bitrate}"
 
 
-def test_e6_avg_bitrate_matrix_returns_8x3_with_real_values():
-    from _data import E6_COL_ORDER, E6_ROW_ORDER, e6_avg_bitrate_matrix
-    matrix = e6_avg_bitrate_matrix()
-    assert matrix.shape == (8, 3)
-    assert list(matrix.index) == E6_ROW_ORDER
-    assert list(matrix.columns) == E6_COL_ORDER
+def test_e4_avg_bitrate_matrix_returns_13x3_with_real_values():
+    from _data import E4_COL_ORDER, E4_ROW_ORDER, e4_avg_bitrate_matrix
+    matrix = e4_avg_bitrate_matrix()
+    assert matrix.shape == (13, 3)
+    assert list(matrix.index) == E4_ROW_ORDER
+    assert list(matrix.columns) == E4_COL_ORDER
     # At least some cells must have non-NaN bitrates from completed runs.
     assert matrix.notna().any(axis=None)

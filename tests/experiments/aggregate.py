@@ -106,7 +106,7 @@ def aggregate_experiment(results_root: Path, experiment: str) -> tuple[Path, Pat
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("experiment", help="Experiment id (e1, e2, e3, e4, e6)")
+    parser.add_argument("experiment", help="Experiment id (e1, e2, e4)")
     parser.add_argument(
         "--results-root",
         default=str(Path(__file__).resolve().parent / "results"),

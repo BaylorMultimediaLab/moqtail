@@ -1,4 +1,4 @@
-"""ABR rule configurations for the E5/E6 sweep.
+"""ABR rule configurations for the E3/E4 sweep.
 
 Each config isolates a single rule (or, for `none`, disables all of them)
 so its individual contribution to delivered bitrate, switch count, and
@@ -11,10 +11,14 @@ start from a known, comparable rung across the three bandwidth profiles.
 The client honors this override in app.tsx by selecting the closest-
 bitrate track instead of using the WebTransport bandwidth estimate.
 
-Twelve configs total:
+Thirteen configs total:
   none                      — no rule active; serves as the no-adaptation reference
   thrpt / bola / probe      — quality drivers, one at a time
   ins-buf / drain / latency / abandon / sw-hist / drops — guard rules, one at a time
+  all                       — every dash.js rule active simultaneously, except
+                              LoLP/L2A (which assume exclusive ownership of
+                              the switching decision). Composes all the
+                              individually-isolated rules above.
   lolp / l2a                — standalone algorithms (assume exclusive
                               ownership of the switching decision)
 """
@@ -51,6 +55,19 @@ def _config(active: str | None) -> dict:
     }
 
 
+def _config_all_except(*disabled: str) -> dict:
+    """Every rule active except the named ones (e.g. LoLP/L2A)."""
+    rules = _all_off()
+    for name in rules:
+        rules[name] = {"active": True}
+    for name in disabled:
+        rules[name] = {"active": False}
+    return {
+        "initialBitrate": _JOIN_BITRATE_BPS,
+        "rules": rules,
+    }
+
+
 ABR_CONFIGS = {
     # No adaptation: every rule disabled. Pinned to the middle rung; the
     # delivered bitrate under each profile bounds what passive playback can
@@ -71,6 +88,11 @@ ABR_CONFIGS = {
     "abandon": _config("AbandonRequestsRule"),
     "sw-hist": _config("SwitchHistoryRule"),
     "drops": _config("DroppedFramesRule"),
+
+    # All dash.js-style rules active simultaneously. Excludes LoLP/L2A (which
+    # are standalone algorithms — see below). Compositionality reference: what
+    # happens when every individually-isolated rule from above runs together.
+    "all": _config_all_except("LoLPRule", "L2ARule"),
 
     # Standalone algorithms whose internal state machine assumes exclusive
     # ownership of the switching decision (no composition with other rules).

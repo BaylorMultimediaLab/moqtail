@@ -1,8 +1,8 @@
-"""E5: ABR composability under unfiltered + naive switching.
+"""E3: ABR composability under unfiltered + naive switching.
 
-Exact mirror of E6's parameter sweep (12 ABR configs × 3 bandwidth
-profiles × 5 runs = 180 cells) but with clientMode=unfiltered and
-switchMode=naive instead of E6's filtered+aligned.
+Exact mirror of E4's parameter sweep (13 ABR configs × 3 bandwidth
+profiles × 5 runs = 195 cells) but with clientMode=unfiltered and
+switchMode=naive instead of E4's filtered+aligned.
 
 Each config isolates a single rule (or, for `none`, no rule at all)
 and pins the join rung to the middle of the ladder (1200k) so
@@ -27,7 +27,7 @@ observations. Cells with zero switches satisfy the assertion trivially
 (gap = 0).
 
 Per-run output lands at:
-  tests/experiments/results/test_e5_unfiltered_naive[runN-{cell_id}]/<timestamp>/
+  tests/experiments/results/test_e3_unfiltered_naive[runN-{cell_id}]/<timestamp>/
 """
 
 import asyncio
@@ -44,7 +44,7 @@ _RUNS_PER_CELL = 5
 
 # t=0 bandwidth for each profile, applied via the initial_bandwidth_mbps
 # marker so the shaper is active BEFORE the WebTransport handshake. See
-# the matching block in test_e6_abr_composability.py for the rationale.
+# the matching block in test_e4_abr_composability.py for the rationale.
 _PROFILE_INITIAL_BW_MBPS = {
     "stable1.5M": 1.5,
     "step3M_500k": 3.0,
@@ -68,7 +68,7 @@ def _cell_params():
     """Build pytest.param entries stamping each cell with its
     abr_url_overrides and abr_settings_override markers.
 
-    Same shape as E6's _cell_params() but with clientMode=unfiltered,
+    Same shape as E4's _cell_params() but with clientMode=unfiltered,
     switchMode=naive, no filterDelay.
     """
     params = []
@@ -100,7 +100,7 @@ def _cell_params():
 @pytest.mark.parametrize(
     "run_index", range(_RUNS_PER_CELL), ids=[f"run{i}" for i in range(_RUNS_PER_CELL)]
 )
-async def test_e5_unfiltered_naive(
+async def test_e3_unfiltered_naive(
     config_name, profile_name, run_index,
     net, relay_proc, publisher_proc, browser_page, collector, results_dir,
 ):
@@ -128,7 +128,7 @@ async def test_e5_unfiltered_naive(
         json.dumps(ABR_CONFIGS[config_name], indent=2)
     )
     cell_params = {
-        "experiment": "e5",
+        "experiment": "e3",
         "cell_id": cell_id,
         "run_index": run_index,
         "abr_config_name": config_name,

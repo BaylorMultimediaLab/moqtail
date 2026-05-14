@@ -1,6 +1,6 @@
-"""E6: ABR rule composability across bandwidth profiles.
+"""E4: ABR rule composability across bandwidth profiles.
 
-12 configs x 3 profiles x 5 runs = 180 cells. Each cell:
+13 configs x 3 profiles x 5 runs = 195 cells. Each cell:
 - Filtered client at filterDelay=10, switchMode=aligned (both fixed)
 - ABR config from ABR_CONFIGS injected via window.__abrSettingsOverride
 - Bandwidth profile (stable / step / sinusoidal) driven via tc/netem
@@ -91,7 +91,7 @@ def _cell_params():
 @pytest.mark.parametrize(
     "run_index", range(_RUNS_PER_CELL), ids=[f"run{i}" for i in range(_RUNS_PER_CELL)]
 )
-async def test_e6_abr_composability(
+async def test_e4_abr_composability(
     config_name, profile_name, run_index,
     net, relay_proc, publisher_proc, browser_page, collector, results_dir,
 ):
@@ -119,7 +119,7 @@ async def test_e6_abr_composability(
         json.dumps(ABR_CONFIGS[config_name], indent=2)
     )
     cell_params = {
-        "experiment": "e6",
+        "experiment": "e4",
         "cell_id": cell_id,
         "run_index": run_index,
         "abr_config_name": config_name,
@@ -139,7 +139,7 @@ async def test_e6_abr_composability(
     # Aligned-mode invariant: new track lands within one GOP of the playhead.
     # max_pts_gap_ms is buffer-end-relative and is ~filterDelay in filtered
     # mode by design (playhead seeks behind the buffer at startup), so it's
-    # diagnostic here, not assertive. Mirrors E3's invariant. Cells with
+    # diagnostic here, not assertive. Mirrors E2's invariant. Cells with
     # zero switches satisfy this trivially (gap = 0), which is legitimate
     # for `none` and for guard-only configs whose trigger never fires.
     GOP_DURATION_MS = 1000  # publisher emits 1-second GOPs

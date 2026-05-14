@@ -4,8 +4,8 @@
 # Usage:
 #   ./scripts/run-experiments.sh                 # all experiments, serial
 #   ./scripts/run-experiments.sh e1 e2           # selected experiments, serial
-#   ./scripts/run-experiments.sh e6 e5 -n 4      # selected, 4 xdist workers
-#   ./scripts/run-experiments.sh -n auto e6      # let xdist size to CPU count
+#   ./scripts/run-experiments.sh e4 e3 -n 4      # selected, 4 xdist workers
+#   ./scripts/run-experiments.sh -n auto e4      # let xdist size to CPU count
 #
 # Flags:
 #   -n N | --workers N    pytest-xdist worker count. `auto` picks ncpus.
@@ -47,7 +47,7 @@ while (( $# > 0 )); do
 done
 
 if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
-  EXPERIMENTS=(e1 e2 e3 e4 e5 e6)
+  EXPERIMENTS=(e1 e2 e3 e4)
 else
   EXPERIMENTS=("${POSITIONAL[@]}")
 fi
@@ -57,7 +57,7 @@ fi
 # assume serial + live-encode mode; replay + xdist parallelism cuts these
 # substantially (~10x per-test load drop, plus N-way concurrency).
 declare -A WALL=(
-  [e1]=2 [e2]=27 [e3]=27 [e4]=33 [e5]=162 [e6]=162
+  [e1]=27 [e2]=27 [e3]=175 [e4]=175
 )
 total=0
 for e in "${EXPERIMENTS[@]}"; do
