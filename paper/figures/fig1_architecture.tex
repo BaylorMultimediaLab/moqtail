@@ -1,4 +1,5 @@
 \documentclass[border=6pt]{standalone}
+\usepackage{mathptmx}  % Times New Roman for text + math
 \usepackage{tikz}
 \usepackage{xcolor}
 \usetikzlibrary{positioning,shapes.geometric,arrows.meta,calc,fit,backgrounds,decorations.pathmorphing}
@@ -11,7 +12,7 @@
 
 \begin{document}
 \begin{tikzpicture}[
-  font=\sffamily\small,
+  font=\rmfamily\small,
   box/.style={
     draw, rounded corners=3pt,
     minimum width=26mm, minimum height=16mm,
@@ -22,7 +23,7 @@
   inner/.style={
     draw, dashed, rounded corners=2pt,
     fill=cachegray, inner sep=3pt,
-    align=center, font=\sffamily\scriptsize\itshape,
+    align=center, font=\rmfamily\scriptsize\itshape,
     line width=0.4pt
   },
   flow/.style={-{Stealth[length=3mm]}, line width=0.8pt},
@@ -40,13 +41,13 @@
   {playhead trails live edge\\by $\mathit{filterDelay}$ seconds};
 
 % Pub -> Relay arrow with single-line label above.
-\draw[flow] (pub) -- node[above, font=\sffamily\scriptsize, midway]
+\draw[flow] (pub) -- node[above, font=\rmfamily\scriptsize, midway]
   {publishes groups} (relay);
 
 % Relay -> Client arrow: label is a SINGLE compact node ABOVE the
 % arrow midpoint so it doesn't bleed into the Client box.
 \draw[flow, alignedblue] (relay.east) --
-  node[above=1mm, midway, font=\sffamily\scriptsize, text=alignedblue, align=center]
+  node[above=1mm, midway, font=\rmfamily\scriptsize, text=alignedblue, align=center]
        {\textbf{aligned-switch primitive}\\start\,$=$\,group containing playhead}
   (client.west);
 

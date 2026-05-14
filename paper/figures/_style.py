@@ -29,13 +29,18 @@ COL_CLAMPED = "#F28E2B"   # orange
 
 
 def apply_acm_style() -> None:
-    """Apply ACM sigconf-friendly rcParams (sans-serif, 8pt, embedded fonts).
+    """Apply ACM sigconf-friendly rcParams (Times serif, 8pt, embedded fonts).
+
+    Times New Roman is preferred; on systems that don't ship it, matplotlib
+    falls through to Liberation Serif / Nimbus Roman (both metric-compatible
+    drop-ins) so the layout is preserved.
 
     Idempotent. Safe to call from every notebook's first cell.
     """
     plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": ["DejaVu Sans", "Arial", "Helvetica"],
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Liberation Serif", "Nimbus Roman", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
         "font.size": 8.0,
         "axes.titlesize": 8.0,
         "axes.labelsize": 8.0,
