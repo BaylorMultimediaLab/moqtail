@@ -2,8 +2,20 @@
 # Convenience wrapper for the paper experiment suite.
 #
 # Usage:
-#   ./scripts/run-experiments.sh                 # all experiments
-#   ./scripts/run-experiments.sh e1 e2           # selected experiments
+#   ./scripts/run-experiments.sh                 # all experiments, serial
+#   ./scripts/run-experiments.sh e1 e2           # selected experiments, serial
+#   ./scripts/run-experiments.sh e6 e5 -n 4      # selected, 4 xdist workers
+#   ./scripts/run-experiments.sh -n auto e6      # let xdist size to CPU count
+#
+# Flags:
+#   -n N | --workers N    pytest-xdist worker count. `auto` picks ncpus.
+#                         Each worker gets its own mininet topology with
+#                         worker_idx-suffixed names (pub_w0, rly_w0, …) and
+#                         a per-worker mgmt subnet 169.254.<idx>.0/24, so
+#                         parallel workers don't collide in the root netns.
+#                         Replay mode (--encoded-dir) is what makes this
+#                         actually faster; live HEVC encode would saturate
+#                         the VAAPI encode block before CPU.
 #
 # Each experiment runs through pytest under sudo (Mininet requires root),
 # then aggregates per-cell summaries. Per-run artifacts land at:
@@ -16,23 +28,46 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [[ $# -eq 0 ]]; then
-  EXPERIMENTS=(e1 e2 e3 e4 e6)
+# Parse args: split flags from positional experiment names. The flag may
+# appear before, after, or interleaved with experiment names.
+WORKERS=""
+POSITIONAL=()
+while (( $# > 0 )); do
+  case "$1" in
+    -n|--workers)
+      [[ $# -lt 2 ]] && { echo "[run-experiments] -n/--workers requires a value" >&2; exit 2; }
+      WORKERS="$2"; shift 2 ;;
+    -n=*|--workers=*)
+      WORKERS="${1#*=}"; shift ;;
+    --)
+      shift; POSITIONAL+=("$@"); break ;;
+    *)
+      POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+  EXPERIMENTS=(e1 e2 e3 e4 e5 e6)
 else
-  EXPERIMENTS=("$@")
+  EXPERIMENTS=("${POSITIONAL[@]}")
 fi
 
 # Estimated wall time per experiment (matches design doc § 8). Used only
-# for the upfront ETA; the actual runtime depends on the host.
+# for the upfront ETA; the actual runtime depends on the host. Numbers
+# assume serial + live-encode mode; replay + xdist parallelism cuts these
+# substantially (~10x per-test load drop, plus N-way concurrency).
 declare -A WALL=(
-  [e1]=2 [e2]=27 [e3]=27 [e4]=33 [e6]=162
+  [e1]=2 [e2]=27 [e3]=27 [e4]=33 [e5]=162 [e6]=162
 )
 total=0
 for e in "${EXPERIMENTS[@]}"; do
   total=$((total + ${WALL[$e]:-0}))
 done
 echo "[run-experiments] Will run: ${EXPERIMENTS[*]}"
-echo "[run-experiments] Estimated wall time: ${total} minutes"
+if [[ -n "$WORKERS" ]]; then
+  echo "[run-experiments] Parallel: pytest-xdist -n ${WORKERS}"
+fi
+echo "[run-experiments] Estimated wall time (serial, live-encode): ${total} minutes"
 echo ""
 
 # Step 1: Tears of Steel asset must exist.
@@ -90,11 +125,44 @@ else
   PYTEST_PREFIX=(sudo -E)
 fi
 
+# Step 2.5: Pre-warm the encoded-GOP cache for the experiment ladder. The
+# publisher_proc fixture lazily runs `prepare` on the first test that needs
+# a given (video, ladder) cache; with -n >= 2 multiple xdist workers would
+# race that prepare on a cold cache. Doing it here, once, on the host
+# eliminates that race and gets the GPU encode cost out of the test run.
+LADDER="720p:400,800,1200,2500,5000"
+VIDEO_STEM="tears_of_steel_60s_720p"
+LADDER_SLUG="${LADDER//:/_}"; LADDER_SLUG="${LADDER_SLUG//,/-}"
+CACHE_DIR="$ROOT_DIR/data/encoded/${VIDEO_STEM}__${LADDER_SLUG}"
+if [[ ! -f "$CACHE_DIR/meta.json" ]]; then
+  echo "[run-experiments] Pre-warming encoded cache at $CACHE_DIR (one-time, ~10s on VAAPI)..."
+  mkdir -p "$CACHE_DIR"
+  "$ROOT_DIR/target/release/publisher" \
+    --video-path "$ASSET" \
+    --encoded-dir "$CACHE_DIR" \
+    --ladder-spec "$LADDER" \
+    2>&1 | tail -5
+  if [[ ! -f "$CACHE_DIR/meta.json" ]]; then
+    echo "[run-experiments] Cache warm-up failed (no meta.json at $CACHE_DIR)." >&2
+    exit 1
+  fi
+fi
+echo ""
+
+# xdist flag for pytest if -n was passed.
+XDIST_ARGS=()
+if [[ -n "$WORKERS" ]]; then
+  XDIST_ARGS=(-n "$WORKERS")
+fi
+
 # Step 3 + 4: For each experiment, run pytest then aggregate.
 for e in "${EXPERIMENTS[@]}"; do
   echo "[run-experiments] === Running ${e} ==="
   # The tests/experiments/test_<exp>_*.py glob matches a single file per experiment.
-  if ! "${PYTEST_PREFIX[@]}" uv --project tests/experiments run pytest "tests/experiments/test_${e}_"*.py -v; then
+  # `--` separates uv's own flags from the pytest command line. Without it, uv
+  # eats `-n 4` as its `--no-sync` short option and pytest never sees it (xdist
+  # silently runs serially despite the plugin being loaded).
+  if ! "${PYTEST_PREFIX[@]}" uv --project tests/experiments run -- pytest "tests/experiments/test_${e}_"*.py "${XDIST_ARGS[@]}" -v; then
     echo "[run-experiments] Some ${e} cells failed — continuing to aggregate so partial data is preserved."
   fi
 

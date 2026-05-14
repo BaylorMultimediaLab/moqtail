@@ -102,13 +102,79 @@ def publisher_ladder_spec(request):
     )
 
 
+def _ladder_slug(ladder_spec: str) -> str:
+    """Filesystem-safe slug for a publisher --ladder-spec value.
+
+    `720p:400,800,1200,2500,5000` -> `720p_400-800-1200-2500-5000`. Used to
+    pick a deterministic cache directory per (video, ladder) combination so
+    different experiment ladders don't clobber each other's encoded GOPs.
+    """
+    return ladder_spec.replace(":", "_").replace(",", "-")
+
+
+def _ensure_encoded_dir(project_root, pub_bin, video_path, ladder_spec, max_variants=4):
+    """Return the encoded-GOP cache dir for (video, ladder); prepare if missing.
+
+    Replay mode (--encoded-dir) cuts per-test CPU/GPU load by ~10x — it skips
+    decode+encode and just reads pre-encoded `.gop` files from disk at 1 GOP/s.
+    The prepare step is a one-time pipeline run that writes those files; we
+    detect a complete cache by the presence of `meta.json` (written atomically
+    last by run_prepare). Different ladder specs land in different subdirs so
+    a stale 12-config cache and a default-ladder cache can coexist.
+
+    Prepare runs on the host (not in the mininet publisher netns) — it's a pure
+    file->file transform with no MoQ connection, so the netns is irrelevant
+    and host-side avoids paying mininet setup cost during the prepare step.
+    """
+    video_stem = Path(video_path).stem
+    if ladder_spec == "default":
+        cache_dir = project_root / "data" / "encoded" / video_stem
+    else:
+        cache_dir = project_root / "data" / "encoded" / f"{video_stem}__{_ladder_slug(ladder_spec)}"
+
+    meta = cache_dir / "meta.json"
+    if meta.is_file():
+        return cache_dir
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log_path = cache_dir.parent / f"{cache_dir.name}.prepare.log"
+    print(
+        f"[publisher_proc] No encoded cache at {cache_dir}; running prepare "
+        f"(one-time, ~30-90s for 60s @ 5 variants on VAAPI). Log: {log_path}"
+    )
+    with open(log_path, "w") as logf:
+        result = subprocess.run(
+            [
+                pub_bin,
+                "--video-path", str(video_path),
+                "--encoded-dir", str(cache_dir),
+                "--ladder-spec", ladder_spec,
+                "--max-variants", str(max_variants),
+            ],
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            timeout=600,
+        )
+    if result.returncode != 0 or not meta.is_file():
+        tail = log_path.read_text()[-2000:] if log_path.is_file() else "(no log)"
+        raise RuntimeError(
+            f"Publisher prepare failed for {cache_dir} (rc={result.returncode}).\n"
+            f"Last lines of {log_path}:\n{tail}"
+        )
+    return cache_dir
+
+
 @pytest.fixture
 def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec):
     """Override of tests/network's publisher_proc.
 
-    Uses the Tears of Steel 60-second 720p source by default. The publisher
-    binary must be built with the vaapi feature for AMD GPU encoding:
-    `cargo build --release --workspace --features publisher/vaapi`.
+    Uses the Tears of Steel 60-second 720p source by default and runs the
+    publisher in replay mode (`--encoded-dir`) so per-test CPU/GPU load is
+    bounded by disk reads, not by live HEVC encoding. The first invocation
+    for a given (video, ladder) pair triggers a one-time prepare on the host.
+
+    The publisher binary must be built with the vaapi feature for AMD GPU
+    encoding during prepare: `cargo build --release --workspace --features publisher/vaapi`.
     """
     publisher = net.get("publisher")
     pub_bin = str(project_root / config["binaries"]["publisher"])
@@ -118,6 +184,11 @@ def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec)
             f"Tears of Steel asset missing at {video_path}. "
             f"Run: ./scripts/prepare_tears_of_steel.sh"
         )
+
+    encoded_dir = _ensure_encoded_dir(
+        project_root, pub_bin, video_path, publisher_ladder_spec
+    )
+
     relay_ip = config["topology"]["relay_ip_pub"]
 
     proc = publisher.popen(
@@ -127,6 +198,7 @@ def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec)
             "--namespace", "moqtail",
             "--video-path", video_path,
             "--ladder-spec", publisher_ladder_spec,
+            "--encoded-dir", str(encoded_dir),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -170,4 +242,11 @@ def pytest_configure(config):
         "markers",
         "abr_settings_override(settings): inject window.__abrSettingsOverride before "
         "Connect click. Used by E6 to sweep ABR rule configurations.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "initial_bandwidth_mbps(value): apply tc/tbf shaping at the given rate to "
+        "the relay-client link BEFORE the Connect click, so SWMA reads the "
+        "rate-limited link from the very first GOP. Required for E5/E6 cells "
+        "whose profile's t=0 bandwidth is below the highest ladder rung.",
     )

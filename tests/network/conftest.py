@@ -16,7 +16,87 @@ from playwright.async_api import async_playwright
 
 from metrics_collector import MetricsCollector
 from relay_log_parser import RelayLogParser
-from topology import create_network
+from shaper import shape_link2
+from topology import client_alt_ip, create_network, physical_names
+
+
+def _worker_idx() -> int:
+    """Numeric worker index derived from pytest-xdist's PYTEST_XDIST_WORKER env.
+
+    `gw0`/`gw1`/... → 0/1/...; absent or `master` → 0. The conftest uses the
+    integer to suffix every root-namespace artifact (OVS bridge name, root0
+    veth, management subnet) so parallel xdist workers never collide.
+    """
+    name = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    if name == "master":
+        return 0
+    if name.startswith("gw"):
+        return int(name[2:])
+    raise RuntimeError(f"Unrecognized PYTEST_XDIST_WORKER value: {name!r}")
+
+
+def _worker_cleanup(worker_idx: int) -> None:
+    """Best-effort removal of leaked per-worker mininet state.
+
+    Replaces the global `mn -c` we used to run before each `net` fixture: that
+    sledgehammer wipes ALL mininet state on the host, which under pytest-xdist
+    would tear down other workers' running topologies mid-test. This targets
+    only the worker-suffixed OVS bridges and veths so each worker's cleanup is
+    isolated. Idempotent; tolerates missing items.
+    """
+    names = physical_names(worker_idx)
+    # OVS bridges live in the root namespace and persist across mininet
+    # invocations if a prior test errored before `network.stop()` ran.
+    for sw in (names["s1"], names["s2"]):
+        subprocess.run(
+            ["ovs-vsctl", "--if-exists", "del-br", sw],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+    # veth interfaces: mininet creates each pair in the root namespace and then
+    # moves the host-side end into the host's netns. If creation succeeded but
+    # the move didn't (mid-construction failure), the host-side veth stays in
+    # root ns under its default `<hostname>-eth<n>` name. Deleting one side of
+    # a veth removes both. `root0`'s eth0 is always in root ns by design.
+    for iface in (
+        f"{names['root0']}-eth0",
+        f"{names['publisher']}-eth0",
+        f"{names['relay']}-eth0",
+        f"{names['relay']}-eth1",
+        f"{names['client']}-eth0",
+    ):
+        subprocess.run(
+            ["ip", "link", "del", iface],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+
+
+class WorkerNet:
+    """Translates logical node names (`publisher`, `relay`, `client`, `s1`,
+    `s2`, `root0`) to the worker-suffixed physical names mininet sees.
+
+    All other Mininet methods/attributes pass through unchanged via
+    `__getattr__`. Tests can keep calling `net.get("publisher")` without
+    knowing about worker indices; shaper.py reads `host.name` and gets back
+    the suffixed name, which matches the actual interface naming.
+    """
+
+    def __init__(self, mn_net, worker_idx: int):
+        self._net = mn_net
+        self._worker_idx = worker_idx
+        self._name_map = physical_names(worker_idx)
+
+    @property
+    def worker_idx(self) -> int:
+        return self._worker_idx
+
+    def get(self, name):
+        return self._net.get(self._name_map.get(name, name))
+
+    def stop(self):
+        return self._net.stop()
+
+    def __getattr__(self, attr):
+        return getattr(self._net, attr)
 
 
 def pytest_addoption(parser):
@@ -57,39 +137,39 @@ def results_dir(results_base, request):
 
 
 @pytest.fixture
-def net(config):
-    # Clean any leaked Mininet state from a prior run BEFORE creating the
-    # network. Without this, when a previous test errors during topology
-    # construction, its `try/finally` cleanup never runs and leaves veth
-    # pairs (client-eth0, s2-eth2, etc.) in the root namespace. The next
-    # `addLink` then fails with "RTNETLINK answers: File exists" and
-    # cascades through every subsequent test in the session.
-    subprocess.run(
-        ["mn", "-c"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+def worker_idx() -> int:
+    """Numeric worker index. 0 outside pytest-xdist; gwN → N under xdist.
+
+    Exposed as a fixture so other fixtures (browser_page, etc.) can derive
+    per-worker addresses without reaching into the env directly.
+    """
+    return _worker_idx()
+
+
+@pytest.fixture
+def net(config, worker_idx):
+    # Per-worker pre-cleanup of any leaked state from a prior errored run. We
+    # cannot use the global `mn -c` here: under pytest-xdist that would wipe
+    # other workers' active topologies. See _worker_cleanup for the scoped
+    # alternative. Each worker only touches its own _w<n>-suffixed artifacts.
+    _worker_cleanup(worker_idx)
 
     topo_cfg = config["topology"]
     network = create_network(
+        worker_idx=worker_idx,
         link1_bw=topo_cfg["link1_default_bw"],
         link2_bw=topo_cfg["link2_default_bw"],
         delay=topo_cfg["default_delay"],
         loss=topo_cfg["default_loss"],
     )
     try:
-        yield network
+        yield WorkerNet(network, worker_idx)
     finally:
         network.stop()
         # root0 has inNamespace=False, so mininet.stop() leaves its veth behind
         # and the next run's addLink fails with "RTNETLINK answers: File exists".
-        subprocess.run(
-            ["ip", "link", "del", "root0-eth0"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        # Worker-scoped cleanup also catches any other interfaces mininet missed.
+        _worker_cleanup(worker_idx)
 
 
 @pytest.fixture
@@ -184,10 +264,18 @@ def pytest_configure(config):
         "abr_settings_override(settings): inject window.__abrSettingsOverride before "
         "Connect click. Used by E6 to sweep ABR rule configurations.",
     )
+    config.addinivalue_line(
+        "markers",
+        "initial_bandwidth_mbps(value): apply tc/tbf shaping at the given rate to "
+        "the relay-client link BEFORE the Connect click, so the player's SWMA "
+        "reads the rate-limited delivery rate from the very first GOP. Without "
+        "this, the first group transfers over the unshaped Mininet veth and "
+        "seeds the SWMA with a phantom-high reading.",
+    )
 
 
 @pytest.fixture
-async def browser_page(net, config, results_dir, request):
+async def browser_page(net, config, results_dir, request, worker_idx):
     # Headful under Weston, not --headless=new. With --headless=new on Linux +
     # AMD VA-API the GPU process exits 8704 trying to allocate a platform
     # GpuMemoryBuffer for HEVC frames → PIPELINE_ERROR_DISCONNECTED → the
@@ -195,7 +283,11 @@ async def browser_page(net, config, results_dir, request):
     client = net.get("client")
     dist_path = str(Path(__file__).parent.parent.parent / config["client_js"]["dist_path"])
     chromium_flags = config["chromium"]["flags"]
-    client_ip = config["topology"]["client_ip"]
+    # CDP traffic from pytest (root namespace) reaches the client netns via the
+    # per-worker management subnet 169.254.<worker_idx>.0/24. The in-netns
+    # client IP (10.0.2.1) would route ambiguously across parallel workers'
+    # s2 bridges since they all share that subnet number.
+    client_ip = client_alt_ip(worker_idx)
     relay_url = config["client_js"]["relay_url"]
     chrome_bin = _find_chrome_binary()
 
@@ -422,6 +514,17 @@ async def browser_page(net, config, results_dir, request):
                 await page.evaluate(
                     "(s) => { window.__abrSettingsOverride = s; }", settings
                 )
+
+            # Pre-Connect bandwidth shaping: install tc/tbf BEFORE the
+            # WebTransport handshake so SWMA sees the rate-limited link from
+            # the very first GOP. Without this the first group transfers over
+            # the unshaped Mininet veth and feeds SWMA a phantom-high sample,
+            # which fools bandwidth-EMA-driven rules (ThroughputRule,
+            # InsufficientBufferRule, L2A, LoLP) into firing upswitches they
+            # cannot sustain on slow profiles (E5/E6 stable1.5M).
+            initial_bw_marker = request.node.get_closest_marker("initial_bandwidth_mbps")
+            if initial_bw_marker and initial_bw_marker.args:
+                shape_link2(net, bw_mbps=float(initial_bw_marker.args[0]))
 
             # The client-js UI sits idle until Connect is clicked, so the ABR
             # pipeline (and window.__moqtailMetrics.abr) stays null without this.

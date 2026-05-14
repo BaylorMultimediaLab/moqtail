@@ -42,6 +42,15 @@ from summary import build_run_summary, write_run_summary
 
 _RUNS_PER_CELL = 5
 
+# t=0 bandwidth for each profile, applied via the initial_bandwidth_mbps
+# marker so the shaper is active BEFORE the WebTransport handshake. See
+# the matching block in test_e6_abr_composability.py for the rationale.
+_PROFILE_INITIAL_BW_MBPS = {
+    "stable1.5M": 1.5,
+    "step3M_500k": 3.0,
+    "sin600k_3M": 1.8,
+}
+
 
 def _make_profile_task(net, profile_name: str):
     if profile_name == "stable1.5M":
@@ -76,6 +85,9 @@ def _cell_params():
                             switchMode="naive",
                         ),
                         pytest.mark.abr_settings_override(settings),
+                        pytest.mark.initial_bandwidth_mbps(
+                            _PROFILE_INITIAL_BW_MBPS[profile_name]
+                        ),
                     ],
                     id=cell_id,
                 )
