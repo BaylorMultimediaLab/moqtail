@@ -54,6 +54,20 @@ async fn main() -> Result<()> {
 
 // ── LIVE MODE ────────────────────────────────────────────────────────────────
 
+fn compute_variants(
+  video_info: &video::VideoInfo,
+  ladder_spec_str: &str,
+  max_variants: u8,
+) -> Result<Vec<adaptive::QualityVariant>> {
+  let ladder_spec = adaptive::LadderSpec::parse(ladder_spec_str)
+    .map_err(|e| anyhow::anyhow!("invalid --ladder-spec: {}", e))?;
+  match &ladder_spec {
+    adaptive::LadderSpec::Default => adaptive::quality_variants(video_info, max_variants as usize),
+    _ => adaptive::quality_variants_for_spec(video_info, &ladder_spec)
+      .map_err(|e| anyhow::anyhow!("ladder generation failed: {}", e)),
+  }
+}
+
 async fn run_live(cli: Cli) -> Result<()> {
   let hw_encoder = encoder::detect_hardware_encoder();
   let video_info = video::get_video_info(&cli.video_path).await?;
@@ -63,15 +77,7 @@ async fn run_live(cli: Cli) -> Result<()> {
   );
   info!("Catalog target latency: {} ms", cli.target_latency_ms);
 
-  let ladder_spec = adaptive::LadderSpec::parse(&cli.ladder_spec)
-    .map_err(|e| anyhow::anyhow!("invalid --ladder-spec: {}", e))?;
-  let variants = match &ladder_spec {
-    adaptive::LadderSpec::Default => {
-      adaptive::quality_variants(&video_info, cli.max_variants as usize)?
-    }
-    _ => adaptive::quality_variants_for_spec(&video_info, &ladder_spec)
-      .map_err(|e| anyhow::anyhow!("ladder generation failed: {}", e))?,
-  };
+  let variants = compute_variants(&video_info, &cli.ladder_spec, cli.max_variants)?;
   log_variants(&variants);
 
   let extras = collect_extradata(&variants, video_info.framerate, hw_encoder.as_ref()).await?;
@@ -239,7 +245,7 @@ async fn run_prepare(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
     video_info.width, video_info.height, video_info.framerate
   );
 
-  let variants = adaptive::quality_variants(&video_info, cli.max_variants as usize)?;
+  let variants = compute_variants(&video_info, &cli.ladder_spec, cli.max_variants)?;
   log_variants(&variants);
 
   let extras = collect_extradata(&variants, video_info.framerate, hw_encoder.as_ref()).await?;
@@ -428,15 +434,16 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
     height: top_meta.source_height,
     framerate: top_meta.framerate,
   };
-  let expected_variants = adaptive::quality_variants(&synth_video_info, cli.max_variants as usize)?;
+  let expected_variants = compute_variants(&synth_video_info, &cli.ladder_spec, cli.max_variants)?;
   let expected_qualities: Vec<String> = expected_variants
     .iter()
     .map(|v| v.quality.to_string())
     .collect();
   if top_meta.variants != expected_qualities {
     anyhow::bail!(
-      "Cache variant set {:?} does not match current request (max_variants={}) which would produce {:?}; delete {} and re-prepare",
+      "Cache variant set {:?} does not match current request (ladder-spec={}, max_variants={}) which would produce {:?}; delete {} and re-prepare",
       top_meta.variants,
+      cli.ladder_spec,
       cli.max_variants,
       expected_qualities,
       encoded_dir.display()
