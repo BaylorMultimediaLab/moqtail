@@ -62,9 +62,15 @@ dash.js: switch BOLA on at buffer ≥ `bufferTimeDefault`, off at half that
 (`AbrController.js#L956-L986`, comment: "use hysteresis to avoid oscillating
 rules").
 
-Ours: [`AbrController.ts:#updateDynamicStrategy`](AbrController.ts) uses the
-same on/off thresholds (`switchOnThreshold = bufferTimeDefault`,
-`switchOffThreshold = 0.5 * bufferTimeDefault`).
+Ours (deliberate divergence): [`AbrController.ts:#updateDynamicStrategy`](AbrController.ts)
+uses a separate `bolaActivationBufferS` knob (default 10 s, hysteresis off
+at 5 s) instead of `bufferTimeDefault`. dash.js's overload couples two
+independent decisions: BOLA's `Vp` horizon (large = high-quality bias) and
+the activation point of BOLA-vs-Throughput. Setting `bufferTimeDefault=300`
+(used in long-running experiments to widen Vp) would silently disable BOLA
+entirely under dash.js's coupling because the activation threshold becomes
+unreachable in any practical test window. The split lets us tune the Vp
+horizon without trampling the activation gate.
 
 ### InsufficientBufferRule (dash.js formula)
 

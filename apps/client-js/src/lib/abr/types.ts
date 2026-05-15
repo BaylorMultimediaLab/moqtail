@@ -41,6 +41,17 @@ export interface AbrSettings {
   fastSwitching: boolean;
   videoAutoSwitch: boolean;
   bufferTimeDefault: number;
+  /**
+   * Buffer level (seconds) at which BolaRule takes over from ThroughputRule
+   * in the DYNAMIC strategy. Hysteresis: half this value to switch back.
+   *
+   * Kept independent of `bufferTimeDefault` (BOLA's Vp horizon) so the two
+   * can be tuned without coupling. Without the split, raising
+   * `bufferTimeDefault` to widen BOLA's Vp horizon (e.g. 300 in long-running
+   * experiments) silently disables BOLA entirely because the activation
+   * threshold becomes unreachable in any practical test window.
+   */
+  bolaActivationBufferS: number;
   stableBufferTime: number;
   bandwidthSafetyFactor: number;
   ewma: {
@@ -57,6 +68,9 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
   fastSwitching: false,
   videoAutoSwitch: true,
   bufferTimeDefault: 18,
+  // Matches BolaRule's MINIMUM_BUFFER_S — BOLA-O's score formula assumes
+  // at least one MINIMUM_BUFFER_S of buffer to make sensible decisions.
+  bolaActivationBufferS: 10,
   stableBufferTime: 18,
   bandwidthSafetyFactor: 0.9,
   ewma: {

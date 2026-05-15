@@ -378,8 +378,11 @@ export class AbrController {
       return;
     }
 
-    const switchOnThreshold = this.#settings.bufferTimeDefault; // 18s by default
-    const switchOffThreshold = 0.5 * this.#settings.bufferTimeDefault; // 9s by default
+    // NOT bufferTimeDefault — that's BOLA's Vp horizon, an independent knob.
+    // Tying activation to Vp would make raising bufferTimeDefault silently
+    // disable BOLA in any test whose buffer can't reach the Vp value.
+    const switchOnThreshold = this.#settings.bolaActivationBufferS; // 10s default
+    const switchOffThreshold = 0.5 * this.#settings.bolaActivationBufferS; // 5s default
 
     // Hysteresis: use the current state to pick which threshold to compare against
     this.#usingBolaRule =

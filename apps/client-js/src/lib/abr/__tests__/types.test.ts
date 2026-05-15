@@ -40,4 +40,8 @@ describe('DEFAULT_ABR_SETTINGS', () => {
   it('bufferTimeDefault is 18', () => {
     expect(DEFAULT_ABR_SETTINGS.bufferTimeDefault).toBe(18);
   });
+
+  it('bolaActivationBufferS is 10 (matches BolaRule MINIMUM_BUFFER_S)', () => {
+    expect(DEFAULT_ABR_SETTINGS.bolaActivationBufferS).toBe(10);
+  });
 });
