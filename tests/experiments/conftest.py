@@ -191,6 +191,11 @@ def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec)
 
     relay_ip = config["topology"]["relay_ip_pub"]
 
+    # Intentionally NOT passing --loop: the publisher exits after one full pass
+    # through the cached GOPs. Looping would re-emit cached chunks with wrapped
+    # tfdt offsets which, even when relabelled, are an unnecessary failure
+    # mode for short paper experiments. If a test ever needs more than
+    # `gops_per_variant` seconds of media, lengthen the source video instead.
     proc = publisher.popen(
         [
             pub_bin,

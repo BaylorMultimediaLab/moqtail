@@ -520,6 +520,12 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   let emit_barrier = Arc::new(Barrier::new(variant_metas.len()));
   let variant_count = variant_metas.len();
   let gop_duration_secs = top_meta.framerate.recip() * encoder::gop_size(top_meta.framerate) as f64;
+  // One cycle of replay = gops_per_variant * gop_duration in timescale ticks.
+  // Used to rewrite tfdt/prft per cycle so the decode timeline stays monotonic
+  // across the wraparound (see replay::replay_variant).
+  let cycle_offset_ticks =
+    (top_meta.gops_per_variant as f64 * gop_duration_secs * encoder::TIMESCALE as f64) as u64;
+  let loop_mode = cli.loop_mode;
 
   for (i, vm) in variant_metas.into_iter().enumerate() {
     let track_alias = track_aliases[i];
@@ -537,6 +543,8 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
         variant_dir,
         gops_per_variant,
         gop_duration_secs,
+        cycle_offset_ticks,
+        loop_mode,
         conn,
         track_alias,
         publisher_priority,
@@ -561,6 +569,8 @@ async fn run_replay_variant(
   variant_dir: PathBuf,
   gops_per_variant: u64,
   gop_duration_secs: f64,
+  cycle_offset_ticks: u64,
+  loop_mode: bool,
   conn: Arc<wtransport::Connection>,
   track_alias: u64,
   publisher_priority: u8,
@@ -578,6 +588,8 @@ async fn run_replay_variant(
     variant_dir,
     gops_per_variant,
     gop_duration_secs,
+    cycle_offset_ticks,
+    loop_mode,
     quality.clone(),
     gop_tx,
   ));

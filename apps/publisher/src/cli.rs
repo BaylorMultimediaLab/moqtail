@@ -46,4 +46,12 @@ pub struct Cli {
   /// Used by the paper experiment harness; production publisher leaves this at default.
   #[arg(long, default_value = "default")]
   pub ladder_spec: String,
+
+  /// Replay-mode only: when set, loop the cached GOPs forever after the last
+  /// file. Each cycle's CMAF `tfdt` and `prft.media_time` are rewritten so
+  /// the receiver sees a monotonically rising decode timeline across the
+  /// wraparound. When unset (default), the publisher exits cleanly after one
+  /// full pass through the cache.
+  #[arg(long = "loop", default_value_t = false)]
+  pub loop_mode: bool,
 }

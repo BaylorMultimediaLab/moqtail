@@ -837,7 +837,7 @@ where
 }
 
 /// CMAF timescale matching the catalog's `timescale: 90000`.
-const TIMESCALE: u32 = 90000;
+pub const TIMESCALE: u32 = 90000;
 
 #[cfg(test)]
 mod tests {
