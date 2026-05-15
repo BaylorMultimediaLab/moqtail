@@ -70,11 +70,28 @@ export class AbrController {
   // timeout. Set to Date.now() + SWITCH_COOLDOWN_MS when SWITCH_TIMEOUT_MS
   // expires so the same infeasible switch isn't re-triggered immediately.
   #switchBackoffUntil = 0;
-  // Maximum time #switching may be held before being force-released. Long
-  // enough to cover normal switch landing under healthy conditions
-  // (typically < 1 GOP duration), short enough that ABR can re-evaluate
-  // before buffer fully drains.
-  static readonly SWITCH_TIMEOUT_MS = 3000;
+  // Track-name of the most recent in-flight Switch. Cleared only when a real
+  // new-track frame is decoded (`#pendingFrameAdvance && totalFrames moved`).
+  // SWITCH_TIMEOUT_MS releasing the #switching guard does NOT clear this:
+  // under bandwidth pressure (e.g. 0.5 Mbps with a 400k segment that takes
+  // ~6 s to arrive) the timeout fires before the legitimately-slow delivery
+  // completes, and re-firing the same Switch only piles up parallel
+  // subscriptions whose data lands out of order, breaking the per-switch
+  // playhead-gap invariant.
+  #inflightTrackName: string | null = null;
+  // Maximum time #switching may be held before being force-released. Must
+  // be longer than the worst-case legitimate slow-delivery time for a
+  // segment on the lowest-tier track at the lowest expected bandwidth,
+  // otherwise the timeout fires while delivery is still in progress, ABR
+  // re-evaluates, picks a (possibly different) target, and parallel Switch
+  // subscriptions pile up — the older one's first-arriving frame gets paired
+  // against the newer one's playheadPTS in the discontinuity record, breaking
+  // the aligned-switch playhead-gap invariant. Reserved for truly-stuck
+  // recovery (relay broken, subscription died) — NOT for "just slow."
+  // Observed worst slow-delivery in the E2 0.5 Mbps dip: ~17 s. 30 s leaves
+  // margin while still recovering from truly-stuck within the 60 s test
+  // window. Was 3000 (too aggressive — covered only "healthy" conditions).
+  static readonly SWITCH_TIMEOUT_MS = 30_000;
   // After a switch times out (init segment never arrived — typical under severe
   // packet loss or a fleeting bandwidth spike), hold off this long before
   // running rules again. Without the cooldown the ABR re-fires the same
@@ -150,6 +167,7 @@ export class AbrController {
     const m = this.#player.getMetrics();
     this.#framesAtSwitch = m.totalFrames;
     this.#pendingFrameAdvance = false;
+    this.#inflightTrackName = trackName;
     this.#recordHistory(m.activeTrack ?? '', trackName, 'manual', 0, 0);
     void this.#player.switchTrack(trackName);
   }
@@ -219,6 +237,7 @@ export class AbrController {
     if (this.#pendingFrameAdvance && totalFrames > this.#framesAtSwitch) {
       this.#switching = false;
       this.#pendingFrameAdvance = false;
+      this.#inflightTrackName = null;
     }
 
     // Switching guard timeout: if #switching has been held longer than
@@ -305,6 +324,14 @@ export class AbrController {
     const targetTrack = this.#tracks[targetIndex];
     if (!targetTrack) return;
 
+    // Suppress duplicates while a Switch to the same target is already on the
+    // wire. The relay can't deliver any faster; firing again only piles up
+    // parallel subscriptions whose first-arriving frame may be from an earlier
+    // Switch (older START_LOCATION_GROUP), producing a discontinuity record
+    // whose latest-Switch playheadPTS is compared against an earliest-arriving
+    // frame's PTS — breaking the per-switch playhead-gap invariant.
+    if (targetTrack.name === this.#inflightTrackName) return;
+
     // Determine switch reason
     const currentBitrate =
       activeTrackIndex >= 0 ? (this.#tracks[activeTrackIndex]?.bitrate ?? 0) : 0;
@@ -323,6 +350,7 @@ export class AbrController {
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
+    this.#inflightTrackName = targetTrack.name;
     this.#recordHistory(activeTrack ?? '', targetTrack.name, reason, bufferSeconds, fastEmaBps);
     // Update tracksize (Algorithm 1 lines 13/16): after upswitch, carry
     // forward the gap from new current to next-up; after downswitch,

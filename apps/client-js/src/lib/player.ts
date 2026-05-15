@@ -134,7 +134,20 @@ interface MOQStreamStruct {
   requestId: bigint;
   tracker: GoodputTracker;
   lastGroupId: bigint;
-  pendingSwitch: PendingSwitch | null;
+  /**
+   * In-flight Switch contexts keyed by target trackName. Multiple Switches can
+   * be live at once (rapid ABR re-evaluation, or one-RTT cache-replay lag where
+   * Switch N+1 fires while Switch N's first frame hasn't decoded). The writer
+   * pairs each incoming object's track name to its OWN Switch context so the
+   * discontinuity record's `playheadPTS_ms` and `newStartPTS_ms` come from the
+   * SAME Switch — preventing the "Switch K's playheadPTS paired against Switch
+   * J's first-arriving frame" misattribution that breaks the per-switch
+   * playhead-gap invariant under multi-switch interleaving.
+   *
+   * Map identity also lets the writer cull older pendings when it applies a
+   * newer one (data for stale targets is dropped instead of seeking backward).
+   */
+  pendingSwitches: Map<string, PendingSwitch>;
   /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
   /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
@@ -580,24 +593,22 @@ export class Player {
             // decode and stall MSE.
             const objectTrackName = new TextDecoder().decode(object.fullTrackName.name);
 
-            // Drop anything that isn't the current track or the pending
-            // switch target. Covers two cases:
-            //   1. Rapid ABR switching (A→B→C) where intermediate-track data
-            //      arrives after pendingSwitch was overwritten to C.
-            //   2. Old-track trailing packets delivered after a switch has
-            //      already activated and pendingSwitch was cleared.
-            if (
-              objectTrackName !== struct.trackName &&
-              objectTrackName !== struct.pendingSwitch?.trackName
-            ) {
+            // Drop anything that isn't the current track or one of the in-flight
+            // pending Switch targets. Per-target tracking (pendingSwitches map)
+            // means each Switch's context survives later Switches firing —
+            // critical when A→B→C fires rapidly: the writer might see B's data
+            // arrive after C was already requested, and we want B's context (not
+            // C's) when recording B's discontinuity.
+            const pendingForObject = struct.pendingSwitches.get(objectTrackName);
+            if (objectTrackName !== struct.trackName && !pendingForObject) {
               logger.info(
                 'media',
-                `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
+                `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=[${[...struct.pendingSwitches.keys()].join(',') || 'none'}]`,
               );
               return;
             }
 
-            if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
+            if (pendingForObject) {
               const {
                 initData,
                 mimeType,
@@ -606,10 +617,17 @@ export class Player {
                 playheadPTS_ms,
                 switchSentAt,
                 framesAtSwitch,
-              } = struct.pendingSwitch;
+              } = pendingForObject;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
               struct.trackName = newTrackName;
-              struct.pendingSwitch = null;
+              // Remove THIS switch and any OLDER pending switches whose data we
+              // never saw — applying their init now would seek backward in time
+              // (older switch's playhead target is by definition behind the
+              // playhead at the moment we applied this newer one). Their data,
+              // if it still arrives, is correctly dropped by the check above.
+              for (const [name, p] of struct.pendingSwitches) {
+                if (p.switchSentAt <= switchSentAt) struct.pendingSwitches.delete(name);
+              }
               struct.firstFrameAfterSwitchSeen = false; // reset for C5
               // Stash C5 state on sibling struct fields that survive the
               // pendingSwitch clear. The rVFC poll consumes these to compute
@@ -1090,7 +1108,7 @@ export class Player {
   abortPendingSwitch(): void {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     if (!videoStruct) return;
-    videoStruct.pendingSwitch = null;
+    videoStruct.pendingSwitches.clear();
   }
 
   /**
@@ -1188,7 +1206,7 @@ export class Player {
       // Tracker is intentionally not reset — the previous-track bandwidth
       // estimate is still a valid indicator of network capacity. (dash.js
       // doesn't reset throughput on quality switches either.)
-      videoStruct.pendingSwitch = {
+      videoStruct.pendingSwitches.set(trackName, {
         trackName,
         initData: initData.buffer as ArrayBuffer,
         mimeType,
@@ -1196,7 +1214,7 @@ export class Player {
         playheadPTS_ms,
         switchSentAt,
         framesAtSwitch,
-      };
+      });
       videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
@@ -1273,7 +1291,7 @@ export class Player {
         source: result.stream,
         tracker,
         lastGroupId: -1n,
-        pendingSwitch: null,
+        pendingSwitches: new Map(),
         lastAppendedEndPTS_ms: undefined,
       };
     }
@@ -1362,7 +1380,7 @@ export class Player {
       source: result.stream,
       tracker,
       lastGroupId: -1n,
-      pendingSwitch: null,
+      pendingSwitches: new Map(),
       lastAppendedEndPTS_ms: undefined,
     };
 

@@ -1193,6 +1193,15 @@ export class MOQtailClient {
       if (!parameters) parameters = new VersionSpecificParameters()
       const requestId = args.requestId ?? this.#nextClientRequestId
       this.requests.set(requestId, subscription)
+      // Keep subscriptionAliasMap in lockstep with requests. Until the new
+      // track's first subgroup arrives and the pendingStateUpdates callback
+      // below rebinds this entry, the new requestId aliases to the still-valid
+      // old trackAlias (subscription object is unchanged). Without this, any
+      // re-entry on `requestId` before the callback fires (another switch,
+      // subscribeUpdate, or unsubscribe) throws InternalError on the next
+      // subscriptionAliasMap.get(...) check — and the catch handler calls
+      // disconnect(), destroying the client.
+      this.subscriptionAliasMap.set(requestId, trackAlias)
 
       const msg = new Switch(requestId, fullTrackName, subscriptionRequestId, parameters.build())
       subscription.switch(fullTrackName, parameters.build())
@@ -1222,6 +1231,11 @@ export class MOQtailClient {
       } else {
         this.requestIdMap.removeMappingByRequestId(requestId)
         this.requests.delete(requestId)
+        // Undo the optimistic alias insert above — the new id never became
+        // a real subscription, so leaving it pointing at the old alias would
+        // make a future lookup resolve to a stale (or by-then-deleted)
+        // subscription.
+        this.subscriptionAliasMap.delete(requestId)
         return response
       }
     } catch (error) {

@@ -17,7 +17,6 @@
 import { logger } from '@/lib/logger';
 
 // MSE Buffer Configuration
-export const MSE_IMMEDIATE_SEEK_THRESHOLD = 0.1; // seconds
 export const DEFAULT_LIVE_EDGE_DELAY = 1.25; // seconds
 export const DEFAULT_LIVE_EDGE_TOLERANCE = 0.1; // seconds
 export const DEFAULT_BUFFER_CHECK_INTERVAL = 250; // milliseconds
@@ -243,51 +242,21 @@ class MSEBuffer {
     // Only consider seeking if we're very close to the end (within threshold)
     if (distanceToEnd > this.config.stallThreshold) return { seek: false };
 
-    // Check if there's a next buffered range
-    if (currentRangeIndex + 1 < buffered.length) {
-      for (let nextRange = currentRangeIndex + 1; nextRange < buffered.length; nextRange++) {
-        const nextRangeStart = buffered.start(currentRangeIndex + 1);
-        const gap = nextRangeStart - currentRangeEnd;
-
-        // If gap is too small, seek to next range immediately
-        if (gap < MSE_IMMEDIATE_SEEK_THRESHOLD) {
-          logger.info(
-            'buffer',
-            `[mseBuffer] Small gap of ${gap.toFixed(3)}s to next range, seeking immediately`,
-          );
-          return { seek: true, targetTime: nextRangeStart };
-        }
-
-        // Next range must have enough buffer to jump to
-        const nextRangeEnd = buffered.end(currentRangeIndex + 1);
-        const nextRangeDuration = nextRangeEnd - nextRangeStart;
-
-        if (nextRangeDuration < this.config.stallThreshold) {
-          logger.warn(
-            'buffer',
-            `[mseBuffer] Next range too short (${nextRangeDuration.toFixed(3)}s), not seeking`,
-          );
-          continue;
-        }
-
-        if (nextRangeDuration < this.config.liveEdgeDelay) {
-          logger.warn(
-            'buffer',
-            `[mseBuffer] Next range shorter than live edge delay (${nextRangeDuration.toFixed(
-              3,
-            )}s < ${this.config.liveEdgeDelay}s), not seeking`,
-          );
-          continue;
-        }
-
-        if (gap > 0) {
-          logger.warn(
-            'buffer',
-            `[mseBuffer] At buffer end with gap of ${gap.toFixed(3)}s, must jump to next range`,
-          );
-          return { seek: true, targetTime: nextRangeStart };
-        }
-      }
+    // Recovery: walk every range past the current one and seek to the first
+    // playable one. Stays minimal — live-edge alignment is the catch-up loop's
+    // job, not this function's.
+    for (let i = currentRangeIndex + 1; i < buffered.length; i++) {
+      const nextStart = buffered.start(i);
+      const nextEnd = buffered.end(i);
+      if (nextEnd - nextStart <= 0) continue;
+      const gap = nextStart - currentRangeEnd;
+      logger.info(
+        'buffer',
+        `[mseBuffer] Seeking across ${gap.toFixed(3)}s gap to range ${nextStart.toFixed(
+          3,
+        )}-${nextEnd.toFixed(3)}s`,
+      );
+      return { seek: true, targetTime: nextStart + 0.001 };
     }
 
     return { seek: false };
