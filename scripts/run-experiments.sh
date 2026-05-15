@@ -118,6 +118,45 @@ else
 fi
 echo ""
 
+# Step 2b: client-js dist freshness. The browser loads the bundle from
+# apps/client-js/dist/, NOT from source — without this check, edits to
+# player.ts / AbrController.ts / etc. silently run against the OLD
+# compiled bundle. Same find-newer pattern as the Rust block above.
+DIST_DIR="$ROOT_DIR/apps/client-js/dist"
+NEED_DIST_BUILD=0
+if [[ ! -d "$DIST_DIR" ]] || ! ls "$DIST_DIR"/assets/index-*.js >/dev/null 2>&1; then
+  NEED_DIST_BUILD=1
+else
+  # Pick the most recently-modified bundle as the freshness baseline.
+  newest_bundle=$(ls -t "$DIST_DIR"/assets/index-*.js 2>/dev/null | head -1)
+  if [[ -n "$newest_bundle" ]]; then
+    newer=$(find "$ROOT_DIR/apps/client-js/src" "$ROOT_DIR/libs/moqtail-ts/src" "$ROOT_DIR/libs/moqtail-ts/dist" \
+      \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name 'package.json' \) -newer "$newest_bundle" -print -quit 2>/dev/null)
+    if [[ -n "$newer" ]]; then
+      echo "[run-experiments] client-js dist is stale (newer source: $newer) — rebuilding."
+      NEED_DIST_BUILD=1
+    fi
+  fi
+fi
+
+if [[ "${MOQTAIL_FORCE_BUILD:-0}" == "1" || "$NEED_DIST_BUILD" == "1" ]]; then
+  if [[ ! -x "$ROOT_DIR/node_modules/.bin/vite" ]]; then
+    echo "[run-experiments] node_modules missing — running npm install at workspace root..."
+    (cd "$ROOT_DIR" && npm install) || {
+      echo "[run-experiments] npm install failed."
+      exit 1
+    }
+  fi
+  echo "[run-experiments] Building client-js dist (vite build)..."
+  (cd "$ROOT_DIR/apps/client-js" && "$ROOT_DIR/node_modules/.bin/vite" build 2>&1 | tail -8) || {
+    echo "[run-experiments] client-js build failed."
+    exit 1
+  }
+else
+  echo "[run-experiments] Reusing existing apps/client-js/dist (set MOQTAIL_FORCE_BUILD=1 to rebuild)."
+fi
+echo ""
+
 # If we're already root, drop the sudo prefix (cleaner output, no password prompt).
 if [[ "$(id -u)" == "0" ]]; then
   PYTEST_PREFIX=()
