@@ -21,12 +21,11 @@ RESULTS_ROOT = (Path(__file__).resolve().parents[2] / "tests" / "experiments" / 
 
 # E4 row/column ordering for Fig 5. One row per ABR config; matches
 # tests/experiments/abr_configs.py exactly. Ordering groups configs by
-# family: no-adaptation baseline, quality drivers, buffer/latency/delivery
-# guards, then standalone algorithms.
+# family: no-adaptation baseline, quality drivers (individually then
+# composed), the full dash.js composition, then standalone algorithms.
 E4_ROW_ORDER = [
     "none",
-    "thrpt", "bola", "probe",
-    "ins-buf", "drain", "latency", "abandon", "sw-hist", "drops",
+    "thrpt", "bola", "bola+thrpt",
     "all",
     "lolp", "l2a",
 ]
@@ -96,7 +95,7 @@ def load_run_metrics(run_dir: Path) -> pd.DataFrame:
 
 
 def e4_heatmap_matrix(metric: str) -> pd.DataFrame:
-    """Reshape the E4 aggregate_summary into a 12x3 heat-map matrix.
+    """Reshape the E4 aggregate_summary into a 7x3 heat-map matrix.
 
     Rows are ABR configs in E4_ROW_ORDER; columns are bandwidth profiles
     in E4_COL_ORDER. Cells with no data appear as NaN (Fig 5 will draw
@@ -146,7 +145,7 @@ def compute_avg_delivered_bitrate_kbps(run_dir: Path) -> float:
 
 
 def e4_avg_bitrate_matrix() -> pd.DataFrame:
-    """12x3 matrix of mean delivered bitrate (kbps) per (abr_config, profile).
+    """7x3 matrix of mean delivered bitrate (kbps) per (abr_config, profile).
 
     Walks every E4 per-run directory, computes the time-weighted bitrate for
     each run via compute_avg_delivered_bitrate_kbps, then averages across runs
