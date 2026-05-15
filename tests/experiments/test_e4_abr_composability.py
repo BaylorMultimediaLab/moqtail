@@ -1,15 +1,15 @@
 """E4: ABR rule composability across bandwidth profiles.
 
-13 configs x 3 profiles x 5 runs = 195 cells. Each cell:
+7 configs x 3 profiles x 5 runs = 105 cells. Each cell:
 - Filtered client at filterDelay=10, switchMode=aligned (both fixed)
 - ABR config from ABR_CONFIGS injected via window.__abrSettingsOverride
 - Bandwidth profile (stable / step / sinusoidal) driven via tc/netem
 
-Each config isolates a single rule (or, for `none`, no rule at all) and
-pins the join rung to the middle of the ladder (1200k) so guard-only
-cells start from a known, comparable position. Some cells will produce
-zero switches by design — `none` cannot switch, and a guard rule that
-never trips under a given profile leaves the player at the join rung.
+Each config either disables adaptation (`none`), exercises a single
+quality driver (`thrpt`, `bola`), composes both (`bola+thrpt`),
+composes every dash.js rule (`all`), or runs a standalone algorithm
+(`lolp`, `l2a`). All configs pin the join rung to the middle of the
+ladder (1200k). The `none` config produces zero switches by design.
 
 Aligned-mode invariant: max_playhead_gap_ms must be within one GOP
 whenever a switch fires. Cells with zero switches satisfy the invariant
@@ -141,7 +141,7 @@ async def test_e4_abr_composability(
     # mode by design (playhead seeks behind the buffer at startup), so it's
     # diagnostic here, not assertive. Mirrors E2's invariant. Cells with
     # zero switches satisfy this trivially (gap = 0), which is legitimate
-    # for `none` and for guard-only configs whose trigger never fires.
+    # for `none`.
     GOP_DURATION_MS = 1000  # publisher emits 1-second GOPs
     assert summary["max_playhead_gap_ms"] <= GOP_DURATION_MS, (
         f"aligned mode should land within one GOP of the playhead, "

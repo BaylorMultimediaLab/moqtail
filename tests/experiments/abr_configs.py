@@ -1,26 +1,24 @@
 """ABR rule configurations for the E3/E4 sweep.
 
-Each config isolates a single rule (or, for `none`, disables all of them)
-so its individual contribution to delivered bitrate, switch count, and
-stall behavior is observable without confounding from an always-on
-safety floor.
+Each config isolates one rule (or a small composition) so its individual
+contribution to delivered bitrate, switch count, and stall behavior is
+observable without confounding from an always-on safety floor.
 
 All configs pin the join rung to the middle of the 5-rung ladder
-(1200 kbps `video-720p-1200k`) via `initialBitrate`, so guard-only cells
-start from a known, comparable rung across the three bandwidth profiles.
+(1200 kbps `video-720p-1200k`) via `initialBitrate`, so cells start
+from a known, comparable rung across the three bandwidth profiles.
 The client honors this override in app.tsx by selecting the closest-
 bitrate track instead of using the WebTransport bandwidth estimate.
 
-Thirteen configs total:
-  none                      — no rule active; serves as the no-adaptation reference
-  thrpt / bola / probe      — quality drivers, one at a time
-  ins-buf / drain / latency / abandon / sw-hist / drops — guard rules, one at a time
-  all                       — every dash.js rule active simultaneously, except
-                              LoLP/L2A (which assume exclusive ownership of
-                              the switching decision). Composes all the
-                              individually-isolated rules above.
-  lolp / l2a                — standalone algorithms (assume exclusive
-                              ownership of the switching decision)
+Seven configs total:
+  none          — no rule active; the no-adaptation reference
+  thrpt / bola  — quality drivers, one at a time
+  bola+thrpt    — the two quality drivers composed
+  all           — every dash.js rule active simultaneously, except
+                  LoLP/L2A (which assume exclusive ownership of the
+                  switching decision)
+  lolp / l2a    — standalone algorithms (assume exclusive ownership
+                  of the switching decision)
 """
 
 # Middle rung of the 5-rung experiment ladder (400k, 800k, 1200k, 2500k, 5000k).
@@ -29,7 +27,7 @@ _JOIN_BITRATE_BPS = 1_200_000
 
 
 def _all_off() -> dict:
-    """Every rule explicitly inactive. Each config below flips one back on."""
+    """Every rule explicitly inactive. Each config below flips one or more back on."""
     return {
         "ThroughputRule": {"active": False},
         "BolaRule": {"active": False},
@@ -45,10 +43,10 @@ def _all_off() -> dict:
     }
 
 
-def _config(active: str | None) -> dict:
+def _config(*active: str) -> dict:
     rules = _all_off()
-    if active is not None:
-        rules[active] = {"active": True}
+    for name in active:
+        rules[name] = {"active": True}
     return {
         "initialBitrate": _JOIN_BITRATE_BPS,
         "rules": rules,
@@ -72,26 +70,18 @@ ABR_CONFIGS = {
     # No adaptation: every rule disabled. Pinned to the middle rung; the
     # delivered bitrate under each profile bounds what passive playback can
     # achieve when the network must absorb whatever the variant emits.
-    "none": _config(None),
+    "none": _config(),
 
     # Quality drivers, one at a time.
     "thrpt": _config("ThroughputRule"),
     "bola": _config("BolaRule"),
-    "probe": _config("ProbeRule"),
 
-    # Guard rules, one at a time. With no quality driver they can only
-    # constrain downward from the join rung; their delivered bitrate exposes
-    # what each guard does on its own.
-    "ins-buf": _config("InsufficientBufferRule"),
-    "drain": _config("BufferDrainRateRule"),
-    "latency": _config("LatencyTrendRule"),
-    "abandon": _config("AbandonRequestsRule"),
-    "sw-hist": _config("SwitchHistoryRule"),
-    "drops": _config("DroppedFramesRule"),
+    # Both quality drivers composed (dash.js style: ThroughputRule + BolaRule).
+    "bola+thrpt": _config("ThroughputRule", "BolaRule"),
 
     # All dash.js-style rules active simultaneously. Excludes LoLP/L2A (which
     # are standalone algorithms — see below). Compositionality reference: what
-    # happens when every individually-isolated rule from above runs together.
+    # happens when every dash.js rule runs together.
     "all": _config_all_except("LoLPRule", "L2ARule"),
 
     # Standalone algorithms whose internal state machine assumes exclusive

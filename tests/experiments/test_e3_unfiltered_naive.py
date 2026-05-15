@@ -1,15 +1,14 @@
 """E3: ABR composability under unfiltered + naive switching.
 
-Exact mirror of E4's parameter sweep (13 ABR configs × 3 bandwidth
-profiles × 5 runs = 195 cells) but with clientMode=unfiltered and
+Exact mirror of E4's parameter sweep (7 ABR configs × 3 bandwidth
+profiles × 5 runs = 105 cells) but with clientMode=unfiltered and
 switchMode=naive instead of E4's filtered+aligned.
 
-Each config isolates a single rule (or, for `none`, no rule at all)
-and pins the join rung to the middle of the ladder (1200k) so
-guard-only cells start from a known, comparable position. Some cells
-will produce zero switches by design — `none` cannot switch, and a
-guard rule that never trips under a given profile leaves the player
-at the join rung.
+Each config either disables adaptation (`none`), exercises a single
+quality driver (`thrpt`, `bola`), composes both (`bola+thrpt`),
+composes every dash.js rule (`all`), or runs a standalone algorithm
+(`lolp`, `l2a`). All configs pin the join rung to the middle of the
+ladder (1200k). The `none` config produces zero switches by design.
 
 Headline finding (vs aligned): naive switching produces a playhead
 gap equal to the buffer occupancy at switch time, regardless of
@@ -152,7 +151,7 @@ async def test_e3_unfiltered_naive(
     # the gap past 30 s) without false-flagging the genuine multi-second
     # observations this experiment is designed to measure. Cells with
     # zero switches satisfy this trivially (gap = 0), which is legitimate
-    # for `none` and for guard-only configs whose trigger never fires.
+    # for `none`.
     assert summary["max_playhead_gap_ms"] <= 30_000, (
         f"playheadGapMs catastrophically large for unfiltered + naive — "
         f"likely a regression in the unfiltered subscribe path or "
