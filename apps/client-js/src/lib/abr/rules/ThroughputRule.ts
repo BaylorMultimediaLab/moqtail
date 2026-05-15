@@ -7,7 +7,6 @@ export class ThroughputRule implements AbrRule {
   getMaxIndex(context: RulesContext): SwitchRequest | null {
     const { tracks, bandwidthBps, abrSettings } = context;
 
-    // Cold start: no bandwidth estimate yet
     if (bandwidthBps === 0) {
       return null;
     }
@@ -15,25 +14,22 @@ export class ThroughputRule implements AbrRule {
     const { bandwidthSafetyFactor, minBitrate, maxBitrate } = abrSettings;
     const effectiveBandwidth = bandwidthBps * bandwidthSafetyFactor;
 
-    // Find the highest track index whose bitrate fits within effective bandwidth
-    // and respects minBitrate/maxBitrate clamps (-1 means unconstrained)
+    // Highest track whose bitrate fits within effective bandwidth and the
+    // minBitrate/maxBitrate clamps. -1 on either clamp means unconstrained.
     let bestIndex = -1;
 
     for (let i = 0; i < tracks.length; i++) {
       const track = tracks[i];
       const bitrate = track.bitrate ?? 0;
 
-      // Must fit within effective bandwidth
       if (bitrate > effectiveBandwidth) {
         continue;
       }
 
-      // Respect minBitrate (-1 = no minimum)
       if (minBitrate !== -1 && bitrate < minBitrate) {
         continue;
       }
 
-      // Respect maxBitrate (-1 = no maximum)
       if (maxBitrate !== -1 && bitrate > maxBitrate) {
         continue;
       }
@@ -57,6 +53,6 @@ export class ThroughputRule implements AbrRule {
   }
 
   reset(): void {
-    // Stateless rule — nothing to reset
+    /* stateless */
   }
 }

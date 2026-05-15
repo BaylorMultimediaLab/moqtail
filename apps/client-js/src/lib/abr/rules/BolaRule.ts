@@ -28,23 +28,14 @@
 import type { AbrRule, RulesContext, SwitchRequest } from '../types';
 import { SwitchRequestPriority } from '../types';
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const MINIMUM_BUFFER_S = 10;
 const PLACEHOLDER_BUFFER_DECAY = 0.99;
 
-// Internal state enum
 const enum BolaState {
   ONE_BITRATE = 0,
   STARTUP = 1,
   STEADY = 2,
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /** Log-based utility function. Returns 1 for the lowest bitrate, >1 for higher tiers. */
 function utility(bitrate: number, bitrateMin: number): number {
@@ -83,10 +74,6 @@ function throughputIndex(
   return best;
 }
 
-// ---------------------------------------------------------------------------
-// BolaRule
-// ---------------------------------------------------------------------------
-
 export class BolaRule implements AbrRule {
   readonly name = 'BolaRule';
 
@@ -98,16 +85,12 @@ export class BolaRule implements AbrRule {
     const { tracks, activeTrackIndex, bufferSeconds, bandwidthBps, segmentDurationS, abrSettings } =
       context;
 
-    // -----------------------------------------------------------------------
-    // State 0: only one representation — nothing to decide
-    // -----------------------------------------------------------------------
     if (tracks.length <= 1) {
       this.#state = BolaState.ONE_BITRATE;
       return null;
     }
 
-    // Sort tracks by bitrate ascending and build parallel arrays.
-    // We work with indices into the *sorted* array throughout.
+    // We work with indices into the *sorted* (ascending-bitrate) array throughout.
     const sorted = [...tracks]
       .map((t, origIdx) => ({ t, origIdx }))
       .sort((a, b) => (a.t.bitrate ?? 0) - (b.t.bitrate ?? 0));
@@ -124,28 +107,21 @@ export class BolaRule implements AbrRule {
     const bufferTime = abrSettings.bufferTimeDefault;
     const { Vp, gp } = computeBolaParams(bufferTime, utilityMax);
 
-    // -----------------------------------------------------------------------
-    // State 1: STARTUP — buffer below one segment duration
-    // -----------------------------------------------------------------------
     if (this.#state !== BolaState.STEADY) {
       this.#state = BolaState.STARTUP;
     }
 
     if (this.#state === BolaState.STARTUP) {
-      // Decay placeholder buffer on each call to prevent it from stalling startup
+      // Decay placeholder buffer each call to prevent it from stalling startup.
       this.#placeholderBuffer = Math.max(0, this.#placeholderBuffer * PLACEHOLDER_BUFFER_DECAY);
 
-      // Effective buffer is the real buffer plus the placeholder
       const effectiveBuffer = bufferSeconds + this.#placeholderBuffer;
 
       if (bufferSeconds >= segmentDurationS) {
-        // Enough real buffer accumulated — transition to steady state
         this.#state = BolaState.STEADY;
         this.#placeholderBuffer = 0;
       } else {
-        // Still in startup: use throughput-based selection
         if (bandwidthBps === 0) {
-          // No throughput measurement yet — stay at lowest quality
           return {
             representationIndex: sorted[0]!.origIdx,
             priority: SwitchRequestPriority.DEFAULT,
@@ -155,7 +131,7 @@ export class BolaRule implements AbrRule {
 
         const tpIdx = throughputIndex(bitrates, bandwidthBps, abrSettings.bandwidthSafetyFactor);
 
-        // Grow placeholder buffer toward what STEADY state would need
+        // Grow placeholder buffer toward what STEADY state would need.
         const tpBitrate = bitrates[tpIdx] ?? 1;
         const increment = (effectiveBuffer * tpBitrate) / (bitrates[0] ?? 1);
         this.#placeholderBuffer = Math.min(
@@ -172,11 +148,8 @@ export class BolaRule implements AbrRule {
       }
     }
 
-    // -----------------------------------------------------------------------
-    // State 2: STEADY — Lyapunov optimisation
-    // -----------------------------------------------------------------------
-
-    // Compute score for each representation: score[i] = (Vp*(utility[i]+gp) - bufferLevel) / bitrate[i]
+    // STEADY: Lyapunov optimisation.
+    // score[i] = (Vp*(utility[i]+gp) - bufferLevel) / bitrate[i]
     let bestIndex = 0;
     let bestScore = -Infinity;
     for (let i = 0; i < bitrates.length; i++) {

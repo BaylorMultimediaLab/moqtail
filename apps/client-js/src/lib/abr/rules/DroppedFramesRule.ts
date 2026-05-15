@@ -8,8 +8,7 @@ export class DroppedFramesRule implements AbrRule {
     const { activeTrackIndex, droppedFrames, totalFrames, abrSettings } = context;
 
     const ruleConfig =
-      abrSettings.rules['DroppedFramesRule'] ??
-      DEFAULT_ABR_SETTINGS.rules['DroppedFramesRule'];
+      abrSettings.rules['DroppedFramesRule'] ?? DEFAULT_ABR_SETTINGS.rules['DroppedFramesRule'];
 
     const minimumSampleSize: number =
       ruleConfig.parameters['minimumSampleSize'] ??
@@ -21,23 +20,19 @@ export class DroppedFramesRule implements AbrRule {
         'droppedFramesPercentageThreshold'
       ];
 
-    // Not enough data yet
     if (totalFrames < minimumSampleSize) {
       return null;
     }
 
     const dropRatio = droppedFrames / totalFrames;
 
-    // Drop rate is acceptable
     if (dropRatio <= droppedFramesPercentageThreshold) {
       return null;
     }
 
-    // Drop rate exceeds threshold — downgrade one level, but not below 0
     const targetIndex = Math.max(0, activeTrackIndex - 1);
 
-    const rulePriority =
-      ruleConfig.priority ?? SwitchRequestPriority.DEFAULT;
+    const rulePriority = ruleConfig.priority ?? SwitchRequestPriority.DEFAULT;
 
     return {
       representationIndex: targetIndex,
@@ -47,6 +42,6 @@ export class DroppedFramesRule implements AbrRule {
   }
 
   reset(): void {
-    // Stateless rule — dropped frame counts come from browser API via RulesContext
+    // Stateless: dropped frame counts come from the browser API via RulesContext.
   }
 }

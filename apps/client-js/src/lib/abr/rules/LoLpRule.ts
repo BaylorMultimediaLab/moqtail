@@ -25,7 +25,7 @@ export class LoLpRule implements AbrRule {
   getMaxIndex(context: RulesContext): SwitchRequest | null {
     const { tracks, activeTrackIndex, bufferSeconds, bandwidthBps, abrSettings } = context;
 
-    // Emergency: critically low buffer
+    // Emergency: critically low buffer.
     if (bufferSeconds < MIN_BUFFER_S) {
       return {
         representationIndex: 0,
@@ -34,22 +34,19 @@ export class LoLpRule implements AbrRule {
       };
     }
 
-    // Cold start: no bandwidth estimate yet
     if (bandwidthBps === 0) {
       return null;
     }
 
-    // Single track: nothing to decide
     if (tracks.length <= 1) {
       return null;
     }
 
     const { bandwidthSafetyFactor, stableBufferTime } = abrSettings;
 
-    // Initialise neurons if needed (one per track)
     if (this.neurons.length !== tracks.length) {
       this.neurons = tracks.map((_, i) => ({
-        throughput: (tracks[i]?.bitrate ?? 0),
+        throughput: tracks[i]?.bitrate ?? 0,
         bufferLevel: stableBufferTime,
         rebufferCount: 0,
         switchCount: 0,
@@ -57,7 +54,6 @@ export class LoLpRule implements AbrRule {
       }));
     }
 
-    // Track rebuffers (buffer empty) and switches
     if (bufferSeconds === 0) {
       this.rebufferCount += 1;
     }
@@ -66,7 +62,7 @@ export class LoLpRule implements AbrRule {
     }
     this.prevActiveTrackIndex = activeTrackIndex;
 
-    // Update current neuron with SOM learning
+    // SOM learning update for the current neuron.
     const currentNeuron = this.neurons[activeTrackIndex];
     if (currentNeuron) {
       currentNeuron.throughput += ALPHA * (bandwidthBps - currentNeuron.throughput);
@@ -75,7 +71,7 @@ export class LoLpRule implements AbrRule {
       currentNeuron.switchCount += ALPHA * (this.switchCount - currentNeuron.switchCount);
     }
 
-    // Target state: ideal conditions
+    // Target state: ideal conditions.
     const target = {
       throughput: bandwidthBps * bandwidthSafetyFactor,
       bufferLevel: stableBufferTime,
@@ -85,14 +81,13 @@ export class LoLpRule implements AbrRule {
 
     const effectiveBandwidth = bandwidthBps * bandwidthSafetyFactor;
 
-    // Find neurons with acceptable bitrate and compute weighted Euclidean distance to target
+    // Among neurons whose bitrate fits, pick the smallest weighted Euclidean distance.
     let bestIndex = -1;
     let bestDistance = Infinity;
 
     for (let i = 0; i < tracks.length; i++) {
       const bitrate = tracks[i]?.bitrate ?? 0;
 
-      // Skip if bitrate exceeds available bandwidth
       if (bitrate > effectiveBandwidth) {
         continue;
       }
@@ -118,8 +113,7 @@ export class LoLpRule implements AbrRule {
     }
 
     const rulePriority =
-      abrSettings.rules['LoLPRule']?.priority ??
-      DEFAULT_ABR_SETTINGS.rules['LoLPRule'].priority;
+      abrSettings.rules['LoLPRule']?.priority ?? DEFAULT_ABR_SETTINGS.rules['LoLPRule'].priority;
 
     return {
       representationIndex: bestIndex,

@@ -22,17 +22,17 @@ export class SwitchHistoryRule implements AbrRule {
       ruleConfig?.parameters?.['switchPercentageThreshold'] ??
       defaultConfig.parameters['switchPercentageThreshold'];
 
-    // Rebuild per-track stats from the full switch history on each call
+    // Rebuild per-track stats from the full switch history on each call.
     this.trackStats = new Map();
 
     for (const event of switchHistory) {
       if (event.reason === 'auto-downgrade' || event.reason === 'auto-emergency') {
-        // Downgrade/emergency: record a drop against the track being left
+        // Record a drop against the track being left.
         const stats = this.trackStats.get(event.fromTrack) ?? { drops: 0, noDrops: 0 };
         stats.drops += 1;
         this.trackStats.set(event.fromTrack, stats);
       } else if (event.reason === 'auto-upgrade') {
-        // Upgrade: record a successful "no-drop" visit on the target track
+        // Record a successful "no-drop" visit on the target track.
         const stats = this.trackStats.get(event.toTrack) ?? { drops: 0, noDrops: 0 };
         stats.noDrops += 1;
         this.trackStats.set(event.toTrack, stats);
@@ -50,7 +50,7 @@ export class SwitchHistoryRule implements AbrRule {
       );
     };
 
-    // Walk from activeTrackIndex down, looking for the highest safe index
+    // Walk down from activeTrackIndex looking for the highest safe index.
     let highestSafeIndex: number | null = null;
 
     for (let i = activeTrackIndex; i >= 0; i--) {
@@ -61,12 +61,10 @@ export class SwitchHistoryRule implements AbrRule {
       }
     }
 
-    // If the current active track is already safe, no constraint is needed
     if (highestSafeIndex === activeTrackIndex) {
       return null;
     }
 
-    // If no safe index was found, or nothing is lower — return null
     if (highestSafeIndex === null) {
       return null;
     }

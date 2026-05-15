@@ -5,10 +5,6 @@ import { AbrRulesCollection } from '../AbrRulesCollection';
 import { DEFAULT_ABR_SETTINGS } from '../types';
 import type { AbrSettings, Track } from '../types';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 type MockPlayer = {
   getMetrics: ReturnType<typeof vi.fn>;
   switchTrack: ReturnType<typeof vi.fn>;
@@ -75,10 +71,6 @@ function makeController(
   return { controller, player, collection, metrics: capturedMetrics };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe('AbrController', () => {
   describe('metrics emission', () => {
     it('emits metrics on every tick regardless of mode', async () => {
@@ -134,7 +126,6 @@ describe('AbrController', () => {
 
       await controller._tick();
 
-      // switchTrack should NOT have been called by the tick
       expect(player.switchTrack).not.toHaveBeenCalled();
     });
 
@@ -172,7 +163,7 @@ describe('AbrController', () => {
         { videoAutoSwitch: true },
       );
 
-      await controller._tick(); // first switch fires
+      await controller._tick();
       expect(player.switchTrack).toHaveBeenCalledTimes(1);
       player.switchTrack.mockClear();
 
@@ -187,7 +178,6 @@ describe('AbrController', () => {
         makePlayerMetrics({ bufferSeconds: 5, activeTrack: '360p', totalFrames: 2000 }),
       );
 
-      // Next tick should be able to switch again
       await controller._tick();
       expect(player.switchTrack).toHaveBeenCalledTimes(1);
     });
@@ -221,7 +211,6 @@ describe('AbrController', () => {
 
       // With BolaRule active and high bandwidth/buffer, it should upgrade
       expect(player.switchTrack).toHaveBeenCalled();
-      // Verify we didn't call with 360p (current track) — it should upgrade
       const calledWith = (player.switchTrack.mock.calls[0] as string[])[0];
       expect(calledWith).not.toBe('360p');
     });
@@ -354,16 +343,13 @@ describe('AbrController', () => {
         { videoAutoSwitch: true },
       );
 
-      // First tick should switch (auto mode)
       await controller._tick();
       expect(player.switchTrack).toHaveBeenCalledTimes(1);
       player.switchTrack.mockClear();
       controller.releaseSwitchingGuard();
 
-      // Switch to manual mode
       controller.updateSettings(makeSettings({ videoAutoSwitch: false }));
 
-      // Now tick should not switch
       await controller._tick();
       expect(player.switchTrack).not.toHaveBeenCalled();
 

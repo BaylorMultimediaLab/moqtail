@@ -40,11 +40,9 @@ describe('InsufficientBufferRule', () => {
   it('ignores first segmentIgnoreCount (2) calls and returns null', () => {
     const ctx = makeContext({ bufferSeconds: 0 });
 
-    // Call 1 — should be ignored
     expect(rule.getMaxIndex(ctx)).toBeNull();
-    // Call 2 — should also be ignored
     expect(rule.getMaxIndex(ctx)).toBeNull();
-    // Call 3 — now past ignore count, buffer = 0, should intervene
+    // 3rd call: past ignore count, buffer = 0, should intervene
     const result = rule.getMaxIndex(ctx);
     expect(result).not.toBeNull();
     expect(result!.representationIndex).toBe(0);
@@ -54,7 +52,6 @@ describe('InsufficientBufferRule', () => {
   it('returns STRONG priority index 0 when buffer is empty (after ignore count)', () => {
     const ctx = makeContext({ bufferSeconds: 0 });
 
-    // Burn through ignore count
     rule.getMaxIndex(ctx);
     rule.getMaxIndex(ctx);
 
@@ -69,7 +66,6 @@ describe('InsufficientBufferRule', () => {
     // DEFAULT_ABR_SETTINGS.stableBufferTime = 18
     const ctx = makeContext({ bufferSeconds: 20 });
 
-    // Burn through ignore count
     rule.getMaxIndex(ctx);
     rule.getMaxIndex(ctx);
 
@@ -146,12 +142,10 @@ describe('InsufficientBufferRule', () => {
   it('reset() clears callCount so ignoring restarts', () => {
     const ctx = makeContext({ bufferSeconds: 0 });
 
-    // Burn through ignore count and confirm intervention
     rule.getMaxIndex(ctx);
     rule.getMaxIndex(ctx);
     expect(rule.getMaxIndex(ctx)).not.toBeNull();
 
-    // Reset — ignore count starts over
     rule.reset();
     expect(rule.getMaxIndex(ctx)).toBeNull(); // call 1 after reset
     expect(rule.getMaxIndex(ctx)).toBeNull(); // call 2 after reset
@@ -171,12 +165,11 @@ describe('InsufficientBufferRule', () => {
     };
     const ctx = makeContext({ bufferSeconds: 0, abrSettings: customSettings });
 
-    // Calls 1-4 should be ignored
+    // Calls 1-4 ignored, call 5 should intervene
     expect(rule.getMaxIndex(ctx)).toBeNull();
     expect(rule.getMaxIndex(ctx)).toBeNull();
     expect(rule.getMaxIndex(ctx)).toBeNull();
     expect(rule.getMaxIndex(ctx)).toBeNull();
-    // Call 5 should intervene
     const result = rule.getMaxIndex(ctx);
     expect(result).not.toBeNull();
     expect(result!.representationIndex).toBe(0);

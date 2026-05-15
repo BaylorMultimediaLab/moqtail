@@ -162,10 +162,8 @@ export function SettingsPanel({
         open ? 'max-h-[420px] px-4 py-3 opacity-100' : 'max-h-0 px-4 py-0 opacity-0',
       )}
     >
-      {/* Horizontal scroll wrapper */}
       <div className="relative">
         <div className="scrollbar-thin scrollbar-track-transparent scrollbar-thumb-neutral-700 flex snap-x snap-proximity gap-3 overflow-x-auto pb-2">
-          {/* Connection Card (pre-connect only) */}
           <OptionCard title="Connection">
             <SectionLabel>Client Mode</SectionLabel>
             <div className="mb-2 flex gap-1">
@@ -220,7 +218,6 @@ export function SettingsPanel({
             </div>
           </OptionCard>
 
-          {/* Blur Card */}
           <OptionCard title="Blur">
             <SectionLabel>Mode</SectionLabel>
             <div className="mb-1 flex gap-1">
@@ -272,7 +269,6 @@ export function SettingsPanel({
             />
           </OptionCard>
 
-          {/* ABR Card */}
           <OptionCard title="ABR">
             <SettingCheckbox
               label="Fast Switching"
@@ -286,7 +282,6 @@ export function SettingsPanel({
             />
           </OptionCard>
 
-          {/* ABR Rules Card */}
           <OptionCard title="ABR Rules">
             {ABR_RULES.map(ruleName => (
               <SettingCheckbox
@@ -307,7 +302,6 @@ export function SettingsPanel({
             ))}
           </OptionCard>
 
-          {/* Buffer Card */}
           <OptionCard title="Buffer">
             <NumberInput
               label="Buffer Time (s)"
@@ -329,7 +323,6 @@ export function SettingsPanel({
             />
           </OptionCard>
 
-          {/* Initial Settings Card */}
           <OptionCard title="Initial Settings">
             <NumberInput
               label="Initial Bitrate (kbps)"
@@ -351,7 +344,6 @@ export function SettingsPanel({
             />
           </OptionCard>
 
-          {/* EWMA Card */}
           <OptionCard title="EWMA">
             <NumberInput
               label="Fast Half-life (s)"
@@ -378,7 +370,6 @@ export function SettingsPanel({
           </OptionCard>
         </div>
 
-        {/* Right-edge fade indicator */}
         <div className="pointer-events-none absolute top-0 right-0 bottom-2 w-10 bg-gradient-to-r from-transparent to-neutral-950/80" />
       </div>
     </div>

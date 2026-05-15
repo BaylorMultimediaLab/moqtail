@@ -74,12 +74,9 @@ export class AbrRulesCollection {
     for (const [name, entry] of this.#rules) {
       if (!entry.active) continue;
 
-      // Apply dynamic mutual exclusivity for BolaRule and ThroughputRule
       if (name === 'BolaRule') {
-        // Skip BOLA in low-latency mode, or when !shouldUseBolaRule in normal mode
         if (isLowLatencyMode || !this.#shouldUseBolaRule) continue;
       } else if (name === 'ThroughputRule') {
-        // Skip Throughput in low-latency mode, or when shouldUseBolaRule in normal mode
         if (isLowLatencyMode || this.#shouldUseBolaRule) continue;
       }
 
@@ -96,7 +93,6 @@ export class AbrRulesCollection {
 function getMinSwitchRequest(requests: SwitchRequest[]): SwitchRequest | null {
   if (requests.length === 0) return null;
 
-  // Group by priority tier
   const tiers = new Map<SwitchRequestPriority, SwitchRequest[]>();
 
   for (const req of requests) {
@@ -108,7 +104,6 @@ function getMinSwitchRequest(requests: SwitchRequest[]): SwitchRequest | null {
     }
   }
 
-  // Evaluate from highest to lowest priority tier
   const priorityOrder: SwitchRequestPriority[] = [
     SwitchRequestPriority.STRONG,
     SwitchRequestPriority.DEFAULT,
@@ -119,7 +114,6 @@ function getMinSwitchRequest(requests: SwitchRequest[]): SwitchRequest | null {
     const bucket = tiers.get(priority);
     if (!bucket || bucket.length === 0) continue;
 
-    // Pick the request with the lowest representationIndex within this tier
     let best = bucket[0]!;
     for (let i = 1; i < bucket.length; i++) {
       if (bucket[i]!.representationIndex < best.representationIndex) {

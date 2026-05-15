@@ -19,10 +19,6 @@ import { BolaRule } from '../BolaRule';
 import { DEFAULT_ABR_SETTINGS } from '../../types';
 import type { RulesContext } from '../../types';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 const TRACKS_MULTI = [
   { name: '360p', bitrate: 500_000 },
   { name: '720p', bitrate: 2_000_000 },
@@ -52,10 +48,6 @@ function makeContext(overrides: Partial<RulesContext> = {}): RulesContext {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe('BolaRule', () => {
   let rule: BolaRule;
 
@@ -63,9 +55,6 @@ describe('BolaRule', () => {
     rule = new BolaRule();
   });
 
-  // -------------------------------------------------------------------------
-  // 1. Returns null when only one track (ONE_BITRATE state)
-  // -------------------------------------------------------------------------
   describe('ONE_BITRATE state', () => {
     it('returns null when tracks array has exactly one entry', () => {
       const ctx = makeContext({ tracks: TRACKS_SINGLE });
@@ -78,9 +67,6 @@ describe('BolaRule', () => {
     });
   });
 
-  // -------------------------------------------------------------------------
-  // 2. Throughput-based selection during STARTUP (low buffer)
-  // -------------------------------------------------------------------------
   describe('STARTUP state', () => {
     it('uses throughput-based selection when buffer < segmentDurationS', () => {
       // Buffer is 0.5s, segment duration is 2s → STARTUP
@@ -105,12 +91,10 @@ describe('BolaRule', () => {
     });
 
     it('transitions to STEADY after buffer >= segmentDurationS', () => {
-      // First call: STARTUP
       rule.getMaxIndex(
         makeContext({ bufferSeconds: 0.5, segmentDurationS: 2, bandwidthBps: 5_000_000 }),
       );
 
-      // Second call with sufficient buffer: should enter STEADY and pick based on Lyapunov score
       const highBufferCtx = makeContext({
         bufferSeconds: 15,
         segmentDurationS: 2,
@@ -123,9 +107,6 @@ describe('BolaRule', () => {
     });
   });
 
-  // -------------------------------------------------------------------------
-  // 3. In STEADY state, higher buffer favors higher quality
-  // -------------------------------------------------------------------------
   describe('STEADY state', () => {
     function getQualityAtBuffer(bufferSeconds: number): number {
       const r = new BolaRule();
@@ -150,7 +131,6 @@ describe('BolaRule', () => {
 
     it('selects highest quality with very high buffer and ample bandwidth', () => {
       const r = new BolaRule();
-      // Transition through startup with high buffer
       r.getMaxIndex(
         makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 20_000_000 }),
       );
@@ -180,9 +160,6 @@ describe('BolaRule', () => {
     });
   });
 
-  // -------------------------------------------------------------------------
-  // 4. BOLA-O: does not increase above throughput-sustainable level
-  // -------------------------------------------------------------------------
   describe('BOLA-O oscillation cap', () => {
     it('does not select quality above what throughput can sustain', () => {
       const r = new BolaRule();
@@ -191,10 +168,8 @@ describe('BolaRule', () => {
       // cap = 600_000 * 0.9 = 540_000 bps → only 360p fits
       const lowBw = 600_000;
 
-      // Transition to STEADY via high buffer
       r.getMaxIndex(makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: lowBw }));
 
-      // In steady state, Lyapunov might want higher quality, but BOLA-O should cap it
       const result = r.getMaxIndex(
         makeContext({
           bufferSeconds: 17,
@@ -237,14 +212,10 @@ describe('BolaRule', () => {
     });
   });
 
-  // -------------------------------------------------------------------------
-  // 5. reset() returns to STARTUP state
-  // -------------------------------------------------------------------------
   describe('reset()', () => {
     it('returns to STARTUP after reset', () => {
       const r = new BolaRule();
 
-      // Push into STEADY
       r.getMaxIndex(
         makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
       );
@@ -252,16 +223,13 @@ describe('BolaRule', () => {
         makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
       );
 
-      // Verify it is in STEADY (reason = 'BOLA steady')
       const beforeReset = r.getMaxIndex(
         makeContext({ bufferSeconds: 15, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
       );
       expect(beforeReset?.reason).toBe('BOLA steady');
 
-      // Reset
       r.reset();
 
-      // Now with low buffer it should be in STARTUP
       const afterReset = r.getMaxIndex(
         makeContext({ bufferSeconds: 0.5, segmentDurationS: 2, bandwidthBps: 10_000_000 }),
       );
@@ -271,7 +239,7 @@ describe('BolaRule', () => {
     it('reset() clears placeholder buffer', () => {
       const r = new BolaRule();
 
-      // Run a few STARTUP iterations to build up placeholder buffer
+      // Build up placeholder buffer via STARTUP iterations
       for (let i = 0; i < 5; i++) {
         r.getMaxIndex(
           makeContext({ bufferSeconds: 0.5, segmentDurationS: 2, bandwidthBps: 10_000_000 }),

@@ -80,28 +80,23 @@ class MSEBuffer {
   }
 
   private init() {
-    // Attach event listeners
     this.video.addEventListener('pause', this.handlePause);
     this.video.addEventListener('play', this.handlePlay);
     this.video.addEventListener('waiting', this.handleWaiting);
     this.video.addEventListener('stalled', this.handleStalled);
 
-    // Listen tab visibility changes
     document.addEventListener('visibilitychange', this.handleTabChange);
 
-    // Start periodic buffer checking
     this.startBufferMonitoring();
   }
 
   private handleTabChange = () => {
     if (document.hidden) {
-      // Tab is hidden, pause monitoring
       if (this.bufferCheckInterval) {
         clearInterval(this.bufferCheckInterval);
         this.bufferCheckInterval = null;
       }
     } else {
-      // Calculate the live edge
       const buffered = this.video.buffered;
       if (buffered.length > 0) {
         logger.info('buffer', '[mseBuffer] Tab became visible, seeking to live edge');
@@ -114,7 +109,6 @@ class MSEBuffer {
         this.video.play();
       }
 
-      // Tab is visible, resume monitoring
       this.startBufferMonitoring();
     }
   };
@@ -180,7 +174,6 @@ class MSEBuffer {
       }
     }
 
-    // Check if we're at the end of a buffer range and need to jump to the next one
     const shouldSeek = this.shouldSeekToNextRange(currentTime, buffered);
 
     if (shouldSeek.seek) {
@@ -189,11 +182,9 @@ class MSEBuffer {
         `[mseBuffer] At end of range, seeking to next buffered range: ${shouldSeek.targetTime!.toFixed(2)}s`,
       );
 
-      // Perform the seek, only if targetTime is ahead of currentTime
       if (shouldSeek.targetTime <= currentTime) return;
       this.seek(shouldSeek.targetTime);
 
-      // Resume the video if it was paused
       if (this.video.paused) {
         this.video
           .play()
@@ -214,10 +205,8 @@ class MSEBuffer {
     currentTime: number,
     buffered: TimeRanges,
   ): { seek: true; targetTime: number } | { seek: false } {
-    // If no buffered ranges, cannot seek
     if (buffered.length === 0) return { seek: false };
 
-    // Find which buffered range we're currently in (if any)
     let currentRangeIndex = -1;
     for (let i = 0; i < buffered.length; i++) {
       const start = buffered.start(i);
@@ -235,7 +224,6 @@ class MSEBuffer {
       return this.findNearestBufferedRange(currentTime, buffered);
     }
 
-    // Check if we're close to the end of the current range
     const currentRangeEnd = buffered.end(currentRangeIndex);
     const distanceToEnd = currentRangeEnd - currentTime;
 
@@ -288,14 +276,12 @@ class MSEBuffer {
       const start = buffered.start(i);
       const end = buffered.end(i);
 
-      // Check distance to start of range
       const distanceToStart = Math.abs(currentTime - start);
       if (distanceToStart < minDistance) {
         minDistance = distanceToStart;
         bestTarget = start;
       }
 
-      // Check distance to end of range
       const distanceToEnd = Math.abs(currentTime - end);
       if (distanceToEnd < minDistance) {
         minDistance = distanceToEnd;
@@ -310,7 +296,6 @@ class MSEBuffer {
     const buffered = this.video.buffered;
     if (buffered.length === 0) return;
 
-    // Get the end of the last buffered range (live edge)
     const bufferEdge = buffered.end(buffered.length - 1);
     const currentLatency = bufferEdge - this.video.currentTime;
     const targetDistance = this.config.liveEdgeDelay;
@@ -373,19 +358,15 @@ class MSEBuffer {
     if (this.isDisposed) return;
     this.isDisposed = true;
 
-    // Reset playback rate before disposing
     this.resetPlaybackRate();
 
-    // Remove event listeners
     this.video.removeEventListener('pause', this.handlePause);
     this.video.removeEventListener('play', this.handlePlay);
     this.video.removeEventListener('waiting', this.handleWaiting);
     this.video.removeEventListener('stalled', this.handleStalled);
 
-    // Remove tab visibility listener
     document.removeEventListener('visibilitychange', this.handleTabChange);
 
-    // Clear interval
     if (this.bufferCheckInterval) {
       clearInterval(this.bufferCheckInterval);
       this.bufferCheckInterval = null;

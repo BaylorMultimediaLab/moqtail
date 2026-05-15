@@ -39,7 +39,6 @@ describe('L2ARule', () => {
     expect(rule.name).toBe('L2ARule');
   });
 
-  // Test 1: Returns null when only one track
   it('returns null when only one track', () => {
     const ctx = makeContext({
       tracks: [{ name: '360p', bitrate: 500_000 }],
@@ -52,7 +51,6 @@ describe('L2ARule', () => {
     expect(rule.getMaxIndex(ctx)).toBeNull();
   });
 
-  // Test 2: Uses throughput-based selection during STARTUP
   it('uses throughput-based selection during STARTUP', () => {
     // safeThroughput = 2_000_000 * 0.9 = 1_800_000
     // tracks: 500k fits, 1.5M fits, 4M does not → bestIndex = 1
@@ -72,7 +70,6 @@ describe('L2ARule', () => {
     }
   });
 
-  // Test 3: Transitions to STEADY and makes optimization-based decisions
   it('transitions to STEADY after HORIZON ticks and makes optimization-based decisions', () => {
     const ctx = makeContext({ bandwidthBps: 2_000_000, bufferSeconds: 3 });
 
@@ -81,7 +78,6 @@ describe('L2ARule', () => {
       rule.getMaxIndex(ctx);
     }
 
-    // Next call should be in STEADY state
     const result = rule.getMaxIndex(ctx);
     expect(result).not.toBeNull();
     expect(result!.reason).toBe('l2a-steady');
@@ -91,7 +87,6 @@ describe('L2ARule', () => {
     const ctx = makeContext({ bandwidthBps: 5_000_000, bufferSeconds: 3 });
     const n = ctx.tracks.length;
 
-    // Drive past STARTUP
     for (let i = 0; i < 4; i++) {
       rule.getMaxIndex(ctx);
     }
@@ -125,20 +120,16 @@ describe('L2ARule', () => {
     expect(result!.reason).toBe('l2a-steady');
   });
 
-  // Test 4: reset() returns to STARTUP
   it('reset() returns to STARTUP state', () => {
     const ctx = makeContext({ bandwidthBps: 2_000_000 });
 
-    // Drive past STARTUP
     for (let i = 0; i < 4; i++) {
       rule.getMaxIndex(ctx);
     }
 
-    // Verify we are in STEADY
     const steadyResult = rule.getMaxIndex(ctx);
     expect(steadyResult!.reason).toBe('l2a-steady');
 
-    // Reset and verify we're back to STARTUP
     rule.reset();
     const afterResetResult = rule.getMaxIndex(ctx);
     expect(afterResetResult!.reason).toBe('l2a-startup');
@@ -147,14 +138,12 @@ describe('L2ARule', () => {
   it('reset() clears the weight vector (re-initializes on next call)', () => {
     const ctx = makeContext({ bandwidthBps: 2_000_000 });
 
-    // Run a few steady-state ticks to modify w
     for (let i = 0; i < 10; i++) {
       rule.getMaxIndex(ctx);
     }
 
     rule.reset();
 
-    // After reset, first call is STARTUP again
     const result = rule.getMaxIndex(ctx);
     expect(result!.reason).toBe('l2a-startup');
   });

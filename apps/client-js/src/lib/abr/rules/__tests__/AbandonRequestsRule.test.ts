@@ -45,7 +45,6 @@ describe('AbandonRequestsRule', () => {
       bufferSeconds: 20,
       bandwidthBps: 100_000, // bandwidth very low, but buffer is fine
     });
-    // Call enough times to exceed minThroughputSamples
     for (let i = 0; i < 5; i++) rule.getMaxIndex(ctx);
     expect(rule.getMaxIndex(ctx)).toBeNull();
   });
@@ -93,12 +92,10 @@ describe('AbandonRequestsRule', () => {
       expect(rule.getMaxIndex(ctx)).toBeNull();
     }
 
-    // 6th call should trigger abandon
     const result = rule.getMaxIndex(ctx);
     expect(result).not.toBeNull();
     expect(result!.priority).toBe(SwitchRequestPriority.STRONG);
     expect(result!.reason).toBe('abandon-slow-delivery');
-    // representationIndex should be a lower track than current (2)
     expect(result!.representationIndex).toBeLessThan(2);
   });
 
@@ -131,7 +128,6 @@ describe('AbandonRequestsRule', () => {
       bandwidthBps: 500_000,
     });
 
-    // Get past the sample threshold
     for (let i = 0; i < 6; i++) rule.getMaxIndex(ctx);
     expect(rule.getMaxIndex(ctx)).not.toBeNull();
 

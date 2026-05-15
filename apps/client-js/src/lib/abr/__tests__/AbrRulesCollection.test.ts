@@ -3,10 +3,6 @@ import { AbrRulesCollection } from '../AbrRulesCollection';
 import { DEFAULT_ABR_SETTINGS, SwitchRequestPriority } from '../types';
 import type { AbrSettings, RulesContext } from '../types';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 function makeSettings(overrides: Partial<AbrSettings> = {}): AbrSettings {
   return {
     ...DEFAULT_ABR_SETTINGS,
@@ -48,10 +44,6 @@ function settingsWithOnlyRules(ruleNames: string[]): AbrSettings {
   }
   return { ...DEFAULT_ABR_SETTINGS, rules };
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe('AbrRulesCollection', () => {
   describe('constructor', () => {

@@ -112,16 +112,13 @@ export class BufferDrainRateRule implements AbrRule {
     const linkBps = currentBitrate * fraction;
     const cappedBps = linkBps * safetyFactor;
 
-    // Find the highest track index whose bitrate fits within the cap.
-    // Tracks are sorted ascending in AbrController, so we can stop at the
-    // first one that exceeds the cap.
+    // Tracks are sorted ascending in AbrController.
     let bestIndex = 0;
     for (let i = 0; i < tracks.length; i++) {
       const bitrate = tracks[i]?.bitrate ?? 0;
       if (bitrate <= cappedBps) bestIndex = i;
     }
 
-    // Only fire if this would actually move us downward.
     if (bestIndex >= activeTrackIndex) return null;
 
     return {

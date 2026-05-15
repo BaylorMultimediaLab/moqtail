@@ -186,7 +186,6 @@ describe('BufferDrainRateRule', () => {
   });
 
   it('reset() clears samples so window restarts', () => {
-    // Build a clear drain signal
     rule.getMaxIndex(makeContext({ bufferSeconds: 1.5 }));
     vi.advanceTimersByTime(250);
     rule.getMaxIndex(makeContext({ bufferSeconds: 1.0 }));

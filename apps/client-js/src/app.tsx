@@ -110,7 +110,6 @@ function Checkbox({
         className="size-px overflow-hidden opacity-0"
         onChange={e => onChange((e.target as HTMLInputElement).checked)}
       />
-      {/* Visual indicator */}
       <span
         aria-hidden="true"
         className={cn(
@@ -414,7 +413,7 @@ export function App() {
       const sortedVideoTracks = [...videoTracksAll].sort(
         (a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0),
       );
-      let firstVideo = sortedVideoTracks[0]; // default: lowest bitrate
+      let firstVideo = sortedVideoTracks[0];
       // Experiment harness can pin the join rung deterministically by setting
       // window.__abrSettingsOverride.initialBitrate (bps). The closest-bitrate
       // track wins, bypassing the WebTransport estimate path.
@@ -441,7 +440,6 @@ export function App() {
         if (initialBw > 0 && sortedVideoTracks.length > 0) {
           const safetyFactor = abrSettings.bandwidthSafetyFactor;
           const effectiveBw = initialBw * safetyFactor;
-          // Pick highest track that fits within the estimated bandwidth
           for (const track of sortedVideoTracks) {
             if ((track.bitrate ?? 0) <= effectiveBw) {
               firstVideo = track;
@@ -678,7 +676,6 @@ export function App() {
 
   return (
     <div className="flex h-dvh w-dvw flex-col bg-neutral-950 font-sans text-neutral-100 antialiased">
-      {/* Header */}
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-white/6 bg-neutral-950/80 px-4 backdrop-blur-sm md:px-5">
         <div className="flex items-center gap-2.5">
           <img src="/favicon.svg" alt="MOQtail logo" className="h-5 w-5" />
@@ -731,7 +728,6 @@ export function App() {
         </div>
       </header>
 
-      {/* Options panel — horizontal cards (dash.js style) */}
       <SettingsPanel
         open={optionsPanelOpen}
         settings={abrSettings}
@@ -747,11 +743,8 @@ export function App() {
         onSwitchModeChange={setSwitchMode}
       />
 
-      {/* Body */}
       <div className="flex h-full min-h-0 w-full flex-1 grow flex-col md:flex-row">
-        {/* Sidebar */}
         <aside className="order-last flex max-h-full flex-col overflow-auto border-t border-white/6 bg-neutral-950 md:order-first md:w-72 md:border-t-0 md:border-r">
-          {/* Connection */}
           <div className="space-y-3 border-b border-white/6 p-4">
             <div className="grid grid-cols-2 gap-3 md:grid-cols-1">
               <Field label="Relay URL">
@@ -853,7 +846,6 @@ export function App() {
             </Field>
           </div>
 
-          {/* Tracks */}
           {hasTracks && (
             <div className="space-y-4 p-3">
               <TrackGroup
@@ -878,7 +870,6 @@ export function App() {
           )}
         </aside>
 
-        {/* Main — video */}
         <main className="relative flex flex-1 flex-col items-center justify-center overflow-hidden bg-neutral-950 p-4 md:p-6">
           <div
             className={cn(
@@ -904,7 +895,6 @@ export function App() {
           </div>
           {!hasTracks && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 px-6 text-center select-none">
-              {/* Icon */}
               <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-white/6 bg-neutral-900 text-neutral-600">
                 <svg
                   viewBox="0 0 24 24"
@@ -921,12 +911,10 @@ export function App() {
                 </svg>
               </div>
 
-              {/* Heading */}
               <p className="text-sm font-medium text-neutral-300">
                 Connect to a relay to start playback
               </p>
 
-              {/* Info card */}
               <div className="w-full max-w-sm space-y-3 rounded-xl border border-white/6 bg-neutral-900/60 p-4 text-left backdrop-blur-sm">
                 <p className="text-xs leading-relaxed text-neutral-400">
                   A minimal{' '}

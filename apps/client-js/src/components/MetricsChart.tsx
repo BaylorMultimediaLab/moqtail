@@ -32,7 +32,6 @@ type AxisSide = 'left' | 'right';
 export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartProps) {
   if (lines.length === 0) return null;
 
-  // ── Assign units to axes ──
   // 1st unique unit → left, 2nd → right, 3rd+ → fall back to left
   const unitOrder: string[] = [];
   for (const line of lines) {
@@ -46,7 +45,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
 
   const hasRightAxis = unitOrder.length >= 2;
 
-  // ── Build axis labels by concatenating unique unitLabels with " / " ──
   const axisLabels: Record<AxisSide, string[]> = { left: [], right: [] };
   for (const line of lines) {
     const side = unitToAxis[line.unit];
@@ -57,7 +55,7 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
   const leftLabel = axisLabels.left.join(' / ');
   const rightLabel = axisLabels.right.join(' / ');
 
-  // ── Compute Y range per axis (all lines on same axis share one scale) ──
+  // All lines on the same axis share one Y scale.
   const axisRange: Record<AxisSide, { min: number; max: number }> = {
     left: { min: Infinity, max: -Infinity },
     right: { min: Infinity, max: -Infinity },
@@ -81,7 +79,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
     r.max = r.max + (r.max - r.min) * 0.05;
   }
 
-  // ── Layout ──
   const padL = 40;
   const padR = hasRightAxis ? 40 : 8;
   const padT = 6;
@@ -97,7 +94,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
     return padT + plotH - ((v - r.min) / (r.max - r.min)) * plotH;
   };
 
-  // ── Path builder ──
   const buildPath = (line: ChartLine): string => {
     if (line.data.length === 0) return '';
     const points = line.data.map((v, i) => ({
@@ -114,7 +110,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
     return points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`).join(' ');
   };
 
-  // ── Tick values for an axis ──
   const ticks = (side: AxisSide): number[] => {
     const r = axisRange[side];
     const result: number[] = [];
@@ -124,7 +119,7 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
     return result;
   };
 
-  // ── Representative unit for tick formatting (first unit assigned to that axis) ──
+  // Tick formatting uses the first unit assigned to each axis as its representative.
   const leftTickUnit = unitOrder[0];
   const rightTickUnit = unitOrder[1] ?? unitOrder[0];
 
@@ -139,7 +134,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
         className="w-full overflow-visible"
         aria-label="Metrics chart"
       >
-        {/* Grid lines from left axis */}
         {ticks('left').map((v, i) => {
           const y = toY(v, leftTickUnit);
           return (
@@ -156,7 +150,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
           );
         })}
 
-        {/* Left Y-axis ticks */}
         {ticks('left').map((v, i) => (
           <text
             key={`lt-${i}`}
@@ -169,7 +162,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
             {fmtTick(v, leftTickUnit)}
           </text>
         ))}
-        {/* Left axis label */}
         <text
           x={6}
           y={padT + plotH / 2}
@@ -181,7 +173,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
           {leftLabel}
         </text>
 
-        {/* Right Y-axis ticks + label */}
         {hasRightAxis &&
           ticks('right').map((v, i) => (
             <text
@@ -208,7 +199,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
           </text>
         )}
 
-        {/* Plot area border */}
         <rect
           x={padL}
           y={padT}
@@ -219,7 +209,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
           strokeWidth="0.5"
         />
 
-        {/* Data lines */}
         {lines.map((line, i) => (
           <path
             key={i}
@@ -232,7 +221,6 @@ export function MetricsChart({ lines, width = 300, height = 140 }: MetricsChartP
         ))}
       </svg>
 
-      {/* Legend */}
       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
         {lines.map((line, i) => (
           <span key={i} className="flex items-center gap-1 text-[9px] text-neutral-400">

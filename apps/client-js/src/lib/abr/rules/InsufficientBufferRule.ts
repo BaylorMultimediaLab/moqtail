@@ -19,17 +19,15 @@ export class InsufficientBufferRule implements AbrRule {
 
     this.#callCount += 1;
 
-    // Ignore first segmentIgnoreCount calls (warm-up period)
+    // Warm-up: ignore the first segmentIgnoreCount calls.
     if (this.#callCount <= segmentIgnoreCount) {
       return null;
     }
 
-    // Buffer is healthy — do not intervene
     if (bufferSeconds >= stableBufferTime) {
       return null;
     }
 
-    // Buffer is completely empty — force lowest quality with STRONG priority
     if (bufferSeconds === 0) {
       return {
         representationIndex: 0,
@@ -58,7 +56,6 @@ export class InsufficientBufferRule implements AbrRule {
     void stableBufferTime;
     const cappedBps = (bandwidthBps * throughputSafetyFactor * bufferSeconds) / segmentDurationS;
 
-    // Find the highest track index whose bitrate fits within the capped bandwidth
     let bestIndex = 0;
     for (let i = 0; i < tracks.length; i++) {
       const bitrate = tracks[i]!.bitrate ?? 0;

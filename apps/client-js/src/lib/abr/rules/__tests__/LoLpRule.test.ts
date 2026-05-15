@@ -80,7 +80,6 @@ describe('LoLpRule', () => {
     // bufferSeconds === 0.5 should NOT trigger emergency
     const ctx05 = makeContext({ bufferSeconds: 0.5 });
     const result05 = rule.getMaxIndex(ctx05);
-    // Should not be emergency (reason should be 'lolp' or null)
     if (result05 !== null) {
       expect(result05.reason).not.toBe('lolp-emergency-low-buffer');
     }
@@ -119,10 +118,8 @@ describe('LoLpRule', () => {
 
   it('reset() clears internal state so neurons are re-initialised on next call', () => {
     const ctx = makeContext();
-    // Call once to prime neurons
     rule.getMaxIndex(ctx);
 
-    // Reset and call again — should still return a valid result (no error)
     rule.reset();
     const result = rule.getMaxIndex(ctx);
     expect(result).not.toBeNull();
@@ -131,13 +128,12 @@ describe('LoLpRule', () => {
   });
 
   it('reset() clears rebuffer and switch counters', () => {
-    // Simulate a rebuffer by calling with bufferSeconds=0 (after reset to avoid emergency)
+    // Simulate a rebuffer by calling with bufferSeconds just above the 0.5 emergency threshold
     const ctxRebuffer = makeContext({ bufferSeconds: 0.6 });
     rule.getMaxIndex(ctxRebuffer);
 
     rule.reset();
 
-    // After reset, a fresh call should work without accumulated state
     const ctx = makeContext();
     const result = rule.getMaxIndex(ctx);
     expect(result).not.toBeNull();

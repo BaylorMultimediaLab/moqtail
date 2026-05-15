@@ -5,8 +5,6 @@ import type { Track } from '@/lib/abr/types';
 import { MetricsChart } from './MetricsChart';
 import type { ChartLine } from './MetricsChart';
 
-// ── Metric definitions ──
-
 interface MetricDef {
   key: string;
   label: string;
@@ -89,8 +87,6 @@ const METRIC_MAP = new Map(METRIC_DEFS.map(d => [d.key, d]));
 const MAX_ACTIVE = 5;
 const DEFAULT_ACTIVE = new Set(['buffer', 'bitrate']);
 
-// ── Helpers ──
-
 function fmt(value: number, unit: string): string {
   if (unit === 'kbps' || unit === 'kbit/s') {
     if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} Mbit/s`;
@@ -102,8 +98,6 @@ function fmt(value: number, unit: string): string {
   if (unit === 'x') return `${value.toFixed(2)}x`;
   return `${value} ${unit}`;
 }
-
-// ── Toggle dot next to plottable stat rows ──
 
 function ToggleDot({
   metricKey,
@@ -171,8 +165,6 @@ function StatRow({
   );
 }
 
-// ── Panel ──
-
 interface MetricsPanelProps {
   metrics: AbrMetrics | null;
   snapshot: MetricsSnapshot | null;
@@ -213,7 +205,6 @@ export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
 
   const samples = snapshot?.samples ?? [];
 
-  // Build chart lines for active metrics
   const chartLines: ChartLine[] = [];
   for (const key of activeMetrics) {
     const def = METRIC_MAP.get(key);
@@ -230,7 +221,6 @@ export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
 
   return (
     <div className="space-y-3 text-[11px]">
-      {/* ── Video stats ── */}
       <div>
         <p className="mb-1 font-semibold tracking-widest text-neutral-500 uppercase">Video</p>
         <div className="space-y-0">
@@ -268,7 +258,6 @@ export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
         </div>
       </div>
 
-      {/* ── Playback Metrics ── */}
       <div>
         <p className="mb-1 font-semibold tracking-widest text-neutral-500 uppercase">
           Playback Metrics
@@ -312,7 +301,6 @@ export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
         </div>
       </div>
 
-      {/* ── Transport Metrics ── */}
       <div>
         <p className="mb-1 font-semibold tracking-widest text-neutral-500 uppercase">
           Transport Metrics
@@ -333,7 +321,6 @@ export function MetricsPanel({ metrics, snapshot, tracks }: MetricsPanelProps) {
         </div>
       </div>
 
-      {/* ── Unified chart ── */}
       {chartLines.length > 0 && (
         <div>
           <MetricsChart lines={chartLines} />

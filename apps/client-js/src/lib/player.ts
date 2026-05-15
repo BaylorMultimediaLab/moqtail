@@ -309,11 +309,9 @@ export class Player {
   }
 
   async initialize() {
-    // If we already received the catalog, skip initialization
     if (this.catalog) return this.catalog;
 
     try {
-      // Initialize the client and fetch the catalog
       this.client = await MOQtailClient.new({
         url: this.#options.relayUrl,
         supportedVersions: [DRAFT_14],
@@ -333,7 +331,6 @@ export class Player {
         (trackName: string) => this.switchTrack(trackName);
     }
 
-    // Fetch the catalog
     try {
       this.catalog = await this.retrieveCatalog();
     } catch (error) {
@@ -341,7 +338,7 @@ export class Player {
       throw error;
     }
 
-    // B4: construct the TimeMap once, anchored on the video track's GOP duration.
+    // Construct the TimeMap once, anchored on the video track's GOP duration.
     // Quality variants share a TimeMap — gopDurationMs is equal across them in practice.
     const videoTracks = this.catalog?.getTracks('video');
     const videoTrack = videoTracks?.[0];
@@ -394,10 +391,8 @@ export class Player {
     }
     this.#disposers = [];
 
-    // Unsubscribe from all active streams
     await Promise.all(this.#streams.map(s => this.unsubscribe(s.requestId)));
 
-    // Close the client connection
     await this.client?.disconnect();
 
     // Tear down the debug-only force-switch hook installed in initialize().
@@ -405,7 +400,6 @@ export class Player {
       delete (window as Window & { __forceSwitch?: unknown }).__forceSwitch;
     }
 
-    // Reset state
     this.catalog = null;
     this.client = null;
     this.#element = null;
@@ -414,7 +408,6 @@ export class Player {
   }
 
   async attachMedia(element: HTMLVideoElement) {
-    // Create a MediaSource and set it as the video element's source
     const mediaSource = new MediaSource();
     element.src = URL.createObjectURL(mediaSource);
     this.#element = element;
@@ -426,7 +419,6 @@ export class Player {
     if (!this.catalog) throw new Error('Catalog not loaded');
     if (!this.client) throw new Error('MOQProcessor not initialized');
 
-    // We require a catalog entry to be present
     if (!this.catalog?.getByTrackName(trackName))
       throw new Error(`Track not found in catalog: ${trackName}`);
 
@@ -436,13 +428,10 @@ export class Player {
         `Unsupported packaging type for track ${trackName}, only 'loc', 'cmaf', and 'chunk-per-object' are supported`,
       );
 
-    // Get the stream struct
     const struct = await this.subscribe({ trackName });
 
-    // Create new Source Buffer
     await this.#newSourceBufferMSE(struct, trackName);
 
-    // Return the request ID
     return struct.requestId;
   }
 
@@ -490,7 +479,6 @@ export class Player {
     }, 500);
     this.#disposers.push(() => clearInterval(wedgeIntervalId));
 
-    // Convenience function to wait for buffer updates
     const waitForBufferUpdate = (sourceBuffer: SourceBuffer) =>
       new Promise<void>(resolve =>
         sourceBuffer.addEventListener('updateend', () => resolve(), { once: true }),
@@ -532,19 +520,15 @@ export class Player {
       return true;
     };
 
-    // Iterate over all added roles
     for (const struct of this.#streams) {
-      // Get the init segment for the track
       const initSegment = this.catalog?.getInitData(struct.trackName);
       if (!initSegment) {
         await this.unsubscribe(struct.requestId);
         throw new Error(`Failed to get init segment for track: ${struct.trackName}`);
       }
 
-      // Get the Buffer and AbortController for this track
       const { sourceBuffer, ac } = struct.buffer!;
 
-      // Append the init segment
       try {
         sourceBuffer.appendBuffer(initSegment);
         await waitForBufferUpdate(sourceBuffer);
@@ -555,15 +539,12 @@ export class Player {
         );
       }
 
-      // MSE State
       let lastMSEErrorLogged = 0;
       let kickStarted = false;
 
-      // Create the WritableStream to handle incoming objects
       const writable = new WritableStream<MoqtObject>({
         write: async (object, controller) => {
           try {
-            // Skip end-of-group objects
             if (object.isEndOfGroup()) {
               logger.info(
                 'media',
@@ -572,13 +553,11 @@ export class Player {
               return;
             }
 
-            // Make TypeScript happy
             if (!(object.payload?.buffer instanceof ArrayBuffer)) {
               console.warn('Received non-ArrayBuffer payload, ignoring', object);
               return;
             }
 
-            // Cancel if aborted
             if (ac.signal.aborted) {
               controller.error(new DOMException('Stream aborted', 'InternalError'));
               return;
@@ -745,18 +724,14 @@ export class Player {
               }
             }
 
-            // Append the data
             let maxRetries = 5;
             while (maxRetries--) {
               try {
-                // Append the data
                 sourceBuffer.appendBuffer(object.payload.buffer);
 
-                // Wait for the source buffer to be consumed
                 await waitForBufferUpdate(sourceBuffer);
                 break;
               } catch (error) {
-                // Wait for the source buffer to be ready
                 if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
                 else if (lastMSEErrorLogged + 5000 < performance.now()) {
                   lastMSEErrorLogged = performance.now();
@@ -776,7 +751,6 @@ export class Player {
               }
             }
 
-            // Check the buffered amount
             if (sourceBuffer.buffered.length > 0 && !kickStarted) {
               const minStart = sourceBuffer.buffered.start(0);
               const maxEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
@@ -872,7 +846,6 @@ export class Player {
         },
       });
 
-      // Pipe to the writable stream
       const promise = struct.source.pipeTo(writable, { signal: ac.signal });
 
       // Cleanup stream — for live streams, do NOT call endOfStream() when the
@@ -983,7 +956,6 @@ export class Player {
           const perceivedPauseMs = performance.now() - struct.postSwitchSentAt;
           const targetTrack = struct.postSwitchToTrack;
 
-          // Find the most recent matching switch record and attach.
           if (typeof window !== 'undefined' && window.__moqtailMetrics) {
             const records = window.__moqtailMetrics.switchDiscontinuities;
             if (records) {
@@ -997,13 +969,11 @@ export class Player {
             }
           }
 
-          // Clean up — switch transition complete.
           struct.postSwitchFrameTarget = undefined;
           struct.postSwitchSentAt = undefined;
           struct.postSwitchToTrack = undefined;
         }
       }
-      // Re-arm for next frame.
       this.#element.requestVideoFrameCallback(poll);
     };
     this.#element.requestVideoFrameCallback(poll);
@@ -1227,7 +1197,6 @@ export class Player {
   async #newSourceBufferMSE(struct: MOQStreamStruct, trackName: string) {
     if (!this.#mse) throw new Error('MediaSource not initialized');
 
-    // Wait for media source to be open
     if (this.#mse.readyState === 'closed') {
       await new Promise(resolve => {
         const onSourceOpen = () => {
@@ -1238,7 +1207,6 @@ export class Player {
       });
     }
 
-    // Get the MIME type
     const codecString = this.catalog?.getCodecString(trackName);
     const role = this.catalog?.getRole(trackName);
     if (!codecString || !role) {
@@ -1246,17 +1214,14 @@ export class Player {
       throw new Error(`Failed to get codec or role for track: ${trackName}`);
     }
 
-    // Check if the MIME type is supported
     const mimeType = `${role}/mp4; codecs="${codecString}"`;
     if (!MediaSource.isTypeSupported(mimeType)) {
       await this.unsubscribe(struct.requestId);
       throw new Error(`MIME type not supported: ${mimeType}`);
     }
 
-    // Create a new SourceBuffer
     const sourceBuffer = this.#mse.addSourceBuffer(mimeType);
 
-    // Register the SourceBuffer
     struct.buffer = {
       ac: new AbortController(),
       sourceBuffer,
@@ -1296,7 +1261,6 @@ export class Player {
       };
     }
 
-    // Pull the latest catalog object
     if (!struct.source) {
       throw new Error(
         'Catalog stream unavailable — the publisher may have disconnected. Restart the relay and publisher, then reconnect.',
@@ -1319,7 +1283,6 @@ export class Player {
       buffer = value.payload.buffer;
     }
 
-    // Parse and store the catalog
     const catalog = CMSFCatalog.from(buffer);
 
     // Unsubscribe from the catalog stream since we only needed the latest object
@@ -1342,7 +1305,6 @@ export class Player {
       });
     }
 
-    // Send the appropriate control message
     let struct: MOQStreamStruct;
     const result = await this.client.subscribe({
       fullTrackName: getFullTrackName(this.#options.namespace, params.trackName),
@@ -1384,7 +1346,6 @@ export class Player {
       lastAppendedEndPTS_ms: undefined,
     };
 
-    // Add the stream to the pool
     this.#streams.push(struct);
     return struct;
   }
@@ -1392,16 +1353,13 @@ export class Player {
   private async unsubscribe(requestId: bigint) {
     if (!this.client) throw new Error('MOQProcessor not initialized');
 
-    // Find the stream struct
     const index = this.#streams.findIndex(s => s.requestId === requestId);
     if (index === -1) throw new Error(`No active subscription found for requestId ${requestId}`);
     const struct = this.#streams[index];
     if (!struct) throw new Error(`No active subscription found for requestId ${requestId}`);
 
-    // Send the UNSUBSCRIBE message
     await this.client.unsubscribe(struct.requestId);
 
-    // Remove the stream from the pool
     this.#streams.splice(index, 1);
   }
 }

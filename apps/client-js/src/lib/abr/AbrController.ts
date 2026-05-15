@@ -117,7 +117,6 @@ export class AbrController {
   ) {
     this.#player = player;
     this.#rulesCollection = rulesCollection;
-    // Sort ascending by bitrate — index 0 = lowest quality, last = highest
     this.#tracks = [...tracks].sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
     this.#settings = settings;
     this.#onMetricsUpdate = onMetricsUpdate;
@@ -161,7 +160,7 @@ export class AbrController {
   }
 
   manualSwitch(trackName: string): void {
-    if (this.#switching) return; // switch already in-flight
+    if (this.#switching) return;
     this.#switching = true;
     this.#switchingStartTs = Date.now();
     const m = this.#player.getMetrics();
@@ -199,7 +198,6 @@ export class AbrController {
       lastLatencyMs,
     } = raw;
 
-    // Find the active track index in the sorted tracks array
     const activeTrackIndex = activeTrack ? this.#tracks.findIndex(t => t.name === activeTrack) : -1;
 
     const mode: 'auto' | 'manual' = this.#settings.videoAutoSwitch ? 'auto' : 'manual';
@@ -263,16 +261,12 @@ export class AbrController {
       this.#switchBackoffUntil = Date.now() + AbrController.SWITCH_COOLDOWN_MS;
     }
 
-    // Manual mode — don't make automatic decisions
     if (!this.#settings.videoAutoSwitch) return;
 
-    // Switching guard — wait for previous switch to complete
     if (this.#switching) return;
 
-    // Post-timeout cooldown — don't re-fire rules immediately after a failed switch
     if (Date.now() < this.#switchBackoffUntil) return;
 
-    // Update DYNAMIC strategy based on buffer level
     this.#updateDynamicStrategy(bufferSeconds);
 
     // Active probe via the relay's synthetic `.probe:<size>:<priority>`
@@ -294,7 +288,6 @@ export class AbrController {
       this.#probeManager.maybeProbe(`.probe:${probeSizeBytes}:0`);
     }
 
-    // Build context for rules
     const context: RulesContext = {
       tracks: this.#tracks,
       activeTrackIndex: currentIdx,
@@ -318,7 +311,6 @@ export class AbrController {
 
     const targetIndex = switchRequest.representationIndex;
 
-    // Only switch if the target differs from current
     if (targetIndex === currentIdx) return;
 
     const targetTrack = this.#tracks[targetIndex];
@@ -332,7 +324,6 @@ export class AbrController {
     // frame's PTS — breaking the per-switch playhead-gap invariant.
     if (targetTrack.name === this.#inflightTrackName) return;
 
-    // Determine switch reason
     const currentBitrate =
       activeTrackIndex >= 0 ? (this.#tracks[activeTrackIndex]?.bitrate ?? 0) : 0;
     const targetBitrate = targetTrack.bitrate ?? 0;
@@ -345,7 +336,6 @@ export class AbrController {
       reason = 'auto-upgrade';
     }
 
-    // Activate switching guard, record history, and switch
     this.#switching = true;
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
@@ -358,11 +348,9 @@ export class AbrController {
     // way the value is the bitrate delta of the tier that's currently
     // adjacent to the new position in the SAME direction as the switch.
     if (targetIndex > currentIdx) {
-      // upswitch: tracksize = b[newIdx+1] - b[newIdx]
       const next = this.#tracks[targetIndex + 1]?.bitrate ?? targetBitrate;
       this.#tracksize = Math.max(0, next - targetBitrate);
     } else if (targetIndex < currentIdx) {
-      // downswitch: tracksize = b[newIdx] - b[newIdx-1]
       const prev = this.#tracks[targetIndex - 1]?.bitrate ?? targetBitrate;
       this.#tracksize = Math.max(0, targetBitrate - prev);
     }
@@ -370,7 +358,6 @@ export class AbrController {
   }
 
   #updateDynamicStrategy(bufferLevel: number): void {
-    // Skip if L2A or LoLP is active — they manage strategy themselves
     if (
       this.#rulesCollection.isRuleActive('L2ARule') ||
       this.#rulesCollection.isRuleActive('LoLPRule')
@@ -381,10 +368,9 @@ export class AbrController {
     // NOT bufferTimeDefault — that's BOLA's Vp horizon, an independent knob.
     // Tying activation to Vp would make raising bufferTimeDefault silently
     // disable BOLA in any test whose buffer can't reach the Vp value.
-    const switchOnThreshold = this.#settings.bolaActivationBufferS; // 10s default
-    const switchOffThreshold = 0.5 * this.#settings.bolaActivationBufferS; // 5s default
+    const switchOnThreshold = this.#settings.bolaActivationBufferS;
+    const switchOffThreshold = 0.5 * this.#settings.bolaActivationBufferS;
 
-    // Hysteresis: use the current state to pick which threshold to compare against
     this.#usingBolaRule =
       bufferLevel >= (this.#usingBolaRule ? switchOffThreshold : switchOnThreshold);
 
