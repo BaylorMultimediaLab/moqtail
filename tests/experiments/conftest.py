@@ -90,15 +90,16 @@ def relay_proc(net, config, project_root, results_dir, relay_cache_size):
 def publisher_ladder_spec(request):
     """Per-test override for publisher --ladder-spec.
 
-    Defaults to the experiment ladder (720p with 5 rungs at the bitrates
-    aligned with Bentaleb et al. 2019 + a 5 Mbps top tier). Override with
+    Defaults to the experiment's multi-resolution ladder (240p/360p/480p/720p/
+    1080p at 150/200/500/1200/4000 kbps). Only consulted on a cache miss; the
+    replay path reads the ladder from the cache's meta.json. Override with
     @pytest.mark.publisher_ladder_spec("default") to fall back to the legacy
     resolution-coupled ladder.
     """
     return _read_marker(
         request,
         "publisher_ladder_spec",
-        default="720p:400,800,1200,2500,5000",
+        default="240p@150,360p@200,480p@500,720p@1200,1080p@4000",
     )
 
 
@@ -106,19 +107,32 @@ def publisher_ladder_spec(request):
 def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec):
     """Override of tests/network's publisher_proc.
 
-    Uses the Tears of Steel 60-second 720p source by default. The publisher
-    binary must be built with the vaapi feature for AMD GPU encoding:
+    Replays the pre-encoded Tears of Steel 120-second cache (1080p source, 5-rung
+    multi-resolution ladder) from data/encoded/tears_of_steel_120s_1080p via
+    --encoded-dir, so no GPU encode runs during experiments. The cache is built
+    once with the publisher's prepare mode (see scripts/prepare_tears_of_steel.sh);
+    a live-encode fallback still needs the vaapi feature:
     `cargo build --release --workspace --features publisher/vaapi`.
+
+    --no-loop makes the publisher emit each cached GOP exactly once and stop,
+    rather than looping back to GOP 0 (which restarts the media PTS at 0 and
+    wedges the player at the seam). The 120s clip is 2x the 60s collection
+    window, so a measurement never reaches end-of-stream either.
     """
     publisher = net.get("publisher")
     pub_bin = str(project_root / config["binaries"]["publisher"])
-    video_path = str(project_root / "data/video/tears_of_steel_60s_720p.mp4")
+    video_path = str(project_root / "data/video/tears_of_steel_120s_1080p.mp4")
     if not os.path.exists(video_path):
         raise RuntimeError(
             f"Tears of Steel asset missing at {video_path}. "
             f"Run: ./scripts/prepare_tears_of_steel.sh"
         )
-    relay_ip = config["topology"]["relay_ip_pub"]
+    # Pre-encoded GOP cache for replay mode: the publisher streams cached GOPs
+    # from disk (no decode, no GPU encode) when --encoded-dir holds a complete
+    # meta.json. The multi-res ladder (240p..1080p) is baked into this cache, so
+    # --ladder-spec is only consulted on a cache miss (live encode fallback).
+    encoded_dir = str(project_root / "data/encoded/tears_of_steel_120s_1080p")
+    relay_ip = f"10.{net._net_idx}.1.2"
 
     proc = publisher.popen(
         [
@@ -126,7 +140,9 @@ def publisher_proc(net, config, project_root, relay_proc, publisher_ladder_spec)
             f"https://{relay_ip}:4433",
             "--namespace", "moqtail",
             "--video-path", video_path,
+            "--encoded-dir", encoded_dir,
             "--ladder-spec", publisher_ladder_spec,
+            "--no-loop",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -170,4 +186,10 @@ def pytest_configure(config):
         "markers",
         "abr_settings_override(settings): inject window.__abrSettingsOverride before "
         "Connect click. Used by E6 to sweep ABR rule configurations.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "initial_link_bw(mbps): shape the relay-client link to this bandwidth "
+        "before the Connect click so the startup throughput estimate reflects "
+        "the constrained link. Should match the bandwidth profile's t=0 value.",
     )

@@ -1,6 +1,6 @@
 """E6: ABR rule composability across bandwidth profiles.
 
-8 configs x 3 profiles x 5 runs = 120 cells. Each cell:
+9 configs x 3 profiles x 5 runs = 135 cells. Each cell:
 - Filtered client at filterDelay=10, switchMode=aligned (both fixed)
 - ABR config from ABR_CONFIGS injected via window.__abrSettingsOverride
 - Bandwidth profile (stable / step / sinusoidal) driven via tc/netem
@@ -13,6 +13,7 @@ ABR config. (n_discontinuities is buffer-end-relative and naturally
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -21,7 +22,9 @@ from profiles import apply_stable, apply_step, apply_sinusoidal
 from summary import build_run_summary, write_run_summary
 
 
-_RUNS_PER_CELL = 5
+# Runs per (config, profile) cell. Override via MOQTAIL_RUNS_PER_CELL
+# (run-experiments.sh --runs N) to widen or shrink the sweep.
+_RUNS_PER_CELL = int(os.environ.get("MOQTAIL_RUNS_PER_CELL", "5"))
 
 
 def _make_profile_task(net, profile_name: str):
@@ -34,6 +37,17 @@ def _make_profile_task(net, profile_name: str):
             apply_sinusoidal(net, 0.6, 3.0, period_s=60, duration_s=60)
         )
     raise ValueError(f"unknown profile: {profile_name}")
+
+
+# Each profile's bandwidth at t=0, used to pre-shape the link before the client
+# connects (see the initial_link_bw marker / browser_page). Matches the t=0 of
+# the corresponding apply_* schedule: stable holds 1.5; step starts at 3.0; the
+# sinusoid begins at its midline (0.6+3.0)/2 = 1.8 since sin(0)=0.
+_INITIAL_BW_MBPS = {
+    "stable1.5M": 1.5,
+    "step3M_500k": 3.0,
+    "sin600k_3M": 1.8,
+}
 
 
 def _cell_params():
@@ -54,6 +68,7 @@ def _cell_params():
                             switchMode="aligned",
                         ),
                         pytest.mark.abr_settings_override(settings),
+                        pytest.mark.initial_link_bw(_INITIAL_BW_MBPS[profile_name]),
                     ],
                     id=cell_id,
                 )
@@ -123,10 +138,13 @@ async def test_e6_abr_composability(
     )
     # Sanity: a switch must have fired so the aligned-mode invariant above is
     # meaningful (max_playhead_gap_ms defaults to 0 with no switches). Some
-    # cells (e.g. abr_config="none" + stable1.5M) drive the player into 5000k
+    # cells (e.g. abr_config="all" + stable1.5M) drive the player into 5000k
     # on a 1.5Mbps link, where catch-up redelivery exhausts the 60s window —
-    # that's the test exercising ABR behavior, not a failure.
-    assert summary["n_switches"] > 0, (
-        f"no switches fired; alignment invariant trivially passed "
-        f"(playback ended at {summary['current_time_at_end_s']}s)"
-    )
+    # that's the test exercising ABR behavior, not a failure. The "none"
+    # config disables every ABR rule, so zero switches is the expected,
+    # correct behavior — skip the check there.
+    if config_name != "none":
+        assert summary["n_switches"] > 0, (
+            f"no switches fired; alignment invariant trivially passed "
+            f"(playback ended at {summary['current_time_at_end_s']}s)"
+        )

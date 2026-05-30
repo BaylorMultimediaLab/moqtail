@@ -32,6 +32,8 @@ _NUMERIC_FIELDS = [
     "n_discontinuities",
     "max_pts_gap_ms",
     "mean_pts_gap_ms",
+    "max_playhead_gap_ms",
+    "mean_playhead_gap_ms",
     "avg_delivered_bitrate_kbps",
     "mean_e2e_latency_ms",
     "p50_e2e_latency_ms",
@@ -106,7 +108,7 @@ def aggregate_experiment(results_root: Path, experiment: str) -> tuple[Path, Pat
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("experiment", help="Experiment id (e1, e2, e3, e4, e6)")
+    parser.add_argument("experiment", help="Experiment id (for example, e1 or e7)")
     parser.add_argument(
         "--results-root",
         default=str(Path(__file__).resolve().parent / "results"),

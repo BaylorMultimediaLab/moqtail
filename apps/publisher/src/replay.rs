@@ -12,14 +12,17 @@ use crate::pacing::pace_gop_emit_async;
 
 /// Reads pre-encoded GOPs from `<variant_dir>/NNNNNN.gop` and forwards them at
 /// the wall-clock cadence (one GOP per `gop_duration_secs`) to the existing
-/// per-variant sender via `gop_tx`. After the last file it loops back to
-/// `000000.gop` but keeps incrementing `group_id`, so MoQ relays/subscribers
-/// see a monotonically rising sequence across the wraparound.
+/// per-variant sender via `gop_tx`. When `loop_replay` is true, after the last
+/// file it loops back to `000000.gop` but keeps incrementing `group_id`, so MoQ
+/// relays/subscribers see a monotonically rising sequence across the wraparound
+/// (the cached media PTS does restart at 0, so subscribers wedge at the seam).
+/// When `loop_replay` is false, it emits each cached GOP exactly once and stops.
 pub async fn replay_variant(
   variant_dir: PathBuf,
   gops_per_variant: u64,
   gop_duration_secs: f64,
   label: String,
+  loop_replay: bool,
   gop_tx: mpsc::Sender<EncodedGop>,
 ) -> Result<()> {
   if gops_per_variant == 0 {
@@ -66,6 +69,13 @@ pub async fn replay_variant(
     group_id += 1;
 
     if file_index + 1 == gops_per_variant {
+      if !loop_replay {
+        info!(
+          "Replay ({}): emitted all {} GOPs (--no-loop), stopping",
+          label, gops_per_variant
+        );
+        return Ok(());
+      }
       // Wrap-around log so it's visible in test runs.
       warn!(
         "Replay ({}): wrapped past last cached GOP, next group_id={}",

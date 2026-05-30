@@ -16,7 +16,38 @@ from playwright.async_api import async_playwright
 
 from metrics_collector import MetricsCollector
 from relay_log_parser import RelayLogParser
+from shaper import shape_link2
 from topology import create_network
+
+
+def _cleanup_worker_ifaces(net_idx: int) -> None:
+    """Delete all root-namespace interfaces owned by this worker's Mininet network.
+
+    OVS del-br removes the bridge from the OVS database but leaves the kernel
+    veth interfaces (s1_{b}-eth*, s2_{b}-eth*, root0_{b}-eth*) in the root
+    namespace. If they're not removed, the next addLink on the same worker fails
+    with "RTNETLINK answers: File exists". Called both as pre-cleanup (to clear
+    crash debris) and in the fixture teardown (for clean sequential reuse).
+    """
+    result = subprocess.run(
+        ["ip", "-o", "link", "show"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    prefixes = (f"s1_{net_idx}-eth", f"s2_{net_idx}-eth", f"root0_{net_idx}-eth")
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        iface = parts[1].split("@")[0].rstrip(":")
+        if any(iface.startswith(p) for p in prefixes):
+            subprocess.run(
+                ["ip", "link", "del", iface],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
 
 
 def pytest_addoption(parser):
@@ -57,19 +88,23 @@ def results_dir(results_base, request):
 
 
 @pytest.fixture
-def net(config):
-    # Clean any leaked Mininet state from a prior run BEFORE creating the
-    # network. Without this, when a previous test errors during topology
-    # construction, its `try/finally` cleanup never runs and leaves veth
-    # pairs (client-eth0, s2-eth2, etc.) in the root namespace. The next
-    # `addLink` then fails with "RTNETLINK answers: File exists" and
-    # cascades through every subsequent test in the session.
-    subprocess.run(
-        ["mn", "-c"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+def net(config, request):
+    # Determine which xdist worker slot this is. With -n N each worker gets a
+    # unique id ('gw0', 'gw1', …); without xdist we fall back to 0.
+    worker_id = getattr(request.config, "workerinput", {}).get("workerid", "master")
+    net_idx = int(worker_id[2:]) if worker_id.startswith("gw") else 0
+
+    # Targeted pre-cleanup: remove only THIS worker's stale OVS bridges and
+    # root-namespace veth interfaces from a previous crash. A global `mn -c`
+    # races with concurrent workers and tears down their live networks.
+    for bridge in [f"s1_{net_idx}", f"s2_{net_idx}"]:
+        subprocess.run(
+            ["ovs-vsctl", "--if-exists", "del-br", bridge],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    _cleanup_worker_ifaces(net_idx)
 
     topo_cfg = config["topology"]
     network = create_network(
@@ -77,19 +112,16 @@ def net(config):
         link2_bw=topo_cfg["link2_default_bw"],
         delay=topo_cfg["default_delay"],
         loss=topo_cfg["default_loss"],
+        net_idx=net_idx,
     )
     try:
         yield network
     finally:
         network.stop()
-        # root0 has inNamespace=False, so mininet.stop() leaves its veth behind
-        # and the next run's addLink fails with "RTNETLINK answers: File exists".
-        subprocess.run(
-            ["ip", "link", "del", "root0-eth0"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        # network.stop() removes OVS bridges but leaves the kernel veth pairs
+        # (s1_{n}-eth*, s2_{n}-eth*, root0_{n}-eth*) in the root namespace;
+        # the next test's addLink would fail with "RTNETLINK answers: File exists".
+        _cleanup_worker_ifaces(net_idx)
 
 
 @pytest.fixture
@@ -184,6 +216,13 @@ def pytest_configure(config):
         "abr_settings_override(settings): inject window.__abrSettingsOverride before "
         "Connect click. Used by E6 to sweep ABR rule configurations.",
     )
+    config.addinivalue_line(
+        "markers",
+        "initial_link_bw(mbps): shape the relay-client link to this bandwidth "
+        "BEFORE the Connect click, so the client's startup throughput estimate "
+        "reflects the constrained link rather than the unshaped default. Should "
+        "match the bandwidth profile's t=0 value.",
+    )
 
 
 @pytest.fixture
@@ -194,9 +233,15 @@ async def browser_page(net, config, results_dir, request):
     # client retries in a loop and leaks RAM.
     client = net.get("client")
     dist_path = str(Path(__file__).parent.parent.parent / config["client_js"]["dist_path"])
-    chromium_flags = config["chromium"]["flags"]
-    client_ip = config["topology"]["client_ip"]
-    relay_url = config["client_js"]["relay_url"]
+    b = net._net_idx
+    client_ip = f"10.{b}.2.1"
+    relay_url = f"https://10.{b}.2.2:4433"
+    # Replace the hardcoded base IP in any chromium flag (e.g.
+    # --origin-to-force-quic-on) with this worker's relay IP.
+    relay_ip_client = f"10.{b}.2.2"
+    chromium_flags = [
+        f.replace("10.0.2.2", relay_ip_client) for f in config["chromium"]["flags"]
+    ]
     chrome_bin = _find_chrome_binary()
 
     user_data_dir = Path(tempfile.mkdtemp(prefix="moqtail-chrome-"))
@@ -389,11 +434,12 @@ async def browser_page(net, config, results_dir, request):
             except Exception as e:
                 (results_dir / "chrome_gpu.txt").write_text(f"chrome://gpu dump failed: {e}\n")
 
-            # bufferTimeDefault=300 keeps ThroughputRule active for the whole
-            # ramp run; BOLA would otherwise take over once buffer crosses
-            # the default 18s threshold. Tests can layer extra ABR settings via
+            # bufferTimeDefault defaults to the main-repo value (18s, see
+            # DEFAULT_ABR_SETTINGS in apps/client-js/src/lib/abr/types.ts) so the
+            # experiments exercise the shipping ABR configuration rather than an
+            # inflated 300s buffer target. Tests can layer extra ABR settings via
             # the @pytest.mark.abr_url_overrides(...) marker.
-            url_params = {"bufferTimeDefault": "300"}
+            url_params = {"bufferTimeDefault": "18"}
             override_marker = request.node.get_closest_marker("abr_url_overrides")
             if override_marker:
                 for k, v in (override_marker.kwargs or {}).items():
@@ -422,6 +468,16 @@ async def browser_page(net, config, results_dir, request):
                 await page.evaluate(
                     "(s) => { window.__abrSettingsOverride = s; }", settings
                 )
+
+            # Shape the relay-client link to the profile's starting bandwidth
+            # BEFORE connecting, so the client's startup throughput estimate sees
+            # the constrained link instead of the unshaped default (link2 = 5 Mbps
+            # via TCLink). Without this the EMA seeds high and the ABR over-
+            # upswitches before the bandwidth profile clamps the link. The
+            # profile task started in the test body then takes over from t=0.
+            initial_bw_marker = request.node.get_closest_marker("initial_link_bw")
+            if initial_bw_marker and initial_bw_marker.args:
+                shape_link2(net, bw_mbps=float(initial_bw_marker.args[0]))
 
             # The client-js UI sits idle until Connect is clicked, so the ABR
             # pipeline (and window.__moqtailMetrics.abr) stays null without this.
