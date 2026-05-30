@@ -21,6 +21,7 @@ export interface AbrMetrics {
   playbackRate: number;
   deliveryTimeMs: number;
   lastObjectBytes: number;
+  sampleCount: number;
   switchHistory: SwitchEvent[];
   mode: 'auto' | 'manual';
   switching: boolean;
@@ -81,6 +82,13 @@ export class AbrController {
   // switch every SWITCH_TIMEOUT_MS, generating unbounded downswitch events
   // while activeTrack never changes.
   static readonly SWITCH_COOLDOWN_MS = 5_000;
+  // Minimum number of real per-group throughput samples before an *upswitch*
+  // is allowed. The startup throughput signal (handshake burst, first backlog
+  // GOP, or a not-yet-shaped link) over-reads the sustainable rate; gating
+  // upswitches on a few sustained samples is a config-agnostic slow-start that
+  // stops a single startup burst from green-lighting a multi-tier climb.
+  // Downswitches are never gated — an emergency drop must always be allowed.
+  static readonly MIN_STARTUP_SAMPLES = 3;
   // Carry-over bitrate delta from the most recent switch. Used in the
   // thesis Algorithm 1 probe_size formula: probe_size = t · (b[i+1] - b[i]
   // + tracksize). Initialized to 0; updated whenever a switch fires.
@@ -171,6 +179,7 @@ export class AbrController {
       playbackRate,
       deliveryTimeMs,
       lastObjectBytes,
+      sampleCount,
       readyState,
       paused,
       currentTime,
@@ -198,6 +207,7 @@ export class AbrController {
       playbackRate,
       deliveryTimeMs,
       lastObjectBytes,
+      sampleCount,
       switchHistory: [...this.#switchHistory],
       mode,
       switching: this.#switching,
@@ -301,6 +311,15 @@ export class AbrController {
 
     // Only switch if the target differs from current
     if (targetIndex === currentIdx) return;
+
+    // Startup slow-start: gate *upswitches* until enough real per-group
+    // throughput samples have accumulated. The startup signal over-reads the
+    // sustainable rate, so an early burst must not trigger a climb above the
+    // conservatively-chosen startup tier. Downswitches are always permitted
+    // (an emergency drop on a starved link can't wait for samples).
+    if (targetIndex > currentIdx && sampleCount < AbrController.MIN_STARTUP_SAMPLES) {
+      return;
+    }
 
     const targetTrack = this.#tracks[targetIndex];
     if (!targetTrack) return;

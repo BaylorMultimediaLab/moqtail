@@ -881,6 +881,7 @@ export class Player {
     playbackRate: number;
     deliveryTimeMs: number;
     lastObjectBytes: number;
+    sampleCount: number;
     readyState: number;
     paused: boolean;
     currentTime: number;
@@ -917,6 +918,7 @@ export class Player {
       playbackRate: el?.playbackRate ?? 1,
       deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
       lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
+      sampleCount: videoStruct?.tracker.getSampleCount() ?? 0,
       readyState: el?.readyState ?? 0,
       paused: el?.paused ?? true,
       currentTime: el?.currentTime ?? 0,
@@ -931,6 +933,16 @@ export class Player {
   setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     videoStruct?.tracker.setHalfLives(halfLifeFastSec, halfLifeSlowSec);
+  }
+
+  /**
+   * Anchor the active video tracker's throughput EMA to a conservative startup
+   * estimate (bps) so the first real per-group sample can't seed the EMA from a
+   * startup burst. See GoodputTracker.seedEma. No-op once real samples exist.
+   */
+  seedThroughputEstimate(bps: number): void {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    videoStruct?.tracker.seedEma(bps);
   }
 
   /**

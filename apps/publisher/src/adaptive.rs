@@ -10,12 +10,41 @@ pub enum LadderSpec {
     height: u16,
     bitrates_kbps: Vec<u32>,
   },
+  /// Explicit per-rung resolution+bitrate ladder, parsed from the
+  /// `<h>p@<kbps>,<h>p@<kbps>,...` form. Each rung is `(height, bitrate_kbps)`;
+  /// width is the 16:9 partner of the height.
+  MultiRes { rungs: Vec<(u16, u32)> },
 }
 
 impl LadderSpec {
   pub fn parse(s: &str) -> Result<Self, String> {
     if s == "default" {
       return Ok(LadderSpec::Default);
+    }
+    // Multi-resolution form: comma-separated `<height>p@<bitrate_kbps>` rungs,
+    // e.g. `240p@150,360p@200,720p@1200`. The `@` distinguishes it from the
+    // single-resolution `<height>p:<csv>` form handled below.
+    if s.contains('@') {
+      let rungs = s
+        .split(',')
+        .map(|rung| {
+          let (res, br) = rung
+            .split_once('@')
+            .ok_or_else(|| format!("ladder-spec: rung '{}' missing '@'", rung))?;
+          let height: u16 = res
+            .trim()
+            .strip_suffix('p')
+            .ok_or_else(|| format!("ladder-spec: rung resolution must end in 'p' in '{}'", rung))?
+            .parse()
+            .map_err(|e| format!("ladder-spec: bad height in '{}': {}", rung, e))?;
+          let bitrate_kbps: u32 = br
+            .trim()
+            .parse()
+            .map_err(|e| format!("ladder-spec: bad bitrate in '{}': {}", rung, e))?;
+          Ok((height, bitrate_kbps))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+      return Ok(LadderSpec::MultiRes { rungs });
     }
     let (res_part, bitrate_part) = s
       .split_once(':')
@@ -129,14 +158,7 @@ pub fn quality_variants_for_spec(
       height,
       bitrates_kbps,
     } => {
-      let width: u16 = match height {
-        2160 => 3840,
-        1080 => 1920,
-        720 => 1280,
-        480 => 854,
-        360 => 640,
-        h => return Err(format!("LadderSpec::SingleRes: unsupported height {}", h)),
-      };
+      let width = width_for_height_16x9(*height)?;
       // Source-resolution check — refuse to upscale.
       if *height > info.height {
         return Err(format!(
@@ -158,7 +180,60 @@ pub fn quality_variants_for_spec(
         .collect();
       Ok(variants)
     }
+    LadderSpec::MultiRes { rungs } => rungs
+      .iter()
+      .map(|&(height, bitrate_kbps)| {
+        let width = width_for_height_16x9(height)?;
+        // Source-resolution check — refuse to upscale.
+        if height > info.height {
+          return Err(format!(
+            "LadderSpec::MultiRes: rung {}p exceeds source height {}",
+            height, info.height
+          ));
+        }
+        Ok(QualityVariant {
+          quality: Quality::SameResRung {
+            height,
+            bitrate_kbps,
+          },
+          width,
+          height,
+          bitrate_kbps,
+        })
+      })
+      .collect::<Result<Vec<_>, String>>(),
   }
+}
+
+/// Resolve a `--ladder-spec` string into concrete variants for `info`. Only
+/// `default` honors `max_variants`; explicit (`SingleRes` / `MultiRes`) specs
+/// emit every rung they name. Single entry point shared by live, prepare, and
+/// replay modes so they never diverge on which ladder is built.
+pub fn resolve_ladder(
+  spec: &str,
+  max_variants: usize,
+  info: &VideoInfo,
+) -> Result<Vec<QualityVariant>, String> {
+  let spec = LadderSpec::parse(spec)?;
+  match &spec {
+    LadderSpec::Default => quality_variants(info, max_variants).map_err(|e| e.to_string()),
+    _ => quality_variants_for_spec(info, &spec),
+  }
+}
+
+/// Maps a standard 16:9 rung height to its width. Shared by the spec-driven
+/// (`SingleRes` / `MultiRes`) ladders; the legacy `Default` ladder carries its
+/// own widths in `VARIANTS`.
+fn width_for_height_16x9(height: u16) -> Result<u16, String> {
+  Ok(match height {
+    2160 => 3840,
+    1080 => 1920,
+    720 => 1280,
+    480 => 854,
+    360 => 640,
+    240 => 426,
+    h => return Err(format!("ladder-spec: unsupported rung height {}p", h)),
+  })
 }
 
 impl std::fmt::Display for Quality {
@@ -363,5 +438,100 @@ mod tests {
       bitrate_kbps: 5000,
     };
     assert_eq!(q2.to_string(), "720p-5000k");
+  }
+
+  #[test]
+  fn ladder_spec_parses_multi_res() {
+    let spec = LadderSpec::parse("240p@150,360p@200,480p@500,720p@1200,1080p@4000").unwrap();
+    assert_eq!(
+      spec,
+      LadderSpec::MultiRes {
+        rungs: vec![
+          (240, 150),
+          (360, 200),
+          (480, 500),
+          (720, 1200),
+          (1080, 4000)
+        ],
+      }
+    );
+  }
+
+  #[test]
+  fn ladder_spec_multi_res_rejects_garbage() {
+    assert!(LadderSpec::parse("240p@").is_err()); // empty bitrate
+    assert!(LadderSpec::parse("240@150").is_err()); // missing 'p'
+    assert!(LadderSpec::parse("240p@abc").is_err()); // non-numeric bitrate
+    assert!(LadderSpec::parse("@150").is_err()); // missing resolution
+  }
+
+  #[test]
+  fn quality_variants_multi_res_emits_per_rung_resolution() {
+    let info = video(1920, 1080);
+    let spec = LadderSpec::MultiRes {
+      rungs: vec![
+        (240, 150),
+        (360, 200),
+        (480, 500),
+        (720, 1200),
+        (1080, 4000),
+      ],
+    };
+    let variants = quality_variants_for_spec(&info, &spec).unwrap();
+    let got: Vec<(u16, u16, u32)> = variants
+      .iter()
+      .map(|v| (v.width, v.height, v.bitrate_kbps))
+      .collect();
+    assert_eq!(
+      got,
+      vec![
+        (426, 240, 150),
+        (640, 360, 200),
+        (854, 480, 500),
+        (1280, 720, 1200),
+        (1920, 1080, 4000),
+      ]
+    );
+  }
+
+  #[test]
+  fn quality_variants_multi_res_refuses_upscale() {
+    let info = video(1280, 720);
+    let spec = LadderSpec::MultiRes {
+      rungs: vec![(720, 1200), (1080, 4000)],
+    };
+    assert!(quality_variants_for_spec(&info, &spec).is_err());
+  }
+
+  #[test]
+  fn resolve_ladder_custom_spec_keeps_all_rungs() {
+    // A 5-rung explicit ladder must NOT be trimmed by max_variants: prepare/replay
+    // pass max_variants=4 by default, but custom specs use every rung they name.
+    let variants = resolve_ladder(
+      "240p@150,360p@200,480p@500,720p@1200,1080p@4000",
+      4,
+      &video(1920, 1080),
+    )
+    .unwrap();
+    let got: Vec<(u16, u16, u32)> = variants
+      .iter()
+      .map(|v| (v.width, v.height, v.bitrate_kbps))
+      .collect();
+    assert_eq!(
+      got,
+      vec![
+        (426, 240, 150),
+        (640, 360, 200),
+        (854, 480, 500),
+        (1280, 720, 1200),
+        (1920, 1080, 4000),
+      ]
+    );
+  }
+
+  #[test]
+  fn resolve_ladder_default_honors_max_variants() {
+    let variants = resolve_ladder("default", 3, &video(1920, 1080)).unwrap();
+    assert_eq!(variants.len(), 3);
   }
 }

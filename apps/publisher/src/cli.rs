@@ -41,9 +41,20 @@ pub struct Cli {
   #[arg(long)]
   pub encoded_dir: Option<PathBuf>,
 
-  /// Ladder specification. Either `default` (legacy resolution-coupled ladder)
-  /// or `<height>p:<comma-list-of-bitrates-kbps>` (e.g. `720p:400,800,1200,2500,5000`).
+  /// Ladder specification. One of: `default` (legacy resolution-coupled ladder);
+  /// `<height>p:<comma-list-of-bitrates-kbps>` for one resolution at several
+  /// bitrates (e.g. `720p:400,800,1200,2500,5000`); or
+  /// `<height>p@<kbps>,<height>p@<kbps>,...` for an explicit per-rung
+  /// resolution+bitrate ladder (e.g. `240p@150,360p@200,480p@500,720p@1200,1080p@4000`).
   /// Used by the paper experiment harness; production publisher leaves this at default.
   #[arg(long, default_value = "default")]
   pub ladder_spec: String,
+
+  /// Replay mode only: emit each cached GOP exactly once and then stop,
+  /// instead of looping back to the first GOP. Looping re-reads the cached
+  /// bytes whose media PTS restarts at 0, producing a backward timeline
+  /// discontinuity that wedges players at the loop seam. The paper experiment
+  /// harness sets this so a fixed-length collection never straddles that seam.
+  #[arg(long, default_value_t = false)]
+  pub no_loop: bool,
 }

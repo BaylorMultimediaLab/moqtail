@@ -4,6 +4,8 @@
 # Usage:
 #   ./scripts/run-experiments.sh                 # all experiments
 #   ./scripts/run-experiments.sh e1 e2           # selected experiments
+#   ./scripts/run-experiments.sh e7 -n 16        # selected, 16 xdist workers
+#   ./scripts/run-experiments.sh e5 -r 4         # 4 runs per cell (default 5)
 #
 # Each experiment runs through pytest under sudo (Mininet requires root),
 # then aggregates per-cell summaries. Per-run artifacts land at:
@@ -16,22 +18,58 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [[ $# -eq 0 ]]; then
+# Parse args: split worker flags from positional experiment names. The flag may
+# appear before, after, or interleaved with experiment names.
+WORKERS=""
+RUNS=""
+POSITIONAL=()
+while (( $# > 0 )); do
+  case "$1" in
+    -n|--workers)
+      [[ $# -lt 2 ]] && { echo "[run-experiments] -n/--workers requires a value" >&2; exit 2; }
+      WORKERS="$2"; shift 2 ;;
+    -n=*|--workers=*)
+      WORKERS="${1#*=}"; shift ;;
+    -r|--runs)
+      [[ $# -lt 2 ]] && { echo "[run-experiments] -r/--runs requires a value" >&2; exit 2; }
+      RUNS="$2"; shift 2 ;;
+    -r=*|--runs=*)
+      RUNS="${1#*=}"; shift ;;
+    --)
+      shift; POSITIONAL+=("$@"); break ;;
+    *)
+      POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# Runs per cell. Exported so pytest (under sudo -E) sees it; the test modules
+# read MOQTAIL_RUNS_PER_CELL (default 5).
+if [[ -n "$RUNS" ]]; then
+  export MOQTAIL_RUNS_PER_CELL="$RUNS"
+fi
+
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
   EXPERIMENTS=(e1 e2 e3 e4 e6)
 else
-  EXPERIMENTS=("$@")
+  EXPERIMENTS=("${POSITIONAL[@]}")
 fi
 
 # Estimated wall time per experiment (matches design doc § 8). Used only
 # for the upfront ETA; the actual runtime depends on the host.
 declare -A WALL=(
-  [e1]=2 [e2]=27 [e3]=27 [e4]=33 [e6]=162
+  [e1]=2 [e2]=27 [e3]=27 [e4]=33 [e6]=162 [e7]=162
 )
 total=0
 for e in "${EXPERIMENTS[@]}"; do
   total=$((total + ${WALL[$e]:-0}))
 done
 echo "[run-experiments] Will run: ${EXPERIMENTS[*]}"
+if [[ -n "$WORKERS" ]]; then
+  echo "[run-experiments] Parallel: pytest-xdist -n ${WORKERS}"
+fi
+if [[ -n "$RUNS" ]]; then
+  echo "[run-experiments] Runs per cell: ${RUNS} (default 5) — ETA below assumes 5"
+fi
 echo "[run-experiments] Estimated wall time: ${total} minutes"
 echo ""
 
@@ -91,10 +129,15 @@ else
 fi
 
 # Step 3 + 4: For each experiment, run pytest then aggregate.
+XDIST_ARGS=()
+if [[ -n "$WORKERS" ]]; then
+  XDIST_ARGS=(-n "$WORKERS")
+fi
+
 for e in "${EXPERIMENTS[@]}"; do
   echo "[run-experiments] === Running ${e} ==="
   # The tests/experiments/test_<exp>_*.py glob matches a single file per experiment.
-  if ! "${PYTEST_PREFIX[@]}" uv --project tests/experiments run pytest "tests/experiments/test_${e}_"*.py -v; then
+  if ! "${PYTEST_PREFIX[@]}" uv --project tests/experiments run -- pytest "tests/experiments/test_${e}_"*.py "${XDIST_ARGS[@]}" -v; then
     echo "[run-experiments] Some ${e} cells failed — continuing to aggregate so partial data is preserved."
   fi
 

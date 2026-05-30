@@ -91,6 +91,44 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
     expect(t.getSlowEmaBps()).toBe(10_000_000);
   });
 
+  it('seedEma anchors both EMAs so the first real sample blends in', () => {
+    const t = new GoodputTracker(3, 8);
+    t.seedEma(400_000); // conservative startup anchor (e.g. lowest rung bitrate)
+    expect(t.getFastEmaBps()).toBe(400_000);
+    expect(t.getSlowEmaBps()).toBe(400_000);
+
+    // First real group bursts at 10 Mbps. Because the EMA is already seeded,
+    // updateEma blends rather than replacing — both EMAs stay far below the
+    // burst, so a single startup burst can't green-light a multi-tier climb.
+    t.recordObject(1_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(125_000, 0n); // 125_000 B * 8 / 0.1 s = 10_000_000 bps
+    t.recordObject(0, 1n); // finalize group 0
+
+    expect(t.getSlowEmaBps()).toBeLessThan(2_000_000);
+    expect(t.getFastEmaBps()).toBeLessThan(10_000_000);
+  });
+
+  it('seedEma is a no-op once real EMA data exists', () => {
+    const t = new GoodputTracker(3, 8);
+    t.recordObject(1_000, 0n);
+    vi.advanceTimersByTime(100);
+    t.recordObject(125_000, 0n);
+    t.recordObject(0, 1n); // finalize → EMA = 10 Mbps
+    expect(t.getSlowEmaBps()).toBe(10_000_000);
+
+    t.seedEma(400_000); // must not clobber real measurements
+    expect(t.getSlowEmaBps()).toBe(10_000_000);
+  });
+
+  it('seedEma ignores non-positive seeds', () => {
+    const t = new GoodputTracker();
+    t.seedEma(0);
+    expect(t.getSlowEmaBps()).toBe(0);
+    t.seedEma(-100);
+    expect(t.getSlowEmaBps()).toBe(0);
+  });
+
   it('reset() clears SWMA, EMAs, and current-group accumulator', () => {
     const t = new GoodputTracker();
     t.recordObject(1_000, 0n);

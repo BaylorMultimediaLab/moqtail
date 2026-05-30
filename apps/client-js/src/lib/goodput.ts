@@ -143,6 +143,25 @@ export class GoodputTracker {
     this.#halfLifeSlowSec = halfLifeSlowSec;
   }
 
+  /**
+   * Seed both EMAs with a conservative startup estimate (bps) so the *first*
+   * real per-group sample blends into this anchor (via the half-life weight)
+   * rather than replacing it outright. Without a seed, #updateEma sets both
+   * EMAs to the first sample — and that sample is the startup burst, which
+   * over-reads the sustainable rate (the first GOP often arrives as a backlog
+   * burst, and the link may not yet be at its steady rate). Anchoring to the
+   * startup track's own bitrate gives a slow-start ramp: the ABR only believes
+   * it has more headroom as sustained evidence accumulates.
+   *
+   * No-op once any EMA data exists (real samples take precedence).
+   */
+  seedEma(bps: number): void {
+    if (this.#hasEmaData || bps <= 0) return;
+    this.#emaFast = bps;
+    this.#emaSlow = bps;
+    this.#hasEmaData = true;
+  }
+
   reset(): void {
     this.#swma = [];
     this.#currentGroupId = null;

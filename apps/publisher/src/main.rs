@@ -63,15 +63,8 @@ async fn run_live(cli: Cli) -> Result<()> {
   );
   info!("Catalog target latency: {} ms", cli.target_latency_ms);
 
-  let ladder_spec = adaptive::LadderSpec::parse(&cli.ladder_spec)
-    .map_err(|e| anyhow::anyhow!("invalid --ladder-spec: {}", e))?;
-  let variants = match &ladder_spec {
-    adaptive::LadderSpec::Default => {
-      adaptive::quality_variants(&video_info, cli.max_variants as usize)?
-    }
-    _ => adaptive::quality_variants_for_spec(&video_info, &ladder_spec)
-      .map_err(|e| anyhow::anyhow!("ladder generation failed: {}", e))?,
-  };
+  let variants = adaptive::resolve_ladder(&cli.ladder_spec, cli.max_variants as usize, &video_info)
+    .map_err(|e| anyhow::anyhow!("--ladder-spec: {}", e))?;
   log_variants(&variants);
 
   let extras = collect_extradata(&variants, video_info.framerate, hw_encoder.as_ref()).await?;
@@ -239,7 +232,8 @@ async fn run_prepare(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
     video_info.width, video_info.height, video_info.framerate
   );
 
-  let variants = adaptive::quality_variants(&video_info, cli.max_variants as usize)?;
+  let variants = adaptive::resolve_ladder(&cli.ladder_spec, cli.max_variants as usize, &video_info)
+    .map_err(|e| anyhow::anyhow!("--ladder-spec: {}", e))?;
   log_variants(&variants);
 
   let extras = collect_extradata(&variants, video_info.framerate, hw_encoder.as_ref()).await?;
@@ -428,7 +422,12 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
     height: top_meta.source_height,
     framerate: top_meta.framerate,
   };
-  let expected_variants = adaptive::quality_variants(&synth_video_info, cli.max_variants as usize)?;
+  let expected_variants = adaptive::resolve_ladder(
+    &cli.ladder_spec,
+    cli.max_variants as usize,
+    &synth_video_info,
+  )
+  .map_err(|e| anyhow::anyhow!("--ladder-spec: {}", e))?;
   let expected_qualities: Vec<String> = expected_variants
     .iter()
     .map(|v| v.quality.to_string())
@@ -513,6 +512,7 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   let emit_barrier = Arc::new(Barrier::new(variant_metas.len()));
   let variant_count = variant_metas.len();
   let gop_duration_secs = top_meta.framerate.recip() * encoder::gop_size(top_meta.framerate) as f64;
+  let loop_replay = !cli.no_loop;
 
   for (i, vm) in variant_metas.into_iter().enumerate() {
     let track_alias = track_aliases[i];
@@ -530,6 +530,7 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
         variant_dir,
         gops_per_variant,
         gop_duration_secs,
+        loop_replay,
         conn,
         track_alias,
         publisher_priority,
@@ -554,6 +555,7 @@ async fn run_replay_variant(
   variant_dir: PathBuf,
   gops_per_variant: u64,
   gop_duration_secs: f64,
+  loop_replay: bool,
   conn: Arc<wtransport::Connection>,
   track_alias: u64,
   publisher_priority: u8,
@@ -572,6 +574,7 @@ async fn run_replay_variant(
     gops_per_variant,
     gop_duration_secs,
     quality.clone(),
+    loop_replay,
     gop_tx,
   ));
   let send_handle = tokio::spawn(sender::send_track(

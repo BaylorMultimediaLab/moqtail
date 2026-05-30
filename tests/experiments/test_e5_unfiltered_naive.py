@@ -1,6 +1,6 @@
 """E5: ABR composability under unfiltered + naive switching.
 
-Exact mirror of E6's parameter sweep (8 ABR configs × 3 bandwidth
+Exact mirror of E6's parameter sweep (9 ABR configs × 3 bandwidth
 profiles × 5 runs) but with clientMode=unfiltered and switchMode=naive
 instead of E6's filtered+aligned.
 
@@ -35,6 +35,7 @@ Per-run output lands at:
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -43,7 +44,9 @@ from profiles import apply_stable, apply_step, apply_sinusoidal
 from summary import build_run_summary, write_run_summary
 
 
-_RUNS_PER_CELL = 5
+# Runs per (config, profile) cell. Override via MOQTAIL_RUNS_PER_CELL
+# (run-experiments.sh --runs N) to widen or shrink the sweep.
+_RUNS_PER_CELL = int(os.environ.get("MOQTAIL_RUNS_PER_CELL", "5"))
 
 
 def _make_profile_task(net, profile_name: str):
@@ -56,6 +59,17 @@ def _make_profile_task(net, profile_name: str):
             apply_sinusoidal(net, 0.6, 3.0, period_s=60, duration_s=60)
         )
     raise ValueError(f"unknown profile: {profile_name}")
+
+
+# Each profile's bandwidth at t=0, used to pre-shape the link before the client
+# connects (see the initial_link_bw marker / browser_page). Matches the t=0 of
+# the corresponding apply_* schedule: stable holds 1.5; step starts at 3.0; the
+# sinusoid begins at its midline (0.6+3.0)/2 = 1.8 since sin(0)=0.
+_INITIAL_BW_MBPS = {
+    "stable1.5M": 1.5,
+    "step3M_500k": 3.0,
+    "sin600k_3M": 1.8,
+}
 
 
 def _cell_params():
@@ -79,6 +93,7 @@ def _cell_params():
                             switchMode="naive",
                         ),
                         pytest.mark.abr_settings_override(settings),
+                        pytest.mark.initial_link_bw(_INITIAL_BW_MBPS[profile_name]),
                     ],
                     id=cell_id,
                 )
@@ -150,7 +165,10 @@ async def test_e5_unfiltered_naive(
         f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
     )
     # Sanity: a switch must have fired so the assertion above is meaningful.
-    assert summary["n_switches"] > 0, (
-        f"no switches fired; assertion trivially passed "
-        f"(playback ended at {summary['current_time_at_end_s']}s)"
-    )
+    # The "none" config disables every ABR rule, so zero switches is the
+    # expected, correct behavior — skip the check there.
+    if config_name != "none":
+        assert summary["n_switches"] > 0, (
+            f"no switches fired; assertion trivially passed "
+            f"(playback ended at {summary['current_time_at_end_s']}s)"
+        )

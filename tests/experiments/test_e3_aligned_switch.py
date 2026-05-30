@@ -10,6 +10,7 @@ to the E2 naive failure where the gap scales with filterDelaySeconds.
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -18,7 +19,8 @@ from summary import build_run_summary, write_run_summary
 
 
 _OFFSETS = [5, 10, 20, 30]
-_RUNS_PER_CELL = 5
+# Runs per cell. Override via MOQTAIL_RUNS_PER_CELL (run-experiments.sh --runs N).
+_RUNS_PER_CELL = int(os.environ.get("MOQTAIL_RUNS_PER_CELL", "5"))
 
 
 def _offset_params():

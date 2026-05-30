@@ -257,3 +257,5 @@ apps/relay/cert/key.pem.bak
 ### Paper Experiments ###
 data/video/tears_of_steel_*
 data/video/.cache/
+CLAUDE.md
+.antigravitycli/

@@ -434,6 +434,11 @@ export function App() {
           liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
         });
         await player.addMediaTrack(firstVideo.name);
+        // Anchor the throughput EMA to the startup track's own bitrate so the
+        // first real per-group sample can't seed the EMA from a startup burst
+        // (which over-reads the sustainable rate). The ABR then ramps up only
+        // as sustained evidence accumulates. No-op once real samples exist.
+        player.seedThroughputEstimate(firstVideo.bitrate ?? 0);
         await player.startMedia();
         setStatus('playing');
         const videoTracks = allTracks.filter(t => t.role === 'video');

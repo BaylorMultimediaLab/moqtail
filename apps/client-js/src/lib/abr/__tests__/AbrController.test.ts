@@ -44,6 +44,9 @@ function makePlayerMetrics(overrides: Partial<ReturnType<MockPlayer['getMetrics'
     playbackRate: 1,
     deliveryTimeMs: 50,
     lastObjectBytes: 8000,
+    // Default above MIN_STARTUP_SAMPLES so existing upswitch tests aren't gated
+    // by the startup slow-start guard; startup-specific tests override this.
+    sampleCount: 10,
     latencyTrendRatio: 1,
     lastLatencyMs: 0,
     ...overrides,
@@ -224,6 +227,67 @@ describe('AbrController', () => {
       // Verify we didn't call with 360p (current track) — it should upgrade
       const calledWith = (player.switchTrack.mock.calls[0] as string[])[0];
       expect(calledWith).not.toBe('360p');
+    });
+  });
+
+  describe('startup slow-start guard', () => {
+    it('suppresses an upswitch until MIN_STARTUP_SAMPLES real samples exist', async () => {
+      // High bandwidth would normally upswitch 360p -> 1080p, but only 1 real
+      // throughput sample has arrived, so the startup guard blocks the climb.
+      const { controller, player } = makeController(
+        {
+          bufferSeconds: 5,
+          activeTrack: '360p',
+          bandwidthBps: 10_000_000,
+          sampleCount: 1,
+        },
+        { videoAutoSwitch: true },
+      );
+
+      await controller._tick();
+
+      expect(player.switchTrack).not.toHaveBeenCalled();
+    });
+
+    it('allows the upswitch once enough samples have accumulated', async () => {
+      const { controller, player } = makeController(
+        {
+          bufferSeconds: 5,
+          activeTrack: '360p',
+          bandwidthBps: 10_000_000,
+          sampleCount: AbrController.MIN_STARTUP_SAMPLES,
+        },
+        { videoAutoSwitch: true },
+      );
+
+      await controller._tick();
+
+      expect(player.switchTrack).toHaveBeenCalled();
+    });
+
+    it('still permits a downswitch during startup (emergency drop not gated)', async () => {
+      // Low throughput on a high tier with buffer below threshold: ThroughputRule
+      // wants the lowest track. Even with 0 samples the startup guard must NOT
+      // block it — the guard only gates upswitches.
+      // EMA just above the lowest rung (360p=500k) so ThroughputRule selects
+      // index 0 — a genuine downswitch from 1080p (index 2).
+      const { controller, player } = makeController(
+        {
+          bufferSeconds: 5,
+          activeTrack: '1080p',
+          bandwidthBps: 600_000,
+          fastEmaBps: 600_000,
+          slowEmaBps: 600_000,
+          sampleCount: 0,
+        },
+        { videoAutoSwitch: true },
+      );
+
+      await controller._tick();
+
+      expect(player.switchTrack).toHaveBeenCalled();
+      const calledWith = (player.switchTrack.mock.calls[0] as string[])[0];
+      expect(calledWith).not.toBe('1080p');
     });
   });
 

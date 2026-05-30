@@ -77,15 +77,15 @@ def test_e4_decision_counts_returns_one_row_per_cell():
     assert (counts["ready"] + counts["clamped"] == 5).all()
 
 
-def test_e6_heatmap_matrix_returns_8x3_grid():
+def test_e6_heatmap_matrix_returns_9x3_grid():
     # NOTE: avg_delivered_bitrate_kbps_mean is not yet in e6 summary.json;
     # using n_switches_mean (a real column) until the metric is backfilled.
     matrix = e6_heatmap_matrix(metric="n_switches_mean")
-    # 8 ABR configs (rows) x 3 bandwidth profiles (columns).
-    assert matrix.shape == (8, 3)
-    # Row order is fixed: none -> l2a (matches Fig 5 spec).
+    # 9 ABR configs (rows) x 3 bandwidth profiles (columns).
+    assert matrix.shape == (9, 3)
+    # Row order is fixed: all -> l2a (matches Fig 5 spec).
     assert list(matrix.index) == [
-        "none", "throughput-only", "bola-only", "default",
+        "all", "none", "throughput-only", "bola-only", "default",
         "dampened", "aggressive", "lolp", "l2a",
     ]
     assert list(matrix.columns) == ["stable1.5M", "step3M_500k", "sin600k_3M"]
@@ -98,9 +98,10 @@ def test_compute_avg_delivered_bitrate_kbps_returns_positive_for_real_run():
         experiment="e3", cell_id="aligned_offset20", metric="max_playhead_gap_ms"
     )
     bitrate = compute_avg_delivered_bitrate_kbps(run_dir)
-    # Bitrates are in [400, 5000] kbps for the 720p ladder; time-weighted
-    # average must land somewhere in that closed range.
-    assert 400 <= bitrate <= 5000, f"bitrate {bitrate} outside ladder range"
+    # Bitrates are the *measured* encoded bitrate of each 720p rung (~430 to
+    # ~5035 kbps — the top rung's rate-control target overshoots its 5000k
+    # label slightly); a time-weighted average must land in that closed range.
+    assert 400 <= bitrate <= 5100, f"bitrate {bitrate} outside ladder range"
 
 
 def test_compute_avg_delivered_bitrate_kbps_handles_unknown_track_format():
@@ -125,10 +126,10 @@ def test_compute_avg_delivered_bitrate_kbps_handles_unknown_track_format():
         assert 1800 <= bitrate <= 1900, f"expected ~1850, got {bitrate}"
 
 
-def test_e6_avg_bitrate_matrix_returns_8x3_with_real_values():
+def test_e6_avg_bitrate_matrix_returns_9x3_with_real_values():
     from _data import E6_COL_ORDER, E6_ROW_ORDER, e6_avg_bitrate_matrix
     matrix = e6_avg_bitrate_matrix()
-    assert matrix.shape == (8, 3)
+    assert matrix.shape == (9, 3)
     assert list(matrix.index) == E6_ROW_ORDER
     assert list(matrix.columns) == E6_COL_ORDER
     # At least some cells must have non-NaN bitrates from completed runs.
