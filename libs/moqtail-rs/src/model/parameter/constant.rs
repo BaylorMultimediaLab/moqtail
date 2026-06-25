@@ -60,8 +60,19 @@ pub enum VersionSpecificParameterType {
   /// Behind-live offset in groups for filtered (delay-mode) clients.
   DelayGroups = 0x70,
   /// Project-local extension; non-MoQT-standard.
-  /// Absolute group_id where a Switch should start delivering the new track.
+  /// Carried on a SWITCH: the floor group_id at or above which the relay may
+  /// perform the switch. This is the draft-ietf-moq-transport (PR #1378)
+  /// "Minimum Switching Group ID"; the relay selects the smallest common,
+  /// gap-free boundary >= this value (see `compute_switch_group`). Kept under
+  /// the historical `StartLocationGroup` name to avoid churn.
   StartLocationGroup = 0x72,
+  /// Project-local extension; non-MoQT-standard.
+  /// SWITCH_TRANSITION (draft-ietf-moq-transport PR #1378). Carried on the
+  /// target Track's PUBLISH so the subscriber learns where the seam is. Odd
+  /// type => bytes-valued KeyValuePair whose payload is two varints:
+  /// `{ Switching Group ID (G_switch), Live Edge Group ID }`. See
+  /// `parameter::switch_transition::SwitchTransition`.
+  SwitchTransition = 0x73,
 }
 
 impl TryFrom<u64> for VersionSpecificParameterType {
@@ -74,6 +85,7 @@ impl TryFrom<u64> for VersionSpecificParameterType {
       0x04 => Ok(VersionSpecificParameterType::MaxCacheDuration),
       0x70 => Ok(VersionSpecificParameterType::DelayGroups),
       0x72 => Ok(VersionSpecificParameterType::StartLocationGroup),
+      0x73 => Ok(VersionSpecificParameterType::SwitchTransition),
       _ => Err(ParseError::InvalidType {
         context: "VersionSpecificParameterType::try_from(u64)",
         details: format!("Invalid type, got {value}"),

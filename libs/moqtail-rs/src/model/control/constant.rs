@@ -52,7 +52,9 @@ pub enum ControlMessageType {
   PublishDone = 0x0B,
   PublishOk = 0x1E,
   PublishError = 0x1F,
-  Switch = 0x22,
+  // draft-ietf-moq-transport "SWITCH for Client-side ABR" (PR #1378) assigns
+  // 0x1B. Previously 0x22 in this codebase's pre-draft prototype.
+  Switch = 0x1B,
 }
 
 impl TryFrom<u64> for ControlMessageType {
@@ -90,7 +92,7 @@ impl TryFrom<u64> for ControlMessageType {
       0x1D => Ok(ControlMessageType::Publish),
       0x1E => Ok(ControlMessageType::PublishOk),
       0x1F => Ok(ControlMessageType::PublishError),
-      0x22 => Ok(ControlMessageType::Switch),
+      0x1B => Ok(ControlMessageType::Switch),
       _ => Err(ParseError::InvalidType {
         context: " ControlMessageType::try_from(u64)",
         details: format!("Invalid type, got {value}"),
@@ -448,6 +450,17 @@ pub enum PublishDoneStatusCode {
   Expired = 0x5,
   TooFarBehind = 0x6,
   MalformedTrack = 0x7,
+  // SWITCH failure codes (draft-ietf-moq-transport PR #1378). A relay that
+  // cannot complete a SWITCH still opens the target PUBLISH and reports the
+  // outcome here, leaving the current subscription untouched.
+  /// The relay could not identify G_switch within its T_switch budget.
+  Timeout = 0x8,
+  /// The target Track is not available.
+  DoesNotExist = 0x9,
+  /// The relay does not support the SWITCH message.
+  NotSupported = 0xA,
+  /// A prior SWITCH for the same Current Subscribe Request ID is in flight.
+  ExcessiveLoad = 0xB,
 }
 
 impl TryFrom<u64> for PublishDoneStatusCode {
@@ -463,6 +476,10 @@ impl TryFrom<u64> for PublishDoneStatusCode {
       0x5 => Ok(PublishDoneStatusCode::Expired),
       0x6 => Ok(PublishDoneStatusCode::TooFarBehind),
       0x7 => Ok(PublishDoneStatusCode::MalformedTrack),
+      0x8 => Ok(PublishDoneStatusCode::Timeout),
+      0x9 => Ok(PublishDoneStatusCode::DoesNotExist),
+      0xA => Ok(PublishDoneStatusCode::NotSupported),
+      0xB => Ok(PublishDoneStatusCode::ExcessiveLoad),
       _ => Err(ParseError::InvalidType {
         context: "PublishDoneStatusCode::try_from(u64)",
         details: format!("Invalid type, got {value}"),

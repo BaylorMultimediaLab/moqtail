@@ -13,16 +13,17 @@
 // limitations under the License.
 
 /*
-SWITCH Message {
-  Type (i) = 0x1F,
+SWITCH Message (draft-ietf-moq-transport PR #1378) {
+  Type (i) = 0x1B,
   Length (16),
-  Request ID (i),
-  Track Namespace (..),
+  Request ID (i),                 // new Request ID for this SWITCH
+  Track Namespace (..),           // target Track
   Track Name Length (i),
   Track Name (..),
-  Subscription Request ID (i),
+  Subscription Request ID (i),    // draft's "Current Subscribe Request ID"
   Number of Parameters (i),
-  Parameters (..) ...
+  Parameters (..) ...             // incl. StartLocationGroup = Minimum
+                                  // Switching Group ID (PR #1378)
 }
 */
 use super::constant::ControlMessageType;

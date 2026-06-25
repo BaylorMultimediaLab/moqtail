@@ -60,7 +60,9 @@ export enum ControlMessageType {
   Publish = 0x1d,
   PublishOk = 0x1e,
   PublishError = 0x1f,
-  Switch = 0x22,
+  // draft-ietf-moq-transport "SWITCH for Client-side ABR" (PR #1378) assigns
+  // 0x1b. Previously 0x22 in this codebase's pre-draft prototype.
+  Switch = 0x1b,
 }
 
 /**
@@ -135,6 +137,8 @@ export function controlMessageTypeFromBigInt(v: bigint): ControlMessageType {
       return ControlMessageType.PublishOk
     case 0x1fn:
       return ControlMessageType.PublishError
+    case 0x1bn:
+      return ControlMessageType.Switch
     default:
       throw new Error(`Invalid ControlMessageType: ${v}`)
   }
