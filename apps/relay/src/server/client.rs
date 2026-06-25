@@ -31,6 +31,7 @@ use moqtail::{
   },
   transport::data_stream_handler::{FetchRequest, SubscribeRequest},
 };
+use crate::server::switch_guard::SwitchInFlight;
 use switch_context::SwitchContext;
 
 use std::{
@@ -80,6 +81,12 @@ pub(crate) struct MOQTClient {
   pub subscriptions: TrackSubscriptionMap,
 
   pub switch_context: SwitchContext,
+
+  // PR #1378 single-in-flight SWITCH guard, keyed by Current Subscribe Request
+  // ID. Admitted/rejected (EXCESSIVE_LOAD) by the switch handler; entries
+  // self-expire at T_switch. Consumed by the relay's SWITCH handler.
+  #[allow(dead_code)]
+  pub switch_in_flight: Arc<Mutex<SwitchInFlight>>,
 }
 
 impl MOQTClient {
@@ -108,6 +115,7 @@ impl MOQTClient {
       fetch_cancel_senders: Arc::new(RwLock::new(HashMap::new())),
       subscriptions: TrackSubscriptionMap::new(),
       switch_context: SwitchContext::new(),
+      switch_in_flight: Arc::new(Mutex::new(SwitchInFlight::new())),
     }
   }
 

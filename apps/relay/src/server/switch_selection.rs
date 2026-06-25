@@ -32,6 +32,11 @@
 //! and maps the result onto PUBLISH / PUBLISH_DONE.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
+
+use crate::server::track::Track;
 
 /// Outcome of `compute_switch_group`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +55,7 @@ pub(crate) enum SwitchSelection {
 /// * `current_available` — group IDs currently available on the source Track.
 /// * `target_available` — group IDs currently available on the target Track.
 /// * `target_live_edge` — the target Track's live edge group ID.
-#[allow(dead_code)] // consumed by Area 3 (relay switch handler), not yet wired
+#[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
 pub(crate) fn compute_switch_group(
   min_switch_group: u64,
   current_available: &BTreeSet<u64>,
@@ -87,6 +92,37 @@ pub(crate) fn compute_switch_group(
     Some(&g) => SwitchSelection::Ready(g),
     None => SwitchSelection::NoCommonBoundary,
   }
+}
+
+/// Async bridge from the relay's live state to the pure [`compute_switch_group`].
+///
+/// Reads both Tracks' current cache availability and the target's live edge,
+/// then defers to the pure selector. The relay's SWITCH handler calls
+/// this after the Current-Subscribe-Request-ID gate passes and before opening
+/// the target PUBLISH. Kept thin and side-effect-free beyond the reads so the
+/// decision logic stays in the unit-tested core.
+#[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
+pub(crate) async fn select_switch_group(
+  current_track: &Arc<RwLock<Track>>,
+  target_track: &Arc<RwLock<Track>>,
+  min_switch_group: u64,
+) -> SwitchSelection {
+  let current_available = {
+    let t = current_track.read().await;
+    t.cache.available_group_ids().await
+  };
+  let (target_available, target_live_edge) = {
+    let t = target_track.read().await;
+    let groups = t.cache.available_group_ids().await;
+    let live_edge = t.largest_location.read().await.group;
+    (groups, live_edge)
+  };
+  compute_switch_group(
+    min_switch_group,
+    &current_available,
+    &target_available,
+    target_live_edge,
+  )
 }
 
 #[cfg(test)]

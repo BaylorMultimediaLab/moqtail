@@ -16,6 +16,7 @@ use moka::future::Cache;
 use moka::notification::RemovalCause;
 use moqtail::model::common::location::Location;
 use moqtail::model::data::fetch_object::FetchObject;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -346,6 +347,22 @@ impl TrackCache {
       .min()
   }
 
+  /// Returns the set of group_ids currently cached for this track.
+  ///
+  /// Feeds the SWITCH handler's `compute_switch_group` (PR #1378): the relay
+  /// needs the full availability set on both the current and target Tracks to
+  /// test the common-boundary and gap-free-to-live-edge conditions, which the
+  /// scalar `oldest`/`newest` accessors can't express. O(n) over cache entries.
+  #[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
+  pub async fn available_group_ids(&self) -> BTreeSet<u64> {
+    self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.track_alias == self.track_alias)
+      .map(|(k, _)| k.group_id)
+      .collect()
+  }
+
   /// Returns the largest group_id currently in the cache for this track,
   /// or None if empty. Mirror of `oldest_group_id`.
   ///
@@ -495,5 +512,64 @@ mod tests_newest_group {
     cache_a.add_object(fetch_object(5, 0)).await;
     cache_a.run_pending_tasks().await;
     assert_eq!(cache_a.newest_group_id().await, Some(5));
+  }
+}
+
+#[cfg(test)]
+mod tests_available_group_ids {
+  use super::*;
+  use bytes::Bytes;
+  use std::collections::BTreeSet;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      initial_max_request_id: 100,
+    }
+  }
+
+  fn fetch_object(group_id: u64, object_id: u64) -> FetchObject {
+    FetchObject {
+      group_id,
+      subgroup_id: 0,
+      object_id,
+      publisher_priority: 0,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    }
+  }
+
+  #[tokio::test]
+  async fn empty_cache_returns_empty_set() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    assert!(cache.available_group_ids().await.is_empty());
+  }
+
+  #[tokio::test]
+  async fn collects_distinct_groups_with_a_gap() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    // Two objects in group 5 must not double-count; group 4 is absent (a gap).
+    cache.add_object(fetch_object(3, 0)).await;
+    cache.add_object(fetch_object(5, 0)).await;
+    cache.add_object(fetch_object(5, 1)).await;
+    cache.add_object(fetch_object(6, 0)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(
+      cache.available_group_ids().await,
+      BTreeSet::from([3, 5, 6])
+    );
   }
 }
