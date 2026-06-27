@@ -48,7 +48,10 @@ impl MessageHandler {
       ControlMessage::SubscribeUpdate(msg) => Some(msg.request_id),
       ControlMessage::TrackStatus(msg) => Some(msg.request_id),
       ControlMessage::SubscribeNamespace(msg) => Some(msg.request_id),
-      ControlMessage::Switch(msg) => Some(msg.request_id),
+      // Per SWITCH PR #1378 the subscriber allocates no Request ID for a SWITCH, so there
+      // is nothing to validate against max_request_id here. The relay allocates
+      // the target delivery's Request ID in the SWITCH handler.
+      ControlMessage::Switch(_) => None,
       _ => None,
     };
 

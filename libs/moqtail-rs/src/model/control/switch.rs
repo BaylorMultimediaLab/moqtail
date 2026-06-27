@@ -13,18 +13,22 @@
 // limitations under the License.
 
 /*
-SWITCH Message (draft-ietf-moq-transport PR #1378) {
+SWITCH Message {
   Type (i) = 0x1B,
   Length (16),
-  Request ID (i),                 // new Request ID for this SWITCH
-  Track Namespace (..),           // target Track
-  Track Name Length (i),
-  Track Name (..),
-  Subscription Request ID (i),    // draft's "Current Subscribe Request ID"
+  Current Subscribe Request ID (i),  // the Established subscription being replaced
+  Target Track Namespace (..),
+  Target Track Name Length (i),
+  Target Track Name (..),
+  Minimum Switching Group ID (i),    // floor: do not transition before this group
   Number of Parameters (i),
-  Parameters (..) ...             // incl. StartLocationGroup = Minimum
-                                  // Switching Group ID (PR #1378)
+  Parameters (..) ...,
 }
+
+Note: the subscriber does NOT allocate a Request ID for the SWITCH. The relay
+allocates the Request ID of the target PUBLISH it opens in response. The
+Minimum Switching Group ID is a lower bound, not an exact transition point: the
+relay selects the smallest feasible common, gap-free boundary at or above it.
 */
 use super::constant::ControlMessageType;
 use super::control_message::ControlMessageTrait;
@@ -37,27 +41,32 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Switch {
-  pub request_id: u64,
+  /// The Established subscription being replaced ("Current Subscribe Request
+  /// ID"). Must identify a live subscription; otherwise the relay must not
+  /// modify existing subscription state.
+  pub current_subscribe_request_id: u64,
   pub track_namespace: Tuple,
   pub track_name: TupleField,
-  pub subscription_request_id: u64,
+  /// Lower bound on the transition group: the relay must not switch before
+  /// this group, and selects the smallest feasible boundary at or above it.
+  pub minimum_switching_group_id: u64,
   pub subscribe_parameters: Vec<KeyValuePair>,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl Switch {
   pub fn new(
-    request_id: u64,
+    current_subscribe_request_id: u64,
     track_namespace: Tuple,
     track_name: TupleField,
-    subscription_request_id: u64,
+    minimum_switching_group_id: u64,
     subscribe_parameters: Vec<KeyValuePair>,
   ) -> Self {
     Self {
-      request_id,
+      current_subscribe_request_id,
       track_namespace,
       track_name,
-      subscription_request_id,
+      minimum_switching_group_id,
       subscribe_parameters,
     }
   }
@@ -75,12 +84,13 @@ impl ControlMessageTrait for Switch {
     buf.put_vi(ControlMessageType::Switch)?;
 
     let mut payload = BytesMut::new();
-    payload.put_vi(self.request_id)?;
+    payload.put_vi(self.current_subscribe_request_id)?;
 
     payload.extend_from_slice(&self.track_namespace.serialize()?);
     payload.put_vi(self.track_name.len())?;
     payload.extend_from_slice(self.track_name.as_bytes());
-    payload.put_vi(self.subscription_request_id)?;
+
+    payload.put_vi(self.minimum_switching_group_id)?;
 
     payload.put_vi(self.subscribe_parameters.len())?;
     for param in &self.subscribe_parameters {
@@ -103,14 +113,14 @@ impl ControlMessageTrait for Switch {
   }
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
-    let request_id = payload.get_vi()?;
+    let current_subscribe_request_id = payload.get_vi()?;
     let track_namespace = Tuple::deserialize(payload)?;
 
     let name_len_u64 = payload.get_vi()?;
     let name_len: usize = name_len_u64
       .try_into()
       .map_err(|e: std::num::TryFromIntError| ParseError::CastingError {
-        context: "Subscribe::parse_payload(track_name_len)",
+        context: "Switch::parse_payload(track_name_len)",
         from_type: "u64",
         to_type: "usize",
         details: e.to_string(),
@@ -118,29 +128,21 @@ impl ControlMessageTrait for Switch {
 
     if payload.remaining() < name_len {
       return Err(ParseError::NotEnoughBytes {
-        context: "Subscribe::parse_payload(track_name)",
+        context: "Switch::parse_payload(track_name)",
         needed: name_len,
         available: payload.remaining(),
       });
     }
     let track_name = TupleField::new(payload.copy_to_bytes(name_len));
 
-    if payload.remaining() < 1 {
-      return Err(ParseError::NotEnoughBytes {
-        context: "Subscribe::parse_payload(subscriber_priority)",
-        needed: 1,
-        available: 0,
-      });
-    }
-
-    let subscription_request_id = payload.get_vi()?;
+    let minimum_switching_group_id = payload.get_vi()?;
 
     let param_count_u64 = payload.get_vi()?;
     let param_count: usize =
       param_count_u64
         .try_into()
         .map_err(|e: std::num::TryFromIntError| ParseError::CastingError {
-          context: "Subscribe::deserialize(param_count)",
+          context: "Switch::parse_payload(param_count)",
           from_type: "u64",
           to_type: "usize",
           details: e.to_string(),
@@ -153,10 +155,10 @@ impl ControlMessageTrait for Switch {
     }
 
     Ok(Box::new(Switch {
-      request_id,
+      current_subscribe_request_id,
       track_namespace,
       track_name,
-      subscription_request_id,
+      minimum_switching_group_id,
       subscribe_parameters,
     }))
   }
@@ -171,19 +173,19 @@ mod tests {
 
   #[test]
   fn test_roundtrip() {
-    let request_id = 128242;
+    let current_subscribe_request_id = 31;
     let track_namespace = Tuple::from_utf8_path("nein/nein/nein");
     let track_name = TupleField::from_utf8("${Name}");
-    let subscription_request_id = 31;
+    let minimum_switching_group_id = 128242;
     let subscribe_parameters = vec![
       KeyValuePair::try_new_varint(0, 10).unwrap(),
       KeyValuePair::try_new_bytes(1, Bytes::from_static(b"I'll sync you up")).unwrap(),
     ];
     let switch = Switch {
-      request_id,
+      current_subscribe_request_id,
       track_namespace,
       track_name,
-      subscription_request_id,
+      minimum_switching_group_id,
       subscribe_parameters,
     };
 
@@ -199,19 +201,19 @@ mod tests {
 
   #[test]
   fn test_excess_roundtrip() {
-    let request_id = 128242;
+    let current_subscribe_request_id = 31;
     let track_namespace = Tuple::from_utf8_path("nein/nein/nein");
     let track_name = TupleField::from_utf8("${Name}");
-    let subscription_request_id = 31;
+    let minimum_switching_group_id = 128242;
     let subscribe_parameters = vec![
       KeyValuePair::try_new_varint(0, 10).unwrap(),
       KeyValuePair::try_new_bytes(1, Bytes::from_static(b"I'll sync you up")).unwrap(),
     ];
     let switch = Switch {
-      request_id,
+      current_subscribe_request_id,
       track_namespace,
       track_name,
-      subscription_request_id,
+      minimum_switching_group_id,
       subscribe_parameters,
     };
 
@@ -233,19 +235,19 @@ mod tests {
 
   #[test]
   fn test_partial_message() {
-    let request_id = 128242;
+    let current_subscribe_request_id = 31;
     let track_namespace = Tuple::from_utf8_path("nein/nein/nein");
     let track_name = TupleField::from_utf8("${Name}");
-    let subscription_request_id = 31;
+    let minimum_switching_group_id = 128242;
     let subscribe_parameters = vec![
       KeyValuePair::try_new_varint(0, 10).unwrap(),
       KeyValuePair::try_new_bytes(1, Bytes::from_static(b"I'll sync you up")).unwrap(),
     ];
     let switch = Switch {
-      request_id,
+      current_subscribe_request_id,
       track_namespace,
       track_name,
-      subscription_request_id,
+      minimum_switching_group_id,
       subscribe_parameters,
     };
 

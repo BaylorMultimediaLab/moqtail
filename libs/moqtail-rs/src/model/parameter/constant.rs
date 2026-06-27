@@ -60,11 +60,10 @@ pub enum VersionSpecificParameterType {
   /// Behind-live offset in groups for filtered (delay-mode) clients.
   DelayGroups = 0x70,
   /// Project-local extension; non-MoQT-standard.
-  /// Carried on a SWITCH: the floor group_id at or above which the relay may
-  /// perform the switch. This is the draft-ietf-moq-transport (PR #1378)
-  /// "Minimum Switching Group ID"; the relay selects the smallest common,
-  /// gap-free boundary >= this value (see `compute_switch_group`). Kept under
-  /// the historical `StartLocationGroup` name to avoid churn.
+  /// Legacy: previously carried a SWITCH's start group as a parameter. The
+  /// SWITCH message now has a first-class `Minimum Switching Group ID` field
+  /// (SWITCH PR #1378), so this parameter is no longer used
+  /// for switching. Retained for wire-compatibility of the type registry.
   StartLocationGroup = 0x72,
   /// Project-local extension; non-MoQT-standard.
   /// SWITCH_TRANSITION (draft-ietf-moq-transport PR #1378). Carried on the

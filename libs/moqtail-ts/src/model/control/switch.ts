@@ -19,11 +19,22 @@ import { KeyValuePair } from '../common/pair'
 import { ControlMessageType } from './constant'
 import { FullTrackName } from '../data'
 
+/**
+ * SWITCH control message (SWITCH PR #1378).
+ *
+ * The subscriber does NOT allocate a Request ID for the SWITCH; the relay
+ * allocates the Request ID of the target PUBLISH it opens in response.
+ * `minimumSwitchingGroupId` is a lower bound, not an exact transition point —
+ * the relay selects the smallest feasible common, gap-free boundary at or
+ * above it.
+ */
 export class Switch {
   constructor(
-    public requestId: bigint,
+    /** The Established subscription being replaced ("Current Subscribe Request ID"). */
+    public currentSubscribeRequestId: bigint,
     public fullTrackName: FullTrackName,
-    public subscriptionRequestId: bigint,
+    /** Lower bound on the transition group; 0 means "no floor" (switch at the live edge). */
+    public minimumSwitchingGroupId: bigint,
     public parameters: KeyValuePair[],
   ) {}
 
@@ -32,9 +43,9 @@ export class Switch {
     buf.putVI(ControlMessageType.Switch)
 
     const payload = new ByteBuffer()
-    payload.putVI(this.requestId)
+    payload.putVI(this.currentSubscribeRequestId)
     payload.putBytes(this.fullTrackName.serialize().toUint8Array())
-    payload.putVI(this.subscriptionRequestId)
+    payload.putVI(this.minimumSwitchingGroupId)
 
     payload.putVI(this.parameters.length)
     for (const param of this.parameters) {
@@ -49,9 +60,9 @@ export class Switch {
   }
 
   static parsePayload(buf: BaseByteBuffer): Switch {
-    const requestId = buf.getVI()
+    const currentSubscribeRequestId = buf.getVI()
     const fullTrackName = buf.getFullTrackName()
-    const subscriptionRequestId = buf.getVI()
+    const minimumSwitchingGroupId = buf.getVI()
 
     const paramCount = Number(buf.getVI())
     const parameters: KeyValuePair[] = []
@@ -59,6 +70,6 @@ export class Switch {
       parameters.push(KeyValuePair.deserialize(buf))
     }
 
-    return new Switch(requestId, fullTrackName, subscriptionRequestId, parameters)
+    return new Switch(currentSubscribeRequestId, fullTrackName, minimumSwitchingGroupId, parameters)
   }
 }

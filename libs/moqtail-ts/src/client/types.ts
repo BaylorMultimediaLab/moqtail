@@ -238,11 +238,18 @@ export type SwitchOptions = {
   /** Optional additional {@link VersionSpecificParameters}; existing parameters persist if omitted. */
   parameters?: VersionSpecificParameters
   /**
-   * Optional pre-allocated request id for the SWITCH itself. When provided, the
-   * client uses it instead of allocating internally — letting the caller update
-   * its own subscription-id state synchronously *before* awaiting, so concurrent
-   * `switch()` calls each pass a fresh `subscriptionRequestId` rather than racing
-   * on a stale one (which the relay rejects as ProtocolViolation).
+   * Lower bound on the transition group (SWITCH PR #1378 "Minimum Switching Group ID").
+   * The relay must not switch before this group and selects the smallest
+   * feasible boundary at or above it. Omit or pass `0n` for "no floor" — switch
+   * at the live edge (naive switching).
+   */
+  minimumSwitchingGroupId?: bigint
+  /**
+   * Optional pre-allocated request id the client uses for its own local
+   * subscription-id bookkeeping (NOT sent on the wire - SWITCH PR #1378 has the relay
+   * allocate the target PUBLISH's Request ID). Pre-allocating lets the caller
+   * update its own subscription-id state synchronously *before* awaiting, so
+   * concurrent `switch()` calls each pass a fresh `subscriptionRequestId`.
    * Allocate via {@link MOQtailClient.allocateNextRequestId}.
    */
   requestId?: bigint

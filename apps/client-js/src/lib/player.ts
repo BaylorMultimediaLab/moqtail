@@ -216,27 +216,25 @@ export function buildSubscribeParameters(opts: {
 }
 
 /**
- * Builds the `parameters` field for a SWITCH message based on the active
+ * Computes the SWITCH "Minimum Switching Group ID" from the active
  * switchMode and the player's current PTS.
  *
- * - 'naive' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
- * - 'aligned' mode: looks up the group containing `currentTime` via the TimeMap
- *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
- *   switch fired before any object was received), returns `{ params: undefined,
- *   timeMapMiss: true }` so the caller can record the miss.
+ * - 'naive' mode: returns 0 — no floor; the relay switches at the live edge.
+ * - 'aligned' mode: returns the group containing `currentTime` (via the TimeMap)
+ *   as the floor. If the TimeMap has no anchor yet (rare: switch fired before
+ *   any object was received), returns `{ minimumSwitchingGroupId: 0,
+ *   timeMapMiss: true }` so the caller can record the miss and fall through to
+ *   naive.
  *
  * Exported for unit testing.
  */
-export function buildSwitchParameters(opts: {
+export function computeSwitchMinimumGroup(opts: {
   switchMode: 'naive' | 'aligned';
   targetGroup: number | undefined;
-}): { params: VersionSpecificParameters | undefined; timeMapMiss: boolean } {
-  if (opts.switchMode !== 'aligned') return { params: undefined, timeMapMiss: false };
-  if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
-  return {
-    params: new VersionSpecificParameters().addStartLocationGroup(opts.targetGroup),
-    timeMapMiss: false,
-  };
+}): { minimumSwitchingGroupId: number; timeMapMiss: boolean } {
+  if (opts.switchMode !== 'aligned') return { minimumSwitchingGroupId: 0, timeMapMiss: false };
+  if (opts.targetGroup === undefined) return { minimumSwitchingGroupId: 0, timeMapMiss: true };
+  return { minimumSwitchingGroupId: opts.targetGroup, timeMapMiss: false };
 }
 
 /**
@@ -1150,7 +1148,7 @@ export class Player {
     if (this.#options.switchMode === 'aligned' && this.#timeMap && playheadPTS_ms !== undefined) {
       targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
     }
-    const { params: switchParams, timeMapMiss } = buildSwitchParameters({
+    const { minimumSwitchingGroupId, timeMapMiss } = computeSwitchMinimumGroup({
       switchMode: this.#options.switchMode,
       targetGroup,
     });
@@ -1176,7 +1174,7 @@ export class Player {
         requestId: newRequestId,
         fullTrackName,
         subscriptionRequestId,
-        parameters: switchParams,
+        minimumSwitchingGroupId: BigInt(minimumSwitchingGroupId),
       });
 
       if (result instanceof SubscribeError) {

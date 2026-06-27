@@ -1191,10 +1191,14 @@ export class MOQtailClient {
       if (!subscription) throw new InternalError('MOQtailClient.switch', 'Request exists but subscription does not')
 
       if (!parameters) parameters = new VersionSpecificParameters()
+      // `requestId` is the client's LOCAL bookkeeping id only. SWITCH PR #1378 does not
+      // carry a subscriber-allocated Request ID on the wire; the relay allocates
+      // the target PUBLISH's Request ID and reports it back.
       const requestId = args.requestId ?? this.#nextClientRequestId
       this.requests.set(requestId, subscription)
 
-      const msg = new Switch(requestId, fullTrackName, subscriptionRequestId, parameters.build())
+      const minimumSwitchingGroupId = args.minimumSwitchingGroupId ?? 0n
+      const msg = new Switch(subscriptionRequestId, fullTrackName, minimumSwitchingGroupId, parameters.build())
       subscription.switch(fullTrackName, parameters.build())
       await this.controlStream.send(msg)
 

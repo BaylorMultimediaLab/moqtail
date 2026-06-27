@@ -54,21 +54,6 @@ fn parse_delay_groups(params: &[KeyValuePair]) -> Option<u64> {
   })
 }
 
-/// Search a SWITCH message's parameters for the project-local
-/// START_LOCATION_GROUP (VarInt). Returns the first match's value, or None
-/// if not present. Used by handle_switch_message to start the new track at
-/// an absolute group_id rather than at the live edge.
-fn parse_start_location_group(params: &[KeyValuePair]) -> Option<u64> {
-  params.iter().find_map(|p| match p {
-    KeyValuePair::VarInt { type_value, value }
-      if *type_value == VersionSpecificParameterType::StartLocationGroup as u64 =>
-    {
-      Some(*value)
-    }
-    _ => None,
-  })
-}
-
 /// The relay's decision after applying a `DELAY_GROUPS` parameter to a SUBSCRIBE.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -902,7 +887,7 @@ async fn handle_switch_message(
   let switch_from_track = {
     let requests = client.subscribe_requests.read().await;
 
-    let req = requests.get(&switch_message.subscription_request_id);
+    let req = requests.get(&switch_message.current_subscribe_request_id);
     match req {
       Some(req) => {
         let track_name = req.original_subscribe_request.get_full_track_name();
@@ -923,8 +908,8 @@ async fn handle_switch_message(
 
   if switch_from_track.is_none() {
     warn!(
-      "no existing track found for switch subscription request id: {:?}",
-      switch_message.subscription_request_id
+      "no existing track found for switch current subscribe request id: {:?}",
+      switch_message.current_subscribe_request_id
     );
     return Err(TerminationCode::ProtocolViolation);
   }
@@ -967,38 +952,46 @@ async fn handle_switch_message(
     return Err(TerminationCode::ProtocolViolation);
   }
 
-  // Inspect for START_LOCATION_GROUP: when present, start the new track at
-  // the requested absolute group (aligned switch). Otherwise default to the
-  // existing live-edge ("naive switch") semantic.
-  let subscribe = match parse_start_location_group(&switch_message.subscribe_parameters) {
-    Some(start_group) => {
-      info!(
-        "Switch has START_LOCATION_GROUP={}; using new_absolute_start (request_id={})",
-        start_group, switch_message.request_id
-      );
-      Subscribe::new_absolute_start(
-        switch_message.request_id,
-        switch_message.track_namespace.clone(),
-        switch_message.track_name.clone(),
-        0,
-        GroupOrder::Original,
-        true,
-        Location {
-          group: start_group,
-          object: 0,
-        },
-        switch_message.subscribe_parameters.clone(),
-      )
-    }
-    None => Subscribe::new_latest_object(
-      switch_message.request_id,
+  // Per SWITCH PR #1378 the subscriber does not allocate a Request ID for the SWITCH; the
+  // relay allocates the Request ID for the target delivery it opens. Threading
+  // this id back to the subscriber is finalized with the PUBLISH-based delivery
+  // rework (verified against the network harness).
+  let target_request_id =
+    Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+
+  // Minimum Switching Group ID is a floor, not an exact transition point. 0
+  // means "no floor" -> switch at the live edge (naive). A non-zero floor asks
+  // for an aligned transition at or above that group; until the common,
+  // gap-free boundary selection is wired end to end, the relay starts the
+  // target delivery at the floor itself.
+  let subscribe = if switch_message.minimum_switching_group_id > 0 {
+    info!(
+      "Switch minimum_switching_group_id={}; using new_absolute_start (target_request_id={})",
+      switch_message.minimum_switching_group_id, target_request_id
+    );
+    Subscribe::new_absolute_start(
+      target_request_id,
+      switch_message.track_namespace.clone(),
+      switch_message.track_name.clone(),
+      0,
+      GroupOrder::Original,
+      true,
+      Location {
+        group: switch_message.minimum_switching_group_id,
+        object: 0,
+      },
+      switch_message.subscribe_parameters.clone(),
+    )
+  } else {
+    Subscribe::new_latest_object(
+      target_request_id,
       switch_message.track_namespace.clone(),
       switch_message.track_name.clone(),
       0,
       GroupOrder::Original,
       true,
       switch_message.subscribe_parameters.clone(),
-    ),
+    )
   };
 
   let new_full_track_name = subscribe.get_full_track_name();
@@ -1187,47 +1180,3 @@ mod tests_compute_delayed_start {
   }
 }
 
-#[cfg(test)]
-mod tests_parse_start_location_group {
-  use super::*;
-  use moqtail::model::common::pair::KeyValuePair;
-  use moqtail::model::parameter::constant::VersionSpecificParameterType;
-
-  fn start_location_kvp(value: u64) -> KeyValuePair {
-    KeyValuePair::VarInt {
-      type_value: VersionSpecificParameterType::StartLocationGroup as u64,
-      value,
-    }
-  }
-
-  #[test]
-  fn parse_returns_some_when_present() {
-    let params = vec![start_location_kvp(42)];
-    assert_eq!(parse_start_location_group(&params), Some(42));
-  }
-
-  #[test]
-  fn parse_returns_none_when_absent() {
-    let params: Vec<KeyValuePair> = vec![];
-    assert_eq!(parse_start_location_group(&params), None);
-  }
-
-  #[test]
-  fn parse_ignores_other_params() {
-    let params = vec![KeyValuePair::VarInt {
-      type_value: VersionSpecificParameterType::DelayGroups as u64,
-      value: 99,
-    }];
-    assert_eq!(parse_start_location_group(&params), None);
-  }
-
-  #[test]
-  fn parse_ignores_bytes_kvp_with_same_type_id() {
-    use bytes::Bytes;
-    let params = vec![KeyValuePair::Bytes {
-      type_value: VersionSpecificParameterType::StartLocationGroup as u64,
-      value: Bytes::from_static(b"oops"),
-    }];
-    assert_eq!(parse_start_location_group(&params), None);
-  }
-}
