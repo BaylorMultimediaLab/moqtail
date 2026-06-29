@@ -185,12 +185,15 @@ export class MOQtailClient {
    */
   readonly pendingStateUpdates: Map<bigint, (newTrackAlias: bigint) => boolean> = new Map()
   /**
-   * In-flight SWITCH operations keyed by target {@link FullTrackName.toString}.
-   * Per SWITCH PR #1378 a SWITCH is acknowledged by the relay opening a PUBLISH for the
-   * target track (not a SubscribeOk). The PUBLISH handler resolves the matching
-   * entry here with the pushed object stream, completing {@link MOQtailClient.switch}.
+   * In-flight SWITCH operations keyed by target {@link FullTrackName.toString},
+   * each a FIFO queue of resolvers. Per SWITCH PR #1378 a SWITCH is acknowledged
+   * by the relay opening a PUBLISH for the target track (not a SubscribeOk). The
+   * PUBLISH handler shifts the oldest resolver for that track and completes it
+   * with the pushed object stream. The queue tolerates multiple concurrent
+   * switches to the same target track (the PUBLISH alone cannot identify which
+   * source subscription it replaces), resolving them in send order.
    */
-  readonly pendingSwitches: Map<string, (result: SubscribeResult) => void> = new Map()
+  readonly pendingSwitches: Map<string, Array<(result: SubscribeResult) => void>> = new Map()
   /** Underlying WebTransport session (set after successful construction in MOQtailClient.new). */
   webTransport!: WebTransport
   /** Validated ServerSetup message captured during handshake (protocol parameters negotiated). */
@@ -1193,7 +1196,9 @@ export class MOQtailClient {
       // Request ID for the subscription being replaced (the relay validates it
       // and tears it down — Close-After-Switch).
       const result = new Promise<SubscribeResult>((resolve) => {
-        this.pendingSwitches.set(key, resolve)
+        const queue = this.pendingSwitches.get(key) ?? []
+        queue.push(resolve)
+        this.pendingSwitches.set(key, queue)
       })
 
       const msg = new Switch(subscriptionRequestId, fullTrackName, minimumSwitchingGroupId, parameters.build())

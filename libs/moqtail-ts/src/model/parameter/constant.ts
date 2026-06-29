@@ -58,8 +58,15 @@ export enum VersionSpecificParameterType {
    */
   DelayGroups = 0x70,
   /** Project-local extension; non-MoQT-standard.
-   *  Absolute group_id where a Switch should start delivering the new track. */
+   *  Legacy: a SWITCH's transition group is now a first-class field (Minimum
+   *  Switching Group ID, PR #1378), so this parameter is no longer used for
+   *  switching. Retained for wire-compatibility of the type registry. */
   StartLocationGroup = 0x72,
+  /** Project-local extension; non-MoQT-standard.
+   *  SWITCH_TRANSITION (PR #1378): carried on the target Track's PUBLISH so the
+   *  subscriber learns the seam. Bytes value = two varints
+   *  { Switching Group ID (G_switch), Live Edge Group ID }. */
+  SwitchTransition = 0x73,
 }
 
 export function versionSpecificParameterTypeFromNumber(value: number): VersionSpecificParameterType {
@@ -74,6 +81,8 @@ export function versionSpecificParameterTypeFromNumber(value: number): VersionSp
       return VersionSpecificParameterType.DelayGroups
     case 0x72:
       return VersionSpecificParameterType.StartLocationGroup
+    case 0x73:
+      return VersionSpecificParameterType.SwitchTransition
     default:
       throw new InvalidTypeError('versionSpecificParameterTypeFromNumber', `Invalid version parameter type: ${value}`)
   }

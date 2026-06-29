@@ -16,6 +16,8 @@
 import { FilterType, GroupOrder, Publish, PublishOk } from '../../model/control'
 import { ControlMessageHandler } from './handler'
 import { MoqtObject } from '../../model/data' // Make sure to import MoqtObject
+import { VersionSpecificParameterType } from '../../model/parameter/constant'
+import { ProtocolViolationError } from '../../model/error/error'
 
 export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg) => {
   // 1. Create a stream to receive the pushed objects natively
@@ -54,10 +56,23 @@ export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg
   // PUBLISH's request id; the player adopts it as the new subscription id.
   // Otherwise surface the PUBLISH to the application as an unsolicited peer publish.
   const switchKey = msg.fullTrackName.toString()
-  const pendingSwitch = client.pendingSwitches.get(switchKey)
-  if (pendingSwitch) {
-    client.pendingSwitches.delete(switchKey)
-    pendingSwitch({ requestId: msg.requestId, stream, largestLocation: msg.largestLocation })
+  const queue = client.pendingSwitches.get(switchKey)
+  const resolver = queue?.shift()
+  if (queue && queue.length === 0) client.pendingSwitches.delete(switchKey)
+
+  const hasSwitchTransition = msg.parameters.some(
+    (p) => p.typeValue === BigInt(VersionSpecificParameterType.SwitchTransition),
+  )
+
+  if (resolver) {
+    resolver({ requestId: msg.requestId, stream, largestLocation: msg.largestLocation })
+  } else if (hasSwitchTransition) {
+    // PR #1378: a PUBLISH carrying SWITCH_TRANSITION with no pending SWITCH for
+    // its track is a protocol violation — it is not an ordinary peer publish.
+    throw new ProtocolViolationError(
+      'handlerPublish',
+      `PUBLISH for ${switchKey} carries SWITCH_TRANSITION but no SWITCH is pending`,
+    )
   } else if (client.onPeerPublish) {
     client.onPeerPublish(msg, stream)
   }
