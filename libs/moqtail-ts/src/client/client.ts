@@ -40,7 +40,6 @@ import {
   PublishError,
   SubscribeNamespaceOk,
   Switch,
-  SubscribeOk,
   PublishDone,
 } from '../model/control'
 import {
@@ -185,6 +184,13 @@ export class MOQtailClient {
    * Used to avoid premature state updates.
    */
   readonly pendingStateUpdates: Map<bigint, (newTrackAlias: bigint) => boolean> = new Map()
+  /**
+   * In-flight SWITCH operations keyed by target {@link FullTrackName.toString}.
+   * Per SWITCH PR #1378 a SWITCH is acknowledged by the relay opening a PUBLISH for the
+   * target track (not a SubscribeOk). The PUBLISH handler resolves the matching
+   * entry here with the pushed object stream, completing {@link MOQtailClient.switch}.
+   */
+  readonly pendingSwitches: Map<string, (result: SubscribeResult) => void> = new Map()
   /** Underlying WebTransport session (set after successful construction in MOQtailClient.new). */
   webTransport!: WebTransport
   /** Validated ServerSetup message captured during handshake (protocol parameters negotiated). */
@@ -1175,60 +1181,27 @@ export class MOQtailClient {
    */
   async switch(args: SwitchOptions): Promise<SubscribeError | SubscribeResult> {
     this.#ensureActive()
-    let { fullTrackName, subscriptionRequestId, parameters } = args
+    const { fullTrackName, subscriptionRequestId } = args
+    const parameters = args.parameters ?? new VersionSpecificParameters()
+    const minimumSwitchingGroupId = args.minimumSwitchingGroupId ?? 0n
+    const key = fullTrackName.toString()
     try {
-      if (!this.requests.has(subscriptionRequestId))
-        throw new ProtocolViolationError('MOQtailClient.switch', 'Unknown subscription request id')
+      // Per SWITCH PR #1378 the subscriber allocates no request id and receives no
+      // SubscribeOk. The relay acknowledges by opening a PUBLISH for the target
+      // track; the PUBLISH handler (handler/publish.ts) resolves this promise
+      // with the pushed object stream. `subscriptionRequestId` is the relay's
+      // Request ID for the subscription being replaced (the relay validates it
+      // and tears it down — Close-After-Switch).
+      const result = new Promise<SubscribeResult>((resolve) => {
+        this.pendingSwitches.set(key, resolve)
+      })
 
-      const request = this.requests.get(subscriptionRequestId)!
-      if (!(request instanceof SubscribeRequest))
-        throw new ProtocolViolationError('MOQtailClient.switch', 'Request id is not a subscription')
-
-      const trackAlias = this.subscriptionAliasMap.get(subscriptionRequestId)
-      if (!trackAlias)
-        throw new InternalError('MOQtailClient.switch', 'Request exists but track alias mapping does not')
-      const subscription = this.subscriptions.get(trackAlias)
-      if (!subscription) throw new InternalError('MOQtailClient.switch', 'Request exists but subscription does not')
-
-      if (!parameters) parameters = new VersionSpecificParameters()
-      // `requestId` is the client's LOCAL bookkeeping id only. SWITCH PR #1378 does not
-      // carry a subscriber-allocated Request ID on the wire; the relay allocates
-      // the target PUBLISH's Request ID and reports it back.
-      const requestId = args.requestId ?? this.#nextClientRequestId
-      this.requests.set(requestId, subscription)
-
-      const minimumSwitchingGroupId = args.minimumSwitchingGroupId ?? 0n
       const msg = new Switch(subscriptionRequestId, fullTrackName, minimumSwitchingGroupId, parameters.build())
-      subscription.switch(fullTrackName, parameters.build())
       await this.controlStream.send(msg)
 
-      const response = await subscription
-      if (response instanceof SubscribeOk) {
-        // Generate a new update callback mapping for the new track alias
-        this.aliasFullTrackNameMap.set(response.trackAlias, fullTrackName)
-        this.pendingStateUpdates.set(subscriptionRequestId, (newTrackAlias: bigint) => {
-          if (newTrackAlias !== response.trackAlias) return false
-          // Update internal state to expect the new subscription
-          this.subscriptions.set(response.trackAlias, subscription)
-          this.subscriptionAliasMap.set(requestId, response.trackAlias)
-          subscription.requestId = requestId
-
-          // Old subscription id is no longer valid
-          this.requestIdMap.removeMappingByRequestId(subscriptionRequestId)
-          this.requestIdMap.addMapping(subscriptionRequestId, fullTrackName)
-
-          // remove the old subscription
-          this.subscriptions.delete(trackAlias)
-          return true
-        })
-
-        return { requestId, stream: subscription.stream, largestLocation: response.largestLocation }
-      } else {
-        this.requestIdMap.removeMappingByRequestId(requestId)
-        this.requests.delete(requestId)
-        return response
-      }
+      return await result
     } catch (error) {
+      this.pendingSwitches.delete(key)
       await this.disconnect(
         new InternalError('MOQtailClient.switch', error instanceof Error ? error.message : String(error)),
       )
@@ -1851,6 +1824,32 @@ export class MOQtailClient {
           }
           return
         }
+
+        // Per SWITCH PR #1378 SWITCH catch-up a relay-initiated FETCH_HEADER stream whose
+        // request id maps to a peer-published track alias (set up in the PUBLISH
+        // handler) rather than a client-issued FetchRequest. Route its objects
+        // into that receiver so [G_switch, live_edge) reaches the same stream as
+        // the live SUBGROUP objects.
+        const catchupAlias = this.subscriptionAliasMap.get(header.requestId)
+        const catchupReceiver = catchupAlias !== undefined ? this.subscriptions.get(catchupAlias) : undefined
+        const catchupName = catchupAlias !== undefined ? this.aliasFullTrackNameMap.get(catchupAlias) : undefined
+        if (catchupReceiver && catchupName) {
+          try {
+            while (true) {
+              const { done, value: nextObject } = await reader.read()
+              if (done) break
+              if (nextObject instanceof FetchObject) {
+                catchupReceiver.controller?.enqueue(MoqtObject.fromFetchObject(nextObject, catchupName))
+                continue
+              }
+              throw new ProtocolViolationError('MOQtailClient', 'Received subgroup object after fetch header')
+            }
+          } finally {
+            reader.releaseLock()
+          }
+          return
+        }
+
         throw new ProtocolViolationError('MOQtailClient', 'No request for received request id')
       } else {
         let subscription = this.subscriptions.get(header.trackAlias)

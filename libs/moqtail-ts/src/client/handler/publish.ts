@@ -32,6 +32,11 @@ export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg
   client.requestIdMap.addMapping(localPseudoRequestId, msg.fullTrackName)
   client.subscriptionAliasMap.set(localPseudoRequestId, msg.trackAlias)
   client.aliasFullTrackNameMap.set(msg.trackAlias, msg.fullTrackName)
+  // Per SWITCH PR #1378 a relay-initiated catch-up stream begins with a
+  // FETCH_HEADER carrying THIS PUBLISH's request id (not a client-issued
+  // FetchRequest). Map it to the same track alias so #handleRecvStreams can
+  // route its FetchObjects into this receiver.
+  client.subscriptionAliasMap.set(msg.requestId, msg.trackAlias)
 
   // This object mimics a SubscribeRequest so #handleRecvStreams can use it identically
   const receiver = {
@@ -44,8 +49,16 @@ export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg
   // 3. Register the receiver map so data streams don't trigger ProtocolViolationError
   client.subscriptions.set(msg.trackAlias, receiver)
 
-  // 4. Bubble the event up to the application layer, passing the data stream!
-  if (client.onPeerPublish) {
+  // 4. If this PUBLISH acknowledges an in-flight SWITCH for this track (SWITCH PR #1378),
+  // complete client.switch() with the pushed stream. The relay allocated this
+  // PUBLISH's request id; the player adopts it as the new subscription id.
+  // Otherwise surface the PUBLISH to the application as an unsolicited peer publish.
+  const switchKey = msg.fullTrackName.toString()
+  const pendingSwitch = client.pendingSwitches.get(switchKey)
+  if (pendingSwitch) {
+    client.pendingSwitches.delete(switchKey)
+    pendingSwitch({ requestId: msg.requestId, stream, largestLocation: msg.largestLocation })
+  } else if (client.onPeerPublish) {
     client.onPeerPublish(msg, stream)
   }
 }
