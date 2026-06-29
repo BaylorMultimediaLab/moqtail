@@ -415,6 +415,7 @@ impl Subscription {
   }
 
   // Returns true if the subscription is active (not finished and forwarding objects)
+  #[allow(dead_code)] // retained accessor; no longer used after the PUBLISH-based SWITCH rework
   pub async fn is_active(&self) -> bool {
     !self.is_finished().await && self.is_forwarding().await
   }

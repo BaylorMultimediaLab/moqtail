@@ -34,12 +34,19 @@ use moqtail::model::control::constant::GroupOrder;
 use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::publish::Publish;
 use moqtail::model::control::publish_done::PublishDone;
+use moqtail::model::data::fetch_header::FetchHeader;
 use moqtail::model::data::full_track_name::FullTrackName;
 use moqtail::model::error::ParseError;
 use moqtail::model::parameter::switch_transition::SwitchTransition;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
+use tracing::{error, info};
 
 use crate::server::client::MOQTClient;
+use crate::server::stream_id::StreamId;
 use crate::server::switch_guard::SwitchFailure;
+use crate::server::track::Track;
+use crate::server::track_cache::CacheConsumeEvent;
 
 /// Open the target Track's PUBLISH for a successful SWITCH.
 ///
@@ -109,4 +116,82 @@ pub(crate) async fn send_switch_failure(
   subscriber
     .queue_message(ControlMessage::PublishDone(Box::new(done)))
     .await;
+}
+
+/// Deliver the catch-up range `[g_switch, live_edge)` of the target Track on a
+/// dedicated unidirectional stream that begins with a `FETCH_HEADER` carrying
+/// the target PUBLISH's Request ID (PR #1378). Live objects from `live_edge`
+/// onward arrive separately on the subscription's SUBGROUP streams.
+///
+/// Spawns a task and returns immediately. A no-op when `g_switch >= live_edge`
+/// (the switch lands at the live edge, so there is nothing to catch up). Mirrors
+/// the ranged delivery in `fetch_handler` but is relay-initiated.
+#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
+pub(crate) fn spawn_switch_catchup_stream(
+  subscriber: Arc<MOQTClient>,
+  target_track: Arc<RwLock<Track>>,
+  publish_request_id: u64,
+  g_switch: u64,
+  live_edge: u64,
+) {
+  if g_switch >= live_edge {
+    return;
+  }
+  tokio::spawn(async move {
+    let track = target_track.read().await;
+    let track_alias = track.track_alias;
+    // [g_switch, live_edge): stop one group below the edge — the live edge and
+    // beyond are delivered by the subscription's SUBGROUP streams.
+    let start = Location::new(g_switch, 0);
+    let end = Location::new(live_edge.saturating_sub(1), 0);
+    let mut object_rx = track.cache.read_objects(start, end, false).await;
+
+    let fetch_header = FetchHeader::new(publish_request_id);
+    let stream_id = StreamId::new_fetch(track_alias, publish_request_id);
+
+    let mut send_stream = None;
+    let mut object_count: u64 = 0;
+    while let Some(event) = object_rx.recv().await {
+      match event {
+        CacheConsumeEvent::Object(object) => {
+          if object_count == 0 {
+            match subscriber
+              .open_stream(&stream_id, fetch_header.serialize().unwrap(), 0)
+              .await
+            {
+              Ok(ss) => send_stream = Some(ss),
+              Err(e) => {
+                error!("switch catch-up: failed to open stream {stream_id}: {e:?}");
+                return;
+              }
+            }
+          }
+          if let Err(e) = subscriber
+            .write_stream_object(
+              &stream_id,
+              object.object_id,
+              object.serialize().unwrap(),
+              send_stream.clone(),
+            )
+            .await
+          {
+            error!("switch catch-up: write failed on {stream_id}: {e:?}");
+            break;
+          }
+          object_count += 1;
+        }
+        CacheConsumeEvent::EndLocation(_) | CacheConsumeEvent::NoObject => {}
+      }
+    }
+
+    if let Some(s) = send_stream {
+      if let Err(e) = s.lock().await.shutdown().await {
+        error!("switch catch-up: error closing stream {stream_id}: {e:?}");
+      }
+      subscriber.remove_stream_by_stream_id(&stream_id).await;
+    }
+    info!(
+      "switch catch-up: delivered {object_count} objects on {stream_id} for [{g_switch}, {live_edge})"
+    );
+  });
 }

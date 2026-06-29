@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
-use crate::server::client::switch_context::SwitchStatus;
 use crate::server::session::Session;
 use crate::server::session_context::SessionContext;
 use crate::server::stream_id::StreamId;
@@ -876,155 +875,206 @@ async fn handle_subscribe_error_message(
 
 async fn handle_switch_message(
   client: Arc<MOQTClient>,
-  control_stream_handler: &mut ControlStreamHandler,
+  _control_stream_handler: &mut ControlStreamHandler,
   switch_message: moqtail::model::control::switch::Switch,
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
   info!("received Switch message: {:?}", switch_message);
 
-  // now different from a normal subscribe, we need to
-  // check whether there is a related track to switch from
-  let switch_from_track = {
-    let requests = client.subscribe_requests.read().await;
+  // SWITCH PR #1378: the relay carries out the switch by opening a PUBLISH for
+  // the target Track toward the subscriber (it does not mutate the existing
+  // subscription). Every post-validation outcome opens the target PUBLISH and
+  // reports via PUBLISH_DONE, leaving the current subscription untouched on
+  // failure — no ProtocolViolation disconnect.
+  use crate::server::switch_delivery::{
+    send_switch_failure, send_switch_publish, spawn_switch_catchup_stream,
+  };
+  use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
+  use crate::server::switch_selection::{SwitchSelection, select_switch_group};
+  use moqtail::model::parameter::switch_transition::SwitchTransition;
+  use std::time::Instant;
 
-    let req = requests.get(&switch_message.current_subscribe_request_id);
-    match req {
+  let target_full_track_name = switch_message.get_full_track_name();
+  let current_sub_req_id = switch_message.current_subscribe_request_id;
+
+  // Resolve the target Track (needed for the PUBLISH track alias and for
+  // G_switch selection). Absent target -> DOES_NOT_EXIST.
+  let target_track_arc = match context
+    .track_manager
+    .get_track(&target_full_track_name)
+    .await
+  {
+    Some(t) => t,
+    None => {
+      warn!("switch: target track not found: {:?}", target_full_track_name);
+      let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+      send_switch_failure(
+        &client,
+        rid,
+        &target_full_track_name,
+        0,
+        SwitchFailure::TargetTrackMissing,
+      )
+      .await;
+      return Ok(());
+    }
+  };
+  let target_alias = target_track_arc.read().await.track_alias;
+
+  // Validate that the Current Subscribe Request ID identifies an Established
+  // subscription. On failure the relay MUST NOT modify subscription state.
+  let current_track_arc = {
+    let requests = client.subscribe_requests.read().await;
+    match requests.get(&current_sub_req_id) {
       Some(req) => {
-        let track_name = req.original_subscribe_request.get_full_track_name();
-        if let Some(track) = context.track_manager.get_track(&track_name).await {
-          info!(
-            "found old track request, original request id: {:?}",
-            req.original_request_id
-          );
-          Some(track.clone())
-        } else {
-          warn!("old track not found for track name: {:?}", track_name);
-          None
-        }
+        let name = req.original_subscribe_request.get_full_track_name();
+        context.track_manager.get_track(&name).await
       }
       None => None,
     }
   };
+  let current_track_arc = match current_track_arc {
+    Some(t) => t,
+    None => {
+      warn!(
+        "switch: current subscription not established: {:?}",
+        current_sub_req_id
+      );
+      let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+      send_switch_failure(
+        &client,
+        rid,
+        &target_full_track_name,
+        target_alias,
+        SwitchFailure::SubscriptionEnded,
+      )
+      .await;
+      return Ok(());
+    }
+  };
+  let current_full_track_name = current_track_arc.read().await.full_track_name.clone();
 
-  if switch_from_track.is_none() {
-    warn!(
-      "no existing track found for switch current subscribe request id: {:?}",
-      switch_message.current_subscribe_request_id
-    );
-    return Err(TerminationCode::ProtocolViolation);
-  }
-
-  let switch_from_track_guard = switch_from_track.unwrap();
-
-  let switch_from_track = switch_from_track_guard.read().await;
-
-  if let Some(sub) = client
-    .subscriptions
-    .get_subscription(&switch_from_track.full_track_name)
-    .await
+  // Single in-flight SWITCH per Current Subscribe Request ID -> EXCESSIVE_LOAD.
   {
-    if sub.upgrade().is_none() {
-      warn!(
-        "subscription weak reference is dead for track: {:?} subscriber: {}",
-        switch_from_track.full_track_name, context.connection_id
-      );
-      return Err(TerminationCode::ProtocolViolation);
+    let mut guard = client.switch_in_flight.lock().await;
+    if guard.try_admit(current_sub_req_id, Instant::now(), DEFAULT_T_SWITCH) == AdmitResult::Rejected
+    {
+      drop(guard);
+      let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+      send_switch_failure(
+        &client,
+        rid,
+        &target_full_track_name,
+        target_alias,
+        SwitchFailure::AlreadyInFlight,
+      )
+      .await;
+      return Ok(());
     }
-
-    let mut is_active = false;
-    if let Some(sub) = sub.upgrade() {
-      let sub = sub.read().await;
-      is_active = sub.is_active().await;
-    }
-
-    if !is_active {
-      warn!(
-        "subscription is not active for track: {:?} subscriber: {}",
-        switch_from_track.full_track_name, context.connection_id
-      );
-      return Err(TerminationCode::ProtocolViolation);
-    }
-  } else {
-    warn!(
-      "no subscription found for track: {:?} subscriber: {}",
-      switch_from_track.full_track_name, context.connection_id
-    );
-    return Err(TerminationCode::ProtocolViolation);
   }
 
-  // Per SWITCH PR #1378 the subscriber does not allocate a Request ID for the SWITCH; the
-  // relay allocates the Request ID for the target delivery it opens. Threading
-  // this id back to the subscriber is finalized with the PUBLISH-based delivery
-  // rework (verified against the network harness).
+  // The relay (not the subscriber) allocates the target delivery's Request ID.
   let target_request_id =
     Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
 
-  // Minimum Switching Group ID is a floor, not an exact transition point. 0
-  // means "no floor" -> switch at the live edge (naive). A non-zero floor asks
-  // for an aligned transition at or above that group; until the common,
-  // gap-free boundary selection is wired end to end, the relay starts the
-  // target delivery at the floor itself.
-  let subscribe = if switch_message.minimum_switching_group_id > 0 {
-    info!(
-      "Switch minimum_switching_group_id={}; using new_absolute_start (target_request_id={})",
-      switch_message.minimum_switching_group_id, target_request_id
-    );
-    Subscribe::new_absolute_start(
-      target_request_id,
-      switch_message.track_namespace.clone(),
-      switch_message.track_name.clone(),
-      0,
-      GroupOrder::Original,
-      true,
-      Location {
-        group: switch_message.minimum_switching_group_id,
-        object: 0,
-      },
-      switch_message.subscribe_parameters.clone(),
-    )
-  } else {
-    Subscribe::new_latest_object(
-      target_request_id,
-      switch_message.track_namespace.clone(),
-      switch_message.track_name.clone(),
-      0,
-      GroupOrder::Original,
-      true,
-      switch_message.subscribe_parameters.clone(),
-    )
-  };
-
-  let new_full_track_name = subscribe.get_full_track_name();
-
-  if let Err(e) = handle_subscribe_message(
-    client.clone(),
-    control_stream_handler,
-    subscribe,
-    context.clone(),
-    true, // is_switch
+  // Select G_switch: the smallest common, gap-free boundary at or above the
+  // client's Minimum Switching Group ID floor. No such boundary -> TIMEOUT.
+  let g_switch = match select_switch_group(
+    &current_track_arc,
+    &target_track_arc,
+    switch_message.minimum_switching_group_id,
   )
   .await
   {
-    error!("error handling switch subscribe message: {:?}", e);
-    Err(e)
-  } else {
-    info!("switch subscribe message handled successfully");
-
-    // update the switch context
-    client
-      .switch_context
-      .add_or_update_switch_item(new_full_track_name, SwitchStatus::Next)
+    SwitchSelection::Ready(g) => g,
+    SwitchSelection::NoCommonBoundary => {
+      warn!(
+        "switch: no common gap-free boundary for {:?} (min={})",
+        target_full_track_name, switch_message.minimum_switching_group_id
+      );
+      send_switch_failure(
+        &client,
+        target_request_id,
+        &target_full_track_name,
+        target_alias,
+        SwitchFailure::NoCommonBoundary,
+      )
       .await;
+      client.switch_in_flight.lock().await.complete(current_sub_req_id);
+      return Ok(());
+    }
+  };
 
-    let switch_from_track_name = switch_from_track.full_track_name.clone();
+  let live_edge = target_track_arc.read().await.largest_location.read().await.group;
+  info!(
+    "switch: target={:?} g_switch={} live_edge={} target_request_id={}",
+    target_full_track_name, g_switch, live_edge, target_request_id
+  );
 
-    client
-      .switch_context
-      .add_or_update_switch_item(switch_from_track_name, SwitchStatus::Current)
-      .await;
-
-    Ok(())
+  // Open the target PUBLISH carrying SWITCH_TRANSITION { G_switch, live edge }.
+  if let Err(e) = send_switch_publish(
+    &client,
+    target_request_id,
+    &target_full_track_name,
+    target_alias,
+    Location::new(live_edge, 0),
+    SwitchTransition::new(g_switch, live_edge),
+  )
+  .await
+  {
+    error!("switch: failed to build target PUBLISH: {e:?}");
+    client.switch_in_flight.lock().await.complete(current_sub_req_id);
+    return Ok(());
   }
+
+  // Register a live-only subscription on the target Track so objects from the
+  // live edge onward forward to the subscriber on SUBGROUP streams. The catch-up
+  // range below the live edge is delivered separately (FETCH_HEADER stream).
+  let live_sub = Subscribe::new_latest_object(
+    target_request_id,
+    switch_message.track_namespace.clone(),
+    switch_message.track_name.clone(),
+    0,
+    GroupOrder::Original,
+    true,
+    switch_message.subscribe_parameters.clone(),
+  );
+  {
+    let target_track = target_track_arc.read().await;
+    add_subscription(live_sub.clone(), &target_track, client.clone(), false).await;
+  }
+  {
+    let mut requests = client.subscribe_requests.write().await;
+    requests.insert(
+      target_request_id,
+      SubscribeRequest::new(target_request_id, context.connection_id, live_sub, None),
+    );
+  }
+
+  // Deliver the catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
+  spawn_switch_catchup_stream(
+    client.clone(),
+    target_track_arc.clone(),
+    target_request_id,
+    g_switch,
+    live_edge,
+  );
+
+  // Close-After-Switch: tear down the current subscription. The subscriber now
+  // renders the target Track from G_switch, so continued delivery of the old
+  // Track is redundant.
+  current_track_arc
+    .read()
+    .await
+    .remove_subscription(context.connection_id)
+    .await;
+  client
+    .subscriptions
+    .remove_subscription(&current_full_track_name)
+    .await;
+
+  client.switch_in_flight.lock().await.complete(current_sub_req_id);
+  Ok(())
 }
 
 pub async fn handle(
