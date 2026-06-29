@@ -27,10 +27,12 @@
 //! stream is opened.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use moqtail::model::common::location::Location;
+use moqtail::model::common::pair::KeyValuePair;
 use moqtail::model::common::reason_phrase::ReasonPhrase;
-use moqtail::model::control::constant::GroupOrder;
+use moqtail::model::control::constant::{GroupOrder, PublishDoneStatusCode};
 use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::publish::Publish;
 use moqtail::model::control::publish_done::PublishDone;
@@ -48,6 +50,12 @@ use crate::server::switch_guard::SwitchFailure;
 use crate::server::track::Track;
 use crate::server::track_cache::CacheConsumeEvent;
 
+/// Relay-side `T_switch` budget for draining the source subscription before
+/// terminating it. Kept at/under the client's switch guard so a congested drain
+/// can't wedge the teardown.
+const SWITCH_DRAIN_TIMEOUT: Duration = Duration::from_millis(3000);
+const SWITCH_DRAIN_POLL: Duration = Duration::from_millis(50);
+
 /// Open the target Track's PUBLISH for a successful SWITCH.
 ///
 /// The PUBLISH advertises the live edge as its largest location and carries the
@@ -56,15 +64,21 @@ use crate::server::track_cache::CacheConsumeEvent;
 /// follow from the live edge. `publish_request_id` is the relay-allocated
 /// Request ID the subscriber will see on the inbound PUBLISH (it did not
 /// pre-allocate it — the client handles this via its peer-publish path).
-#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) async fn send_switch_publish(
   subscriber: &Arc<MOQTClient>,
   publish_request_id: u64,
   target: &FullTrackName,
   track_alias: u64,
   live_edge: Location,
+  target_parameters: &[KeyValuePair],
   switch_transition: SwitchTransition,
 ) -> Result<(), ParseError> {
+  // Per SWITCH PR #1378 the SWITCH's parameter set IS the complete parameter set for the
+  // target PUBLISH (the target does not inherit the old subscription's params).
+  // Carry those parameters through, then append SWITCH_TRANSITION so the
+  // subscriber learns the seam.
+  let mut parameters = target_parameters.to_vec();
+  parameters.push(switch_transition.to_key_value_pair()?);
   let publish = Publish::new(
     publish_request_id,
     target.namespace.clone(),
@@ -74,7 +88,7 @@ pub(crate) async fn send_switch_publish(
     1, // content_exists: data will follow
     Some(live_edge),
     1, // forward
-    vec![switch_transition.to_key_value_pair()?],
+    parameters,
   );
   subscriber
     .queue_message(ControlMessage::Publish(Box::new(publish)))
@@ -193,5 +207,95 @@ pub(crate) fn spawn_switch_catchup_stream(
     info!(
       "switch catch-up: delivered {object_count} objects on {stream_id} for [{g_switch}, {live_edge})"
     );
+  });
+}
+
+/// Drain the source subscription up to the switch boundary, then terminate it
+/// with PUBLISH_DONE on its (the current) Request ID and remove it from relay
+/// state (SWITCH PR #1378 Close-After-Switch).
+///
+/// Spawns a task that:
+/// 1. bounds the source subscription to Groups below `g_switch` (so it stops
+///    overlapping the target above the switch point while still delivering
+///    `[.., g_switch)`);
+/// 2. waits — bounded by `SWITCH_DRAIN_TIMEOUT` — until source delivery has
+///    actually reached the boundary, so Objects in Groups below `g_switch` are
+///    delivered before the handover completes; and
+/// 3. sends PUBLISH_DONE for the current subscription and drops relay state.
+#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
+pub(crate) fn spawn_drain_then_teardown(
+  subscriber: Arc<MOQTClient>,
+  current_track: Arc<RwLock<Track>>,
+  current_full_track_name: FullTrackName,
+  connection_id: usize,
+  g_switch: u64,
+) {
+  tokio::spawn(async move {
+    let sub_opt = current_track
+      .read()
+      .await
+      .get_subscription(connection_id)
+      .await;
+    let Some(sub_arc) = sub_opt else {
+      current_track
+        .read()
+        .await
+        .remove_subscription(connection_id)
+        .await;
+      subscriber
+        .subscriptions
+        .remove_subscription(&current_full_track_name)
+        .await;
+      return;
+    };
+
+    // (1) Bound the source to Groups below G_switch.
+    if g_switch > 0 {
+      let sub = sub_arc.read().await;
+      sub.subscription_state.write().await.end_group = g_switch - 1;
+    }
+
+    // (2) Drain barrier: wait until last-sent reaches G_switch-1 (or timeout).
+    let deadline = Instant::now() + SWITCH_DRAIN_TIMEOUT;
+    loop {
+      let drained = if g_switch == 0 {
+        true
+      } else {
+        let sub = sub_arc.read().await;
+        let state = sub.subscription_state.read().await;
+        state
+          .last_sent_max_location
+          .as_ref()
+          .map(|loc| loc.group + 1 >= g_switch)
+          .unwrap_or(false)
+      };
+      if drained || Instant::now() >= deadline {
+        break;
+      }
+      tokio::time::sleep(SWITCH_DRAIN_POLL).await;
+    }
+
+    // (3) Terminate the current subscription with PUBLISH_DONE on its Request ID.
+    {
+      let sub = sub_arc.read().await;
+      if let Err(e) = sub
+        .send_publish_done(
+          PublishDoneStatusCode::SubscriptionEnded,
+          "switched to target track",
+        )
+        .await
+      {
+        error!("switch teardown: failed to send PUBLISH_DONE: {e:?}");
+      }
+    }
+    current_track
+      .read()
+      .await
+      .remove_subscription(connection_id)
+      .await;
+    subscriber
+      .subscriptions
+      .remove_subscription(&current_full_track_name)
+      .await;
   });
 }

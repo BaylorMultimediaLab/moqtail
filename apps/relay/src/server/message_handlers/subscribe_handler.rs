@@ -887,7 +887,8 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    send_switch_failure, send_switch_publish, spawn_switch_catchup_stream,
+    send_switch_failure, send_switch_publish, spawn_drain_then_teardown,
+    spawn_switch_catchup_stream,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
   use crate::server::switch_selection::{SwitchSelection, select_switch_group};
@@ -1018,6 +1019,7 @@ async fn handle_switch_message(
     &target_full_track_name,
     target_alias,
     Location::new(live_edge, 0),
+    &switch_message.subscribe_parameters,
     SwitchTransition::new(g_switch, live_edge),
   )
   .await
@@ -1060,18 +1062,17 @@ async fn handle_switch_message(
     live_edge,
   );
 
-  // Close-After-Switch: tear down the current subscription. The subscriber now
-  // renders the target Track from G_switch, so continued delivery of the old
-  // Track is redundant.
-  current_track_arc
-    .read()
-    .await
-    .remove_subscription(context.connection_id)
-    .await;
-  client
-    .subscriptions
-    .remove_subscription(&current_full_track_name)
-    .await;
+  // Close-After-Switch: drain the source subscription up to G_switch (delivering
+  // its Groups below the switch point), then terminate it with PUBLISH_DONE on
+  // the current Request ID and drop relay state. Runs in a task so the control
+  // handler is not blocked while the source drains.
+  spawn_drain_then_teardown(
+    client.clone(),
+    current_track_arc.clone(),
+    current_full_track_name,
+    context.connection_id,
+    g_switch,
+  );
 
   client.switch_in_flight.lock().await.complete(current_sub_req_id);
   Ok(())
