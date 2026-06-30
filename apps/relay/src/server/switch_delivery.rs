@@ -211,20 +211,26 @@ pub(crate) fn spawn_switch_catchup_stream(
 }
 
 /// Drain the source subscription up to the switch boundary (SWITCH PR #1378 strict
-/// ordering): bound it to Groups below `g_switch`, then wait — bounded by
-/// `SWITCH_DRAIN_TIMEOUT` — until source delivery has actually reached the
-/// boundary. The caller awaits this BEFORE opening the target PUBLISH so that
-/// all source Objects in Groups below `g_switch` are delivered first (no
-/// concurrent source/target transmission across the seam, even when the source
-/// is itself lagging under congestion).
+/// ordering): wait — bounded by `SWITCH_DRAIN_TIMEOUT` — until source delivery
+/// has reached `g_switch - 1`. The caller awaits this BEFORE opening the target
+/// PUBLISH so that all source Objects in Groups below `g_switch` are delivered
+/// first (no concurrent source/target transmission across the seam, even when
+/// the source is itself lagging under congestion).
+///
+/// Returns `true` if the source drained in time. On success — and ONLY on
+/// success — the source is bounded to Groups below `g_switch` so it cannot then
+/// forward across the seam. Returns `false` on timeout WITHOUT mutating the
+/// source, so the caller can abort the switch and leave the current subscription
+/// unchanged (rather than terminating it and truncating undelivered source
+/// Objects below `g_switch`).
 #[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) async fn drain_source_below(
   current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
   g_switch: u64,
-) {
+) -> bool {
   if g_switch == 0 {
-    return;
+    return true;
   }
   let Some(sub_arc) = current_track
     .read()
@@ -232,19 +238,12 @@ pub(crate) async fn drain_source_below(
     .get_subscription(connection_id)
     .await
   else {
-    return;
+    // No source subscription to drain; nothing to truncate.
+    return true;
   };
 
-  // Bound the source to Groups below G_switch.
-  sub_arc
-    .read()
-    .await
-    .subscription_state
-    .write()
-    .await
-    .end_group = g_switch - 1;
-
-  // Wait until last-sent reaches G_switch-1 (or timeout).
+  // Wait until last-sent reaches G_switch-1 (or timeout). The source is NOT
+  // bounded during the wait so that a timeout leaves it completely unchanged.
   let deadline = Instant::now() + SWITCH_DRAIN_TIMEOUT;
   loop {
     let drained = {
@@ -256,8 +255,20 @@ pub(crate) async fn drain_source_below(
         .map(|loc| loc.group + 1 >= g_switch)
         .unwrap_or(false)
     };
-    if drained || Instant::now() >= deadline {
-      break;
+    if drained {
+      // Drain confirmed: bound the source at the seam so it does not forward
+      // Groups >= G_switch concurrently with the target before teardown.
+      sub_arc
+        .read()
+        .await
+        .subscription_state
+        .write()
+        .await
+        .end_group = g_switch - 1;
+      return true;
+    }
+    if Instant::now() >= deadline {
+      return false;
     }
     tokio::time::sleep(SWITCH_DRAIN_POLL).await;
   }

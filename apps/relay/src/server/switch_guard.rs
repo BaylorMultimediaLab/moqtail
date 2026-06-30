@@ -128,6 +128,11 @@ pub(crate) enum SwitchFailure {
   NotSupported,
   /// The subscription being switched from has ended.
   SubscriptionEnded,
+  /// The source could not be drained below G_switch within `T_switch` (severe
+  /// congestion). The switch is aborted and the current subscription is left
+  /// unchanged, rather than terminating it and truncating source Objects below
+  /// G_switch.
+  DrainTimeout,
 }
 
 #[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
@@ -141,6 +146,7 @@ impl SwitchFailure {
       SwitchFailure::Unauthorized => PublishDoneStatusCode::Unauthorized,
       SwitchFailure::NotSupported => PublishDoneStatusCode::NotSupported,
       SwitchFailure::SubscriptionEnded => PublishDoneStatusCode::SubscriptionEnded,
+      SwitchFailure::DrainTimeout => PublishDoneStatusCode::Timeout,
     }
   }
 }
@@ -240,5 +246,6 @@ mod tests {
       SwitchFailure::SubscriptionEnded.status_code(),
       S::SubscriptionEnded
     );
+    assert_eq!(SwitchFailure::DrainTimeout.status_code(), S::Timeout);
   }
 }

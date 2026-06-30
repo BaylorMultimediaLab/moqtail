@@ -1043,8 +1043,25 @@ async fn handle_switch_message(
   let target_parameters = switch_message.subscribe_parameters.clone();
   let connection_id = context.connection_id;
   tokio::spawn(async move {
-    // (1) Drain the source below G_switch before any target Object is sent.
-    drain_source_below(&current_track_arc, connection_id, g_switch).await;
+    // (1) Drain the source below G_switch before any target Object is sent. On
+    // timeout (severe congestion), abort the switch with TIMEOUT and leave the
+    // current subscription unchanged — do NOT terminate it (which would truncate
+    // undelivered source Objects below G_switch).
+    if !drain_source_below(&current_track_arc, connection_id, g_switch).await {
+      warn!(
+        "switch: source drain timed out below g_switch={g_switch}; aborting, current subscription unchanged"
+      );
+      send_switch_failure(
+        &client,
+        target_request_id,
+        &target_full_track_name,
+        target_alias,
+        SwitchFailure::DrainTimeout,
+      )
+      .await;
+      client.switch_in_flight.lock().await.complete(current_sub_req_id);
+      return;
+    }
 
     // (2) Open the target PUBLISH carrying SWITCH_TRANSITION { G_switch, live edge }.
     if let Err(e) = send_switch_publish(
