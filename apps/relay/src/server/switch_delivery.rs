@@ -210,92 +210,93 @@ pub(crate) fn spawn_switch_catchup_stream(
   });
 }
 
-/// Drain the source subscription up to the switch boundary, then terminate it
-/// with PUBLISH_DONE on its (the current) Request ID and remove it from relay
-/// state (SWITCH PR #1378 Close-After-Switch).
-///
-/// Spawns a task that:
-/// 1. bounds the source subscription to Groups below `g_switch` (so it stops
-///    overlapping the target above the switch point while still delivering
-///    `[.., g_switch)`);
-/// 2. waits — bounded by `SWITCH_DRAIN_TIMEOUT` — until source delivery has
-///    actually reached the boundary, so Objects in Groups below `g_switch` are
-///    delivered before the handover completes; and
-/// 3. sends PUBLISH_DONE for the current subscription and drops relay state.
+/// Drain the source subscription up to the switch boundary (SWITCH PR #1378 strict
+/// ordering): bound it to Groups below `g_switch`, then wait — bounded by
+/// `SWITCH_DRAIN_TIMEOUT` — until source delivery has actually reached the
+/// boundary. The caller awaits this BEFORE opening the target PUBLISH so that
+/// all source Objects in Groups below `g_switch` are delivered first (no
+/// concurrent source/target transmission across the seam, even when the source
+/// is itself lagging under congestion).
 #[allow(dead_code)] // not yet wired; consumed by handle_switch_message
-pub(crate) fn spawn_drain_then_teardown(
-  subscriber: Arc<MOQTClient>,
-  current_track: Arc<RwLock<Track>>,
-  current_full_track_name: FullTrackName,
+pub(crate) async fn drain_source_below(
+  current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
   g_switch: u64,
 ) {
-  tokio::spawn(async move {
-    let sub_opt = current_track
-      .read()
-      .await
-      .get_subscription(connection_id)
-      .await;
-    let Some(sub_arc) = sub_opt else {
-      current_track
-        .read()
-        .await
-        .remove_subscription(connection_id)
-        .await;
-      subscriber
-        .subscriptions
-        .remove_subscription(&current_full_track_name)
-        .await;
-      return;
+  if g_switch == 0 {
+    return;
+  }
+  let Some(sub_arc) = current_track
+    .read()
+    .await
+    .get_subscription(connection_id)
+    .await
+  else {
+    return;
+  };
+
+  // Bound the source to Groups below G_switch.
+  sub_arc
+    .read()
+    .await
+    .subscription_state
+    .write()
+    .await
+    .end_group = g_switch - 1;
+
+  // Wait until last-sent reaches G_switch-1 (or timeout).
+  let deadline = Instant::now() + SWITCH_DRAIN_TIMEOUT;
+  loop {
+    let drained = {
+      let sub = sub_arc.read().await;
+      let state = sub.subscription_state.read().await;
+      state
+        .last_sent_max_location
+        .as_ref()
+        .map(|loc| loc.group + 1 >= g_switch)
+        .unwrap_or(false)
     };
-
-    // (1) Bound the source to Groups below G_switch.
-    if g_switch > 0 {
-      let sub = sub_arc.read().await;
-      sub.subscription_state.write().await.end_group = g_switch - 1;
+    if drained || Instant::now() >= deadline {
+      break;
     }
+    tokio::time::sleep(SWITCH_DRAIN_POLL).await;
+  }
+}
 
-    // (2) Drain barrier: wait until last-sent reaches G_switch-1 (or timeout).
-    let deadline = Instant::now() + SWITCH_DRAIN_TIMEOUT;
-    loop {
-      let drained = if g_switch == 0 {
-        true
-      } else {
-        let sub = sub_arc.read().await;
-        let state = sub.subscription_state.read().await;
-        state
-          .last_sent_max_location
-          .as_ref()
-          .map(|loc| loc.group + 1 >= g_switch)
-          .unwrap_or(false)
-      };
-      if drained || Instant::now() >= deadline {
-        break;
-      }
-      tokio::time::sleep(SWITCH_DRAIN_POLL).await;
-    }
-
-    // (3) Terminate the current subscription with PUBLISH_DONE on its Request ID.
-    {
-      let sub = sub_arc.read().await;
-      if let Err(e) = sub
-        .send_publish_done(
-          PublishDoneStatusCode::SubscriptionEnded,
-          "switched to target track",
-        )
-        .await
-      {
-        error!("switch teardown: failed to send PUBLISH_DONE: {e:?}");
-      }
-    }
-    current_track
-      .read()
+/// Terminate the source subscription after the handover (SWITCH PR #1378
+/// Close-After-Switch): send PUBLISH_DONE on its (the current) Request ID, then
+/// drop relay state.
+#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
+pub(crate) async fn terminate_source(
+  subscriber: &Arc<MOQTClient>,
+  current_track: &Arc<RwLock<Track>>,
+  current_full_track_name: &FullTrackName,
+  connection_id: usize,
+) {
+  if let Some(sub_arc) = current_track
+    .read()
+    .await
+    .get_subscription(connection_id)
+    .await
+  {
+    let sub = sub_arc.read().await;
+    if let Err(e) = sub
+      .send_publish_done(
+        PublishDoneStatusCode::SubscriptionEnded,
+        "switched to target track",
+      )
       .await
-      .remove_subscription(connection_id)
-      .await;
-    subscriber
-      .subscriptions
-      .remove_subscription(&current_full_track_name)
-      .await;
-  });
+    {
+      error!("switch teardown: failed to send PUBLISH_DONE: {e:?}");
+    }
+  }
+  current_track
+    .read()
+    .await
+    .remove_subscription(connection_id)
+    .await;
+  subscriber
+    .subscriptions
+    .remove_subscription(current_full_track_name)
+    .await;
 }

@@ -887,8 +887,8 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    send_switch_failure, send_switch_publish, spawn_drain_then_teardown,
-    spawn_switch_catchup_stream,
+    drain_source_below, send_switch_failure, send_switch_publish, spawn_switch_catchup_stream,
+    terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
   use crate::server::switch_selection::{SwitchSelection, select_switch_group};
@@ -1024,26 +1024,13 @@ async fn handle_switch_message(
     target_full_track_name, g_switch, live_edge, target_request_id
   );
 
-  // Open the target PUBLISH carrying SWITCH_TRANSITION { G_switch, live edge }.
-  if let Err(e) = send_switch_publish(
-    &client,
-    target_request_id,
-    &target_full_track_name,
-    target_alias,
-    Location::new(live_edge, 0),
-    &switch_message.subscribe_parameters,
-    SwitchTransition::new(g_switch, live_edge),
-  )
-  .await
-  {
-    error!("switch: failed to build target PUBLISH: {e:?}");
-    client.switch_in_flight.lock().await.complete(current_sub_req_id);
-    return Ok(());
-  }
-
-  // Register a live-only subscription on the target Track so objects from the
-  // live edge onward forward to the subscriber on SUBGROUP streams. The catch-up
-  // range below the live edge is delivered separately (FETCH_HEADER stream).
+  // SWITCH PR #1378 strict ordering (soft switch): drain the source Track's Objects in
+  // Groups below G_switch FIRST, then open the target PUBLISH and start catch-up
+  // + live delivery, then terminate the source. The whole sequence runs in a
+  // task so the control handler isn't blocked during the drain — which, for
+  // behind-live switches, is typically immediate (the source has already
+  // delivered past G_switch) and only takes time when the source itself lags
+  // under congestion.
   let live_sub = Subscribe::new_latest_object(
     target_request_id,
     switch_message.track_namespace.clone(),
@@ -1053,40 +1040,63 @@ async fn handle_switch_message(
     true,
     switch_message.subscribe_parameters.clone(),
   );
-  {
-    let target_track = target_track_arc.read().await;
-    add_subscription(live_sub.clone(), &target_track, client.clone(), false).await;
-  }
-  {
-    let mut requests = client.subscribe_requests.write().await;
-    requests.insert(
+  let target_parameters = switch_message.subscribe_parameters.clone();
+  let connection_id = context.connection_id;
+  tokio::spawn(async move {
+    // (1) Drain the source below G_switch before any target Object is sent.
+    drain_source_below(&current_track_arc, connection_id, g_switch).await;
+
+    // (2) Open the target PUBLISH carrying SWITCH_TRANSITION { G_switch, live edge }.
+    if let Err(e) = send_switch_publish(
+      &client,
       target_request_id,
-      SubscribeRequest::new(target_request_id, context.connection_id, live_sub, None),
+      &target_full_track_name,
+      target_alias,
+      Location::new(live_edge, 0),
+      &target_parameters,
+      SwitchTransition::new(g_switch, live_edge),
+    )
+    .await
+    {
+      error!("switch: failed to build target PUBLISH: {e:?}");
+      client.switch_in_flight.lock().await.complete(current_sub_req_id);
+      return;
+    }
+
+    // (3) Live-only subscription on the target Track (objects from the live edge
+    // onward, on SUBGROUP streams) + relay-side request mapping.
+    {
+      let target_track = target_track_arc.read().await;
+      add_subscription(live_sub.clone(), &target_track, client.clone(), false).await;
+    }
+    client.subscribe_requests.write().await.insert(
+      target_request_id,
+      SubscribeRequest::new(target_request_id, connection_id, live_sub, None),
     );
-  }
 
-  // Deliver the catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
-  spawn_switch_catchup_stream(
-    client.clone(),
-    target_track_arc.clone(),
-    target_request_id,
-    g_switch,
-    live_edge,
-  );
+    // (4) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
+    spawn_switch_catchup_stream(
+      client.clone(),
+      target_track_arc.clone(),
+      target_request_id,
+      g_switch,
+      live_edge,
+    );
 
-  // Close-After-Switch: drain the source subscription up to G_switch (delivering
-  // its Groups below the switch point), then terminate it with PUBLISH_DONE on
-  // the current Request ID and drop relay state. Runs in a task so the control
-  // handler is not blocked while the source drains.
-  spawn_drain_then_teardown(
-    client.clone(),
-    current_track_arc.clone(),
-    current_full_track_name,
-    context.connection_id,
-    g_switch,
-  );
+    // (5) Close-After-Switch: terminate the source with PUBLISH_DONE on the
+    // current Request ID and drop relay state.
+    terminate_source(
+      &client,
+      &current_track_arc,
+      &current_full_track_name,
+      connection_id,
+    )
+    .await;
 
-  client.switch_in_flight.lock().await.complete(current_sub_req_id);
+    // (6) Release the in-flight guard.
+    client.switch_in_flight.lock().await.complete(current_sub_req_id);
+  });
+
   Ok(())
 }
 
