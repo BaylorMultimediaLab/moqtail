@@ -109,6 +109,17 @@ pub(crate) async fn send_switch_failure(
   track_alias: u64,
   failure: SwitchFailure,
 ) {
+  // SWITCH PR #1378: "The SWITCH_TRANSITION parameter MUST appear in a PUBLISH
+  // opened by a Relay in response to a SWITCH message" — the failure PUBLISH
+  // is such a PUBLISH. Its presence is also what lets the subscriber classify
+  // this PUBLISH as switch-related (and consume the pending switch) rather
+  // than treat it as an unsolicited peer publish. No seam was selected, so
+  // carry {0, 0} as placeholders; the subscriber keys off the immediately
+  // following PUBLISH_DONE status code, not these values.
+  let parameters = SwitchTransition::new(0, 0)
+    .to_key_value_pair()
+    .map(|p| vec![p])
+    .unwrap_or_default();
   let publish = Publish::new(
     publish_request_id,
     target.namespace.clone(),
@@ -118,7 +129,7 @@ pub(crate) async fn send_switch_failure(
     0, // content_exists: no data will follow a failed switch
     None,
     0, // forward
-    vec![],
+    parameters,
   );
   subscriber
     .queue_message(ControlMessage::Publish(Box::new(publish)))

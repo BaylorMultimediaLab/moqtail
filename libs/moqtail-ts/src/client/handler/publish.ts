@@ -13,14 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { FilterType, GroupOrder, Publish, PublishOk } from '../../model/control'
+import { Publish } from '../../model/control'
 import { ControlMessageHandler } from './handler'
-import { MoqtObject } from '../../model/data' // Make sure to import MoqtObject
-import { VersionSpecificParameterType } from '../../model/parameter/constant'
+import { MoqtObject } from '../../model/data'
+import { SwitchTransition } from '../../model/parameter/switch_transition'
 import { ProtocolViolationError } from '../../model/error/error'
 
-export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg) => {
-  // 1. Create a stream to receive the pushed objects natively
+/**
+ * Register the receiver-side plumbing for a PUBLISH-delivered track: the
+ * pushed object stream, alias/name routing for incoming data streams, and —
+ * per SWITCH PR #1378 — the mapping from the PUBLISH's own request id to the track
+ * alias so a relay-initiated catch-up stream (FETCH_HEADER carrying the
+ * PUBLISH's request id, not a client-issued FetchRequest) routes into the
+ * same receiver as the live SUBGROUP objects.
+ */
+function registerPublishReceiver(client: Parameters<ControlMessageHandler<Publish>>[0], msg: Publish) {
   let streamController!: ReadableStreamDefaultController<MoqtObject>
   const stream = new ReadableStream<MoqtObject>({
     start(c) {
@@ -30,50 +37,87 @@ export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg
 
   const localPseudoRequestId = client.allocatePseudoRequestId()
 
-  // 2. Set up the expectation in the client BEFORE sending PublishOk
+  
   client.requestIdMap.addMapping(localPseudoRequestId, msg.fullTrackName)
   client.subscriptionAliasMap.set(localPseudoRequestId, msg.trackAlias)
   client.aliasFullTrackNameMap.set(msg.trackAlias, msg.fullTrackName)
-  // Per SWITCH PR #1378 a relay-initiated catch-up stream begins with a
-  // FETCH_HEADER carrying THIS PUBLISH's request id (not a client-issued
-  // FetchRequest). Map it to the same track alias so #handleRecvStreams can
-  // route its FetchObjects into this receiver.
+  
   client.subscriptionAliasMap.set(msg.requestId, msg.trackAlias)
 
-  // This object mimics a SubscribeRequest so #handleRecvStreams can use it identically
+  // This object mimics a SubscribeRequest so #handleRecvStreams can use it
+  // identically. `pseudoRequestId` is kept so unsubscribe() can clean up the
+  // pseudo-id mappings alongside the PUBLISH's own request id.
   const receiver = {
-    requestId: localPseudoRequestId,
+    requestId: msg.requestId,
+    pseudoRequestId: localPseudoRequestId,
     streamsAccepted: 0,
     largestLocation: undefined,
     controller: streamController,
   }
-
-  // 3. Register the receiver map so data streams don't trigger ProtocolViolationError
   client.subscriptions.set(msg.trackAlias, receiver)
+  return stream
+}
 
-  // 4. If this PUBLISH acknowledges an in-flight SWITCH for this track (SWITCH PR #1378),
-  // complete client.switch() with the pushed stream. The relay allocated this
-  // PUBLISH's request id; the player adopts it as the new subscription id.
-  // Otherwise surface the PUBLISH to the application as an unsolicited peer publish.
+export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg) => {
   const switchKey = msg.fullTrackName.toString()
+  const switchTransition = SwitchTransition.fromParameters(msg.parameters)
+
+  // ---------------------------------------------------------------------
+  // Not switch-related: an ordinary unsolicited peer publish. Per SWITCH PR #1378
+  // only a PUBLISH carrying SWITCH_TRANSITION answers a SWITCH, so a pending
+  // switch resolver must NOT be consumed here — this PUBLISH goes to the
+  // application untouched, and the switch keeps waiting for its own answer.
+  // ---------------------------------------------------------------------
+  if (!switchTransition) {
+    const stream = registerPublishReceiver(client, msg)
+    if (client.onPeerPublish) {
+      client.onPeerPublish(msg, stream)
+    }
+    return
+  }
+
+  // ---------------------------------------------------------------------
+  // Switch-related (SWITCH PR #1378): a PUBLISH opened by the relay in response to
+  // a SWITCH. Resolve the oldest pending switch for this target track (FIFO
+  // in send order — the PUBLISH alone cannot identify which source
+  // subscription it replaces).
+  // ---------------------------------------------------------------------
   const queue = client.pendingSwitches.get(switchKey)
   const resolver = queue?.shift()
   if (queue && queue.length === 0) client.pendingSwitches.delete(switchKey)
 
-  const hasSwitchTransition = msg.parameters.some(
-    (p) => p.typeValue === BigInt(VersionSpecificParameterType.SwitchTransition),
-  )
-
-  if (resolver) {
-    resolver({ requestId: msg.requestId, stream, largestLocation: msg.largestLocation })
-  } else if (hasSwitchTransition) {
-    // PR #1378: a PUBLISH carrying SWITCH_TRANSITION with no pending SWITCH for
-    // its track is a protocol violation — it is not an ordinary peer publish.
+  if (!resolver) {
+    // SWITCH PR #1378: "If a PUBLISH contains a SWITCH_TRANSITION parameter but no
+    // pending SWITCH exists for that target Track, the receiver MUST close
+    // the session with PROTOCOL_VIOLATION." Throwing propagates to the
+    // control-message loop, which disconnects the session.
     throw new ProtocolViolationError(
       'handlerPublish',
       `PUBLISH for ${switchKey} carries SWITCH_TRANSITION but no SWITCH is pending`,
     )
-  } else if (client.onPeerPublish) {
-    client.onPeerPublish(msg, stream)
   }
+
+  if (msg.contentExists === 0) {
+    // Failure PUBLISH: the relay could not perform the switch, opened this
+    // PUBLISH per the always-PUBLISH failure discipline, and will immediately
+    // follow with PUBLISH_DONE carrying the status code on the same control
+    // stream (ordering guaranteed). Park the resolver keyed by this PUBLISH's
+    // request id; handlerPublishDone completes it with a SwitchFailure. No
+    // data follows, so no receiver/alias registration — the relay left the
+    // CURRENT subscription untouched.
+    client.pendingSwitchFailures.set(msg.requestId, resolver)
+    return
+  }
+
+  // Success PUBLISH: register the receiver BEFORE resolving so that early
+  // data streams (SUBGROUP or the catch-up FETCH_HEADER stream) racing the
+  // control message find their route, then complete client.switch() with the
+  // pushed stream, the relay-allocated request id, and the decoded seam.
+  const stream = registerPublishReceiver(client, msg)
+  resolver({
+    requestId: msg.requestId,
+    stream,
+    largestLocation: msg.largestLocation,
+    switchTransition,
+  })
 }

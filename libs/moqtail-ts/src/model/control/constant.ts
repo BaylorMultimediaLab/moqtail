@@ -469,6 +469,19 @@ export enum PublishDoneStatusCode {
   GoingAway = 0x4,
   Expired = 0x5,
   TooFarBehind = 0x6,
+  MalformedTrack = 0x7,
+  // SWITCH failure codes (draft-ietf-moq-transport PR #1378). A relay that
+  // cannot complete a SWITCH still opens the target PUBLISH and reports the
+  // outcome here, leaving the current subscription untouched. Without these,
+  // deserializing a failure PUBLISH_DONE throws and tears the session down.
+  /** The relay could not identify G_switch within its T_switch budget. */
+  Timeout = 0x8,
+  /** The target Track is not available. */
+  DoesNotExist = 0x9,
+  /** The relay does not support the SWITCH message. */
+  NotSupported = 0xa,
+  /** A prior SWITCH for the same Current Subscribe Request ID is in flight. */
+  ExcessiveLoad = 0xb,
 }
 
 /**
@@ -493,6 +506,16 @@ export function publishDoneStatusCodeFromBigInt(v: bigint): PublishDoneStatusCod
       return PublishDoneStatusCode.Expired
     case 0x6n:
       return PublishDoneStatusCode.TooFarBehind
+    case 0x7n:
+      return PublishDoneStatusCode.MalformedTrack
+    case 0x8n:
+      return PublishDoneStatusCode.Timeout
+    case 0x9n:
+      return PublishDoneStatusCode.DoesNotExist
+    case 0xan:
+      return PublishDoneStatusCode.NotSupported
+    case 0xbn:
+      return PublishDoneStatusCode.ExcessiveLoad
     default:
       throw new Error(`Invalid PublishDoneStatusCode: ${v}`)
   }

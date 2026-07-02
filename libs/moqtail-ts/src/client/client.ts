@@ -41,6 +41,7 @@ import {
   SubscribeNamespaceOk,
   Switch,
   PublishDone,
+  PublishDoneStatusCode,
 } from '../model/control'
 import {
   DatagramObject,
@@ -85,6 +86,8 @@ import {
   MOQtailClientOptions,
   SwitchOptions,
   SubscribeResult,
+  SwitchSuccess,
+  SwitchFailure,
 } from './types'
 import { SendDatagramStream } from './datagram_stream'
 
@@ -187,13 +190,29 @@ export class MOQtailClient {
   /**
    * In-flight SWITCH operations keyed by target {@link FullTrackName.toString},
    * each a FIFO queue of resolvers. Per SWITCH PR #1378 a SWITCH is acknowledged
-   * by the relay opening a PUBLISH for the target track (not a SubscribeOk). The
-   * PUBLISH handler shifts the oldest resolver for that track and completes it
-   * with the pushed object stream. The queue tolerates multiple concurrent
-   * switches to the same target track (the PUBLISH alone cannot identify which
-   * source subscription it replaces), resolving them in send order.
+   * by the relay opening a PUBLISH carrying SWITCH_TRANSITION for the target
+   * track (not a SubscribeOk). The PUBLISH handler shifts the oldest resolver
+   * for that track and completes it with the pushed object stream
+   * ({@link SwitchSuccess}) or — via the parked-failure path below — with a
+   * {@link SwitchFailure}. The queue tolerates multiple concurrent switches to
+   * the same target track (the PUBLISH alone cannot identify which source
+   * subscription it replaces), resolving them in send order.
    */
-  readonly pendingSwitches: Map<string, Array<(result: SubscribeResult) => void>> = new Map()
+  readonly pendingSwitches: Map<string, Array<(result: SwitchSuccess | SwitchFailure) => void>> = new Map()
+  /**
+   * Switch resolvers parked by a *failure* PUBLISH (SWITCH_TRANSITION present,
+   * content_exists = 0), keyed by that PUBLISH's request id. The relay
+   * immediately follows such a PUBLISH with PUBLISH_DONE carrying the failure
+   * status code; handlerPublishDone completes the resolver with a
+   * {@link SwitchFailure} built from it.
+   */
+  readonly pendingSwitchFailures: Map<bigint, (result: SwitchFailure) => void> = new Map()
+  /**
+   * Client-side deadline for the relay to answer a SWITCH with a PUBLISH.
+   * Sized at 2x the relay's DEFAULT_T_SWITCH (3000 ms) so a relay operating
+   * within its own budget always wins the race. See {@link MOQtailClient.switch}.
+   */
+  static readonly SWITCH_RESPONSE_TIMEOUT_MS = 6000
   /** Underlying WebTransport session (set after successful construction in MOQtailClient.new). */
   webTransport!: WebTransport
   /** Validated ServerSetup message captured during handshake (protocol parameters negotiated). */
@@ -1066,6 +1085,30 @@ export class MOQtailClient {
           await this.controlStream.send(new Unsubscribe(requestId))
           subscription.unsubscribe()
         }
+      } else if (this.subscriptionAliasMap.has(requestId)) {
+        // PUBLISH-originated subscription (unsolicited peer publish, or the
+        // post-switch subscription of SWITCH PR #1378). It was never registered in
+        // `requests` — the relay pushed it via PUBLISH — but the relay tracks
+        // it under this PUBLISH's request id, so an UNSUBSCRIBE frame with
+        // that id tears it down relay-side. Locally, close the pushed stream
+        // and drop the routing entries (including the pseudo-id ones the
+        // PUBLISH handler registered).
+        const trackAlias = this.subscriptionAliasMap.get(requestId)!
+        await this.controlStream.send(new Unsubscribe(requestId))
+
+        const receiver = this.subscriptions.get(trackAlias)
+        try {
+          receiver?.controller?.close()
+        } catch {
+          // Stream already closed/errored — cleanup proceeds regardless.
+        }
+        this.subscriptions.delete(trackAlias)
+        this.aliasFullTrackNameMap.delete(trackAlias)
+        this.subscriptionAliasMap.delete(requestId)
+        if (receiver?.pseudoRequestId !== undefined) {
+          this.subscriptionAliasMap.delete(receiver.pseudoRequestId)
+          this.requestIdMap.removeMappingByRequestId(receiver.pseudoRequestId)
+        }
       }
       // Q: Throw? Idempotent?
     } catch (error) {
@@ -1179,25 +1222,76 @@ export class MOQtailClient {
    *
    * @example Switch to a different track
    * ```ts
-   * await client.switch({ subscriptionRequestId, fullTrackName: newTrackName });
+   * const r = await client.switch({ subscriptionRequestId, fullTrackName: newTrackName });
+   * if (r instanceof SwitchFailure) {
+   *   // relay could not switch; current subscription is untouched
+   * } else {
+   *   // adopt the relay-allocated id for the next SWITCH / unsubscribe
+   *   currentRequestId = r.requestId;
+   *   // r.switchTransition gives the seam: catch-up covers
+   *   // [switchingGroupId, liveEdgeGroupId)
+   * }
    * ```
    */
-  async switch(args: SwitchOptions): Promise<SubscribeError | SubscribeResult> {
+  async switch(args: SwitchOptions): Promise<SwitchSuccess | SwitchFailure> {
     this.#ensureActive()
     const { fullTrackName, subscriptionRequestId } = args
     const parameters = args.parameters ?? new VersionSpecificParameters()
     const minimumSwitchingGroupId = args.minimumSwitchingGroupId ?? 0n
     const key = fullTrackName.toString()
+
+    // Remove exactly this call's resolver from the FIFO (other concurrent
+    // switches to the same target track keep theirs).
+    let ownResolver: ((result: SwitchSuccess | SwitchFailure) => void) | undefined
+    const removeOwnResolver = () => {
+      if (!ownResolver) return
+      const queue = this.pendingSwitches.get(key)
+      if (!queue) return
+      const i = queue.indexOf(ownResolver)
+      if (i !== -1) queue.splice(i, 1)
+      if (queue.length === 0) this.pendingSwitches.delete(key)
+    }
+
     try {
       // Per SWITCH PR #1378 the subscriber allocates no request id and receives no
-      // SubscribeOk. The relay acknowledges by opening a PUBLISH for the target
-      // track; the PUBLISH handler (handler/publish.ts) resolves this promise
-      // with the pushed object stream. `subscriptionRequestId` is the relay's
-      // Request ID for the subscription being replaced (the relay validates it
-      // and tears it down — Close-After-Switch).
-      const result = new Promise<SubscribeResult>((resolve) => {
+      // SubscribeOk. The relay acknowledges by opening a PUBLISH carrying
+      // SWITCH_TRANSITION for the target track; the PUBLISH handler
+      // (handler/publish.ts) resolves this promise with the pushed object
+      // stream (success) or, together with handler/publish_done.ts, a
+      // SwitchFailure carrying the relay's PUBLISH_DONE status (failure).
+      // `subscriptionRequestId` is the relay's Request ID for the subscription
+      // being replaced (the relay validates it and tears it down on success —
+      // Close-After-Switch; on failure it is left untouched).
+      const result = new Promise<SwitchSuccess | SwitchFailure>((resolve) => {
+        let settled = false
+        // Safety net: the relay answers every post-validation SWITCH with a
+        // PUBLISH within its T_switch budget, but a pre-validation failure
+        // (unknown Current Subscribe Request ID) is answered with nothing at
+        // all per the draft, so without a local deadline this promise could
+        // hang forever. Sized at 2x the relay's DEFAULT_T_SWITCH (3000 ms).
+        // Note: if a success PUBLISH arrives after this fires, its
+        // SWITCH_TRANSITION finds no pending SWITCH and the stray check
+        // closes the session with PROTOCOL_VIOLATION — client and relay
+        // genuinely disagree about subscription state at that point.
+        const timer = setTimeout(() => {
+          if (settled) return
+          settled = true
+          removeOwnResolver()
+          resolve(
+            new SwitchFailure(
+              PublishDoneStatusCode.Timeout,
+              `no relay response to SWITCH within ${MOQtailClient.SWITCH_RESPONSE_TIMEOUT_MS} ms`,
+            ),
+          )
+        }, MOQtailClient.SWITCH_RESPONSE_TIMEOUT_MS)
+        ownResolver = (r: SwitchSuccess | SwitchFailure) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve(r)
+        }
         const queue = this.pendingSwitches.get(key) ?? []
-        queue.push(resolve)
+        queue.push(ownResolver)
         this.pendingSwitches.set(key, queue)
       })
 
@@ -1206,7 +1300,7 @@ export class MOQtailClient {
 
       return await result
     } catch (error) {
-      this.pendingSwitches.delete(key)
+      removeOwnResolver()
       await this.disconnect(
         new InternalError('MOQtailClient.switch', error instanceof Error ? error.message : String(error)),
       )

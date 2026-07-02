@@ -26,7 +26,7 @@ import {
   SubscribeError,
   Tuple,
 } from 'moqtail';
-import { MOQtailClient } from 'moqtail/client';
+import { MOQtailClient, SwitchFailure } from 'moqtail/client';
 import { CMSFCatalog, VersionSpecificParameters } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
@@ -135,6 +135,14 @@ interface MOQStreamStruct {
   tracker: GoodputTracker;
   lastGroupId: bigint;
   pendingSwitch: PendingSwitch | null;
+  /**
+   * True from the moment a SWITCH is sent until the relay's PUBLISH (success
+   * or failure) resolves it. Prevents a second SWITCH from referencing a
+   * Current Subscribe Request ID that is mid-teardown (SWITCH PR #1378 allows only
+   * one in-flight SWITCH per subscription; the relay rejects extras with
+   * EXCESSIVE_LOAD).
+   */
+  switchInFlight?: boolean;
   /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
   /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
@@ -1157,38 +1165,59 @@ export class Player {
     }
     this.#lastSwitchHadTimeMapMiss = timeMapMiss;
 
-    // Pre-allocate the new request id and update videoStruct.requestId BEFORE
-    // awaiting client.switch(). If a second switchTrack call (ABR tick or
-    // force_switch) starts before this one completes, it will read the
-    // already-incremented requestId and pass it as subscriptionRequestId in
-    // its own SWITCH — preventing the stale-id chain that the relay rejects
-    // as ProtocolViolation and tears the WebTransport down. Concurrency on
-    // the wire is preserved; only the id-state read is moved to before the
-    // await.
+    // Per SWITCH PR #1378 the subscriber does NOT allocate a Request ID for a
+    // SWITCH: the relay allocates the Request ID of the PUBLISH it opens for
+    // the target track, and that id is what the relay registers the new
+    // subscription under. The player must therefore adopt `result.requestId`
+    // (relay-allocated) on success — a locally pre-allocated id would be
+    // unknown to the relay and every subsequent SWITCH referencing it as the
+    // Current Subscribe Request ID would fail validation.
+    //
+    // videoStruct.requestId is left untouched until the relay's PUBLISH
+    // arrives, so a concurrent switchTrack (force_switch racing the ABR tick)
+    // sends the same still-established Current Subscribe Request ID; the relay
+    // serializes it via its single-in-flight guard (EXCESSIVE_LOAD), which is
+    // the discipline PR #1378 prescribes. The switchInFlight flag below keeps
+    // the player from issuing that duplicate in the first place.
+    if (videoStruct.switchInFlight) {
+      logger.warn('media', `switchTrack: SWITCH already in flight; ignoring request for ${trackName}`);
+      return;
+    }
     const subscriptionRequestId = videoStruct.requestId;
-    const newRequestId = this.client.allocateNextRequestId();
-    videoStruct.requestId = newRequestId;
+    videoStruct.switchInFlight = true;
 
     try {
       const result = await this.client.switch({
-        requestId: newRequestId,
         fullTrackName,
         subscriptionRequestId,
         minimumSwitchingGroupId: BigInt(minimumSwitchingGroupId),
       });
 
-      if (result instanceof SubscribeError) {
+      if (result instanceof SwitchFailure) {
+        // Relay could not perform the switch (TIMEOUT, EXCESSIVE_LOAD,
+        // DOES_NOT_EXIST, ... — or the client-side response timeout). Per
+        // SWITCH PR #1378 the relay left the CURRENT subscription untouched, and
+        // videoStruct.requestId was never overwritten, so the next attempt
+        // automatically references the still-active subscription.
         logger.error(
           'media',
-          `switchTrack: SWITCH rejected for ${trackName}:`,
-          result.errorReason.phrase,
+          `switchTrack: SWITCH failed for ${trackName}: status=${result.statusCode} ${result.reasonPhrase}`,
         );
-        // Roll back the optimistic id update so the next switchTrack attempt
-        // references the still-active subscription rather than the failed one.
-        videoStruct.requestId = subscriptionRequestId;
+        // videoStruct.requestId was never overwritten, so the next attempt
+        // automatically references the still-active subscription.
         this.#options.onTrackSwitched?.(videoStruct.trackName);
         return;
       }
+
+      // Success: adopt the relay-allocated PUBLISH request id. This is the id
+      // the relay registered the post-switch subscription under, and the id
+      // the NEXT SWITCH must reference as its Current Subscribe Request ID.
+      videoStruct.requestId = result.requestId;
+      logger.info(
+        'media',
+        `switchTrack: seam at group ${result.switchTransition.switchingGroupId}, ` +
+          `catch-up [${result.switchTransition.switchingGroupId}, ${result.switchTransition.liveEdgeGroupId})`,
+      );
 
       // Arm the write handler for init segment re-injection at the next group
       // boundary. The onTrackSwitched callback (which releases the ABR switching
@@ -1210,9 +1239,12 @@ export class Player {
       videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
-      // Roll back the optimistic id update on unexpected failure too.
-      videoStruct.requestId = subscriptionRequestId;
+      // videoStruct.requestId still holds the pre-switch id; nothing to roll
+      // back. (client.switch() disconnects the session on throw, so recovery
+      // here is best-effort logging + guard release.)
       this.#options.onTrackSwitched?.(videoStruct.trackName);
+    } finally {
+      videoStruct.switchInFlight = false;
     }
   }
 

@@ -26,6 +26,8 @@ import {
   DatagramObject,
   DatagramStatus,
   MoqtObject,
+  SwitchTransition,
+  PublishDoneStatusCode,
 } from '@/model'
 import { PublishNamespaceRequest } from './request/publish_namespace'
 import { FetchRequest } from './request/fetch'
@@ -48,6 +50,37 @@ export type SubscribeResult = {
   stream: ReadableStream<MoqtObject>
   /** Relay's `largest_location` at SubscribeOk time, or `undefined` if no live edge known. */
   largestLocation?: Location | undefined
+}
+
+/**
+ * Successful SWITCH outcome (SWITCH PR #1378): resolved from the relay's PUBLISH for
+ * the target track. `requestId` is the relay-allocated PUBLISH Request ID —
+ * the id the relay registered the post-switch subscription under, and the id
+ * a subsequent SWITCH must reference as its Current Subscribe Request ID.
+ */
+export type SwitchSuccess = SubscribeResult & {
+  /**
+   * Decoded SWITCH_TRANSITION: the catch-up range
+   * `[switchingGroupId, liveEdgeGroupId)` arrives on a dedicated FETCH_HEADER
+   * stream (routed into `stream` alongside live objects); live objects follow
+   * from the live edge on SUBGROUP streams. `switchingGroupId` is also the
+   * seam for buffer replacement — buffered old-track groups at or above it
+   * should be discarded.
+   */
+  switchTransition: SwitchTransition
+}
+
+/**
+ * Failed SWITCH outcome (SWITCH PR #1378 failure discipline): the relay opened the
+ * target PUBLISH and immediately closed it with PUBLISH_DONE carrying
+ * `statusCode`. The CURRENT subscription was left untouched by the relay, so
+ * the caller should keep using its existing request id.
+ */
+export class SwitchFailure {
+  constructor(
+    public readonly statusCode: PublishDoneStatusCode,
+    public readonly reasonPhrase: string,
+  ) {}
 }
 /**
  * Discriminated union of every in‑flight MOQ‑tail control request tracked by the {@link MOQtailClient}.
@@ -244,15 +277,6 @@ export type SwitchOptions = {
    * at the live edge (naive switching).
    */
   minimumSwitchingGroupId?: bigint
-  /**
-   * Optional pre-allocated request id the client uses for its own local
-   * subscription-id bookkeeping (NOT sent on the wire - SWITCH PR #1378 has the relay
-   * allocate the target PUBLISH's Request ID). Pre-allocating lets the caller
-   * update its own subscription-id state synchronously *before* awaiting, so
-   * concurrent `switch()` calls each pass a fresh `subscriptionRequestId`.
-   * Allocate via {@link MOQtailClient.allocateNextRequestId}.
-   */
-  requestId?: bigint
 }
 
 /**
