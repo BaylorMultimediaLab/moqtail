@@ -203,7 +203,7 @@ pub(crate) fn spawn_switch_catchup_stream(
             error!("switch catch-up: write failed on {stream_id}: {e:?}");
             break;
           }
-          object_count += 1;
+          object_count = 1;
         }
         CacheConsumeEvent::EndLocation(_) | CacheConsumeEvent::NoObject => {}
       }
@@ -221,6 +221,22 @@ pub(crate) fn spawn_switch_catchup_stream(
   });
 }
 
+/// Outcome of draining the source Track below the switch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
+pub(crate) enum DrainOutcome {
+  /// All source Objects in Groups below `g_switch` were delivered; the source
+  /// is now bounded at the seam and the target PUBLISH may open.
+  Drained,
+  /// The drain did not finish within `SWITCH_DRAIN_TIMEOUT`. The source is
+  /// left completely unchanged; the caller aborts with TIMEOUT.
+  TimedOut,
+  /// An UNSUBSCRIBE for the Current Subscribe Request ID arrived mid-drain
+  /// (SWITCH PR #1378 abandon rule). The source is left unchanged; the caller
+  /// must answer with PUBLISH  PUBLISH_DONE(SUBSCRIPTION_ENDED).
+  Abandoned,
+}
+
 /// Drain the source subscription up to the switch boundary (SWITCH PR #1378 strict
 /// ordering): wait — bounded by `SWITCH_DRAIN_TIMEOUT` — until source delivery
 /// has reached `g_switch - 1`. The caller awaits this BEFORE opening the target
@@ -228,20 +244,27 @@ pub(crate) fn spawn_switch_catchup_stream(
 /// first (no concurrent source/target transmission across the seam, even when
 /// the source is itself lagging under congestion).
 ///
-/// Returns `true` if the source drained in time. On success — and ONLY on
-/// success — the source is bounded to Groups below `g_switch` so it cannot then
-/// forward across the seam. Returns `false` on timeout WITHOUT mutating the
-/// source, so the caller can abort the switch and leave the current subscription
-/// unchanged (rather than terminating it and truncating undelivered source
-/// Objects below `g_switch`).
+/// Returns [`DrainOutcome::Drained`] if the source drained in time. On success
+/// — and ONLY on success — the source is bounded to Groups below `g_switch` so
+/// it cannot then forward across the seam. Returns [`DrainOutcome::TimedOut`]
+/// on timeout WITHOUT mutating the source, so the caller can abort the switch
+/// and leave the current subscription unchanged (rather than terminating it
+/// and truncating undelivered source Objects below `g_switch`). Each poll also
+/// checks the subscriber's abandon mark and returns
+/// [`DrainOutcome::Abandoned`] as soon as an UNSUBSCRIBE for
+/// `current_sub_req_id` abandons the switch — without this the loop would spin
+/// to the deadline (a removed subscription's last-sent stops advancing) and
+/// misreport the UNSUBSCRIBE race as TIMEOUT.
 #[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) async fn drain_source_below(
+  subscriber: &Arc<MOQTClient>,
   current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
-  g_switch: u64,
-) -> bool {
+  g_switch: u64,  
+  current_sub_req_id: u64,
+) -> DrainOutcome {
   if g_switch == 0 {
-    return true;
+    return DrainOutcome::Drained;
   }
   let Some(sub_arc) = current_track
     .read()
@@ -250,13 +273,24 @@ pub(crate) async fn drain_source_below(
     .await
   else {
     // No source subscription to drain; nothing to truncate.
-    return true;
+    return DrainOutcome::Drained;
   };
 
-  // Wait until last-sent reaches G_switch-1 (or timeout). The source is NOT
-  // bounded during the wait so that a timeout leaves it completely unchanged.
+  // Wait until last-sent reaches G_switch-1 (or timeout/abandon). The source
+  // is NOT bounded during the wait so that a timeout leaves it completely
+  // unchanged.
   let deadline = Instant::now() + SWITCH_DRAIN_TIMEOUT;
   loop {
+    // SWITCH PR #1378 UNSUBSCRIBE race: exit as soon as the switch is abandoned so
+    // the caller can emit the SUBSCRIPTION_ENDED failure PUBLISH promptly.
+    if subscriber
+      .switch_in_flight
+      .lock()
+      .await
+      .is_abandoned(current_sub_req_id)
+    {
+      return DrainOutcome::Abandoned;
+    }
     let drained = {
       let sub = sub_arc.read().await;
       let state = sub.subscription_state.read().await;
@@ -276,10 +310,10 @@ pub(crate) async fn drain_source_below(
         .write()
         .await
         .end_group = g_switch - 1;
-      return true;
+      return DrainOutcome::Drained;
     }
     if Instant::now() >= deadline {
-      return false;
+      return DrainOutcome::TimedOut;
     }
     tokio::time::sleep(SWITCH_DRAIN_POLL).await;
   }

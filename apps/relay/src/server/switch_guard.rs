@@ -34,7 +34,7 @@
 //! subscription, the relay "MUST NOT open a PUBLISH or modify state". That
 //! gate is handled in the switch handler before anything here is consulted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use moqtail::model::control::constant::PublishDoneStatusCode;
@@ -57,7 +57,13 @@ pub(crate) enum AdmitResult {
 }
 
 /// Tracks, per Current Subscribe Request ID, the deadline of an in-flight
-/// SWITCH. Time is injected (`now`) rather than read from the clock so the
+/// SWITCH, plus the SWITCH PR #1378 UNSUBSCRIBE-race state: whether the switch was
+/// abandoned by an UNSUBSCRIBE before its target PUBLISH was opened, and
+/// whether the target PUBLISH has been opened (after which an UNSUBSCRIBE is
+/// ordinary teardown, not a switch abandon). `abandon()` and
+/// `mark_published()` are check-and-set on the same struct, so callers that
+/// serialize on the surrounding mutex get an atomic race decision: exactly one
+/// side wins. Time is injected (`now`) rather than read from the clock so the
 /// logic stays pure and unit-testable; the handler passes `Instant::now()`.
 #[derive(Debug, Default)]
 #[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
@@ -65,6 +71,13 @@ pub(crate) struct SwitchInFlight {
   /// Current Subscribe Request ID -> instant at which the in-flight switch
   /// expires and its slot may be reclaimed.
   deadlines: HashMap<u64, Instant>,
+  /// In-flight switches abandoned by an UNSUBSCRIBE for the Current Subscribe
+  /// Request ID arriving before the target PUBLISH was opened (SWITCH PR #1378:
+  /// the relay must answer with PUBLISH  PUBLISH_DONE(SUBSCRIPTION_ENDED)).
+  abandoned: HashSet<u64>,
+  /// In-flight switches whose target PUBLISH has been opened; too late to
+  /// abandon.
+  published: HashSet<u64>,
 }
 
 #[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
@@ -72,13 +85,16 @@ impl SwitchInFlight {
   pub fn new() -> Self {
     Self {
       deadlines: HashMap::new(),
+      abandoned: HashSet::new(),
+      published: HashSet::new(),
     }
   }
 
   /// Try to admit a SWITCH for `sub_request_id`. Admits when there is no
   /// in-flight entry, or the prior entry's deadline has already passed (the
   /// previous switch timed out). On admission a fresh deadline at
-  /// `now + t_switch` is recorded.
+  /// `now  t_switch` is recorded and any stale abandon/publish state from an
+  /// expired prior switch is cleared.
   pub fn try_admit(
     &mut self,
     sub_request_id: u64,
@@ -89,15 +105,54 @@ impl SwitchInFlight {
       Some(&deadline) if now < deadline => AdmitResult::Rejected,
       _ => {
         self.deadlines.insert(sub_request_id, now + t_switch);
+        self.abandoned.remove(&sub_request_id);
+        self.published.remove(&sub_request_id);
         AdmitResult::Admitted
       }
     }
+  }
+
+  /// SWITCH PR #1378 UNSUBSCRIBE race, subscriber side of the mutex: mark the
+  /// in-flight switch for `sub_request_id` abandoned. Returns `true` iff a
+  /// non-expired switch is in flight AND its target PUBLISH has not been
+  /// opened yet — i.e. the UNSUBSCRIBE won the race and the switch task must
+  /// answer with PUBLISH  PUBLISH_DONE(SUBSCRIPTION_ENDED). Returns `false`
+  /// when there is nothing to abandon (no switch in flight, already expired,
+  /// or the PUBLISH already opened — ordinary unsubscribe semantics apply).
+  pub fn abandon(&mut self, sub_request_id: u64, now: Instant) -> bool {
+    if !self.is_in_flight(sub_request_id, now) || self.published.contains(&sub_request_id) {
+      return false;
+    }
+    self.abandoned.insert(sub_request_id);
+    true
+  }
+
+  /// Whether the in-flight switch for this subscription has been abandoned by
+  /// an UNSUBSCRIBE. Polled by the drain loop for early exit.
+  pub fn is_abandoned(&self, sub_request_id: u64) -> bool {
+    self.abandoned.contains(&sub_request_id)
+  }
+
+  /// SWITCH PR #1378 UNSUBSCRIBE race, switch-task side of the mutex: atomically
+  /// claim the right to open the target PUBLISH. Returns `false` if an
+  /// UNSUBSCRIBE already abandoned this switch (the caller must emit the
+  /// SUBSCRIPTION_ENDED failure PUBLISH instead); returns `true` and records
+  /// the PUBLISH as opened otherwise (after which `abandon()` returns
+  /// `false`).
+  pub fn mark_published(&mut self, sub_request_id: u64) -> bool {
+    if self.abandoned.contains(&sub_request_id) {
+      return false;
+    }
+    self.published.insert(sub_request_id);
+    true
   }
 
   /// Release the in-flight slot once the switch reaches a terminal state
   /// (promoted to Current, or failed with a PUBLISH_DONE status). Idempotent.
   pub fn complete(&mut self, sub_request_id: u64) {
     self.deadlines.remove(&sub_request_id);
+    self.abandoned.remove(&sub_request_id);
+    self.published.remove(&sub_request_id);
   }
 
   /// Whether a non-expired switch is in flight for this subscription.
@@ -233,6 +288,74 @@ mod tests {
     g.complete(1);
     assert!(!g.is_in_flight(1, now));
   }
+
+  #[test]
+  fn abandon_before_publish_wins_race() {
+    // UNSUBSCRIBE arrives while the switch task is still draining: abandon
+    // succeeds, and the task's later publish claim loses.
+    let mut g = SwitchInFlight::new();
+    let now = t0();
+    g.try_admit(1, now, T);
+    assert!(g.abandon(1, now + Duration::from_millis(100)));
+    assert!(g.is_abandoned(1));
+    assert!(!g.mark_published(1));
+  }
+
+  #[test]
+  fn publish_before_abandon_wins_race() {
+    // The switch task claims the PUBLISH first: a later UNSUBSCRIBE is
+    // ordinary teardown, not a switch abandon.
+    let mut g = SwitchInFlight::new();
+    let now = t0();
+    g.try_admit(1, now, T);
+    assert!(g.mark_published(1));
+    assert!(!g.abandon(1, now + Duration::from_millis(100)));
+    assert!(!g.is_abandoned(1));
+  }
+
+  #[test]
+  fn abandon_without_in_flight_switch_is_noop() {
+    let mut g = SwitchInFlight::new();
+    assert!(!g.abandon(1, t0()));
+    assert!(!g.is_abandoned(1));
+  }
+
+  #[test]
+  fn abandon_after_deadline_expiry_is_noop() {
+    // The switch's T_switch budget has lapsed; its slot is reclaimable, so an
+    // UNSUBSCRIBE now is not racing anything.
+    let mut g = SwitchInFlight::new();
+    let now = t0();
+    g.try_admit(1, now, T);
+    assert!(!g.abandon(1, now + T + Duration::from_millis(1)));
+  }
+
+  #[test]
+  fn readmission_clears_stale_abandon_and_publish_state() {
+    let mut g = SwitchInFlight::new();
+    let now = t0();
+    g.try_admit(1, now, T);
+    g.abandon(1, now);
+    g.complete(1);
+    // A brand-new switch for the same subscription starts clean.
+    assert_eq!(g.try_admit(1, now + Duration::from_millis(10), T), AdmitResult::Admitted);
+    assert!(!g.is_abandoned(1));
+    assert!(g.mark_published(1));
+  }
+
+  #[test]
+  fn complete_clears_abandon_and_publish_state() {
+    let mut g = SwitchInFlight::new();
+    let now = t0();
+    g.try_admit(1, now, T);
+    g.mark_published(1);
+    g.complete(1);
+    assert!(!g.is_abandoned(1));
+    // Next admission (past the cleared entry) starts unpublished.
+    g.try_admit(1, now + Duration::from_millis(10), T);
+    assert!(g.abandon(1, now + Duration::from_millis(20)));
+  }
+
 
   #[test]
   fn failure_status_code_mapping() {

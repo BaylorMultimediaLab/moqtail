@@ -241,7 +241,7 @@ async fn handle_probe_subscribe(
       break;
     }
     prev_object_id = Some(object_id);
-    object_id += 1;
+    object_id = 1;
     bytes_remaining -= chunk;
   }
 
@@ -692,6 +692,30 @@ async fn handle_unsubscribe_message(
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
   info!("received Unsubscribe message: {:?}", unsubscribe_message);
+  
+  // SWITCH PR #1378 UNSUBSCRIBE race: "If the subscriber sends UNSUBSCRIBE for the
+  // Current Subscribe Request ID before the Relay has opened a PUBLISH for the
+  // target Track, the Relay MUST abandon the SWITCH and MUST open a PUBLISH
+  // for the target Track and immediately send PUBLISH_DONE with Status Code
+  // SUBSCRIPTION_ENDED." Mark the in-flight switch abandoned FIRST (before any
+  // teardown, to shrink the race window); the switch task observes the mark —
+  // mid-drain or at its atomic mark_published() claim — and emits the mandated
+  // failure PUBLISH. abandon() returns false when there is nothing to abandon
+  // (no switch in flight, or its PUBLISH already opened), in which case this
+  // is ordinary unsubscribe teardown. That teardown proceeds below in every
+  // case — the draft requires both the abandon answer AND the unsubscribe to
+  // take effect.
+  {
+    use std::time::Instant;
+    let mut guard = client.switch_in_flight.lock().await;
+    if guard.abandon(unsubscribe_message.request_id, Instant::now()) {
+      info!(
+        "unsubscribe: abandoning in-flight SWITCH for Current Subscribe Request ID {}",
+        unsubscribe_message.request_id
+      );
+    }
+  }
+
   // stop sending objects for the track for the subscriber
   // by removing the subscription
   // find the track alias by using the request id
@@ -887,8 +911,8 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    drain_source_below, send_switch_failure, send_switch_publish, spawn_switch_catchup_stream,
-    terminate_source,
+    DrainOutcome, drain_source_below, send_switch_failure, send_switch_publish,
+    spawn_switch_catchup_stream, terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
   use crate::server::switch_selection::{SwitchSelection, select_switch_group};
@@ -898,8 +922,44 @@ async fn handle_switch_message(
   let target_full_track_name = switch_message.get_full_track_name();
   let current_sub_req_id = switch_message.current_subscribe_request_id;
 
+  // SWITCH PR #1378 pre-PUBLISH gate — this MUST come before anything else:
+  // "Upon receiving a SWITCH message, the Relay MUST first validate that the
+  // Current Subscribe Request ID identifies an Established subscription. If no
+  // such subscription exists, the Relay MUST NOT open a PUBLISH for the target
+  // Track and MUST NOT modify any existing subscription state."
+  //
+  // This is the ONE SWITCH outcome that produces no PUBLISH at all — the
+  // subscriber's client.switch() resolves through its local response timeout
+  // (SWITCH_RESPONSE_TIMEOUT_MS). A known request id whose track has already
+  // been torn down is treated the same way: that subscription is no longer
+  // Established.
+  let current_track_arc = {
+    let requests = client.subscribe_requests.read().await;
+    match requests.get(&current_sub_req_id) {
+      Some(req) => {
+        let name = req.original_subscribe_request.get_full_track_name();
+        context.track_manager.get_track(&name).await
+      }
+      None => None,
+    }
+  };
+  let current_track_arc = match current_track_arc {
+    Some(t) => t,
+    None => {
+      warn!(
+        "switch: Current Subscribe Request ID {} does not identify an Established \
+         subscription; dropping SWITCH (no PUBLISH, no state change)",
+        current_sub_req_id
+      );
+      return Ok(());
+    }
+  };
+  let current_full_track_name = current_track_arc.read().await.full_track_name.clone();
+
   // Resolve the target Track (needed for the PUBLISH track alias and for
-  // G_switch selection). Absent target -> DOES_NOT_EXIST.
+  // G_switch selection). Absent target -> DOES_NOT_EXIST. This is a
+  // post-validation failure, so per the draft's failure discipline it DOES
+  // open the failure PUBLISH.
   let target_track_arc = match context
     .track_manager
     .get_track(&target_full_track_name)
@@ -921,39 +981,6 @@ async fn handle_switch_message(
     }
   };
   let target_alias = target_track_arc.read().await.track_alias;
-
-  // Validate that the Current Subscribe Request ID identifies an Established
-  // subscription. On failure the relay MUST NOT modify subscription state.
-  let current_track_arc = {
-    let requests = client.subscribe_requests.read().await;
-    match requests.get(&current_sub_req_id) {
-      Some(req) => {
-        let name = req.original_subscribe_request.get_full_track_name();
-        context.track_manager.get_track(&name).await
-      }
-      None => None,
-    }
-  };
-  let current_track_arc = match current_track_arc {
-    Some(t) => t,
-    None => {
-      warn!(
-        "switch: current subscription not established: {:?}",
-        current_sub_req_id
-      );
-      let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
-      send_switch_failure(
-        &client,
-        rid,
-        &target_full_track_name,
-        target_alias,
-        SwitchFailure::SubscriptionEnded,
-      )
-      .await;
-      return Ok(());
-    }
-  };
-  let current_full_track_name = current_track_arc.read().await.full_track_name.clone();
 
   // Single in-flight SWITCH per Current Subscribe Request ID -> EXCESSIVE_LOAD.
   {
@@ -1026,7 +1053,7 @@ async fn handle_switch_message(
 
   // SWITCH PR #1378 strict ordering (soft switch): drain the source Track's Objects in
   // Groups below G_switch FIRST, then open the target PUBLISH and start catch-up
-  // + live delivery, then terminate the source. The whole sequence runs in a
+  //  live delivery, then terminate the source. The whole sequence runs in a
   // task so the control handler isn't blocked during the drain — which, for
   // behind-live switches, is typically immediate (the source has already
   // delivered past G_switch) and only takes time when the source itself lags
@@ -1046,17 +1073,57 @@ async fn handle_switch_message(
     // (1) Drain the source below G_switch before any target Object is sent. On
     // timeout (severe congestion), abort the switch with TIMEOUT and leave the
     // current subscription unchanged — do NOT terminate it (which would truncate
-    // undelivered source Objects below G_switch).
-    if !drain_source_below(&current_track_arc, connection_id, g_switch).await {
-      warn!(
-        "switch: source drain timed out below g_switch={g_switch}; aborting, current subscription unchanged"
+    // undelivered source Objects below G_switch). An Abandoned outcome (an
+    // UNSUBSCRIBE for the Current Subscribe Request ID arrived mid-drain)
+    // falls through to the claim below, which resolves it.
+    match drain_source_below(
+      &client,
+      &current_track_arc,
+      connection_id,
+      g_switch,
+      current_sub_req_id,
+    )
+    .await
+    {
+      DrainOutcome::Drained | DrainOutcome::Abandoned => {}
+      DrainOutcome::TimedOut => {
+        warn!(
+          "switch: source drain timed out below g_switch={g_switch}; aborting, current subscription unchanged"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::DrainTimeout,
+        )
+        .await;
+        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        return;
+      }
+    }
+
+    // (1b) SWITCH PR #1378 UNSUBSCRIBE race: atomically claim the right to open the
+    // target PUBLISH. abandon() (unsubscribe handler) and mark_published()
+    // (here) are serialized on the same mutex, so exactly one side wins. If
+    // the UNSUBSCRIBE won — it arrived before this point — the draft mandates:
+    // "the Relay MUST abandon the SWITCH and MUST open a PUBLISH for the
+    // target Track and immediately send PUBLISH_DONE with Status Code
+    // SUBSCRIPTION_ENDED."
+    let claimed = {
+      let mut guard = client.switch_in_flight.lock().await;
+      guard.mark_published(current_sub_req_id)
+    };
+    if !claimed {
+      info!(
+        "switch: abandoned by UNSUBSCRIBE for request id {current_sub_req_id} before target PUBLISH; reporting SUBSCRIPTION_ENDED"
       );
       send_switch_failure(
         &client,
         target_request_id,
         &target_full_track_name,
         target_alias,
-        SwitchFailure::DrainTimeout,
+        SwitchFailure::SubscriptionEnded,
       )
       .await;
       client.switch_in_flight.lock().await.complete(current_sub_req_id);
@@ -1081,7 +1148,7 @@ async fn handle_switch_message(
     }
 
     // (3) Live-only subscription on the target Track (objects from the live edge
-    // onward, on SUBGROUP streams) + relay-side request mapping.
+    // onward, on SUBGROUP streams)  relay-side request mapping.
     {
       let target_track = target_track_arc.read().await;
       add_subscription(live_sub.clone(), &target_track, client.clone(), false).await;
