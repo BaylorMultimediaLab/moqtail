@@ -151,6 +151,15 @@ pub(crate) async fn send_switch_failure(
 /// Spawns a task and returns immediately. A no-op when `g_switch >= live_edge`
 /// (the switch lands at the live edge, so there is nothing to catch up). Mirrors
 /// the ranged delivery in `fetch_handler` but is relay-initiated.
+///
+/// The stream is opened — and FIN'd — unconditionally once `g_switch <
+/// live_edge`: the subscriber was told via SWITCH_TRANSITION to expect this
+/// range, and the draft requires the relay to open the catch-up stream and
+/// send FIN after its last object. If the cache yields nothing (evicted
+/// between G_switch selection and delivery), that is an *empty* catch-up
+/// stream — FETCH_HEADER then immediate FIN — not an absent one; a lazily
+/// opened stream would leave the subscriber waiting on a range that never
+/// terminates.
 #[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) fn spawn_switch_catchup_stream(
   subscriber: Arc<MOQTClient>,
@@ -174,47 +183,45 @@ pub(crate) fn spawn_switch_catchup_stream(
     let fetch_header = FetchHeader::new(publish_request_id);
     let stream_id = StreamId::new_fetch(track_alias, publish_request_id);
 
-    let mut send_stream = None;
+    // Open eagerly (see doc comment): the FETCH_HEADER announces the range and
+    // the trailing FIN terminates it even when zero objects follow.
+    let send_stream = match subscriber
+      .open_stream(&stream_id, fetch_header.serialize().unwrap(), 0)
+      .await
+    {
+      Ok(ss) => ss,
+      Err(e) => {
+        error!("switch catch-up: failed to open stream {stream_id}: {e:?}");
+        return;
+      }
+    };
+
     let mut object_count: u64 = 0;
     while let Some(event) = object_rx.recv().await {
       match event {
         CacheConsumeEvent::Object(object) => {
-          if object_count == 0 {
-            match subscriber
-              .open_stream(&stream_id, fetch_header.serialize().unwrap(), 0)
-              .await
-            {
-              Ok(ss) => send_stream = Some(ss),
-              Err(e) => {
-                error!("switch catch-up: failed to open stream {stream_id}: {e:?}");
-                return;
-              }
-            }
-          }
           if let Err(e) = subscriber
             .write_stream_object(
               &stream_id,
               object.object_id,
               object.serialize().unwrap(),
-              send_stream.clone(),
+              Some(send_stream.clone()),
             )
             .await
           {
             error!("switch catch-up: write failed on {stream_id}: {e:?}");
             break;
           }
-          object_count = 1;
+          object_count += 1;
         }
         CacheConsumeEvent::EndLocation(_) | CacheConsumeEvent::NoObject => {}
       }
     }
 
-    if let Some(s) = send_stream {
-      if let Err(e) = s.lock().await.shutdown().await {
-        error!("switch catch-up: error closing stream {stream_id}: {e:?}");
-      }
-      subscriber.remove_stream_by_stream_id(&stream_id).await;
+    if let Err(e) = send_stream.lock().await.shutdown().await {
+      error!("switch catch-up: error closing stream {stream_id}: {e:?}");
     }
+    subscriber.remove_stream_by_stream_id(&stream_id).await;
     info!(
       "switch catch-up: delivered {object_count} objects on {stream_id} for [{g_switch}, {live_edge})"
     );
@@ -227,13 +234,18 @@ pub(crate) fn spawn_switch_catchup_stream(
 pub(crate) enum DrainOutcome {
   /// All source Objects in Groups below `g_switch` were delivered; the source
   /// is now bounded at the seam and the target PUBLISH may open.
-  Drained,
+  /// `prior_end_group` is the source's `end_group` before the seam bound was
+  /// applied (`None` when nothing was bounded — `g_switch == 0` or no source
+  /// subscription), so a caller whose PUBLISH subsequently fails can unwind
+  /// the bound via [`restore_source_end_group`] and leave the current
+  /// subscription unaltered, as the draft's failure discipline requires.
+  Drained { prior_end_group: Option<u64> },
   /// The drain did not finish within `SWITCH_DRAIN_TIMEOUT`. The source is
   /// left completely unchanged; the caller aborts with TIMEOUT.
   TimedOut,
   /// An UNSUBSCRIBE for the Current Subscribe Request ID arrived mid-drain
   /// (SWITCH PR #1378 abandon rule). The source is left unchanged; the caller
-  /// must answer with PUBLISH  PUBLISH_DONE(SUBSCRIPTION_ENDED).
+  /// must answer with PUBLISH + PUBLISH_DONE(SUBSCRIPTION_ENDED).
   Abandoned,
 }
 
@@ -260,11 +272,13 @@ pub(crate) async fn drain_source_below(
   subscriber: &Arc<MOQTClient>,
   current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
-  g_switch: u64,  
+  g_switch: u64,
   current_sub_req_id: u64,
 ) -> DrainOutcome {
   if g_switch == 0 {
-    return DrainOutcome::Drained;
+    return DrainOutcome::Drained {
+      prior_end_group: None,
+    };
   }
   let Some(sub_arc) = current_track
     .read()
@@ -273,7 +287,9 @@ pub(crate) async fn drain_source_below(
     .await
   else {
     // No source subscription to drain; nothing to truncate.
-    return DrainOutcome::Drained;
+    return DrainOutcome::Drained {
+      prior_end_group: None,
+    };
   };
 
   // Wait until last-sent reaches G_switch-1 (or timeout/abandon). The source
@@ -303,19 +319,52 @@ pub(crate) async fn drain_source_below(
     if drained {
       // Drain confirmed: bound the source at the seam so it does not forward
       // Groups >= G_switch concurrently with the target before teardown.
-      sub_arc
-        .read()
-        .await
-        .subscription_state
-        .write()
-        .await
-        .end_group = g_switch - 1;
-      return DrainOutcome::Drained;
+      // Capture the prior bound under the same write lock so the caller can
+      // unwind exactly what was replaced if the target PUBLISH fails.
+      let prior_end_group = {
+        let sub = sub_arc.read().await;
+        let mut state = sub.subscription_state.write().await;
+        let prior = state.end_group;
+        state.end_group = g_switch - 1;
+        prior
+      };
+      return DrainOutcome::Drained {
+        prior_end_group: Some(prior_end_group),
+      };
     }
     if Instant::now() >= deadline {
       return DrainOutcome::TimedOut;
     }
     tokio::time::sleep(SWITCH_DRAIN_POLL).await;
+  }
+}
+
+/// Unwind the seam bound applied by a successful [`drain_source_below`] after
+/// the target PUBLISH failed to open (SWITCH PR #1378: on any failure the relay
+/// "MUST NOT alter the current subscription"). Restores the exact prior
+/// `end_group` — `0` means "no limit", but a genuine bound from the original
+/// SUBSCRIBE is also possible, which is why the captured value is restored
+/// rather than blindly clearing to `0`. A no-op if the subscription vanished
+/// meanwhile (its teardown owns the state then).
+#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
+pub(crate) async fn restore_source_end_group(
+  current_track: &Arc<RwLock<Track>>,
+  connection_id: usize,
+  prior_end_group: u64,
+) {
+  if let Some(sub_arc) = current_track
+    .read()
+    .await
+    .get_subscription(connection_id)
+    .await
+  {
+    sub_arc
+      .read()
+      .await
+      .subscription_state
+      .write()
+      .await
+      .end_group = prior_end_group;
   }
 }
 

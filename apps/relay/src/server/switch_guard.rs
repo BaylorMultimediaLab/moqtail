@@ -73,7 +73,7 @@ pub(crate) struct SwitchInFlight {
   deadlines: HashMap<u64, Instant>,
   /// In-flight switches abandoned by an UNSUBSCRIBE for the Current Subscribe
   /// Request ID arriving before the target PUBLISH was opened (SWITCH PR #1378:
-  /// the relay must answer with PUBLISH  PUBLISH_DONE(SUBSCRIPTION_ENDED)).
+  /// the relay must answer with PUBLISH + PUBLISH_DONE(SUBSCRIPTION_ENDED)).
   abandoned: HashSet<u64>,
   /// In-flight switches whose target PUBLISH has been opened; too late to
   /// abandon.
@@ -93,7 +93,7 @@ impl SwitchInFlight {
   /// Try to admit a SWITCH for `sub_request_id`. Admits when there is no
   /// in-flight entry, or the prior entry's deadline has already passed (the
   /// previous switch timed out). On admission a fresh deadline at
-  /// `now  t_switch` is recorded and any stale abandon/publish state from an
+  /// `now + t_switch` is recorded and any stale abandon/publish state from an
   /// expired prior switch is cleared.
   pub fn try_admit(
     &mut self,
@@ -116,7 +116,7 @@ impl SwitchInFlight {
   /// in-flight switch for `sub_request_id` abandoned. Returns `true` iff a
   /// non-expired switch is in flight AND its target PUBLISH has not been
   /// opened yet — i.e. the UNSUBSCRIBE won the race and the switch task must
-  /// answer with PUBLISH  PUBLISH_DONE(SUBSCRIPTION_ENDED). Returns `false`
+  /// answer with PUBLISH + PUBLISH_DONE(SUBSCRIPTION_ENDED). Returns `false`
   /// when there is nothing to abandon (no switch in flight, already expired,
   /// or the PUBLISH already opened — ordinary unsubscribe semantics apply).
   pub fn abandon(&mut self, sub_request_id: u64, now: Instant) -> bool {
@@ -188,6 +188,10 @@ pub(crate) enum SwitchFailure {
   /// unchanged, rather than terminating it and truncating source Objects below
   /// G_switch.
   DrainTimeout,
+  /// The target PUBLISH could not be built/sent after the drain succeeded. The
+  /// seam bound applied by the drain is unwound so the current subscription is
+  /// left unaltered, and the failure is reported as INTERNAL_ERROR.
+  PublishBuildFailed,
 }
 
 #[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
@@ -202,6 +206,7 @@ impl SwitchFailure {
       SwitchFailure::NotSupported => PublishDoneStatusCode::NotSupported,
       SwitchFailure::SubscriptionEnded => PublishDoneStatusCode::SubscriptionEnded,
       SwitchFailure::DrainTimeout => PublishDoneStatusCode::Timeout,
+      SwitchFailure::PublishBuildFailed => PublishDoneStatusCode::InternalError,
     }
   }
 }
@@ -370,5 +375,9 @@ mod tests {
       S::SubscriptionEnded
     );
     assert_eq!(SwitchFailure::DrainTimeout.status_code(), S::Timeout);
+    assert_eq!(
+      SwitchFailure::PublishBuildFailed.status_code(),
+      S::InternalError
+    );
   }
 }

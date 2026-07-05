@@ -241,7 +241,7 @@ async fn handle_probe_subscribe(
       break;
     }
     prev_object_id = Some(object_id);
-    object_id = 1;
+    object_id += 1;
     bytes_remaining -= chunk;
   }
 
@@ -911,8 +911,8 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    DrainOutcome, drain_source_below, send_switch_failure, send_switch_publish,
-    spawn_switch_catchup_stream, terminate_source,
+    DrainOutcome, drain_source_below, restore_source_end_group, send_switch_failure,
+    send_switch_publish, spawn_switch_catchup_stream, terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
   use crate::server::switch_selection::{SwitchSelection, select_switch_group};
@@ -1005,6 +1005,10 @@ async fn handle_switch_message(
   let target_request_id =
     Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
 
+  // Snapshot of the target's live edge for G_switch selection only. The value
+  // actually advertised in SWITCH_TRANSITION is re-read inside the task at
+  // PUBLISH-open time (step 1c), since this snapshot can go stale during the
+  // drain.
   let live_edge = target_track_arc.read().await.largest_location.read().await.group;
 
   // Select G_switch.
@@ -1053,7 +1057,7 @@ async fn handle_switch_message(
 
   // SWITCH PR #1378 strict ordering (soft switch): drain the source Track's Objects in
   // Groups below G_switch FIRST, then open the target PUBLISH and start catch-up
-  //  live delivery, then terminate the source. The whole sequence runs in a
+  // + live delivery, then terminate the source. The whole sequence runs in a
   // task so the control handler isn't blocked during the drain — which, for
   // behind-live switches, is typically immediate (the source has already
   // delivered past G_switch) and only takes time when the source itself lags
@@ -1075,8 +1079,11 @@ async fn handle_switch_message(
     // current subscription unchanged — do NOT terminate it (which would truncate
     // undelivered source Objects below G_switch). An Abandoned outcome (an
     // UNSUBSCRIBE for the Current Subscribe Request ID arrived mid-drain)
-    // falls through to the claim below, which resolves it.
-    match drain_source_below(
+    // falls through to the claim below, which resolves it. On success,
+    // `drain_undo` holds the source's pre-bound end_group so a later PUBLISH
+    // failure can unwind the seam bound (draft: on any failure the relay
+    // "MUST NOT alter the current subscription").
+    let drain_undo = match drain_source_below(
       &client,
       &current_track_arc,
       connection_id,
@@ -1085,7 +1092,8 @@ async fn handle_switch_message(
     )
     .await
     {
-      DrainOutcome::Drained | DrainOutcome::Abandoned => {}
+      DrainOutcome::Drained { prior_end_group } => prior_end_group,
+      DrainOutcome::Abandoned => None,
       DrainOutcome::TimedOut => {
         warn!(
           "switch: source drain timed out below g_switch={g_switch}; aborting, current subscription unchanged"
@@ -1101,7 +1109,7 @@ async fn handle_switch_message(
         client.switch_in_flight.lock().await.complete(current_sub_req_id);
         return;
       }
-    }
+    };
 
     // (1b) SWITCH PR #1378 UNSUBSCRIBE race: atomically claim the right to open the
     // target PUBLISH. abandon() (unsubscribe handler) and mark_published()
@@ -1130,6 +1138,23 @@ async fn handle_switch_message(
       return;
     }
 
+    // (1c) SWITCH PR #1378: re-read the target's live edge NOW — the draft pins
+    // SWITCH_TRANSITION's Live Edge Group ID to the live edge "at the time the
+    // PUBLISH is opened". The pre-drain snapshot used for G_switch selection
+    // can be stale by up to the drain timeout; carrying it forward would leave
+    // Groups in [stale edge, fresh edge) covered by neither the catch-up range
+    // (which would end at the stale edge) nor the live subscription (which
+    // attaches at the CURRENT largest object) — an undeliverable hole exactly
+    // at the seam. largest_location is monotonic, so fresh >= the snapshot and
+    // g_switch <= fresh always holds.
+    let live_edge = target_track_arc
+      .read()
+      .await
+      .largest_location
+      .read()
+      .await
+      .group;
+
     // (2) Open the target PUBLISH carrying SWITCH_TRANSITION { G_switch, live edge }.
     if let Err(e) = send_switch_publish(
       &client,
@@ -1143,12 +1168,29 @@ async fn handle_switch_message(
     .await
     {
       error!("switch: failed to build target PUBLISH: {e:?}");
+      // SWITCH PR #1378 failure discipline: the drain already bounded the source at
+      // the seam; a failure here must leave the current subscription unaltered
+      // ("MUST NOT alter the current subscription"), so unwind the bound, then
+      // still answer with the failure PUBLISH + PUBLISH_DONE (the failure
+      // PUBLISH's own parameter is the trivial {0,0} SWITCH_TRANSITION, which
+      // cannot hit the build error that landed us here).
+      if let Some(prior_end_group) = drain_undo {
+        restore_source_end_group(&current_track_arc, connection_id, prior_end_group).await;
+      }
+      send_switch_failure(
+        &client,
+        target_request_id,
+        &target_full_track_name,
+        target_alias,
+        SwitchFailure::PublishBuildFailed,
+      )
+      .await;
       client.switch_in_flight.lock().await.complete(current_sub_req_id);
       return;
     }
 
     // (3) Live-only subscription on the target Track (objects from the live edge
-    // onward, on SUBGROUP streams)  relay-side request mapping.
+    // onward, on SUBGROUP streams) + relay-side request mapping.
     {
       let target_track = target_track_arc.read().await;
       add_subscription(live_sub.clone(), &target_track, client.clone(), false).await;
