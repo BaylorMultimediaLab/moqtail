@@ -53,28 +53,40 @@ describe('buildSubscribeParameters', () => {
 });
 
 describe('computeSwitchMinimumGroup', () => {
-  it('returns 0 (no floor) for naive mode', () => {
-    const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: 42 });
+  it('naive mode floors at the latest received group (SWITCH PR #1378: no live-edge sentinel)', () => {
+    const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: 42, latestGroup: 17n });
+    expect(r.minimumSwitchingGroupId).toBe(17);
+    expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('naive mode before any object arrives sends the spec floor 0', () => {
+    const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: undefined, latestGroup: -1n });
     expect(r.minimumSwitchingGroupId).toBe(0);
     expect(r.timeMapMiss).toBe(false);
   });
 
   it('uses the target group as the floor for aligned mode with a target', () => {
-    const r = computeSwitchMinimumGroup({ switchMode: 'aligned', targetGroup: 42 });
+    const r = computeSwitchMinimumGroup({ switchMode: 'aligned', targetGroup: 42, latestGroup: 17n });
     expect(r.minimumSwitchingGroupId).toBe(42);
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('flags timeMapMiss when aligned but no target', () => {
-    const r = computeSwitchMinimumGroup({ switchMode: 'aligned', targetGroup: undefined });
-    expect(r.minimumSwitchingGroupId).toBe(0);
+  it('flags timeMapMiss when aligned but no target, falling through to the naive floor', () => {
+    const r = computeSwitchMinimumGroup({ switchMode: 'aligned', targetGroup: undefined, latestGroup: 17n });
+    expect(r.minimumSwitchingGroupId).toBe(17);
     expect(r.timeMapMiss).toBe(true);
   });
 
   it("does NOT flag miss when naive + no target (naive doesn't need TimeMap)", () => {
-    const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: undefined });
-    expect(r.minimumSwitchingGroupId).toBe(0);
+    const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: undefined, latestGroup: 17n });
+    expect(r.minimumSwitchingGroupId).toBe(17);
     expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('aligned miss before any object arrives falls all the way to 0', () => {
+    const r = computeSwitchMinimumGroup({ switchMode: 'aligned', targetGroup: undefined, latestGroup: -1n });
+    expect(r.minimumSwitchingGroupId).toBe(0);
+    expect(r.timeMapMiss).toBe(true);
   });
 });
 

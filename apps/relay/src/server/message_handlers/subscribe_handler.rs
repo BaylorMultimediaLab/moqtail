@@ -1011,43 +1011,39 @@ async fn handle_switch_message(
   // drain.
   let live_edge = target_track_arc.read().await.largest_location.read().await.group;
 
-  // Select G_switch.
-  //
-  // A Minimum Switching Group ID of 0 is the "naive" sentinel: switch at the
-  // live edge with no catch-up (the playhead is behind, so this produces the
-  // expected discontinuity baseline). It must NOT go through the smallest-
-  // feasible-boundary search, which would resolve 0 to the *oldest* cached
-  // common boundary and trigger a long, unintended catch-up.
-  //
-  // A non-zero floor is an aligned switch: select the smallest common, gap-free
-  // boundary at or above the floor. No such boundary -> TIMEOUT.
-  let g_switch = if switch_message.minimum_switching_group_id == 0 {
-    live_edge
-  } else {
-    match select_switch_group(
-      &current_track_arc,
-      &target_track_arc,
-      switch_message.minimum_switching_group_id,
-    )
-    .await
-    {
-      SwitchSelection::Ready(g) => g,
-      SwitchSelection::NoCommonBoundary => {
-        warn!(
-          "switch: no common gap-free boundary for {:?} (min={})",
-          target_full_track_name, switch_message.minimum_switching_group_id
-        );
-        send_switch_failure(
-          &client,
-          target_request_id,
-          &target_full_track_name,
-          target_alias,
-          SwitchFailure::NoCommonBoundary,
-        )
-        .await;
-        client.switch_in_flight.lock().await.complete(current_sub_req_id);
-        return Ok(());
-      }
+  // Select G_switch per the draft: the smallest group at/above the client's
+  // Minimum Switching Group ID that is a common boundary between the two
+  // Tracks with a gap-free target tail up to the live edge. A minimum of 0 is
+  // an ordinary floor — "any group is acceptable" — and resolves to the
+  // OLDEST qualifying boundary (full buffer replacement with a maximal
+  // catch-up range), exactly as the draft reads. There is no live-edge
+  // sentinel: a subscriber that wants to switch at/near the live edge
+  // expresses that by sending a floor at its latest received group (see
+  // computeSwitchMinimumGroup in the JS player). No qualifying boundary ->
+  // TIMEOUT.
+  let g_switch = match select_switch_group(
+    &current_track_arc,
+    &target_track_arc,
+    switch_message.minimum_switching_group_id,
+  )
+  .await
+  {
+    SwitchSelection::Ready(g) => g,
+    SwitchSelection::NoCommonBoundary => {
+      warn!(
+        "switch: no common gap-free boundary for {:?} (min={})",
+        target_full_track_name, switch_message.minimum_switching_group_id
+      );
+      send_switch_failure(
+        &client,
+        target_request_id,
+        &target_full_track_name,
+        target_alias,
+        SwitchFailure::NoCommonBoundary,
+      )
+      .await;
+      client.switch_in_flight.lock().await.complete(current_sub_req_id);
+      return Ok(());
     }
   };
   info!(

@@ -273,8 +273,12 @@ export type SwitchOptions = {
   /**
    * Lower bound on the transition group (SWITCH PR #1378 "Minimum Switching Group ID").
    * The relay must not switch before this group and selects the smallest
-   * feasible boundary at or above it. Omit or pass `0n` for "no floor" — switch
-   * at the live edge (naive switching).
+   * feasible boundary at or above it. `0n` (also the default when omitted) is
+   * an ordinary floor meaning "any group is acceptable": the relay resolves it
+   * to the OLDEST common gap-free boundary, i.e. full buffer replacement with
+   * a maximal catch-up range. To switch as close to live as possible, pass the
+   * latest group id received on the current subscription instead — there is no
+   * live-edge sentinel in the draft.
    */
   minimumSwitchingGroupId?: bigint
 }

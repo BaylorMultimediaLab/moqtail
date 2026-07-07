@@ -90,9 +90,11 @@ export interface DiscontinuityRecord {
   /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
   playheadPTS_ms?: number;
   /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
-   *  jump introduced by the switch — naive on a filtered client lands ~filterDelay×1000
-   *  positive (relay delivers from live edge while playhead is filterDelay s behind);
-   *  aligned lands ~0. Undefined for `connect` records. */
+   *  jump introduced by the switch. Since the 0-sentinel was dropped (SWITCH PR
+   *  #1378 conformance) BOTH modes are seam-gap-free: naive floors at the latest
+   *  received group, aligned at the playhead's group, so both land near 0 (naive
+   *  measures buffer-end distance, aligned playhead distance). The historical
+   *  ~filterDelay×1000 naive jump only reproduces on pre-conformance builds. */
   playheadGapMs?: number;
 
   // wall-clock context
@@ -186,7 +188,10 @@ export interface PlayerOptions {
   clientMode?: 'filtered' | 'unfiltered';
   /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
   filterDelaySeconds?: number;
-  /** Quality-switch primitive: 'naive' = today (start at latest); 'aligned' = start at group containing player's current PTS. */
+  /** Quality-switch primitive. Both modes send a spec-conformant SWITCH floor
+   *  (SWITCH PR #1378 has no live-edge sentinel): 'naive' = floor at the latest
+   *  received group (switch as close to live as possible, gap-free);
+   *  'aligned' = floor at the group containing the player's current PTS. */
   switchMode?: 'naive' | 'aligned';
 }
 
@@ -225,23 +230,41 @@ export function buildSubscribeParameters(opts: {
 
 /**
  * Computes the SWITCH "Minimum Switching Group ID" from the active
- * switchMode and the player's current PTS.
+ * switchMode, the player's current PTS, and the latest group received on the
+ * current track.
  *
- * - 'naive' mode: returns 0 — no floor; the relay switches at the live edge.
- * - 'aligned' mode: returns the group containing `currentTime` (via the TimeMap)
- *   as the floor. If the TimeMap has no anchor yet (rare: switch fired before
- *   any object was received), returns `{ minimumSwitchingGroupId: 0,
- *   timeMapMiss: true }` so the caller can record the miss and fall through to
- *   naive.
+ * SWITCH PR #1378 defines the field as a plain floor: the relay selects the
+ * smallest common, gap-free boundary at or above it, and `0` means "any group
+ * is acceptable" (oldest boundary, maximal catch-up). There is no live-edge
+ * sentinel, so "switch as close to live as possible" (naive mode) must be
+ * expressed AS a floor:
+ *
+ * - 'naive' mode: returns the latest group received on the current track.
+ *   That group is guaranteed relay-available (the client just received it),
+ *   so the relay switches there — re-delivering the in-progress group whole
+ *   on the new track (the draft's buffer-replacement case) and catching up
+ *   `[latestGroup, live edge)` with no seam gap. `latestGroup + 1` would be
+ *   marginally closer to live but races the relay's one-shot selection into a
+ *   spurious TIMEOUT whenever the client is exactly at the edge, since a
+ *   not-yet-started group is not "available on both tracks".
+ * - 'aligned' mode: returns the group containing `currentTime` (via the
+ *   TimeMap) as the floor. If the TimeMap has no anchor yet (rare: switch
+ *   fired before any object was received), flags `timeMapMiss: true` and
+ *   falls through to the naive computation.
+ * - Before any object has arrived (`latestGroup < 0`), returns 0 — the spec
+ *   floor for "nothing buffered, any group works".
  *
  * Exported for unit testing.
  */
 export function computeSwitchMinimumGroup(opts: {
   switchMode: 'naive' | 'aligned';
   targetGroup: number | undefined;
+  /** Latest group id received on the current track; -1n when none yet. */
+  latestGroup: bigint;
 }): { minimumSwitchingGroupId: number; timeMapMiss: boolean } {
-  if (opts.switchMode !== 'aligned') return { minimumSwitchingGroupId: 0, timeMapMiss: false };
-  if (opts.targetGroup === undefined) return { minimumSwitchingGroupId: 0, timeMapMiss: true };
+  const naiveFloor = opts.latestGroup >= 0n ? Number(opts.latestGroup) : 0;
+  if (opts.switchMode !== 'aligned') return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: false };
+  if (opts.targetGroup === undefined) return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: true };
   return { minimumSwitchingGroupId: opts.targetGroup, timeMapMiss: false };
 }
 
@@ -1159,6 +1182,7 @@ export class Player {
     const { minimumSwitchingGroupId, timeMapMiss } = computeSwitchMinimumGroup({
       switchMode: this.#options.switchMode,
       targetGroup,
+      latestGroup: videoStruct.lastGroupId,
     });
     if (timeMapMiss) {
       logger.warn('media', 'aligned switch: TimeMap miss; falling through to naive');
