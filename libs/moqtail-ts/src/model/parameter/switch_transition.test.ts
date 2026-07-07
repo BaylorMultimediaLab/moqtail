@@ -46,7 +46,7 @@ describe('SwitchTransition', () => {
   })
 
   test('fromParameters ignores other params', () => {
-    const other = KeyValuePair.tryNewVarInt(VersionSpecificParameterType.StartLocationGroup, 5n)
+    const other = KeyValuePair.tryNewVarInt(VersionSpecificParameterType.DelayGroups, 5n)
     expect(SwitchTransition.fromParameters([other])).toBeNull()
   })
 

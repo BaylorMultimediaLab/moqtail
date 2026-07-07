@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod switch_context;
 pub(crate) mod track_subscription_map;
 
 use crate::server::{
@@ -32,7 +31,6 @@ use moqtail::{
   transport::data_stream_handler::{FetchRequest, SubscribeRequest},
 };
 use crate::server::switch_guard::SwitchInFlight;
-use switch_context::SwitchContext;
 
 use std::{
   collections::{BTreeMap, HashMap, VecDeque},
@@ -80,7 +78,6 @@ pub(crate) struct MOQTClient {
   // this contains the subscriptions made by the client
   pub subscriptions: TrackSubscriptionMap,
 
-  pub switch_context: SwitchContext,
 
   // PR #1378 single-in-flight SWITCH guard, keyed by Current Subscribe Request
   // ID. Admitted/rejected (EXCESSIVE_LOAD) by the switch handler; entries
@@ -114,7 +111,6 @@ impl MOQTClient {
       subscribe_requests: Arc::new(RwLock::new(BTreeMap::new())),
       fetch_cancel_senders: Arc::new(RwLock::new(HashMap::new())),
       subscriptions: TrackSubscriptionMap::new(),
-      switch_context: SwitchContext::new(),
       switch_in_flight: Arc::new(Mutex::new(SwitchInFlight::new())),
     }
   }

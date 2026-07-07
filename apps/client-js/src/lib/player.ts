@@ -313,7 +313,8 @@ export class Player {
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
   // B4: PTS <-> group lookup populated from incoming object decode times.
-  // Consumed by B5 (aligned switch) to compute START_LOCATION_GROUP.
+  // Consumed by aligned switches to compute the SWITCH's Minimum Switching
+  // Group ID floor (SWITCH PR #1378) from the playhead PTS.
   #timeMap: TimeMap | undefined;
   // B5: latched at switchTrack() time; consumed by the next switch
   // DiscontinuityRecord emission and reset to false afterwards so it doesn't

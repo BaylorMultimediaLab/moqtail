@@ -173,29 +173,22 @@ impl Track {
     &self,
     subscriber: Arc<MOQTClient>,
     subscribe_message: Subscribe,
-    is_switch: bool,
   ) -> Result<Arc<RwLock<Subscription>>, anyhow::Error> {
-    // Check if subscription already exists
+    // Check if subscription already exists. (Under SWITCH PR #1378 a quality
+    // switch never re-subscribes the same subscriber to a track through this
+    // path — the relay's SWITCH handler drains the source and PUBLISHes the
+    // target — so a duplicate here is always an error, never a switch.)
 
-    if let Some(sub_guard) = self
+    if self
       .subscription_manager
       .get_subscription(subscriber.connection_id)
       .await
+      .is_some()
     {
-      if !is_switch {
-        error!(
-          "Subscriber with connection_id: {} already exists in track: {}",
-          subscriber.connection_id, self.track_alias
-        );
-      } else {
-        info!(
-          "Subscriber with connection_id: {} already exists in track: {} (switch subscription)",
-          subscriber.connection_id, self.track_alias
-        );
-        // inform the existing subscription about the switch
-        let sub = sub_guard.read().await;
-        sub.notify_switch().await;
-      }
+      error!(
+        "Subscriber with connection_id: {} already exists in track: {}",
+        subscriber.connection_id, self.track_alias
+      );
       return Err(anyhow::anyhow!(
         "A subscription already exists for this subscriber"
       ));
@@ -205,10 +198,6 @@ impl Track {
       .subscription_manager
       .add_subscription(subscriber, subscribe_message, self.cache.clone())
       .await?;
-
-    if is_switch {
-      subscription.read().await.notify_switch().await;
-    }
 
     Ok(subscription)
   }

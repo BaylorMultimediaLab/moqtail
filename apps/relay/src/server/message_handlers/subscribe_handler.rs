@@ -258,10 +258,9 @@ async fn add_subscription(
   subscribe: Subscribe,
   track: &Track,
   subscriber: Arc<MOQTClient>,
-  is_switch: bool,
 ) -> bool {
   match track
-    .add_subscription(subscriber.clone(), subscribe, is_switch)
+    .add_subscription(subscriber.clone(), subscribe)
     .await
   {
     Ok(subscription) => {
@@ -280,7 +279,6 @@ async fn handle_subscribe_message(
   control_stream_handler: &mut ControlStreamHandler,
   sub: Subscribe,
   context: Arc<SessionContext>,
-  is_switch: bool,
 ) -> Result<(), TerminationCode> {
   info!("received Subscribe message: {:?}", sub);
   let track_namespace = sub.track_namespace.clone();
@@ -305,7 +303,7 @@ async fn handle_subscribe_message(
   // not routed to any publisher; the relay generates one object of `size`
   // bytes locally and ends. This intentionally skips track_manager
   // registration and publisher lookup so probe traffic can never share a
-  // track_alias with real video and corrupt switch_context.
+  // track_alias with real video and corrupt per-track subscription state.
   if let Some((size, priority)) = parse_probe_track_name(sub.track_name.as_bytes()) {
     return handle_probe_subscribe(client, control_stream_handler, sub, size, priority).await;
   }
@@ -463,7 +461,7 @@ async fn handle_subscribe_message(
     }
   }
 
-  add_subscription(sub.clone(), &track, client.clone(), is_switch).await;
+  add_subscription(sub.clone(), &track, client.clone()).await;
 
   let res: Result<(), TerminationCode> = if is_creator {
     // First subscriber for this track: forward Subscribe to publisher
@@ -1189,7 +1187,7 @@ async fn handle_switch_message(
     // onward, on SUBGROUP streams) + relay-side request mapping.
     {
       let target_track = target_track_arc.read().await;
-      add_subscription(live_sub.clone(), &target_track, client.clone(), false).await;
+      add_subscription(live_sub.clone(), &target_track, client.clone()).await;
     }
     client.subscribe_requests.write().await.insert(
       target_request_id,
@@ -1230,7 +1228,7 @@ pub async fn handle(
 ) -> Result<(), TerminationCode> {
   match msg {
     ControlMessage::Subscribe(m) => {
-      handle_subscribe_message(client, control_stream_handler, *m, context, false).await
+      handle_subscribe_message(client, control_stream_handler, *m, context).await
     }
     ControlMessage::SubscribeOk(m) => {
       handle_subscribe_ok_message(client, control_stream_handler, *m, context).await

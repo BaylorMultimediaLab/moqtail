@@ -283,7 +283,7 @@ pub async fn handle(
 
           let track_read = track_arc.read().await;
           if let Err(e) = track_read
-            .add_subscription(client.clone(), synthetic_sub, false)
+            .add_subscription(client.clone(), synthetic_sub)
             .await
           {
             warn!("Failed to auto-subscribe client after PublishOk: {:?}", e);

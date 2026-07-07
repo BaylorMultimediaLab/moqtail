@@ -125,7 +125,7 @@ mod tests {
   #[test]
   fn from_parameters_ignores_other_params() {
     let other = KeyValuePair::try_new_varint(
-      VersionSpecificParameterType::StartLocationGroup as u64,
+      VersionSpecificParameterType::DelayGroups as u64,
       5,
     )
     .unwrap();
