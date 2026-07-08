@@ -172,8 +172,9 @@ impl SwitchInFlight {
 pub(crate) enum SwitchFailure {
   /// The target Track is unknown / not announced.
   TargetTrackMissing,
-  /// No common, gap-free boundary was found within `T_switch`
-  /// (`compute_switch_group` -> `NoCommonBoundary`, or the deadline elapsed).
+  /// No common boundary satisfying the draft's conditions (a)-(c) was found
+  /// within `T_switch` (`compute_switch_group` -> `NoCommonBoundary`, or the
+  /// deadline elapsed).
   NoCommonBoundary,
   /// Another SWITCH for the same Current Subscribe Request ID is in flight.
   AlreadyInFlight,

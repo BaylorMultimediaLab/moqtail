@@ -22,8 +22,21 @@
 //!   (b) `g` is a **common boundary** — present on *both* the current and the
 //!       target Track (equivalent tracks must have aligned group IDs;
 //!       misaligned ladders fail here, which is the intended behaviour), and
-//!   (c) the target Track is **gap-free** from `g` up to its live edge, so the
-//!       catch-up stream `[g, live_edge)` can be delivered without holes.
+//!   (c) for every `g'` in `[g, live_edge)`, **if** `g'` is available on the
+//!       current Track **then** it is also available on the target Track.
+//!
+//! Note the exact shape of (c): it is *conditional*, not absolute. A hole the
+//! two Tracks share does not disqualify a boundary below it — the subscriber
+//! was never going to receive those groups from the current Track either, so
+//! the switch loses nothing. Only a group the current Track *has* and the
+//! target *lacks* blocks the seam (switching below it would silently drop
+//! content the subscriber would otherwise have received). The range is also
+//! half-open: the live-edge group itself is delivered by the target's live
+//! SUBGROUP streams, not the catch-up range, so its cache availability is not
+//! a precondition. An earlier revision required the target to be contiguous
+//! from g through (and including) the live edge which inflated `G_switch` past 
+//! the spec's smallest (shrinking the buffer-replacement window) and spuriously 
+//! failed when only the live-edge group was missing.
 //!
 //! This module is the pure, side-effect-free core of that decision so it can be
 //! exhaustively unit-tested. Group availability is modelled as a `BTreeSet<u64>`
@@ -42,7 +55,8 @@ use crate::server::track::Track;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // consumed by relay switch handler, not yet wired
 pub(crate) enum SwitchSelection {
-  /// A valid common, gap-free boundary was found; carry out the switch here.
+  /// A valid common boundary satisfying (a) to (c) was found; carry out the
+  /// switch here.
   Ready(u64),
   /// No group satisfies all three conditions. In the draft this surfaces to
   /// the subscriber as a `PUBLISH_DONE` with `Timeout` / `DoesNotExist`.
@@ -55,6 +69,15 @@ pub(crate) enum SwitchSelection {
 /// * `current_available` — group IDs currently available on the source Track.
 /// * `target_available` — group IDs currently available on the target Track.
 /// * `target_live_edge` — the target Track's live edge group ID.
+///
+/// Implementation note: condition (c) has a closed form. Call `g'` *blocking*
+/// when `g' < live_edge`, the current Track has `g'`, and the target lacks it.
+/// A candidate `g` fails (c) exactly when some blocking group sits in
+/// `[g, live_edge)` — i.e. when `g <= B`, the *highest* blocking group. So (c)
+/// holds precisely for `g > B`, and the spec's smallest valid `g` is the
+/// smallest common boundary at or above `max(min, B + 1)`. With no blocking
+/// group, (c) holds everywhere (shared holes included) and the floor is just
+/// the client's minimum.
 #[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
 pub(crate) fn compute_switch_group(
   min_switch_group: u64,
@@ -62,36 +85,26 @@ pub(crate) fn compute_switch_group(
   target_available: &BTreeSet<u64>,
   target_live_edge: u64,
 ) -> SwitchSelection {
-  // Condition (c) anchor: the live edge itself must be present on the target,
-  // otherwise no range can be gap-free *up to* it.
-  if !target_available.contains(&target_live_edge) {
-    return SwitchSelection::NoCommonBoundary;
-  }
+  // Highest blocking group below the (exclusive) live edge, expressed as the
+  // smallest ceiling `B + 1` that clears it; 0 when nothing blocks.
+  let blocking_ceiling = current_available
+    .range(..target_live_edge)
+    .rev()
+    .find(|g| !target_available.contains(*g))
+    .map(|&b| b + 1)
+    .unwrap_or(0);
 
-  // Walk down from the live edge to find the lowest group `tail_start` such
-  // that `[tail_start, target_live_edge]` is fully present on the target — the
-  // contiguous, gap-free tail that catch-up can serve. Any `g` in this tail
-  // satisfies condition (c).
-  let mut tail_start = target_live_edge;
-  while tail_start > 0 && target_available.contains(&(tail_start - 1)) {
-    tail_start -= 1;
-  }
+  // Condition (a) + (c).
+  let floor = min_switch_group.max(blocking_ceiling);
 
-  // Condition (a) + (c): the smallest candidate is the higher of the client's
-  // floor and the contiguous tail start.
-  let floor = min_switch_group.max(tail_start);
-  if floor > target_live_edge {
-    return SwitchSelection::NoCommonBoundary;
-  }
-
-  // Condition (b): the smallest group present on the *current* Track within
-  // `[floor, target_live_edge]`. Because that window lies inside the target's
-  // gap-free tail, any such group is automatically present on the target too,
-  // making it a genuine common boundary.
-  match current_available.range(floor..=target_live_edge).next() {
-    Some(&g) => SwitchSelection::Ready(g),
-    None => SwitchSelection::NoCommonBoundary,
-  }
+  // Condition (b): the smallest group at/above the floor present on BOTH
+  // Tracks. Groups at/above the live edge qualify too — (c)'s half-open range
+  // is empty there, so a common boundary alone suffices.
+  current_available
+    .range(floor..)
+    .find(|g| target_available.contains(*g))
+    .map(|&g| SwitchSelection::Ready(g))
+    .unwrap_or(SwitchSelection::NoCommonBoundary)
 }
 
 /// Async bridge from the relay's live state to the pure [`compute_switch_group`].
@@ -172,7 +185,10 @@ mod tests {
   }
 
   #[test]
-  fn min_above_live_edge_fails() {
+  fn min_above_all_common_groups_fails() {
+    // Nothing above the floor exists on either Track. (The failure is the
+    // absence of a common boundary >= 11 — a floor above the live edge is not
+    // itself disqualifying, see common_boundary_at_live_edge_or_above.)
     let cur = range_set(0, 10);
     let tgt = range_set(0, 10);
     assert_eq!(
@@ -183,8 +199,10 @@ mod tests {
 
   #[test]
   fn gap_in_target_skips_past_gap() {
-    // Target is missing 3 and 4, so the gap-free tail starts at 5. Even though
-    // the client would accept group 0, catch-up can only begin at 5.
+    // The current Track has 3 and 4 but the target lacks them, so they are
+    // blocking: switching at any g <= 4 would silently drop content the
+    // subscriber would otherwise have received from the current Track.
+    // Condition (c) therefore lifts the boundary to 5 despite the floor of 0.
     let cur = range_set(0, 10);
     let tgt = set(&[0, 1, 2, 5, 6, 7, 8, 9, 10]);
     assert_eq!(
@@ -209,7 +227,7 @@ mod tests {
   fn misaligned_group_ids_fail() {
     // tobbee's constraint: equivalent tracks must have aligned group IDs.
     // Here the current track has only even groups and the target only odd —
-    // the target tail isn't even contiguous, and there is no common boundary.
+    // condition (b) has no candidate at all: no common boundary exists.
     let cur = set(&[0, 2, 4, 6]);
     let tgt = set(&[1, 3, 5, 7]);
     assert_eq!(
@@ -219,12 +237,16 @@ mod tests {
   }
 
   #[test]
-  fn live_edge_absent_on_target_fails() {
+  fn live_edge_absent_on_target_is_not_disqualifying() {
+    // Condition (c)'s range [g, live_edge) is half-open: the live-edge group
+    // is delivered by the target's live subgroup streams, not the catch-up
+    // range, so its cache availability is irrelevant. The earlier
+    // stricter-than-spec rule failed this case outright.
     let cur = range_set(0, 10);
     let tgt = range_set(0, 9); // missing the live-edge group 10
     assert_eq!(
       compute_switch_group(0, &cur, &tgt, 10),
-      SwitchSelection::NoCommonBoundary
+      SwitchSelection::Ready(0)
     );
   }
 
@@ -252,13 +274,127 @@ mod tests {
 
   #[test]
   fn target_tail_shorter_than_floor_still_ok_when_common() {
-    // Target only holds a recent window [8, 12]; client floor is 6. The tail
-    // starts at 8, so the effective floor is 8, and 8 is common.
+    // Target only holds a recent window [8, 12]; client floor is 6. Groups
+    // 6 and 7 are blocking (current has them, target doesn't), so the
+    // effective floor is 8, and 8 is common.
     let cur = range_set(0, 12);
     let tgt = range_set(8, 12);
     assert_eq!(
       compute_switch_group(6, &cur, &tgt, 12),
       SwitchSelection::Ready(8)
     );
+  }
+
+  #[test]
+  fn shared_hole_permits_smallest_boundary() {
+    // Both Tracks are missing 3 and 4. Condition (c) is conditional — a group 
+    // absent on the Current Track cannot block,
+    // because the subscriber was never going to receive it from the current
+    // Track either. The spec's smallest valid boundary is therefore 0 (full
+    // buffer replacement); the earlier stricter rule returned 5.
+    let cur = set(&[0, 1, 2, 5, 6, 7, 8, 9, 10]);
+    let tgt = set(&[0, 1, 2, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(
+      compute_switch_group(0, &cur, &tgt, 10),
+      SwitchSelection::Ready(0)
+    );
+  }
+
+  #[test]
+  fn current_hole_alone_never_blocks() {
+    // Holes only on the current Track: nothing is blocking (the target can
+    // supply everything the current Track would have supplied, and more), so
+    // the floor stays at the client's minimum and the smallest common group
+    // at/above it wins.
+    let cur = set(&[0, 1, 2, 5, 6, 7, 8, 9, 10]);
+    let tgt = range_set(0, 10);
+    assert_eq!(
+      compute_switch_group(0, &cur, &tgt, 10),
+      SwitchSelection::Ready(0)
+    );
+  }
+
+  #[test]
+  fn blocking_ceiling_lifts_a_lower_minimum() {
+    // Client floor 2 sits below the highest blocking group (4): condition (c)
+    // lifts the effective floor to 5.
+    let cur = range_set(0, 10);
+    let tgt = set(&[0, 1, 2, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(
+      compute_switch_group(2, &cur, &tgt, 10),
+      SwitchSelection::Ready(5)
+    );
+  }
+
+  #[test]
+  fn common_boundary_at_live_edge_or_above() {
+    // (c)'s half-open range is empty for g >= live_edge, so a common group
+    // there qualifies on conditions (a) + (b) alone. (Availability above the
+    // live edge is unusual — largest_location can lag the cache briefly — but
+    // the selector should follow the spec, not second-guess its inputs.)
+    let cur = range_set(0, 12);
+    let tgt = range_set(0, 12);
+    assert_eq!(
+      compute_switch_group(11, &cur, &tgt, 10),
+      SwitchSelection::Ready(11)
+    );
+  }
+
+  #[test]
+  fn blocking_group_beyond_live_edge_is_ignored() {
+    // Group 10 is current-only, but it is not below the live edge (7), so it
+    // is outside condition (c)'s range and must not block.
+    let cur = range_set(0, 10);
+    let tgt = range_set(0, 7);
+    assert_eq!(
+      compute_switch_group(0, &cur, &tgt, 7),
+      SwitchSelection::Ready(0)
+    );
+  }
+
+  /// Literal restatement of the draft's G_switch definition, kept naive on
+  /// purpose: iterate candidate common boundaries in ascending order and check
+  /// condition (c) by brute force. This is the oracle for the exhaustive
+  /// cross-check below.
+  fn spec_reference(
+    min_switch_group: u64,
+    current_available: &BTreeSet<u64>,
+    target_available: &BTreeSet<u64>,
+    target_live_edge: u64,
+  ) -> SwitchSelection {
+    for &g in current_available.intersection(target_available) {
+      if g < min_switch_group {
+        continue;
+      }
+      let c_holds = (g..target_live_edge)
+        .all(|gp| !current_available.contains(&gp) || target_available.contains(&gp));
+      if c_holds {
+        return SwitchSelection::Ready(g);
+      }
+    }
+    SwitchSelection::NoCommonBoundary
+  }
+
+  #[test]
+  fn exhaustive_equivalence_with_spec_reference() {
+    // Every availability pattern over groups 0..=5 for both Tracks (64 x 64
+    // subset pairs), crossed with several live edges and minimums: the closed
+    // form must agree with the literal spec restatement everywhere. ~49k
+    // cases; runs in well under a second.
+    for cur_bits in 0u32..64 {
+      let cur: BTreeSet<u64> = (0u64..6).filter(|g| cur_bits & (1u32 << *g) != 0).collect();
+      for tgt_bits in 0u32..64 {
+        let tgt: BTreeSet<u64> = (0u64..6).filter(|g| tgt_bits & (1u32 << *g) != 0).collect();
+        for &live_edge in &[0u64, 3, 5, 7] {
+          for &min in &[0u64, 2, 4, 6] {
+            assert_eq!(
+              compute_switch_group(min, &cur, &tgt, live_edge),
+              spec_reference(min, &cur, &tgt, live_edge),
+              "divergence: min={min} live_edge={live_edge} cur={cur:?} tgt={tgt:?}"
+            );
+          }
+        }
+      }
+    }
   }
 }

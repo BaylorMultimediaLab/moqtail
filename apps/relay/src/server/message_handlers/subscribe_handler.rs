@@ -1011,7 +1011,10 @@ async fn handle_switch_message(
 
   // Select G_switch per the draft: the smallest group at/above the client's
   // Minimum Switching Group ID that is a common boundary between the two
-  // Tracks with a gap-free target tail up to the live edge. A minimum of 0 is
+  // Tracks and past which the target can supply every group the current Track
+  // would have supplied below the live edge (spec condition (c) — conditional,
+  // so holes shared by both Tracks do not block; see switch_selection.rs). A
+  // minimum of 0 is
   // an ordinary floor — "any group is acceptable" — and resolves to the
   // OLDEST qualifying boundary (full buffer replacement with a maximal
   // catch-up range), exactly as the draft reads. There is no live-edge
@@ -1029,7 +1032,7 @@ async fn handle_switch_message(
     SwitchSelection::Ready(g) => g,
     SwitchSelection::NoCommonBoundary => {
       warn!(
-        "switch: no common gap-free boundary for {:?} (min={})",
+        "switch: no qualifying common boundary for {:?} (min={})",
         target_full_track_name, switch_message.minimum_switching_group_id
       );
       send_switch_failure(
