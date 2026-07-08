@@ -56,6 +56,19 @@ use crate::server::track_cache::CacheConsumeEvent;
 const SWITCH_DRAIN_TIMEOUT: Duration = Duration::from_millis(3000);
 const SWITCH_DRAIN_POLL: Duration = Duration::from_millis(50);
 
+/// QUIC send priority for the SWITCH catch-up stream. SWITCH PR #1378: the relay
+/// SHOULD give the catch-up stream a HIGHER priority than concurrent SUBGROUP
+/// streams for the target track until the catch-up stream closes — the
+/// subscriber needs `[G_switch, live_edge)` first to assemble a gap-free
+/// buffer; live objects are only playable once the seam is filled. Subgroup
+/// streams are opened with `i32::MAX - elapsed_ms_since_start`
+/// (subscription.rs), which is strictly below `i32::MAX` for any stream opened
+/// after process start, so `i32::MAX` statically outranks them all for this
+/// stream's whole lifetime. Ordinary client-issued FETCH responses keep
+/// priority 0 in fetch_handler.rs — the draft's SHOULD covers only the switch
+/// catch-up stream.
+const SWITCH_CATCHUP_STREAM_PRIORITY: i32 = i32::MAX;
+
 /// Open the target Track's PUBLISH for a successful SWITCH.
 ///
 /// The PUBLISH advertises the live edge as its largest location and carries the
@@ -186,7 +199,11 @@ pub(crate) fn spawn_switch_catchup_stream(
     // Open eagerly (see doc comment): the FETCH_HEADER announces the range and
     // the trailing FIN terminates it even when zero objects follow.
     let send_stream = match subscriber
-      .open_stream(&stream_id, fetch_header.serialize().unwrap(), 0)
+      .open_stream(
+        &stream_id,
+        fetch_header.serialize().unwrap(),
+        SWITCH_CATCHUP_STREAM_PRIORITY,
+      )
       .await
     {
       Ok(ss) => ss,

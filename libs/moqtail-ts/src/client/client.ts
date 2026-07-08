@@ -213,6 +213,19 @@ export class MOQtailClient {
    * within its own budget always wins the race. See {@link MOQtailClient.switch}.
    */
   static readonly SWITCH_RESPONSE_TIMEOUT_MS = 6000
+  /**
+   * How long an incoming data stream will wait for its routing state before
+   * the missing route is treated as a protocol violation. Control and data
+   * streams have no cross-stream ordering in QUIC, so a data stream can beat
+   * the control message that installs its route — most acutely after a SWITCH,
+   * where the relay opens the catch-up FETCH_HEADER stream (and the target's
+   * SUBGROUP streams) immediately after queueing the PUBLISH. Route
+   * installation is local work that completes in microseconds once the control
+   * message arrives; 2s is a generous bound on control-stream delivery skew.
+   */
+  static readonly DATA_ROUTE_WAIT_TIMEOUT_MS = 2000
+  /** Poll interval for {@link MOQtailClient.DATA_ROUTE_WAIT_TIMEOUT_MS} waits. */
+  static readonly DATA_ROUTE_POLL_INTERVAL_MS = 20
   /** Underlying WebTransport session (set after successful construction in MOQtailClient.new). */
   webTransport!: WebTransport
   /** Validated ServerSetup message captured during handshake (protocol parameters negotiated). */
@@ -1869,6 +1882,24 @@ export class MOQtailClient {
   }
   // TODO: Handle request cancellation. Cancel streams are expected to receive some on-fly objects.
   // Do a timeout? Wait for certain amount of objects?
+  /**
+   * Poll `lookup` until it yields a value or the route-wait deadline passes.
+   * Used by the data-stream handler to tolerate data streams racing ahead of
+   * the control message that installs their routing state. Each
+   * data stream is handled on its own task, so waiting here blocks nothing
+   * else. A genuinely bogus stream still ends in a protocol violation — just
+   * after the deadline instead of instantly.
+   */
+  async #waitForDataRoute<T>(lookup: () => T | undefined): Promise<T | undefined> {
+    const deadline = Date.now() + MOQtailClient.DATA_ROUTE_WAIT_TIMEOUT_MS
+    let result = lookup()
+    while (result === undefined && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, MOQtailClient.DATA_ROUTE_POLL_INTERVAL_MS))
+      result = lookup()
+    }
+    return result
+  }
+
   async #handleRecvStreams(incomingUniStream: ReadableStream): Promise<void> {
     this.#ensureActive()
     try {
@@ -1929,10 +1960,21 @@ export class MOQtailClient {
         // handler) rather than a client-issued FetchRequest. Route its objects
         // into that receiver so [G_switch, live_edge) reaches the same stream as
         // the live SUBGROUP objects.
-        const catchupAlias = this.subscriptionAliasMap.get(header.requestId)
-        const catchupReceiver = catchupAlias !== undefined ? this.subscriptions.get(catchupAlias) : undefined
-        const catchupName = catchupAlias !== undefined ? this.aliasFullTrackNameMap.get(catchupAlias) : undefined
-        if (catchupReceiver && catchupName) {
+        //
+        // The relay opens this stream immediately after queueing the PUBLISH
+        // control message, and QUIC gives no ordering between the control
+        // stream and data streams — so this FETCH_HEADER can arrive before
+        // handlerPublish has installed the route. Wait briefly for it rather
+        // than tearing the session down on a benign race.
+        const catchupRoute = await this.#waitForDataRoute(() => {
+          const alias = this.subscriptionAliasMap.get(header.requestId)
+          if (alias === undefined) return undefined
+          const receiver = this.subscriptions.get(alias)
+          const name = this.aliasFullTrackNameMap.get(alias)
+          return receiver && name ? { receiver, name } : undefined
+        })
+        if (catchupRoute) {
+          const { receiver: catchupReceiver, name: catchupName } = catchupRoute
           try {
             while (true) {
               const { done, value: nextObject } = await reader.read()
@@ -1951,19 +1993,25 @@ export class MOQtailClient {
 
         throw new ProtocolViolationError('MOQtailClient', 'No request for received request id')
       } else {
-        let subscription = this.subscriptions.get(header.trackAlias)
-
-        // Check pending state updates for switch operations
-        if (!subscription) {
-          for (const [subscriptionId, callback] of this.pendingStateUpdates) {
-            const matched = callback(header.trackAlias)
-            if (matched) {
-              subscription = this.subscriptions.get(header.trackAlias)
-              this.pendingStateUpdates.delete(subscriptionId)
-              break
+        // Same control-vs-data race as the catch-up path above: after a SWITCH
+        // the target track's SUBGROUP streams can arrive before the PUBLISH
+        // handler registers the subscription for this alias. The pending
+        // state-update callbacks are folded into the retried lookup so either
+        // path can resolve the route within the wait window.
+        const subscription = await this.#waitForDataRoute(() => {
+          let sub = this.subscriptions.get(header.trackAlias)
+          if (!sub) {
+            for (const [subscriptionId, callback] of this.pendingStateUpdates) {
+              const matched = callback(header.trackAlias)
+              if (matched) {
+                sub = this.subscriptions.get(header.trackAlias)
+                this.pendingStateUpdates.delete(subscriptionId)
+                break
+              }
             }
           }
-        }
+          return sub ?? undefined
+        })
 
         if (subscription) {
           subscription.streamsAccepted++
