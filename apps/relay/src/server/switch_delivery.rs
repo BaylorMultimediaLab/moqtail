@@ -245,6 +245,12 @@ pub(crate) fn spawn_switch_catchup_stream(
   });
 }
 
+/// Captured pre-seam bound for unwinding on PUBLISH failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeamBoundUndo {
+  pub prior_end_group: Option<u64>,
+}
+
 /// Outcome of draining the source Track below the switch boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // not yet wired; consumed by handle_switch_message
@@ -256,7 +262,9 @@ pub(crate) enum DrainOutcome {
   /// subscription), so a caller whose PUBLISH subsequently fails can unwind
   /// the bound via [`restore_source_end_group`] and leave the current
   /// subscription unaltered, as the draft's failure discipline requires.
-  Drained { prior_end_group: Option<u64> },
+  /// `undo` is `Some` iff a seam bound was applied (its inner value may be
+  /// `None` = previously unbounded); `None` when nothing was bounded.
+  Drained { undo: Option<SeamBoundUndo> },
   /// The drain did not finish within `SWITCH_DRAIN_TIMEOUT`. The source is
   /// left completely unchanged; the caller aborts with TIMEOUT.
   TimedOut,
@@ -294,7 +302,7 @@ pub(crate) async fn drain_source_below(
 ) -> DrainOutcome {
   if g_switch == 0 {
     return DrainOutcome::Drained {
-      prior_end_group: None,
+      undo: None,
     };
   }
   let Some(sub_arc) = current_track
@@ -304,9 +312,7 @@ pub(crate) async fn drain_source_below(
     .await
   else {
     // No source subscription to drain; nothing to truncate.
-    return DrainOutcome::Drained {
-      prior_end_group: None,
-    };
+    return DrainOutcome::Drained { undo: None };
   };
 
   // Wait until last-sent reaches G_switch-1 (or timeout/abandon). The source
@@ -342,11 +348,13 @@ pub(crate) async fn drain_source_below(
         let sub = sub_arc.read().await;
         let mut state = sub.subscription_state.write().await;
         let prior = state.end_group;
-        state.end_group = g_switch - 1;
+        // g_switch == 1 now yields Some(0): a real bound at group 0, where the
+        // old u64 sentinel silently meant "no limit".
+        state.end_group = Some(g_switch - 1);
         prior
       };
       return DrainOutcome::Drained {
-        prior_end_group: Some(prior_end_group),
+        undo: Some(SeamBoundUndo { prior_end_group })
       };
     }
     if Instant::now() >= deadline {
@@ -367,7 +375,7 @@ pub(crate) async fn drain_source_below(
 pub(crate) async fn restore_source_end_group(
   current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
-  prior_end_group: u64,
+  prior_end_group: Option<u64>,
 ) {
   if let Some(sub_arc) = current_track
     .read()
@@ -394,6 +402,7 @@ pub(crate) async fn terminate_source(
   current_track: &Arc<RwLock<Track>>,
   current_full_track_name: &FullTrackName,
   connection_id: usize,
+  current_sub_req_id: u64,
 ) {
   if let Some(sub_arc) = current_track
     .read()
@@ -421,4 +430,12 @@ pub(crate) async fn terminate_source(
     .subscriptions
     .remove_subscription(current_full_track_name)
     .await;
+  // PR #1378 gate hygiene: the replaced subscription is no longer
+  // Established. Without this, a later SWITCH naming this Request ID passes
+  // the pre-PUBLISH gate and drives a full switch off a dead subscription.
+  subscriber
+    .subscribe_requests
+    .write()
+    .await
+    .remove(&current_sub_req_id);
 }

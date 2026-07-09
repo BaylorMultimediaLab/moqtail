@@ -53,7 +53,8 @@ pub struct SubscriptionState {
   pub forward: bool,
   pub _filter_type: FilterType,
   pub start_location: Option<Location>,
-  pub end_group: u64,
+  /// Inclusive last group to forward; `None` = unbounded.
+  pub end_group: Option<u64>,
   pub subscribe_parameters: Vec<KeyValuePair>,
   pub last_sent_max_location: Option<Location>,
   pub last_received_object_location: Option<Location>,
@@ -104,7 +105,7 @@ impl From<Subscribe> for SubscriptionState {
       forward: subscribe.forward,
       _filter_type: subscribe.filter_type,
       start_location: subscribe.start_location,
-      end_group: subscribe.end_group.unwrap_or(0),
+      end_group: subscribe.end_group,
       subscribe_parameters: subscribe.subscribe_parameters,
       last_sent_max_location: None,
       last_received_object_location: None,
@@ -382,7 +383,8 @@ impl Subscription {
     state.start_location = Some(subscribe_update.start_location);
     state.subscriber_priority = subscribe_update.subscriber_priority;
     state.forward = subscribe_update.forward;
-    state.end_group = subscribe_update.end_group;
+    // SUBSCRIBE_UPDATE keeps the wire sentinel: 0 = no end group.
+    state.end_group = (subscribe_update.end_group > 0).then_some(subscribe_update.end_group);
 
     // update parameters. If a parameter included in SUBSCRIBE is not present in
     // SUBSCRIBE_UPDATE, its value remains unchanged.  There is no mechanism
@@ -560,7 +562,7 @@ impl Subscription {
             return;
           }
 
-          if state.end_group > 0 && object.location.group > state.end_group {
+          if state.end_group.is_some_and(|end| object.location.group > end) {
             /* With Draft-15, the end group can be increased or decreased.
             TODO: Remove the following code after draft-15 support.
             info!(
@@ -570,7 +572,7 @@ impl Subscription {
             self.finish().await;
             */
             debug!(
-              "Object beyond end group for subscriber: {} track: {} object location: {:?} end group: {}",
+              "Object beyond end group for subscriber: {} track: {} object location: {:?} end group: {:?}",
               self.client_connection_id,
               self.track_alias(),
               object.location,

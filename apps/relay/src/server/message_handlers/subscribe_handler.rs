@@ -717,18 +717,16 @@ async fn handle_unsubscribe_message(
   // stop sending objects for the track for the subscriber
   // by removing the subscription
   // find the track alias by using the request id
-  let requests = client.subscribe_requests.read().await;
-  let request = requests.get(&unsubscribe_message.request_id);
-  if request.is_none() {
-    // a warning is enough
-    warn!(
-      "request not found for request id: {:?}",
-      unsubscribe_message.request_id
-    );
-    return Ok(());
-  }
-  let request = request.unwrap();
-  let full_track_name = request.original_subscribe_request.get_full_track_name();
+  let full_track_name = {
+    let requests = client.subscribe_requests.read().await;
+    match requests.get(&unsubscribe_message.request_id) {
+      Some(req) => req.original_subscribe_request.get_full_track_name(),
+      None => {
+        warn!("request not found for request id: {:?}", unsubscribe_message.request_id);
+        return Ok(());
+      }
+    }
+  };
 
   // remove the subscription from the track
   let track_option = context.track_manager.get_track(&full_track_name).await;
@@ -748,6 +746,12 @@ async fn handle_unsubscribe_message(
     .subscriptions
     .remove_subscription(&full_track_name)
     .await;
+
+  client
+    .subscribe_requests
+    .write()
+    .await
+    .remove(&unsubscribe_message.request_id);
 
   Ok(())
 }
@@ -909,7 +913,7 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    DrainOutcome, drain_source_below, restore_source_end_group, send_switch_failure,
+    DrainOutcome, SeamBoundUndo, drain_source_below, restore_source_end_group, send_switch_failure,
     send_switch_publish, spawn_switch_catchup_stream, terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
@@ -953,6 +957,21 @@ async fn handle_switch_message(
     }
   };
   let current_full_track_name = current_track_arc.read().await.full_track_name.clone();
+  // "Established" means a live subscription on the track for THIS connection,
+  // not merely a leftover request-map entry.
+  if current_track_arc
+    .read()
+    .await
+    .get_subscription(context.connection_id)
+    .await
+    .is_none()
+  {
+    warn!(
+      "switch: request id {} has no live subscription; dropping SWITCH (no PUBLISH, no state change)",
+      current_sub_req_id
+    );
+    return Ok(());
+  }
 
   // Resolve the target Track (needed for the PUBLISH track alias and for
   // G_switch selection). Absent target -> DOES_NOT_EXIST. This is a
@@ -1059,15 +1078,10 @@ async fn handle_switch_message(
   // behind-live switches, is typically immediate (the source has already
   // delivered past G_switch) and only takes time when the source itself lags
   // under congestion.
-  let live_sub = Subscribe::new_latest_object(
-    target_request_id,
-    switch_message.track_namespace.clone(),
-    switch_message.track_name.clone(),
-    0,
-    GroupOrder::Original,
-    true,
-    switch_message.subscribe_parameters.clone(),
-  );
+  // live_sub is built INSIDE the task, after the live edge is re-read at
+  // PUBLISH-open time — its start location depends on that fresh value.
+  let target_namespace = switch_message.track_namespace.clone();
+  let target_name = switch_message.track_name.clone();
   let target_parameters = switch_message.subscribe_parameters.clone();
   let connection_id = context.connection_id;
   tokio::spawn(async move {
@@ -1089,7 +1103,7 @@ async fn handle_switch_message(
     )
     .await
     {
-      DrainOutcome::Drained { prior_end_group } => prior_end_group,
+      DrainOutcome::Drained { undo } => undo,
       DrainOutcome::Abandoned => None,
       DrainOutcome::TimedOut => {
         warn!(
@@ -1171,7 +1185,7 @@ async fn handle_switch_message(
       // still answer with the failure PUBLISH + PUBLISH_DONE (the failure
       // PUBLISH's own parameter is the trivial {0,0} SWITCH_TRANSITION, which
       // cannot hit the build error that landed us here).
-      if let Some(prior_end_group) = drain_undo {
+      if let Some(SeamBoundUndo { prior_end_group }) = drain_undo {
         restore_source_end_group(&current_track_arc, connection_id, prior_end_group).await;
       }
       send_switch_failure(
@@ -1185,6 +1199,25 @@ async fn handle_switch_message(
       client.switch_in_flight.lock().await.complete(current_sub_req_id);
       return;
     }
+
+    // (2b) Live delivery must cover every Object at/after the seam's live
+    // boundary: catch-up ends at live_edge (exclusive), so SUBGROUP delivery
+    // starts at (max(g_switch, live_edge), 0). AbsoluteStart sets is_joining,
+    // which replays the already-cached head of that group before resuming
+    // live-forward (deduped via last_received_object_location). LatestObject
+    // attached mid-group and dropped (live_edge, 0 .. now) — an undeliverable
+    // hole exactly at the seam, typically the group's keyframe.
+    let live_start = g_switch.max(live_edge);
+    let live_sub = Subscribe::new_absolute_start(
+      target_request_id,
+      target_namespace,
+      target_name,
+      0,
+      GroupOrder::Original,
+      true,
+      Location::new(live_start, 0),
+      target_parameters.clone(),
+    );
 
     // (3) Live-only subscription on the target Track (objects from the live edge
     // onward, on SUBGROUP streams) + relay-side request mapping.
@@ -1213,6 +1246,7 @@ async fn handle_switch_message(
       &current_track_arc,
       &current_full_track_name,
       connection_id,
+      current_sub_req_id,
     )
     .await;
 
