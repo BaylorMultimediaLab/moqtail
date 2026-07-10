@@ -59,9 +59,37 @@ pub struct SubscriptionState {
   pub last_sent_max_location: Option<Location>,
   pub last_received_object_location: Option<Location>,
   pub is_joining: bool,
+  /// Per-`(group_id, subgroup_id)` high-water of object IDs actually
+  /// delivered by the joining cache replay. The live-forward path drops a
+  /// queued SubgroupObject event iff its subgroup has a watermark at or above
+  /// its object ID — i.e. iff the replay already delivered that exact object.
+  /// Object IDs are monotonic within a subgroup, and `read_objects` replays a
+  /// consistent per-group snapshot (the group's read lock is held for the
+  /// whole iteration) while `Track::new_subgroup_object` caches every object
+  /// BEFORE fanning it out, so "<= watermark" is exactly "was replayed":
+  /// late arrivals the snapshot never covered — older-group stragglers or
+  /// interleaved subgroups with smaller IDs — have no watermark at/above them
+  /// and pass through. A single max-location threshold cannot express this
+  /// and would drop such stragglers (a seam gap on the target track).
+  pub replay_watermarks: HashMap<(u64, u64), u64>,
 }
 
 impl SubscriptionState {
+  /// True iff the joining cache replay already delivered this exact object,
+  /// i.e. the object's subgroup has a replay watermark at or above its
+  /// object ID. Objects with no subgroup ID never appear in a replay
+  /// (`Object::try_from_fetch` always sets `Some`), so they are never
+  /// duplicates of one.
+  pub fn is_replay_duplicate(&self, location: &Location, subgroup_id: Option<u64>) -> bool {
+    match subgroup_id {
+      Some(subgroup_id) => self
+        .replay_watermarks
+        .get(&(location.group, subgroup_id))
+        .is_some_and(|wm| location.object <= *wm),
+      None => false,
+    }
+  }
+
   pub fn update_last_sent_max_location(&mut self, location: Location) {
     match &self.last_sent_max_location {
       Some(current_max) => {
@@ -109,6 +137,7 @@ impl From<Subscribe> for SubscriptionState {
       subscribe_parameters: subscribe.subscribe_parameters,
       last_sent_max_location: None,
       last_received_object_location: None,
+      replay_watermarks: HashMap::new(),
       is_joining,
     }
   }
@@ -243,6 +272,12 @@ impl Subscription {
 
               let mut last_group: u64 = u64::MAX;
               let mut last_stream_id: Option<StreamId> = None;
+              // Exactly what this replay pass delivers, keyed by
+              // (group_id, subgroup_id) -> max object_id. Published into
+              // SubscriptionState after the loop, so the replayed objects
+              // themselves (which flow through handle_track_event below)
+              // are never self-filtered.
+              let mut replay_watermarks: HashMap<(u64, u64), u64> = HashMap::new();
 
               loop {
                 match object_receiver.recv().await {
@@ -287,6 +322,18 @@ impl Subscription {
                         (None, last_stream_id.clone())
                       };
 
+                      // Record before `object` is moved below. Duplicates of
+                      // these exact objects can already sit in this
+                      // subscription's event queue (cached after
+                      // add_subscription but before this group's snapshot);
+                      // the live-forward path drops them via this watermark.
+                      let wm = replay_watermarks
+                        .entry((object.group_id, object.subgroup_id))
+                        .or_insert(object.object_id);
+                      if object.object_id > *wm {
+                        *wm = object.object_id;
+                      }
+
                       let the_object = Object::try_from_fetch(object, track_alias).unwrap();
 
                       let track_event = TrackEvent::SubgroupObject {
@@ -309,11 +356,21 @@ impl Subscription {
                 }
               }
 
-              // Record what we replayed up to so the live-forward path knows where
-              // to resume. Without this, live objects in the [start_location, end]
-              // range that arrive after the snapshot would be duplicates.
+              // Record the nominal replay end (upper bound for a future
+              // reconnect replay) and publish the per-subgroup watermarks of
+              // what was ACTUALLY delivered. Dedup against queued live events
+              // uses the watermarks, not this location: a single max-location
+              // threshold would also swallow late arrivals the snapshot never
+              // covered. Merge rather than replace, in case a future
+              // reconnect path re-enters the joining block.
               let mut state = instance.subscription_state.write().await;
               state.last_received_object_location = Some(end);
+              for (key, wm) in replay_watermarks.drain() {
+                let entry = state.replay_watermarks.entry(key).or_insert(wm);
+                if wm > *entry {
+                  *entry = wm;
+                }
+              }
               drop(state);
             }
 
@@ -558,6 +615,25 @@ impl Subscription {
               self.track_alias(),
               object.location,
               start
+            );
+            return;
+          }
+
+          // Joining-replay dedup: drop this event iff the replay already
+          // delivered this exact object (its subgroup's watermark is at or
+          // above its object ID). Without this, an object cached between
+          // add_subscription and the replay's group snapshot is sent twice —
+          // and both copies resolve to the SAME subgroup StreamId, producing
+          // non-increasing object IDs on one QUIC stream, which a strict
+          // MOQT receiver must treat as malformed. Objects with no
+          // subgroup_id never appear in the replay (try_from_fetch always
+          // sets Some), so they pass through unfiltered.
+          if state.is_replay_duplicate(&object.location, object.subgroup_id) {
+            debug!(
+              "Duplicate of joining replay; skipping - subscriber: {} track: {} location: {:?}",
+              self.client_connection_id,
+              self.track_alias(),
+              object.location
             );
             return;
           }
@@ -1090,5 +1166,94 @@ mod tests_from_subscribe_is_joining {
     let state = SubscriptionState::from(sub);
     assert_eq!(state.start_location, None);
     assert!(!state.is_joining);
+  }
+}
+
+#[cfg(test)]
+mod tests_replay_watermark_dedup {
+  use super::*;
+  use moqtail::model::common::{
+    location::Location,
+    pair::KeyValuePair,
+    tuple::{Tuple, TupleField},
+  };
+  use moqtail::model::control::{constant::GroupOrder, subscribe::Subscribe};
+
+  fn state_with_watermark(group: u64, subgroup: u64, max_object: u64) -> SubscriptionState {
+    let sub = Subscribe::new_absolute_start(
+      1,
+      Tuple::from_utf8_path("/test"),
+      TupleField::from_utf8("video"),
+      0,
+      GroupOrder::Original,
+      true,
+      Location { group, object: 0 },
+      Vec::<KeyValuePair>::new(),
+    );
+    let mut state = SubscriptionState::from(sub);
+    state.replay_watermarks.insert((group, subgroup), max_object);
+    state
+  }
+
+  #[test]
+  fn object_at_or_below_watermark_is_duplicate() {
+    // The exact race: the object was cached between add_subscription and the
+    // replay's group snapshot, so it was replayed AND queued as a live event.
+    // The queued copy must be dropped — both copies resolve to the same
+    // subgroup StreamId, and a second write means non-increasing object IDs
+    // on one QUIC stream, which a strict MOQT receiver treats as malformed.
+    let state = state_with_watermark(10, 0, 5);
+    assert!(state.is_replay_duplicate(&Location { group: 10, object: 5 }, Some(0)));
+    assert!(state.is_replay_duplicate(&Location { group: 10, object: 0 }, Some(0)));
+  }
+
+  #[test]
+  fn object_above_watermark_passes() {
+    // Cached after the snapshot: only the live event exists; must pass.
+    let state = state_with_watermark(10, 0, 5);
+    assert!(!state.is_replay_duplicate(&Location { group: 10, object: 6 }, Some(0)));
+  }
+
+  #[test]
+  fn interleaved_subgroup_straggler_passes() {
+    // Why the watermark is per-(group, subgroup) and not a max location:
+    // subgroup 1's object 3 can arrive after subgroup 0's object 9 was
+    // replayed. It was never in the snapshot, so it must NOT be dropped —
+    // a single max-location threshold (e.g. (group, u64::MAX)) would
+    // swallow it and re-open a seam gap.
+    let state = state_with_watermark(10, 0, 9);
+    assert!(!state.is_replay_duplicate(&Location { group: 10, object: 3 }, Some(1)));
+  }
+
+  #[test]
+  fn older_group_straggler_passes() {
+    // Same argument across groups: a late object in a group the replay
+    // never saw has no watermark and must pass.
+    let state = state_with_watermark(10, 0, 9);
+    assert!(!state.is_replay_duplicate(&Location { group: 9, object: 2 }, Some(0)));
+  }
+
+  #[test]
+  fn object_without_subgroup_passes() {
+    // try_from_fetch always sets Some(subgroup_id), so a replay can never
+    // have delivered a subgroup-less object; never treat one as a duplicate.
+    let state = state_with_watermark(10, 0, 9);
+    assert!(!state.is_replay_duplicate(&Location { group: 10, object: 1 }, None));
+  }
+
+  #[test]
+  fn empty_watermarks_never_filter() {
+    // No replay ran (live-only LatestObject subscription): nothing filtered.
+    let sub = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path("/test"),
+      TupleField::from_utf8("video"),
+      0,
+      GroupOrder::Original,
+      true,
+      Vec::<KeyValuePair>::new(),
+    );
+    let state = SubscriptionState::from(sub);
+    assert!(!state.is_replay_duplicate(&Location { group: 0, object: 0 }, Some(0)));
   }
 }
