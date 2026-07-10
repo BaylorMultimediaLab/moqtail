@@ -32,10 +32,12 @@ use std::time::{Duration, Instant};
 use moqtail::model::common::location::Location;
 use moqtail::model::common::pair::KeyValuePair;
 use moqtail::model::common::reason_phrase::ReasonPhrase;
+use moqtail::model::common::tuple::{Tuple, TupleField};
 use moqtail::model::control::constant::{GroupOrder, PublishDoneStatusCode};
 use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::publish::Publish;
 use moqtail::model::control::publish_done::PublishDone;
+use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::data::fetch_header::FetchHeader;
 use moqtail::model::data::full_track_name::FullTrackName;
 use moqtail::model::error::ParseError;
@@ -173,6 +175,76 @@ pub(crate) async fn send_switch_failure(
 /// stream — FETCH_HEADER then immediate FIN — not an absent one; a lazily
 /// opened stream would leave the subscriber waiting on a range that never
 /// terminates.
+/// The catch-up range for a switch: `[G_switch, live_edge)` expressed as the
+/// inclusive `(start, end)` pair `TrackCache::read_objects` expects, where
+/// `end.object == 0` means "the whole end group". `None` when
+/// `g_switch >= live_edge`: the switch lands at or above the live edge, so
+/// there is nothing to catch up — SUBGROUP delivery covers the seam.
+/// `live_edge - 1` cannot underflow: it is only computed when
+/// `g_switch < live_edge`, which forces `live_edge >= 1`.
+pub(crate) fn switch_catchup_range(g_switch: u64, live_edge: u64) -> Option<(Location, Location)> {
+  if g_switch >= live_edge {
+    return None;
+  }
+  Some((Location::new(g_switch, 0), Location::new(live_edge - 1, 0)))
+}
+
+/// The seam bound applied to the source subscription once its drain completes:
+/// forward nothing above `G_switch - 1`. `None` for `g_switch == 0` — nothing
+/// exists below Group 0, so no bound is applied (`drain_source_below`
+/// early-returns before bounding in that case).
+///
+/// `g_switch == 1` yields `Some(0)`: a real bound at Group 0. This is the case
+/// the old `u64` encoding could not express — it wrote `0`, which the
+/// forwarding filter read as "no limit", leaking Groups >= 1 across the seam.
+pub(crate) fn seam_end_group_bound(g_switch: u64) -> Option<u64> {
+  g_switch.checked_sub(1)
+}
+
+/// True once the source's last-sent object sits in Group `G_switch - 1` or
+/// beyond. Note this is a heuristic, not proof that every object below the
+/// seam was delivered — see the drain-completeness caveat on
+/// [`drain_source_below`]. Callers guarantee `g_switch >= 1`.
+pub(crate) fn drain_complete(last_sent: Option<&Location>, g_switch: u64) -> bool {
+  last_sent
+    .map(|loc| loc.group + 1 >= g_switch)
+    .unwrap_or(false)
+}
+
+/// Builds the live subscription opened for the target Track of a switch.
+///
+/// SUBGROUP delivery must cover every object at/after the seam's live
+/// boundary: catch-up ends at `live_edge` (exclusive), so live delivery
+/// starts at `(max(g_switch, live_edge), 0)`. The `max` matters when the
+/// selected boundary sits at or above the live edge: there is no catch-up
+/// stream then, and starting at `live_edge` would leak Groups
+/// `[live_edge, G_switch)` that the source is still responsible for.
+///
+/// `AbsoluteStart` (not `LatestObject`) is load-bearing: it sets
+/// `is_joining`, whose cache replay delivers the already-received head of the
+/// start group before live-forward resumes. `LatestObject` attaches mid-group
+/// and drops `(live_edge, 0..now)` — an undecodable hole exactly at the seam,
+/// typically the group's keyframe.
+pub(crate) fn build_switch_live_sub(
+  target_request_id: u64,
+  track_namespace: Tuple,
+  track_name: TupleField,
+  g_switch: u64,
+  live_edge: u64,
+  parameters: Vec<KeyValuePair>,
+) -> Subscribe {
+  Subscribe::new_absolute_start(
+    target_request_id,
+    track_namespace,
+    track_name,
+    0,
+    GroupOrder::Original,
+    true,
+    Location::new(g_switch.max(live_edge), 0),
+    parameters,
+  )
+}
+
 #[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) fn spawn_switch_catchup_stream(
   subscriber: Arc<MOQTClient>,
@@ -181,16 +253,12 @@ pub(crate) fn spawn_switch_catchup_stream(
   g_switch: u64,
   live_edge: u64,
 ) {
-  if g_switch >= live_edge {
+  let Some((start, end)) = switch_catchup_range(g_switch, live_edge) else {
     return;
-  }
+  };
   tokio::spawn(async move {
     let track = target_track.read().await;
     let track_alias = track.track_alias;
-    // [g_switch, live_edge): stop one group below the edge — the live edge and
-    // beyond are delivered by the subscription's SUBGROUP streams.
-    let start = Location::new(g_switch, 0);
-    let end = Location::new(live_edge.saturating_sub(1), 0);
     let mut object_rx = track.cache.read_objects(start, end, false).await;
 
     let fetch_header = FetchHeader::new(publish_request_id);
@@ -333,11 +401,7 @@ pub(crate) async fn drain_source_below(
     let drained = {
       let sub = sub_arc.read().await;
       let state = sub.subscription_state.read().await;
-      state
-        .last_sent_max_location
-        .as_ref()
-        .map(|loc| loc.group + 1 >= g_switch)
-        .unwrap_or(false)
+      drain_complete(state.last_sent_max_location.as_ref(), g_switch)
     };
     if drained {
       // Drain confirmed: bound the source at the seam so it does not forward
@@ -348,9 +412,10 @@ pub(crate) async fn drain_source_below(
         let sub = sub_arc.read().await;
         let mut state = sub.subscription_state.write().await;
         let prior = state.end_group;
-        // g_switch == 1 now yields Some(0): a real bound at group 0, where the
-        // old u64 sentinel silently meant "no limit".
-        state.end_group = Some(g_switch - 1);
+        // g_switch >= 1 here (0 early-returned above), so this is always
+        // Some(g_switch - 1); see seam_end_group_bound for the g_switch == 1
+        // sentinel-collision case this encoding fixes.
+        state.end_group = seam_end_group_bound(g_switch);
         prior
       };
       return DrainOutcome::Drained {
@@ -438,4 +503,147 @@ pub(crate) async fn terminate_source(
     .write()
     .await
     .remove(&current_sub_req_id);
+}
+
+#[cfg(test)]
+mod tests_switch_seam_helpers {
+  use super::*;
+  use crate::server::subscription::SubscriptionState;
+  use moqtail::model::control::constant::FilterType;
+
+  fn loc(group: u64, object: u64) -> Location {
+    Location { group, object }
+  }
+
+  fn namespace() -> Tuple {
+    Tuple::from_utf8_path("/test")
+  }
+
+  fn track_name() -> TupleField {
+    TupleField::from_utf8("video")
+  }
+
+  // ---- seam_end_group_bound ----
+
+  #[test]
+  fn seam_bound_for_g_switch_one_is_a_real_bound_at_group_zero() {
+    // THE sentinel regression: under the old u64 encoding the bound for
+    // G_switch == 1 was written as 0, which the forwarding filter read as
+    // "no limit" — the source leaked Groups >= 1 across the seam while the
+    // target delivered the same groups via catch-up.
+    assert_eq!(seam_end_group_bound(1), Some(0));
+  }
+
+  #[test]
+  fn seam_bound_for_g_switch_zero_is_unbounded() {
+    // Nothing exists below Group 0; drain_source_below early-returns with
+    // undo: None and applies no bound.
+    assert_eq!(seam_end_group_bound(0), None);
+  }
+
+  #[test]
+  fn seam_bound_is_g_switch_minus_one() {
+    assert_eq!(seam_end_group_bound(10), Some(9));
+  }
+
+  // ---- drain_complete ----
+
+  #[test]
+  fn drain_not_complete_when_nothing_sent() {
+    assert!(!drain_complete(None, 1));
+    assert!(!drain_complete(None, 5));
+  }
+
+  #[test]
+  fn drain_complete_when_last_sent_reaches_seam_minus_one() {
+    // G_switch == 1: anything sent in Group 0 completes the drain.
+    assert!(drain_complete(Some(&loc(0, 5)), 1));
+    // G_switch == 5: Group 4 completes, Group 3 does not.
+    assert!(drain_complete(Some(&loc(4, 0)), 5));
+    assert!(!drain_complete(Some(&loc(3, 7)), 5));
+  }
+
+  #[test]
+  fn drain_complete_when_source_already_past_seam() {
+    // Behind-live / buffer-replacement switch: the source forwarded past
+    // G_switch before the SWITCH arrived; the drain is immediately complete.
+    assert!(drain_complete(Some(&loc(7, 2)), 5));
+  }
+
+  // ---- switch_catchup_range ----
+
+  #[test]
+  fn catchup_range_is_half_open() {
+    // [G_switch, live_edge): end group is live_edge - 1, and end.object == 0
+    // means "the whole end group" in read_objects' range semantics.
+    assert_eq!(
+      switch_catchup_range(2, 6),
+      Some((loc(2, 0), loc(5, 0)))
+    );
+  }
+
+  #[test]
+  fn catchup_skipped_at_or_above_live_edge() {
+    // The switch lands at/above the live edge: no catch-up stream; SUBGROUP
+    // delivery covers the seam (see build_switch_live_sub's max()).
+    assert_eq!(switch_catchup_range(6, 6), None);
+    assert_eq!(switch_catchup_range(7, 6), None);
+  }
+
+  #[test]
+  fn catchup_range_at_live_edge_one_does_not_underflow() {
+    // live_edge == 1 with g_switch == 0 is the smallest non-empty range:
+    // exactly Group 0. Pins the `live_edge - 1` underflow guard (the
+    // subtraction is only reachable when live_edge >= 1).
+    assert_eq!(
+      switch_catchup_range(0, 1),
+      Some((loc(0, 0), loc(0, 0)))
+    );
+  }
+
+  // ---- build_switch_live_sub ----
+
+  #[test]
+  fn live_sub_starts_at_live_edge_when_seam_below_edge() {
+    // Normal switch: catch-up covers [g_switch, live_edge); live delivery
+    // must begin exactly at (live_edge, 0) — no gap, no overlap.
+    let sub = build_switch_live_sub(42, namespace(), track_name(), 3, 7, Vec::new());
+    assert_eq!(sub.start_location, Some(loc(7, 0)));
+  }
+
+  #[test]
+  fn live_sub_starts_at_g_switch_when_seam_above_edge() {
+    // No-catch-up case: nothing below G_switch may be delivered for the
+    // target. Starting at live_edge here would leak Groups [live_edge,
+    // g_switch) that the source is still responsible for — duplicates at
+    // the seam.
+    let sub = build_switch_live_sub(42, namespace(), track_name(), 9, 7, Vec::new());
+    assert_eq!(sub.start_location, Some(loc(9, 0)));
+  }
+
+  #[test]
+  fn live_sub_start_at_exact_edge() {
+    let sub = build_switch_live_sub(42, namespace(), track_name(), 7, 7, Vec::new());
+    assert_eq!(sub.start_location, Some(loc(7, 0)));
+  }
+
+  #[test]
+  fn live_sub_uses_absolute_start_and_engages_joining_replay() {
+    // THE seam-gap regression: reverting this to new_latest_object makes
+    // is_joining false — no cache replay — and the already-received head of
+    // the live-edge group, (live_edge, 0..now), is delivered by neither the
+    // catch-up stream (which ends below live_edge) nor the live path
+    // (which only forwards objects arriving after attach). That hole is
+    // typically the group's keyframe.
+    let sub = build_switch_live_sub(42, namespace(), track_name(), 3, 7, Vec::new());
+    assert!(matches!(sub.filter_type, FilterType::AbsoluteStart));
+    assert_eq!(sub.end_group, None, "live sub must be unbounded");
+    assert_eq!(sub.request_id, 42);
+    let state = SubscriptionState::from(sub);
+    assert!(
+      state.is_joining,
+      "AbsoluteStart must set is_joining so the cache replay covers the \
+       already-received head of the start group"
+    );
+  }
 }

@@ -21,7 +21,7 @@ use bytes::Bytes;
 use core::result::Result;
 use moqtail::model::common::location::Location;
 use moqtail::model::common::pair::KeyValuePair;
-use moqtail::model::control::constant::{FilterType, GroupOrder};
+use moqtail::model::control::constant::FilterType;
 use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::data::subgroup_header::SubgroupHeader;
 use moqtail::model::data::subgroup_object::SubgroupObject;
@@ -913,8 +913,9 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    DrainOutcome, SeamBoundUndo, drain_source_below, restore_source_end_group, send_switch_failure,
-    send_switch_publish, spawn_switch_catchup_stream, terminate_source,
+    DrainOutcome, SeamBoundUndo, build_switch_live_sub, drain_source_below,
+    restore_source_end_group, send_switch_failure, send_switch_publish,
+    spawn_switch_catchup_stream, terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
   use crate::server::switch_selection::{SwitchSelection, select_switch_group};
@@ -1200,22 +1201,15 @@ async fn handle_switch_message(
       return;
     }
 
-    // (2b) Live delivery must cover every Object at/after the seam's live
-    // boundary: catch-up ends at live_edge (exclusive), so SUBGROUP delivery
-    // starts at (max(g_switch, live_edge), 0). AbsoluteStart sets is_joining,
-    // which replays the already-cached head of that group before resuming
-    // live-forward (deduped via last_received_object_location). LatestObject
-    // attached mid-group and dropped (live_edge, 0 .. now) — an undeliverable
-    // hole exactly at the seam, typically the group's keyframe.
-    let live_start = g_switch.max(live_edge);
-    let live_sub = Subscribe::new_absolute_start(
+    // (2b) Build the live subscription via the tested helper: AbsoluteStart
+    // at (max(g_switch, live_edge), 0) with is_joining cache replay. See
+    // build_switch_live_sub for the full seam rationale.
+    let live_sub = build_switch_live_sub(
       target_request_id,
       target_namespace,
       target_name,
-      0,
-      GroupOrder::Original,
-      true,
-      Location::new(live_start, 0),
+      g_switch,
+      live_edge,
       target_parameters.clone(),
     );
 

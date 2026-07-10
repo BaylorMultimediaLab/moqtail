@@ -90,6 +90,22 @@ impl SubscriptionState {
     }
   }
 
+  /// True iff `group` lies beyond the subscription's end-group bound
+  /// (`None` = unbounded). `Some(0)` is a real bound at Group 0 — the case
+  /// the old `u64` sentinel (0 = "no limit") could not express, which let the
+  /// switch drain's seam bound for `G_switch == 1` leak Groups >= 1.
+  pub fn exceeds_end_group(&self, group: u64) -> bool {
+    self.end_group.is_some_and(|end| group > end)
+  }
+
+  /// Maps SUBSCRIBE_UPDATE's wire encoding of End Group (0 = "no end group")
+  /// onto the internal `Option` representation. The sentinel survives only at
+  /// the wire boundary; internally `None` is the sole spelling of
+  /// "unbounded".
+  pub fn end_group_from_update_wire(wire_end_group: u64) -> Option<u64> {
+    (wire_end_group > 0).then_some(wire_end_group)
+  }
+
   pub fn update_last_sent_max_location(&mut self, location: Location) {
     match &self.last_sent_max_location {
       Some(current_max) => {
@@ -441,7 +457,7 @@ impl Subscription {
     state.subscriber_priority = subscribe_update.subscriber_priority;
     state.forward = subscribe_update.forward;
     // SUBSCRIBE_UPDATE keeps the wire sentinel: 0 = no end group.
-    state.end_group = (subscribe_update.end_group > 0).then_some(subscribe_update.end_group);
+    state.end_group = SubscriptionState::end_group_from_update_wire(subscribe_update.end_group);
 
     // update parameters. If a parameter included in SUBSCRIBE is not present in
     // SUBSCRIBE_UPDATE, its value remains unchanged.  There is no mechanism
@@ -638,7 +654,7 @@ impl Subscription {
             return;
           }
 
-          if state.end_group.is_some_and(|end| object.location.group > end) {
+          if state.exceeds_end_group(object.location.group) {
             /* With Draft-15, the end group can be increased or decreased.
             TODO: Remove the following code after draft-15 support.
             info!(
@@ -1255,5 +1271,67 @@ mod tests_replay_watermark_dedup {
     );
     let state = SubscriptionState::from(sub);
     assert!(!state.is_replay_duplicate(&Location { group: 0, object: 0 }, Some(0)));
+  }
+}
+
+#[cfg(test)]
+mod tests_end_group_bound {
+  use super::*;
+  use moqtail::model::common::{
+    pair::KeyValuePair,
+    tuple::{Tuple, TupleField},
+  };
+  use moqtail::model::control::{constant::GroupOrder, subscribe::Subscribe};
+
+  fn unbounded_state() -> SubscriptionState {
+    let sub = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path("/test"),
+      TupleField::from_utf8("video"),
+      0,
+      GroupOrder::Original,
+      true,
+      Vec::<KeyValuePair>::new(),
+    );
+    SubscriptionState::from(sub)
+  }
+
+  #[test]
+  fn bound_at_group_zero_is_a_real_bound() {
+    // THE sentinel regression (8934fff fix 3): the switch drain writes
+    // Some(0) when G_switch == 1. Under the old u64 encoding this was 0 =
+    // "no limit" and Group 1+ objects leaked across the seam.
+    let mut state = unbounded_state();
+    state.end_group = Some(0);
+    assert!(state.exceeds_end_group(1), "Group 1 must be filtered");
+    assert!(!state.exceeds_end_group(0), "Group 0 itself must pass");
+  }
+
+  #[test]
+  fn none_means_unbounded() {
+    let state = unbounded_state();
+    assert_eq!(state.end_group, None);
+    assert!(!state.exceeds_end_group(0));
+    assert!(!state.exceeds_end_group(u64::MAX));
+  }
+
+  #[test]
+  fn bound_is_inclusive() {
+    let mut state = unbounded_state();
+    state.end_group = Some(5);
+    assert!(!state.exceeds_end_group(5));
+    assert!(state.exceeds_end_group(6));
+  }
+
+  #[test]
+  fn update_wire_zero_maps_to_unbounded() {
+    // SUBSCRIBE_UPDATE keeps the wire sentinel (0 = no end group); it must
+    // be translated at the boundary, never stored.
+    assert_eq!(SubscriptionState::end_group_from_update_wire(0), None);
+  }
+
+  #[test]
+  fn update_wire_nonzero_maps_to_bound() {
+    assert_eq!(SubscriptionState::end_group_from_update_wire(7), Some(7));
   }
 }
