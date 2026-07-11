@@ -19,3 +19,9 @@ once_cell = "1.21.3"
 moka = { version = "0.12", features = ["future"] }
 fnv = "1.0.7"
 hex = "0.4"
+
+[dev-dependencies]
+# Integration tests (tests/switch_e2e.rs) generate a self-signed identity for
+# the spawned relay and skip cert validation on the test client; these features
+# only affect test builds via unification.
+wtransport = { workspace = true, features = ["self-signed", "dangerous-configuration"] }
