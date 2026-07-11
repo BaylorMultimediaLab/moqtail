@@ -469,12 +469,40 @@ pub(crate) async fn terminate_source(
   connection_id: usize,
   current_sub_req_id: u64,
 ) {
-  if let Some(sub_arc) = current_track
+  // Capture the subscription first: state removal below drops it from the
+  // maps, but the Arc keeps it alive long enough to signal PUBLISH_DONE (which
+  // only queues on the subscriber's control message queue).
+  let sub_arc = current_track
     .read()
     .await
     .get_subscription(connection_id)
+    .await;
+
+  // Commit ALL state removal BEFORE queueing PUBLISH_DONE. The instant the
+  // subscriber observes PUBLISH_DONE it may react — e.g. issue another SWITCH
+  // naming this Request ID — and the control loop processes that concurrently
+  // with the tail of this task. If the signal precedes the cleanup, the stale
+  // id still passes the Established gate and drives a switch off a dead
+  // subscription (caught by the e2e test
+  // stale_switch_request_id_is_silently_dropped). The subscribe_requests entry
+  // is the gate key, so it goes first.
+  subscriber
+    .subscribe_requests
+    .write()
     .await
-  {
+    .remove(&current_sub_req_id);
+  current_track
+    .read()
+    .await
+    .remove_subscription(connection_id)
+    .await;
+  subscriber
+    .subscriptions
+    .remove_subscription(current_full_track_name)
+    .await;
+
+  // Only now tell the subscriber the replaced subscription is over.
+  if let Some(sub_arc) = sub_arc {
     let sub = sub_arc.read().await;
     if let Err(e) = sub
       .send_publish_done(
@@ -486,23 +514,6 @@ pub(crate) async fn terminate_source(
       error!("switch teardown: failed to send PUBLISH_DONE: {e:?}");
     }
   }
-  current_track
-    .read()
-    .await
-    .remove_subscription(connection_id)
-    .await;
-  subscriber
-    .subscriptions
-    .remove_subscription(current_full_track_name)
-    .await;
-  // PR #1378 gate hygiene: the replaced subscription is no longer
-  // Established. Without this, a later SWITCH naming this Request ID passes
-  // the pre-PUBLISH gate and drives a full switch off a dead subscription.
-  subscriber
-    .subscribe_requests
-    .write()
-    .await
-    .remove(&current_sub_req_id);
 }
 
 #[cfg(test)]
