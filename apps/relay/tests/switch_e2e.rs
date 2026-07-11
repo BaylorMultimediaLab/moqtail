@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! End-to-end SWITCH scenarios (moq-transport PR #1378) against a real relay
-//! over real QUIC. These cover the two seam properties that cannot be pinned
-//! at unit level because they need an `MOQTClient` (a live wtransport
+//! over real QUIC. These cover the seam and race properties that cannot be
+//! pinned at unit level because they need an `MOQTClient` (a live wtransport
 //! `Connection`):
 //!
 //! 1. `switch_midgroup_seam_delivers_exactly_once` — a switch landing while
@@ -30,6 +30,17 @@
 //!    "Established" gate fix). Per the draft the relay stays silent; the
 //!    subscriber's own timeout is its only signal.
 //!
+//! 3. `unsubscribe_during_drain_yields_subscription_ended_failure` — an
+//!    UNSUBSCRIBE for the current subscription landing before the target
+//!    PUBLISH opens must abandon the switch and answer with a failure
+//!    PUBLISH + PUBLISH_DONE(SUBSCRIPTION_ENDED) (the abandon/mark_published
+//!    atomic claim).
+//!
+//! 4. `concurrent_switch_same_request_id_fails_excessive_load` — a second
+//!    SWITCH naming the same Current Subscribe Request ID while the first is
+//!    in progress must fail with EXCESSIVE_LOAD while the first completes
+//!    untouched (the single-in-flight guard).
+//!
 //! The harness spawns the relay binary (`CARGO_BIN_EXE_relay`) with a
 //! self-signed certificate written to a temp dir, then drives a publisher
 //! peer and a subscriber peer built from `moqtail::transport`.
@@ -44,7 +55,7 @@ use bytes::Bytes;
 use moqtail::model::common::location::Location;
 use moqtail::model::common::tuple::{Tuple, TupleField};
 use moqtail::model::control::client_setup::ClientSetup;
-use moqtail::model::control::constant::{self, GroupOrder};
+use moqtail::model::control::constant::{self, GroupOrder, PublishDoneStatusCode};
 use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::fetch::{Fetch, StandAloneFetchProps};
 use moqtail::model::control::publish::Publish;
@@ -637,4 +648,244 @@ async fn stale_switch_request_id_is_silently_dropped() {
     .await
     .expect("send SWITCH on unsubscribed id");
   subscriber.assert_no_publish_within(Duration::from_secs(4)).await;
+}
+
+// ---------------------------------------------------------------------------
+// Held-drain scenarios: race a second control message into an in-flight switch
+// ---------------------------------------------------------------------------
+
+fn subscribe_msg(request_id: u64, track: &str) -> Subscribe {
+  Subscribe::new_latest_object(
+    request_id,
+    Tuple::from_utf8_path(NS),
+    TupleField::from_utf8(track),
+    0,
+    GroupOrder::Ascending,
+    true,
+    vec![],
+  )
+}
+
+fn switch_msg(current: u64, track: &str, minimum_switching_group_id: u64) -> Switch {
+  Switch::new(
+    current,
+    Tuple::from_utf8_path(NS),
+    TupleField::from_utf8(track),
+    minimum_switching_group_id,
+    vec![],
+  )
+}
+
+/// Spawns the relay, publishes A and B (groups 0..=2, objects 0..=2, all
+/// complete), and subscribes A (request id 1, LatestObject) — then publishes
+/// NOTHING further on A. That holds any subsequent SWITCH with
+/// `minimum_switching_group_id = 1` in its drain phase deterministically:
+/// G_switch resolves to 1 (both tracks share every boundary), but the drain
+/// completes only once the source has forwarded SOMETHING (`last_sent.group
+/// + 1 >= 1`), and a LatestObject subscription with no live traffic has
+/// forwarded nothing. The drain polls every 50ms up to T_switch = 3s — a
+/// wide-open, deterministic window to race a second control message into.
+async fn setup_held_drain(port: u16) -> (RelayGuard, Peer, Peer) {
+  let relay = spawn_relay(port).await;
+
+  let mut publisher = Peer::connect(port).await;
+  publish_track(&mut publisher, TRACK_A, ALIAS_A).await;
+  publish_track(&mut publisher, TRACK_B, ALIAS_B).await;
+  publish_complete_groups(&publisher.connection, ALIAS_A, 0..=2, 0..=2).await;
+  publish_complete_groups(&publisher.connection, ALIAS_B, 0..=2, 0..=2).await;
+  sleep(Duration::from_millis(300)).await; // let the relay cache both tracks
+
+  let mut subscriber = Peer::connect(port).await;
+  subscriber
+    .control
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(1, TRACK_A))))
+    .await
+    .expect("send SUBSCRIBE");
+  subscriber
+    .expect(Duration::from_secs(5), "SubscribeOk(1)", |m| match m {
+      ControlMessage::SubscribeOk(ok) => Some(ok),
+      _ => None,
+    })
+    .await;
+
+  (relay, publisher, subscriber)
+}
+
+/// SWITCH PR #1378: "If the subscriber sends an UNSUBSCRIBE for the current
+/// subscription before the Relay has opened the PUBLISH for the target Track,
+/// the Relay MUST abandon the SWITCH and MUST open a PUBLISH for the target
+/// Track and immediately send PUBLISH_DONE with Status Code
+/// SUBSCRIPTION_ENDED."
+///
+/// This is also the regression pin for the guard's atomic claim:
+/// `abandon()` (unsubscribe handler) and `mark_published()` (switch task) are
+/// serialized on one mutex, so exactly one side wins — the drain polls
+/// `is_abandoned` every 50ms and exits without touching the source.
+#[tokio::test]
+async fn unsubscribe_during_drain_yields_subscription_ended_failure() {
+  let port = 44875;
+  let (_relay, _publisher, mut subscriber) = setup_held_drain(port).await;
+
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 1))))
+    .await
+    .expect("send SWITCH");
+  // The switch task is now polling its drain (no A object has ever been
+  // forwarded). Land the UNSUBSCRIBE inside that window.
+  sleep(Duration::from_millis(200)).await;
+  subscriber
+    .control
+    .send(&ControlMessage::Unsubscribe(Box::new(Unsubscribe::new(1))))
+    .await
+    .expect("send UNSUBSCRIBE mid-drain");
+
+  // The failure signature is a PUBLISH for the target with no content,
+  // immediately followed by PUBLISH_DONE(SUBSCRIPTION_ENDED) on the SAME
+  // relay-allocated request id.
+  let publish = subscriber
+    .expect(Duration::from_secs(5), "abandon failure PUBLISH", |m| match m {
+      ControlMessage::Publish(p) => Some(p),
+      _ => None,
+    })
+    .await;
+  assert_eq!(
+    publish.content_exists, 0,
+    "abandon must be reported as a failure PUBLISH (no content follows)"
+  );
+  let failure_rid = publish.request_id;
+  let done = subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE for the failure", |m| {
+      match m {
+        ControlMessage::PublishDone(d) if d.request_id == failure_rid => Some(d),
+        _ => None,
+      }
+    })
+    .await;
+  assert_eq!(
+    done.status_code,
+    PublishDoneStatusCode::SubscriptionEnded,
+    "UNSUBSCRIBE-before-PUBLISH must resolve as SUBSCRIPTION_ENDED"
+  );
+
+  // Request id 1 is unsubscribed: a later SWITCH naming it must be silently
+  // dropped by the Established gate (which runs BEFORE the in-flight guard,
+  // so a lingering abandoned guard entry cannot turn this into a second
+  // failure PUBLISH).
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 1))))
+    .await
+    .expect("send SWITCH on unsubscribed id");
+  subscriber.assert_no_publish_within(Duration::from_secs(4)).await;
+}
+
+/// SWITCH PR #1378: "If the Relay receives a SWITCH message for a subscription
+/// for which a previous SWITCH operation is still in progress, the Relay MUST
+/// treat the new SWITCH as a failure with status EXCESSIVE_LOAD" — the
+/// failure answers the SECOND switch while the first proceeds untouched.
+///
+/// This also pins the window the teardown reorder deliberately does
+/// NOT cover: a client reacting to the switch PUBLISH (rather than
+/// PUBLISH_DONE) with another SWITCH on the same id lands while the guard
+/// entry is live, and EXCESSIVE_LOAD — not a second switch — is the mandated
+/// outcome. try_admit runs synchronously in the handler before the drain task
+/// is spawned, so control-stream ordering makes this deterministic with no
+/// sleeps.
+#[tokio::test]
+async fn concurrent_switch_same_request_id_fails_excessive_load() {
+  let port = 44877;
+  let (_relay, publisher, mut subscriber) = setup_held_drain(port).await;
+  let mut data = spawn_data_plane(subscriber.connection.clone());
+
+  // Two SWITCHes back-to-back on the same Current Subscribe Request ID. The
+  // first is admitted and parks in its drain; the second must be rejected.
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 1))))
+    .await
+    .expect("send first SWITCH");
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 1))))
+    .await
+    .expect("send concurrent SWITCH");
+
+  let failure = subscriber
+    .expect(Duration::from_secs(5), "EXCESSIVE_LOAD failure PUBLISH", |m| {
+      match m {
+        ControlMessage::Publish(p) => Some(p),
+        _ => None,
+      }
+    })
+    .await;
+  assert_eq!(
+    failure.content_exists, 0,
+    "the concurrent SWITCH must fail; the first PUBLISH on the wire is its failure"
+  );
+  let failure_rid = failure.request_id;
+  let done = subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE(EXCESSIVE_LOAD)", |m| {
+      match m {
+        ControlMessage::PublishDone(d) if d.request_id == failure_rid => Some(d),
+        _ => None,
+      }
+    })
+    .await;
+  assert_eq!(done.status_code, PublishDoneStatusCode::ExcessiveLoad);
+
+  // Release the FIRST switch's drain: one live A object makes
+  // last_sent = (3, 0), and 3 + 1 >= G_switch(=1).
+  publish_complete_groups(&publisher.connection, ALIAS_A, 3..=3, 0..=0).await;
+
+  // The first switch must complete untouched by the rejection: a success
+  // PUBLISH with the real seam, then PUBLISH_DONE terminating request 1.
+  let publish = subscriber
+    .expect(Duration::from_secs(5), "success PUBLISH", |m| match m {
+      ControlMessage::Publish(p) => Some(p),
+      _ => None,
+    })
+    .await;
+  assert_eq!(publish.content_exists, 1, "first switch must succeed");
+  let transition = SwitchTransition::from_parameters(&publish.parameters)
+    .expect("success PUBLISH must carry SWITCH_TRANSITION");
+  assert_eq!(transition.switching_group_id, 1, "common boundary at min");
+  assert_eq!(transition.live_edge_group_id, 2, "B's live edge is untouched");
+  subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE(1)", |m| match m {
+      ControlMessage::PublishDone(d) if d.request_id == 1 => Some(()),
+      _ => None,
+    })
+    .await;
+
+  // Catch-up delivers exactly [G_switch, live_edge) = group 1, once each —
+  // proving the rejected SWITCH neither disturbed the seam nor doubled
+  // delivery.
+  let seen = collect_until_quiet(&mut data, Duration::from_secs(3)).await;
+  for object in 0..=2u64 {
+    assert_eq!(
+      seen.get(&(Via::Catchup, 1, object)),
+      Some(&1),
+      "catch-up must deliver (1,{object}) exactly once"
+    );
+  }
+  assert!(
+    !seen
+      .keys()
+      .any(|(via, group, _)| *via == Via::Catchup && *group != 1),
+    "catch-up must cover exactly [1, 2)"
+  );
+
+  // And live coverage from the live edge: the live sub attaches at
+  // (max(G_switch, live_edge), 0) = (2, 0) with the joining replay, so B's
+  // cached group 2 must arrive on SUBGROUP streams exactly once each even
+  // though B publishes nothing after the switch.
+  let b_alias = publish.track_alias;
+  for object in 0..=2u64 {
+    assert_eq!(
+      seen.get(&(Via::Subgroup { alias: b_alias }, 2, object)),
+      Some(&1),
+      "live-edge group object (2,{object}) must be replayed exactly once"
+    );
+  }
 }
