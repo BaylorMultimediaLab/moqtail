@@ -49,13 +49,15 @@ use tracing::{error, info};
 use crate::server::client::MOQTClient;
 use crate::server::stream_id::StreamId;
 use crate::server::switch_guard::SwitchFailure;
+use crate::server::switch_selection::{SwitchSelection, select_switch_group};
 use crate::server::track::Track;
 use crate::server::track_cache::CacheConsumeEvent;
 
-/// Relay-side `T_switch` budget for draining the source subscription before
-/// terminating it. Kept at/under the client's switch guard so a congested drain
-/// can't wedge the teardown.
-const SWITCH_DRAIN_TIMEOUT: Duration = Duration::from_millis(3000);
+/// Poll cadence for the T_switch-bounded waits (G_switch identification and
+/// the source drain). The budget itself is the guard's `DEFAULT_T_SWITCH`:
+/// the switch handler computes ONE deadline at SWITCH receipt and threads it
+/// through both phases, so together they honor the draft's "MUST complete the
+/// operation within an implementation-specific timeout T_switch".
 const SWITCH_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 /// QUIC send priority for the SWITCH catch-up stream. SWITCH PR #1378: the relay
@@ -313,6 +315,62 @@ pub(crate) fn spawn_switch_catchup_stream(
   });
 }
 
+/// Outcome of identifying G_switch within the T_switch window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by handle_switch_message
+pub(crate) enum SelectOutcome {
+  /// A qualifying common boundary was identified.
+  Ready(u64),
+  /// No qualifying boundary materialized before the deadline — the SWITCH PR's
+  /// TIMEOUT ("could not identify G_switch within T_switch").
+  TimedOut,
+  /// An UNSUBSCRIBE for the Current Subscribe Request ID arrived while
+  /// waiting; the caller must answer with the SUBSCRIPTION_ENDED failure.
+  Abandoned,
+}
+
+/// Identify G_switch, waiting — bounded by `deadline` — for a qualifying
+/// boundary to materialize.
+///
+/// The SWITCH PR #1378 frames T_switch as the window the relay has to IDENTIFY G_switch
+/// (TIMEOUT means "could not identify G_switch within T_switch"), not a
+/// one-shot check at SWITCH receipt: a floor naming a group the target has not
+/// produced yet — e.g. a subscriber at the live edge switching at its NEXT
+/// boundary — must wait for that group while the relay "MUST continue
+/// forwarding Objects from the current subscription" (which this wait leaves
+/// completely untouched). Re-evaluates the selection every
+/// [`SWITCH_DRAIN_POLL`] against the tracks' live cache state, and exits early
+/// if the switch is abandoned by an UNSUBSCRIBE.
+#[allow(dead_code)] // consumed by handle_switch_message
+pub(crate) async fn poll_select_switch_group(
+  subscriber: &Arc<MOQTClient>,
+  current_track: &Arc<RwLock<Track>>,
+  target_track: &Arc<RwLock<Track>>,
+  minimum_switching_group_id: u64,
+  current_sub_req_id: u64,
+  deadline: Instant,
+) -> SelectOutcome {
+  loop {
+    if subscriber
+      .switch_in_flight
+      .lock()
+      .await
+      .is_abandoned(current_sub_req_id)
+    {
+      return SelectOutcome::Abandoned;
+    }
+    match select_switch_group(current_track, target_track, minimum_switching_group_id).await {
+      SwitchSelection::Ready(g) => return SelectOutcome::Ready(g),
+      SwitchSelection::NoCommonBoundary => {
+        if Instant::now() >= deadline {
+          return SelectOutcome::TimedOut;
+        }
+        tokio::time::sleep(SWITCH_DRAIN_POLL).await;
+      }
+    }
+  }
+}
+
 /// Captured pre-seam bound for unwinding on PUBLISH failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SeamBoundUndo {
@@ -333,7 +391,7 @@ pub(crate) enum DrainOutcome {
   /// `undo` is `Some` iff a seam bound was applied (its inner value may be
   /// `None` = previously unbounded); `None` when nothing was bounded.
   Drained { undo: Option<SeamBoundUndo> },
-  /// The drain did not finish within `SWITCH_DRAIN_TIMEOUT`. The source is
+  /// The drain did not finish within the T_switch deadline. The source is
   /// left completely unchanged; the caller aborts with TIMEOUT.
   TimedOut,
   /// An UNSUBSCRIBE for the Current Subscribe Request ID arrived mid-drain
@@ -343,11 +401,12 @@ pub(crate) enum DrainOutcome {
 }
 
 /// Drain the source subscription up to the switch boundary (SWITCH PR #1378 strict
-/// ordering): wait — bounded by `SWITCH_DRAIN_TIMEOUT` — until source delivery
-/// has reached `g_switch - 1`. The caller awaits this BEFORE opening the target
-/// PUBLISH so that all source Objects in Groups below `g_switch` are delivered
-/// first (no concurrent source/target transmission across the seam, even when
-/// the source is itself lagging under congestion).
+/// ordering): wait — bounded by `deadline`, the same T_switch deadline that
+/// bounded G_switch identification — until source delivery has reached
+/// `g_switch - 1`. The caller awaits this BEFORE opening the target PUBLISH so
+/// that all source Objects in Groups below `g_switch` are delivered first (no
+/// concurrent source/target transmission across the seam, even when the source
+/// is itself lagging under congestion).
 ///
 /// Returns [`DrainOutcome::Drained`] if the source drained in time. On success
 /// — and ONLY on success — the source is bounded to Groups below `g_switch` so
@@ -367,6 +426,7 @@ pub(crate) async fn drain_source_below(
   connection_id: usize,
   g_switch: u64,
   current_sub_req_id: u64,
+  deadline: Instant,
 ) -> DrainOutcome {
   if g_switch == 0 {
     return DrainOutcome::Drained {
@@ -386,7 +446,6 @@ pub(crate) async fn drain_source_below(
   // Wait until last-sent reaches G_switch-1 (or timeout/abandon). The source
   // is NOT bounded during the wait so that a timeout leaves it completely
   // unchanged.
-  let deadline = Instant::now() + SWITCH_DRAIN_TIMEOUT;
   loop {
     // SWITCH PR #1378 UNSUBSCRIBE race: exit as soon as the switch is abandoned so
     // the caller can emit the SUBSCRIPTION_ENDED failure PUBLISH promptly.

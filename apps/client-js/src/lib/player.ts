@@ -91,10 +91,11 @@ export interface DiscontinuityRecord {
   playheadPTS_ms?: number;
   /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
    *  jump introduced by the switch. Since the 0-sentinel was dropped (SWITCH PR
-   *  #1378 conformance) BOTH modes are seam-gap-free: naive floors at the latest
-   *  received group, aligned at the playhead's group, so both land near 0 (naive
-   *  measures buffer-end distance, aligned playhead distance). The historical
-   *  ~filterDelay×1000 naive jump only reproduces on pre-conformance builds. */
+   *  #1378 conformance) BOTH modes are seam-gap-free: naive floors at the next
+   *  boundary after the buffer's edge, aligned at the playhead's group, so both
+   *  land near 0 (naive measures buffer-end distance, aligned playhead
+   *  distance). The historical ~filterDelay×1000 naive jump only reproduces on
+   *  pre-conformance builds. */
   playheadGapMs?: number;
 
   // wall-clock context
@@ -239,14 +240,15 @@ export function buildSubscribeParameters(opts: {
  * sentinel, so "switch as close to live as possible" (naive mode) must be
  * expressed AS a floor:
  *
- * - 'naive' mode: returns the latest group received on the current track.
- *   That group is guaranteed relay-available (the client just received it),
- *   so the relay switches there — re-delivering the in-progress group whole
- *   on the new track (the draft's buffer-replacement case) and catching up
- *   `[latestGroup, live edge)` with no seam gap. `latestGroup + 1` would be
- *   marginally closer to live but races the relay's one-shot selection into a
- *   spurious TIMEOUT whenever the client is exactly at the edge, since a
- *   not-yet-started group is not "available on both tracks".
+ * - 'naive' mode: returns `latestGroup + 1` — the next boundary after the
+ *   buffer's edge. That group may not exist at the relay yet (a client at the
+ *   live edge names a group that hasn't started); the relay identifies
+ *   G_switch within its T_switch window, waiting for the boundary to
+ *   materialize while the current subscription keeps delivering (PR #1378
+ *   frames TIMEOUT as "could not identify G_switch within T_switch", not a
+ *   one-shot check at receipt). The switch therefore lands cleanly on the
+ *   first group that starts after the request: no redelivery of the
+ *   in-progress group, no catch-up, no seam gap.
  * - 'aligned' mode: returns the group containing `currentTime` (via the
  *   TimeMap) as the floor. If the TimeMap has no anchor yet (rare: switch
  *   fired before any object was received), flags `timeMapMiss: true` and
@@ -262,7 +264,7 @@ export function computeSwitchMinimumGroup(opts: {
   /** Latest group id received on the current track; -1n when none yet. */
   latestGroup: bigint;
 }): { minimumSwitchingGroupId: number; timeMapMiss: boolean } {
-  const naiveFloor = opts.latestGroup >= 0n ? Number(opts.latestGroup) : 0;
+  const naiveFloor = opts.latestGroup >= 0n ? Number(opts.latestGroup) + 1 : 0;
   if (opts.switchMode !== 'aligned') return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: false };
   if (opts.targetGroup === undefined) return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: true };
   return { minimumSwitchingGroupId: opts.targetGroup, timeMapMiss: false };

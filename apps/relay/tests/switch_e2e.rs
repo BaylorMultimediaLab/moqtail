@@ -41,6 +41,12 @@
 //!    in progress must fail with EXCESSIVE_LOAD while the first completes
 //!    untouched (the single-in-flight guard).
 //!
+//! 5. `switch_waits_for_future_boundary_within_t_switch` — a floor naming a
+//!    group the target has not produced yet is held, with the current
+//!    subscription still forwarding, until the boundary materializes; TIMEOUT
+//!    means "could not identify G_switch within T_switch", not a failed
+//!    one-shot selection at receipt.
+//!
 //! The harness spawns the relay binary (`CARGO_BIN_EXE_relay`) with a
 //! self-signed certificate written to a temp dir, then drives a publisher
 //! peer and a subscriber peer built from `moqtail::transport`.
@@ -886,6 +892,86 @@ async fn concurrent_switch_same_request_id_fails_excessive_load() {
       seen.get(&(Via::Subgroup { alias: b_alias }, 2, object)),
       Some(&1),
       "live-edge group object (2,{object}) must be replayed exactly once"
+    );
+  }
+}
+
+/// SWITCH PR #1378 frames T_switch as the window the relay has to IDENTIFY
+/// G_switch — TIMEOUT means "could not identify G_switch within T_switch",
+/// not "no boundary existed at SWITCH receipt". A floor naming a group the
+/// target has not produced yet (a subscriber at the live edge switching at
+/// its next boundary) must be held, with the current subscription still
+/// forwarding, until the boundary materializes — not failed on a one-shot
+/// selection.
+///
+/// This also pins the client contract that lets the JS player send
+/// `latestGroup + 1` as its naive floor without racing a spurious TIMEOUT.
+#[tokio::test]
+async fn switch_waits_for_future_boundary_within_t_switch() {
+  let port = 44879;
+  let (_relay, publisher, mut subscriber) = setup_held_drain(port).await;
+  let mut data = spawn_data_plane(subscriber.connection.clone());
+
+  // Both tracks hold groups 0..=2; ask to switch no earlier than group 3,
+  // which does not exist anywhere yet.
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 3))))
+    .await
+    .expect("send SWITCH with future floor");
+
+  // One-shot selection would fail here instantly. The polling relay must
+  // stay silent while it waits for the boundary (well inside T_switch = 3s).
+  subscriber
+    .assert_no_publish_within(Duration::from_secs(1))
+    .await;
+
+  // The boundary materializes on BOTH tracks. Group 3 on the source also
+  // releases the drain: its objects forward to the still-live subscription,
+  // pushing last_sent past the seam.
+  publish_complete_groups(&publisher.connection, ALIAS_B, 3..=3, 0..=2).await;
+  publish_complete_groups(&publisher.connection, ALIAS_A, 3..=3, 0..=2).await;
+
+  // The switch must now complete: success PUBLISH with the seam at group 3,
+  // whose live edge is that same just-started group (no catch-up range).
+  let publish = subscriber
+    .expect(Duration::from_secs(5), "success PUBLISH", |m| match m {
+      ControlMessage::Publish(p) => Some(p),
+      _ => None,
+    })
+    .await;
+  assert_eq!(
+    publish.content_exists, 1,
+    "the held switch must succeed once the boundary exists"
+  );
+  let transition = SwitchTransition::from_parameters(&publish.parameters)
+    .expect("success PUBLISH must carry SWITCH_TRANSITION");
+  assert_eq!(transition.switching_group_id, 3, "seam at the awaited boundary");
+  assert_eq!(
+    transition.live_edge_group_id, 3,
+    "live edge at PUBLISH-open is the just-started group"
+  );
+  subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE(1)", |m| match m {
+      ControlMessage::PublishDone(d) if d.request_id == 1 => Some(()),
+      _ => None,
+    })
+    .await;
+
+  // Seam accounting: G_switch == live edge, so there is NO catch-up stream;
+  // the live subscription attaches at (3, 0) and the joining replay delivers
+  // the target's group 3 on SUBGROUP streams exactly once each.
+  let seen = collect_until_quiet(&mut data, Duration::from_secs(3)).await;
+  let b_alias = publish.track_alias;
+  assert!(
+    !seen.keys().any(|(via, _, _)| *via == Via::Catchup),
+    "no catch-up range when G_switch == live edge"
+  );
+  for object in 0..=2u64 {
+    assert_eq!(
+      seen.get(&(Via::Subgroup { alias: b_alias }, 3, object)),
+      Some(&1),
+      "awaited-boundary group object (3,{object}) must arrive exactly once"
     );
   }
 }

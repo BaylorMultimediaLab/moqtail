@@ -913,12 +913,11 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    DrainOutcome, SeamBoundUndo, build_switch_live_sub, drain_source_below,
-    restore_source_end_group, send_switch_failure, send_switch_publish,
+    DrainOutcome, SeamBoundUndo, SelectOutcome, build_switch_live_sub, drain_source_below,
+    poll_select_switch_group, restore_source_end_group, send_switch_failure, send_switch_publish,
     spawn_switch_catchup_stream, terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
-  use crate::server::switch_selection::{SwitchSelection, select_switch_group};
   use moqtail::model::parameter::switch_transition::SwitchTransition;
   use std::time::Instant;
 
@@ -1023,71 +1022,91 @@ async fn handle_switch_message(
   let target_request_id =
     Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
 
-  // Snapshot of the target's live edge for G_switch selection only. The value
-  // actually advertised in SWITCH_TRANSITION is re-read inside the task at
-  // PUBLISH-open time (step 1c), since this snapshot can go stale during the
-  // drain.
-  let live_edge = target_track_arc.read().await.largest_location.read().await.group;
+  // One T_switch deadline for the whole operation, anchored at SWITCH receipt
+  // (aligned with the guard entry's own expiry from try_admit above). Both
+  // T_switch-bounded phases inside the task — G_switch identification and the
+  // source drain — poll against this same deadline, honoring the draft's
+  // "MUST complete the operation within an implementation-specific timeout
+  // T_switch".
+  let t_switch_deadline = Instant::now() + DEFAULT_T_SWITCH;
 
-  // Select G_switch per the draft: the smallest group at/above the client's
-  // Minimum Switching Group ID that is a common boundary between the two
-  // Tracks and past which the target can supply every group the current Track
-  // would have supplied below the live edge (spec condition (c) — conditional,
-  // so holes shared by both Tracks do not block; see switch_selection.rs). A
-  // minimum of 0 is
-  // an ordinary floor — "any group is acceptable" — and resolves to the
-  // OLDEST qualifying boundary (full buffer replacement with a maximal
-  // catch-up range), exactly as the draft reads. There is no live-edge
-  // sentinel: a subscriber that wants to switch at/near the live edge
-  // expresses that by sending a floor at its latest received group (see
-  // computeSwitchMinimumGroup in the JS player). No qualifying boundary ->
-  // TIMEOUT.
-  let g_switch = match select_switch_group(
-    &current_track_arc,
-    &target_track_arc,
-    switch_message.minimum_switching_group_id,
-  )
-  .await
-  {
-    SwitchSelection::Ready(g) => g,
-    SwitchSelection::NoCommonBoundary => {
-      warn!(
-        "switch: no qualifying common boundary for {:?} (min={})",
-        target_full_track_name, switch_message.minimum_switching_group_id
-      );
-      send_switch_failure(
-        &client,
-        target_request_id,
-        &target_full_track_name,
-        target_alias,
-        SwitchFailure::NoCommonBoundary,
-      )
-      .await;
-      client.switch_in_flight.lock().await.complete(current_sub_req_id);
-      return Ok(());
-    }
-  };
-  info!(
-    "switch: target={:?} g_switch={} live_edge={} target_request_id={}",
-    target_full_track_name, g_switch, live_edge, target_request_id
-  );
-
-  // SWITCH PR #1378 strict ordering (soft switch): drain the source Track's Objects in
-  // Groups below G_switch FIRST, then open the target PUBLISH and start catch-up
-  // + live delivery, then terminate the source. The whole sequence runs in a
-  // task so the control handler isn't blocked during the drain — which, for
-  // behind-live switches, is typically immediate (the source has already
-  // delivered past G_switch) and only takes time when the source itself lags
-  // under congestion.
+  // SWITCH PR #1378 strict ordering (soft switch): identify G_switch, drain the
+  // source Track's Objects in Groups below it, THEN open the target PUBLISH and
+  // start catch-up + live delivery, then terminate the source. The whole
+  // sequence runs in a task so the control handler isn't blocked while
+  // selection waits for a boundary or the drain waits on a lagging source —
+  // for behind-live switches both are typically immediate.
   // live_sub is built INSIDE the task, after the live edge is re-read at
   // PUBLISH-open time — its start location depends on that fresh value.
   let target_namespace = switch_message.track_namespace.clone();
   let target_name = switch_message.track_name.clone();
   let target_parameters = switch_message.subscribe_parameters.clone();
+  let minimum_switching_group_id = switch_message.minimum_switching_group_id;
   let connection_id = context.connection_id;
   tokio::spawn(async move {
-    // (1) Drain the source below G_switch before any target Object is sent. On
-    // timeout (severe congestion), abort the switch with TIMEOUT and leave the
+    // (0) Identify G_switch within T_switch: the smallest group at/above the
+    // client's Minimum Switching Group ID that is a common boundary between
+    // the two Tracks and past which the target can supply every group the
+    // current Track would have supplied below the live edge (see
+    // switch_selection.rs). A minimum of 0 is an ordinary floor — "any group
+    // is acceptable" — and resolves to the OLDEST qualifying boundary (full
+    // buffer replacement with a maximal catch-up range). Selection is a
+    // T_switch-bounded wait, not a one-shot check: a floor naming a group the
+    // target has not produced yet (a subscriber at the live edge switching at
+    // its NEXT boundary) waits here for that group to materialize while the
+    // current subscription keeps forwarding untouched. Only if no boundary
+    // qualifies within the budget does the draft's TIMEOUT apply.
+    let g_switch = match poll_select_switch_group(
+      &client,
+      &current_track_arc,
+      &target_track_arc,
+      minimum_switching_group_id,
+      current_sub_req_id,
+      t_switch_deadline,
+    )
+    .await
+    {
+      SelectOutcome::Ready(g) => g,
+      SelectOutcome::TimedOut => {
+        warn!(
+          "switch: could not identify G_switch within T_switch for {:?} (min={})",
+          target_full_track_name, minimum_switching_group_id
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::NoCommonBoundary,
+        )
+        .await;
+        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        return;
+      }
+      SelectOutcome::Abandoned => {
+        info!(
+          "switch: abandoned by UNSUBSCRIBE for request id {current_sub_req_id} during G_switch selection; reporting SUBSCRIPTION_ENDED"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::SubscriptionEnded,
+        )
+        .await;
+        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        return;
+      }
+    };
+    info!(
+      "switch: target={:?} g_switch={} target_request_id={}",
+      target_full_track_name, g_switch, target_request_id
+    );
+
+    // (1) Drain the source below G_switch before any target Object is sent —
+    // sharing the T_switch deadline with selection above. On timeout (severe
+    // congestion), abort the switch with TIMEOUT and leave the
     // current subscription unchanged — do NOT terminate it (which would truncate
     // undelivered source Objects below G_switch). An Abandoned outcome (an
     // UNSUBSCRIBE for the Current Subscribe Request ID arrived mid-drain)
@@ -1101,6 +1120,7 @@ async fn handle_switch_message(
       connection_id,
       g_switch,
       current_sub_req_id,
+      t_switch_deadline,
     )
     .await
     {

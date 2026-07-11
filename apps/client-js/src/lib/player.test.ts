@@ -53,9 +53,12 @@ describe('buildSubscribeParameters', () => {
 });
 
 describe('computeSwitchMinimumGroup', () => {
-  it('naive mode floors at the latest received group (SWITCH PR #1378: no live-edge sentinel)', () => {
+  it('naive mode floors at the next boundary after the latest received group', () => {
+    // latestGroup + 1: the relay identifies G_switch within T_switch, waiting
+    // for a not-yet-started group, so naming the NEXT boundary is safe and
+    // lands the switch with no redelivery and no catch-up.
     const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: 42, latestGroup: 17n });
-    expect(r.minimumSwitchingGroupId).toBe(17);
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(false);
   });
 
@@ -73,13 +76,13 @@ describe('computeSwitchMinimumGroup', () => {
 
   it('flags timeMapMiss when aligned but no target, falling through to the naive floor', () => {
     const r = computeSwitchMinimumGroup({ switchMode: 'aligned', targetGroup: undefined, latestGroup: 17n });
-    expect(r.minimumSwitchingGroupId).toBe(17);
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(true);
   });
 
   it("does NOT flag miss when naive + no target (naive doesn't need TimeMap)", () => {
     const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: undefined, latestGroup: 17n });
-    expect(r.minimumSwitchingGroupId).toBe(17);
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(false);
   });
 
