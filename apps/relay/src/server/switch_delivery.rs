@@ -50,7 +50,7 @@ use crate::server::client::MOQTClient;
 use crate::server::stream_id::StreamId;
 use crate::server::switch_guard::SwitchFailure;
 use crate::server::switch_selection::{SwitchSelection, select_switch_group};
-use crate::server::track::Track;
+use crate::server::track::{Track, TrackStatus};
 use crate::server::track_cache::CacheConsumeEvent;
 
 /// Poll cadence for the T_switch-bounded waits (G_switch identification and
@@ -327,6 +327,11 @@ pub(crate) enum SelectOutcome {
   /// An UNSUBSCRIBE for the Current Subscribe Request ID arrived while
   /// waiting; the caller must answer with the SUBSCRIPTION_ENDED failure.
   Abandoned,
+  /// The upstream rejected the target Track (SubscribeError -> the track's
+  /// Rejected status) while waiting — the target genuinely is not available at
+  /// the publisher, so the caller must answer DOES_NOT_EXIST rather than
+  /// letting the wait spin to a misleading TIMEOUT.
+  TargetRejected,
 }
 
 /// Identify G_switch, waiting — bounded by `deadline` — for a qualifying
@@ -358,6 +363,15 @@ pub(crate) async fn poll_select_switch_group(
       .is_abandoned(current_sub_req_id)
     {
       return SelectOutcome::Abandoned;
+    }
+    // A target the relay is establishing upstream for this switch surfaces an
+    // upstream SubscribeError as the track's Rejected status; keeping the wait
+    // alive past that point could only end in a misleading TIMEOUT.
+    if matches!(
+      target_track.read().await.get_status().await,
+      TrackStatus::Rejected { .. }
+    ) {
+      return SelectOutcome::TargetRejected;
     }
     match select_switch_group(current_track, target_track, minimum_switching_group_id).await {
       SwitchSelection::Ready(g) => return SelectOutcome::Ready(g),

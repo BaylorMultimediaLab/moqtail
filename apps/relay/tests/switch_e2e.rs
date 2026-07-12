@@ -47,6 +47,12 @@
 //!    means "could not identify G_switch within T_switch", not a failed
 //!    one-shot selection at receipt.
 //!
+//! 6. `switch_establishes_upstream_subscription_for_unknown_target` — a
+//!    target the relay does not yet carry is not DOES_NOT_EXIST: the relay
+//!    establishes an upstream subscription (publisher located via the
+//!    announced namespace) and completes the switch once the upstream
+//!    delivers, with the PUBLISH carrying the upstream-assigned alias.
+//!
 //! The harness spawns the relay binary (`CARGO_BIN_EXE_relay`) with a
 //! self-signed certificate written to a temp dir, then drives a publisher
 //! peer and a subscriber peer built from `moqtail::transport`.
@@ -65,7 +71,9 @@ use moqtail::model::control::constant::{self, GroupOrder, PublishDoneStatusCode}
 use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::fetch::{Fetch, StandAloneFetchProps};
 use moqtail::model::control::publish::Publish;
+use moqtail::model::control::publish_namespace::PublishNamespace;
 use moqtail::model::control::subscribe::Subscribe;
+use moqtail::model::control::subscribe_ok::SubscribeOk;
 use moqtail::model::control::switch::Switch;
 use moqtail::model::control::unsubscribe::Unsubscribe;
 use moqtail::model::data::object::Object;
@@ -972,6 +980,141 @@ async fn switch_waits_for_future_boundary_within_t_switch() {
       seen.get(&(Via::Subgroup { alias: b_alias }, 3, object)),
       Some(&1),
       "awaited-boundary group object (3,{object}) must arrive exactly once"
+    );
+  }
+}
+
+/// SWITCH PR #1378: the relay is responsible for "establishing or selecting any
+/// upstream subscriptions and/or FETCH requests needed to satisfy the switch".
+/// A SWITCH naming a target the relay does not yet carry must NOT fail with
+/// DOES_NOT_EXIST (reserved for "not available at the publisher"): the relay
+/// locates the publisher via the announced namespace, forwards an upstream
+/// SUBSCRIBE, and completes the switch once the upstream delivers.
+#[tokio::test]
+async fn switch_establishes_upstream_subscription_for_unknown_target() {
+  let port = 44881;
+  let _relay = spawn_relay(port).await;
+
+  // Publisher announces the namespace and pushes ONLY track A. Track B is
+  // never published — the relay has no track entry for it, but the announced
+  // namespace marks this publisher as able to supply it on request.
+  let mut publisher = Peer::connect(port).await;
+  publisher
+    .control
+    .send(&ControlMessage::PublishNamespace(Box::new(
+      PublishNamespace::new(7, Tuple::from_utf8_path(NS), &[]),
+    )))
+    .await
+    .expect("send PUBLISH_NAMESPACE");
+  publisher
+    .expect(Duration::from_secs(5), "PublishNamespaceOk", |m| match m {
+      ControlMessage::PublishNamespaceOk(ok) => Some(ok),
+      _ => None,
+    })
+    .await;
+  publish_track(&mut publisher, TRACK_A, ALIAS_A).await;
+  publish_complete_groups(&publisher.connection, ALIAS_A, 0..=2, 0..=2).await;
+  sleep(Duration::from_millis(300)).await;
+
+  let mut subscriber = Peer::connect(port).await;
+  let mut data = spawn_data_plane(subscriber.connection.clone());
+  subscriber
+    .control
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(1, TRACK_A))))
+    .await
+    .expect("send SUBSCRIBE");
+  subscriber
+    .expect(Duration::from_secs(5), "SubscribeOk(1)", |m| match m {
+      ControlMessage::SubscribeOk(ok) => Some(ok),
+      _ => None,
+    })
+    .await;
+
+  // SWITCH to the unknown track B. min = 0: any boundary is acceptable.
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 0))))
+    .await
+    .expect("send SWITCH to unknown target");
+
+  // The relay must reach upstream: expect its SUBSCRIBE for track B, confirm
+  // it, and start supplying the track.
+  let upstream = publisher
+    .expect(Duration::from_secs(5), "relay upstream SUBSCRIBE for B", |m| {
+      match m {
+        ControlMessage::Subscribe(s)
+          if s.track_name == TupleField::from_utf8(TRACK_B) =>
+        {
+          Some(s)
+        }
+        _ => None,
+      }
+    })
+    .await;
+  publisher
+    .control
+    .send(&ControlMessage::SubscribeOk(Box::new(
+      SubscribeOk::new_ascending_with_content(
+        upstream.request_id,
+        ALIAS_B,
+        0,
+        Some(Location::new(0, 0)),
+        None,
+      ),
+    )))
+    .await
+    .expect("send upstream SubscribeOk");
+  // Let the relay register the alias route before data lands on it. Publish a
+  // SINGLE group: selection fires on the earliest viable seam, so a
+  // multi-group publication would race it (the switch could open with live
+  // edge 0, 1, or 2). One group pins the seam deterministically at {0, 0}.
+  sleep(Duration::from_millis(300)).await;
+  publish_complete_groups(&publisher.connection, ALIAS_B, 0..=0, 0..=2).await;
+
+  // The switch must complete against the freshly established upstream: the
+  // seam is the only common boundary (group 0), which is also B's live edge —
+  // no catch-up range, pure joining replay on the live subscription.
+  let publish = subscriber
+    .expect(Duration::from_secs(5), "success PUBLISH", |m| match m {
+      ControlMessage::Publish(p) => Some(p),
+      _ => None,
+    })
+    .await;
+  assert_eq!(
+    publish.content_exists, 1,
+    "switch against an establishable upstream must succeed, not DOES_NOT_EXIST"
+  );
+  assert_eq!(
+    publish.track_alias, ALIAS_B,
+    "PUBLISH must carry the upstream-assigned alias, not the Pending placeholder"
+  );
+  let transition = SwitchTransition::from_parameters(&publish.parameters)
+    .expect("success PUBLISH must carry SWITCH_TRANSITION");
+  assert_eq!(transition.switching_group_id, 0, "the only common boundary");
+  assert_eq!(
+    transition.live_edge_group_id, 0,
+    "target live edge at PUBLISH-open is the single published group"
+  );
+  subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE(1)", |m| match m {
+      ControlMessage::PublishDone(d) if d.request_id == 1 => Some(()),
+      _ => None,
+    })
+    .await;
+
+  // Seam accounting over the established upstream: G_switch == live edge, so
+  // no catch-up stream; the live subscription's joining replay delivers B's
+  // group 0 exactly once each via SUBGROUP.
+  let seen = collect_until_quiet(&mut data, Duration::from_secs(3)).await;
+  assert!(
+    !seen.keys().any(|(via, _, _)| *via == Via::Catchup),
+    "no catch-up range when G_switch == live edge"
+  );
+  for object in 0..=2u64 {
+    assert_eq!(
+      seen.get(&(Via::Subgroup { alias: ALIAS_B }, 0, object)),
+      Some(&1),
+      "established-upstream group object (0,{object}) must arrive exactly once"
     );
   }
 }

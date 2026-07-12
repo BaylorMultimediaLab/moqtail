@@ -21,7 +21,7 @@ use bytes::Bytes;
 use core::result::Result;
 use moqtail::model::common::location::Location;
 use moqtail::model::common::pair::KeyValuePair;
-use moqtail::model::control::constant::FilterType;
+use moqtail::model::control::constant::{FilterType, GroupOrder};
 use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::data::subgroup_header::SubgroupHeader;
 use moqtail::model::data::subgroup_object::SubgroupObject;
@@ -899,6 +899,89 @@ async fn handle_subscribe_error_message(
   Ok(())
 }
 
+/// `requested_by` for upstream SUBSCRIBEs the relay originates on behalf of a
+/// SWITCH. It maps to no client, so the SubscribeOk / SubscribeError fan-out in
+/// handle_subscribe_ok_message / handle_subscribe_error_message quietly skips
+/// the "creator" notification — the SWITCH subscriber's answer is the PUBLISH,
+/// never a SubscribeOk.
+const SWITCH_UPSTREAM_REQUESTED_BY: usize = usize::MAX;
+
+/// SWITCH PR #1378: the relay is responsible for "establishing or selecting any
+/// upstream subscriptions and/or FETCH requests needed to satisfy the switch".
+/// A target Track unknown to THIS relay is therefore not by itself
+/// DOES_NOT_EXIST (the draft reserves that for "not available at the
+/// publisher"): mirror handle_subscribe_message's first-subscriber path —
+/// locate a publisher for the target (by published track, then by announced
+/// namespace), create the Pending track, and forward an upstream SUBSCRIBE
+/// carrying the SWITCH's parameter set. The switch task's selection poll then
+/// waits (bounded by T_switch) for the upstream to confirm and objects to
+/// arrive; an upstream rejection surfaces through the track's Rejected status.
+/// Returns None only when no publisher can supply the target — the genuine
+/// DOES_NOT_EXIST.
+async fn establish_switch_target_upstream(
+  context: &Arc<SessionContext>,
+  target: &moqtail::model::data::full_track_name::FullTrackName,
+  target_parameters: &[KeyValuePair],
+) -> Option<Arc<tokio::sync::RwLock<Track>>> {
+  let publisher = {
+    let m = context.client_manager.read().await;
+    match m.get_publisher_by_full_track_name(target).await {
+      Some(p) => Some(p),
+      None => {
+        m.get_publisher_by_announced_track_namespace(&target.namespace)
+          .await
+      }
+    }
+  }?;
+
+  publisher.add_subscriber(context.connection_id).await;
+
+  let (track_arc, is_creator) = context
+    .track_manager
+    .get_or_create_track(target, || {
+      Track::new(
+        0, // provisional alias, updated on SubscribeOk from the publisher
+        target.clone(),
+        publisher.connection_id,
+        context.server_config,
+        TrackStatus::Pending,
+      )
+    })
+    .await;
+
+  if is_creator {
+    let relay_request_id =
+      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+    let upstream = Subscribe::new_latest_object(
+      relay_request_id,
+      target.namespace.clone(),
+      target.name.clone(),
+      0,
+      GroupOrder::Original,
+      true,
+      target_parameters.to_vec(),
+    );
+    info!(
+      "switch: establishing upstream subscription for target {:?} (relay request id {})",
+      target, relay_request_id
+    );
+    publisher
+      .queue_message(ControlMessage::Subscribe(Box::new(upstream.clone())))
+      .await;
+    context.relay_subscribe_requests.write().await.insert(
+      relay_request_id,
+      SubscribeRequest::new(
+        relay_request_id,
+        SWITCH_UPSTREAM_REQUESTED_BY,
+        upstream.clone(),
+        Some(upstream),
+      ),
+    );
+  }
+
+  Some(track_arc)
+}
+
 async fn handle_switch_message(
   client: Arc<MOQTClient>,
   _control_stream_handler: &mut ControlStreamHandler,
@@ -973,10 +1056,11 @@ async fn handle_switch_message(
     return Ok(());
   }
 
-  // Resolve the target Track (needed for the PUBLISH track alias and for
-  // G_switch selection). Absent target -> DOES_NOT_EXIST. This is a
-  // post-validation failure, so per the draft's failure discipline it DOES
-  // open the failure PUBLISH.
+  // Resolve the target Track, establishing an upstream subscription when this
+  // relay does not yet carry it (see establish_switch_target_upstream).
+  // DOES_NOT_EXIST — a post-validation failure that DOES open the failure
+  // PUBLISH — is reserved for a target no publisher can supply; "unknown to
+  // this relay" alone is not that.
   let target_track_arc = match context
     .track_manager
     .get_track(&target_full_track_name)
@@ -984,19 +1068,38 @@ async fn handle_switch_message(
   {
     Some(t) => t,
     None => {
-      warn!("switch: target track not found: {:?}", target_full_track_name);
-      let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
-      send_switch_failure(
-        &client,
-        rid,
+      match establish_switch_target_upstream(
+        &context,
         &target_full_track_name,
-        0,
-        SwitchFailure::TargetTrackMissing,
+        &switch_message.subscribe_parameters,
       )
-      .await;
-      return Ok(());
+      .await
+      {
+        Some(t) => t,
+        None => {
+          warn!(
+            "switch: no publisher can supply target track {:?}",
+            target_full_track_name
+          );
+          let rid =
+            Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+          send_switch_failure(
+            &client,
+            rid,
+            &target_full_track_name,
+            0,
+            SwitchFailure::TargetTrackMissing,
+          )
+          .await;
+          return Ok(());
+        }
+      }
     }
   };
+  // Provisional for early failure paths; a just-established Pending track still
+  // carries the placeholder alias. Re-read inside the task once selection
+  // succeeds (upstream confirmation set the publisher's real alias before any
+  // object could reach the cache).
   let target_alias = target_track_arc.read().await.track_alias;
 
   // Single in-flight SWITCH per Current Subscribe Request ID -> EXCESSIVE_LOAD.
@@ -1098,7 +1201,28 @@ async fn handle_switch_message(
         client.switch_in_flight.lock().await.complete(current_sub_req_id);
         return;
       }
+      SelectOutcome::TargetRejected => {
+        warn!(
+          "switch: upstream rejected target track {:?}; reporting DOES_NOT_EXIST",
+          target_full_track_name
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::TargetTrackMissing,
+        )
+        .await;
+        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        return;
+      }
     };
+    // Re-read the alias: for a target this SWITCH established upstream, the
+    // pre-task snapshot was the Pending placeholder (0); upstream confirmation
+    // set the publisher's real alias before any object could reach the cache
+    // that selection just accepted.
+    let target_alias = target_track_arc.read().await.track_alias;
     info!(
       "switch: target={:?} g_switch={} target_request_id={}",
       target_full_track_name, g_switch, target_request_id
