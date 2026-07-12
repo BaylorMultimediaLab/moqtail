@@ -525,12 +525,25 @@ async fn handle_subscribe_message(
           "Track confirmed, sending SubscribeOk to subscriber {}",
           client.connection_id
         );
+        // The status snapshot's largest_location is frozen at confirm time;
+        // data may have flowed since. Advertise the freshest of the snapshot
+        // and the track's live largest so subscribers — downstream relays in
+        // particular — can bound backfill fetches and seed their seam math.
+        let live_largest = track.largest_location.read().await.clone();
+        let advertised_largest = if live_largest > Location::new(0, 0) {
+          Some(match largest_location {
+            Some(l) if l > live_largest => l,
+            _ => live_largest,
+          })
+        } else {
+          largest_location
+        };
         let subscribe_ok =
           moqtail::model::control::subscribe_ok::SubscribeOk::new_ascending_with_content(
             sub.request_id,
             publisher_track_alias,
             expires,
-            largest_location,
+            advertised_largest,
             None,
           );
         control_stream_handler.send_impl(&subscribe_ok).await
@@ -1024,7 +1037,7 @@ async fn handle_switch_message(
   use crate::server::switch_delivery::{
     DrainOutcome, SeamBoundUndo, SelectOutcome, build_switch_live_sub, drain_source_below,
     poll_select_switch_group, restore_source_end_group, send_switch_failure, send_switch_publish,
-    spawn_switch_catchup_stream, terminate_source,
+    spawn_switch_catchup_stream, spawn_upstream_backfill, terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
   use moqtail::model::parameter::switch_transition::SwitchTransition;
@@ -1158,6 +1171,20 @@ async fn handle_switch_message(
   // "MUST complete the operation within an implementation-specific timeout
   // T_switch".
   let t_switch_deadline = Instant::now() + DEFAULT_T_SWITCH;
+
+  // Relay chaining (SWITCH PR #1378 "and/or FETCH requests"): when the target is
+  // served by the upstream link, backfill missing history below the client's
+  // floor with one upstream FETCH, concurrently with the selection wait — the
+  // lazy upstream subscription only live-forwards, so older Groups (and the
+  // establishment handshake window) exist only upstream. Best-effort and a
+  // no-op outside the chained case.
+  spawn_upstream_backfill(
+    context.clone(),
+    target_track_arc.clone(),
+    target_full_track_name.clone(),
+    switch_message.minimum_switching_group_id,
+    t_switch_deadline,
+  );
 
   // SWITCH PR #1378 strict ordering (soft switch): identify G_switch, drain the
   // source Track's Objects in Groups below it, THEN open the target PUBLISH and

@@ -140,6 +140,16 @@ impl Track {
     self
       .subscription_manager
       .update_track_alias(publisher_track_alias);
+    // Seed the live edge from the advertised largest (monotonic): a chained
+    // relay learns the track's real edge from the upstream's SubscribeOk
+    // before any object traverses the link — seam selection, backfill bounds,
+    // and the joining replay all key off largest_location.
+    if let Some(l) = &largest_location {
+      let mut current = self.largest_location.write().await;
+      if *l > *current {
+        *current = l.clone();
+      }
+    }
     let mut status = self.status.write().await;
     *status = TrackStatus::Confirmed {
       publisher_track_alias,

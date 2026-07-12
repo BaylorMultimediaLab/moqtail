@@ -47,11 +47,15 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 
 use crate::server::client::MOQTClient;
+use crate::server::session::Session;
+use crate::server::session_context::SessionContext;
 use crate::server::stream_id::StreamId;
 use crate::server::switch_guard::SwitchFailure;
 use crate::server::switch_selection::{SwitchSelection, select_switch_group};
 use crate::server::track::{Track, TrackStatus};
 use crate::server::track_cache::CacheConsumeEvent;
+use moqtail::model::control::fetch::{Fetch, StandAloneFetchProps};
+use moqtail::transport::data_stream_handler::FetchRequest;
 
 /// Poll cadence for the T_switch-bounded waits (G_switch identification and
 /// the source drain). The budget itself is the guard's `DEFAULT_T_SWITCH`:
@@ -383,6 +387,113 @@ pub(crate) async fn poll_select_switch_group(
       }
     }
   }
+}
+
+/// Relay chaining, SWITCH PR #1378 "and/or FETCH requests": backfill the switch
+/// target's missing history from the upstream relay.
+///
+/// The lazy upstream subscription only live-forwards, so Groups older than its
+/// establishment — including the client's Minimum Switching Group ID floor and
+/// anything published during the SUBSCRIBE handshake window — exist only
+/// upstream. This task waits (bounded by the switch's T_switch deadline) for
+/// the upstream confirmation, then issues one standalone upstream FETCH for
+/// `[floor, end]`, where `end` stops below the oldest locally held group (a
+/// refetch of held groups would append duplicate objects into the cache) or,
+/// when nothing is held, at the upstream's advertised live edge (seeded into
+/// `largest_location` by `Track::confirm`). The response's FETCH_HEADER stream
+/// is ingested by the ordinary data plane (`handle_uni_stream` routes it via
+/// the upstream client's `fetch_requests` into `new_subgroup_object`), so the
+/// backfilled Groups land in the cache and the concurrently polling G_switch
+/// selection picks them up. Runs only when the target is served by the
+/// upstream link — only relays answer FETCH from cache.
+///
+/// Best-effort: an upstream FetchError (nothing cached in range) is a benign
+/// no-op downstream, and selection proceeds with whatever live-forwarding
+/// supplies.
+pub(crate) fn spawn_upstream_backfill(
+  context: Arc<SessionContext>,
+  target_track: Arc<RwLock<Track>>,
+  target: FullTrackName,
+  floor: u64,
+  deadline: Instant,
+) {
+  tokio::spawn(async move {
+    let Some(upstream) = context.client_manager.read().await.get_upstream().await else {
+      return;
+    };
+    if target_track.read().await.publisher_connection_id != upstream.connection_id {
+      return;
+    }
+
+    // Wait for upstream confirmation: it carries the track alias and (via the
+    // largest_location seeding in Track::confirm) the upstream's known edge.
+    let alias = loop {
+      match target_track.read().await.get_status().await {
+        TrackStatus::Confirmed {
+          publisher_track_alias,
+          ..
+        } => break publisher_track_alias,
+        TrackStatus::Rejected { .. } => return,
+        TrackStatus::Pending => {
+          if Instant::now() >= deadline {
+            return;
+          }
+          tokio::time::sleep(SWITCH_DRAIN_POLL).await;
+        }
+      }
+    };
+
+    let (known_edge, local_oldest) = {
+      let t = target_track.read().await;
+      let edge = t.largest_location.read().await.group;
+      let oldest = t.cache.oldest_group_id().await;
+      (edge, oldest)
+    };
+    let end_group = match local_oldest {
+      Some(oldest) if floor < oldest => oldest - 1,
+      Some(_) => return, // history at/below the floor is already held
+      None => known_edge,
+    };
+    if floor > end_group {
+      return;
+    }
+
+    let request_id =
+      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+    let fetch = Fetch::new_standalone(
+      request_id,
+      0,
+      GroupOrder::Original,
+      StandAloneFetchProps {
+        track_namespace: target.namespace.clone(),
+        track_name: target.name.clone(),
+        start_location: Location::new(floor, 0),
+        end_location: Location::new(end_group, 0),
+      },
+      Vec::new(),
+    );
+    let record = FetchRequest::new(request_id, upstream.connection_id, fetch.clone(), alias);
+    // Both maps matter: relay_fetch_requests validates the upstream's FetchOk
+    // control message; the upstream client's fetch_requests routes the
+    // FETCH_HEADER data stream (handle_uni_stream resolves the track alias
+    // through it).
+    context
+      .relay_fetch_requests
+      .write()
+      .await
+      .insert(request_id, record.clone());
+    upstream
+      .fetch_requests
+      .write()
+      .await
+      .insert(request_id, record);
+    info!(
+      "switch backfill: upstream FETCH [{floor}, {end_group}] for {target:?} (request {request_id})"
+    );
+    upstream
+      .queue_message(ControlMessage::Fetch(Box::new(fetch)))
+      .await;
+  });
 }
 
 /// Captured pre-seam bound for unwinding on PUBLISH failure.

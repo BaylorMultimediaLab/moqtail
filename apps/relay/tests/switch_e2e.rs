@@ -59,6 +59,13 @@
 //!    R1 on demand through the upstream link (the publisher-of-last-resort
 //!    fallback).
 //!
+//! 8. `switch_backfills_history_via_upstream_fetch` — a chained switch whose
+//!    target history exists only at the upstream relay: the lazy upstream
+//!    subscription live-forwards nothing for a static track, so the relay
+//!    issues an upstream FETCH bounded by the upstream-advertised live edge
+//!    and serves the catch-up range from the backfilled cache (the SWITCH PR 
+//   #1378's "and/or FETCH requests").
+//!
 //! The harness spawns the relay binary (`CARGO_BIN_EXE_relay`) with a
 //! self-signed certificate written to a temp dir, then drives a publisher
 //! peer and a subscriber peer built from `moqtail::transport`.
@@ -1250,6 +1257,123 @@ async fn switch_across_relay_chain() {
       seen.get(&(Via::Subgroup { alias: ALIAS_B }, 0, object)),
       Some(&1),
       "chained B object (0,{object}) must arrive exactly once"
+    );
+  }
+}
+
+/// Relay chaining, SWITCH PR #1378 "and/or FETCH requests": the switch target's
+/// history exists ONLY at the upstream relay — B is fully published at R1
+/// before R2 ever hears of it, and nothing is published after the SWITCH. The
+/// lazy upstream subscription live-forwards nothing for a static track, so
+/// the catch-up range can only come from R2's upstream FETCH backfill
+/// (bounded by the upstream-advertised live edge seeded at confirmation).
+#[tokio::test]
+async fn switch_backfills_history_via_upstream_fetch() {
+  let r1_port = 44887;
+  let r2_port = 44889;
+  let _r1 = spawn_relay(r1_port).await;
+
+  // Publisher at R1: A registered (data later, live); B fully published NOW —
+  // its three groups are history R2 will never see via live-forwarding.
+  let mut publisher = Peer::connect(r1_port).await;
+  publish_track(&mut publisher, TRACK_A, ALIAS_A).await;
+  publish_track(&mut publisher, TRACK_B, ALIAS_B).await;
+  publish_complete_groups(&publisher.connection, ALIAS_B, 0..=2, 0..=2).await;
+
+  let _r2 = spawn_chained_relay(r2_port, r1_port).await;
+
+  let mut subscriber = Peer::connect(r2_port).await;
+  let mut data = spawn_data_plane(subscriber.connection.clone());
+  sleep(Duration::from_millis(500)).await; // upstream link settle
+
+  subscriber
+    .control
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(1, TRACK_A))))
+    .await
+    .expect("send SUBSCRIBE");
+  subscriber
+    .expect(Duration::from_secs(5), "SubscribeOk(1) across the chain", |m| {
+      match m {
+        ControlMessage::SubscribeOk(ok) => Some(ok),
+        _ => None,
+      }
+    })
+    .await;
+
+  // A flows live through both hops so the seam has a common boundary at R2.
+  publish_complete_groups(&publisher.connection, ALIAS_A, 0..=2, 0..=2).await;
+  sleep(Duration::from_millis(500)).await;
+
+  // SWITCH to B with floor 0. Everything below B's live edge must be
+  // backfilled: the publisher sends NOTHING from here on.
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 0))))
+    .await
+    .expect("send SWITCH");
+
+  let publish = subscriber
+    .expect(Duration::from_secs(5), "success PUBLISH", |m| match m {
+      ControlMessage::Publish(p) => Some(p),
+      _ => None,
+    })
+    .await;
+  assert_eq!(
+    publish.content_exists, 1,
+    "backfilled chained switch must succeed"
+  );
+  assert_eq!(publish.track_alias, ALIAS_B, "upstream-confirmed alias");
+  let transition = SwitchTransition::from_parameters(&publish.parameters)
+    .expect("success PUBLISH must carry SWITCH_TRANSITION");
+  assert_eq!(
+    transition.switching_group_id, 0,
+    "the floor is honored: backfill supplies the history below the edge"
+  );
+  assert_eq!(
+    transition.live_edge_group_id, 2,
+    "live edge = the upstream-advertised largest seeded at confirmation"
+  );
+  subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE(1)", |m| match m {
+      ControlMessage::PublishDone(d) if d.request_id == 1 => Some(()),
+      _ => None,
+    })
+    .await;
+
+  let seen = collect_until_quiet(&mut data, Duration::from_secs(3)).await;
+
+  // Pre-switch A delivery (live through the chain), exactly once each.
+  for group in 0..=2u64 {
+    for object in 0..=2u64 {
+      assert_eq!(
+        seen.get(&(Via::Subgroup { alias: ALIAS_A }, group, object)),
+        Some(&1),
+        "chained A object ({group},{object}) must arrive exactly once"
+      );
+    }
+  }
+  // The catch-up range [0, 2) — pure backfill product — exactly once each.
+  for group in 0..=1u64 {
+    for object in 0..=2u64 {
+      assert_eq!(
+        seen.get(&(Via::Catchup, group, object)),
+        Some(&1),
+        "backfilled catch-up ({group},{object}) must arrive exactly once"
+      );
+    }
+  }
+  assert!(
+    !seen
+      .keys()
+      .any(|(via, group, _)| *via == Via::Catchup && *group >= 2),
+    "catch-up must stop below the live edge"
+  );
+  // The live-edge group, replayed from the backfilled cache, exactly once each.
+  for object in 0..=2u64 {
+    assert_eq!(
+      seen.get(&(Via::Subgroup { alias: ALIAS_B }, 2, object)),
+      Some(&1),
+      "live-edge group object (2,{object}) must arrive exactly once"
     );
   }
 }
