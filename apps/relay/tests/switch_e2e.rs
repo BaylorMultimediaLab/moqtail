@@ -53,6 +53,12 @@
 //!    announced namespace) and completes the switch once the upstream
 //!    delivers, with the PUBLISH carrying the upstream-assigned alias.
 //!
+//! 7. `switch_across_relay_chain` — a two-relay chain (publisher -> R1 -> R2
+//!    -> subscriber, R2 running with --upstream-url): both SUBSCRIBE and
+//!    SWITCH name tracks R2 has never seen and are resolved by subscribing to
+//!    R1 on demand through the upstream link (the publisher-of-last-resort
+//!    fallback).
+//!
 //! The harness spawns the relay binary (`CARGO_BIN_EXE_relay`) with a
 //! self-signed certificate written to a temp dir, then drives a publisher
 //! peer and a subscriber peer built from `moqtail::transport`.
@@ -115,6 +121,16 @@ impl Drop for RelayGuard {
 /// `port`. The relay only loads PEM files from disk, so the harness must
 /// materialize them.
 async fn spawn_relay(port: u16) -> RelayGuard {
+  spawn_relay_inner(port, None).await
+}
+
+/// Spawns a relay chained to the relay on `upstream_port`: tracks unknown to
+/// this relay are resolved by subscribing upstream on demand.
+async fn spawn_chained_relay(port: u16, upstream_port: u16) -> RelayGuard {
+  spawn_relay_inner(port, Some(upstream_port)).await
+}
+
+async fn spawn_relay_inner(port: u16, upstream_port: Option<u16>) -> RelayGuard {
   let dir = std::env::temp_dir().join(format!("moqtail-e2e-{}-{}", std::process::id(), port));
   std::fs::create_dir_all(&dir).expect("create temp cert dir");
 
@@ -126,13 +142,21 @@ async fn spawn_relay(port: u16) -> RelayGuard {
   std::fs::write(&cert_path, cert_pem.as_bytes()).expect("write cert");
   std::fs::write(&key_path, key_pem.as_bytes()).expect("write key");
 
-  let child = Command::new(env!("CARGO_BIN_EXE_relay"))
+  let mut cmd = Command::new(env!("CARGO_BIN_EXE_relay"));
+  cmd
     .arg("--port")
     .arg(port.to_string())
     .arg("--cert-file")
     .arg(&cert_path)
     .arg("--key-file")
-    .arg(&key_path)
+    .arg(&key_path);
+  if let Some(up) = upstream_port {
+    cmd
+      .arg("--upstream-url")
+      .arg(format!("https://localhost:{up}"))
+      .arg("--upstream-no-cert-validation");
+  }
+  let child = cmd
     .stdout(Stdio::null())
     .stderr(Stdio::null())
     .spawn()
@@ -1115,6 +1139,117 @@ async fn switch_establishes_upstream_subscription_for_unknown_target() {
       seen.get(&(Via::Subgroup { alias: ALIAS_B }, 0, object)),
       Some(&1),
       "established-upstream group object (0,{object}) must arrive exactly once"
+    );
+  }
+}
+
+/// Relay chaining: a two-relay chain (publisher -> R1 -> R2 -> subscriber)
+/// where R2 runs with `--upstream-url` pointing at R1. Both the plain
+/// SUBSCRIBE and the SWITCH name tracks R2 has never seen; R2 must resolve
+/// them by subscribing to R1 on demand (the publisher-of-last-resort
+/// fallback) — R1's SubscribeOk confirms R2's Pending track with the
+/// publisher-assigned alias and data then flows through the chain.
+#[tokio::test]
+async fn switch_across_relay_chain() {
+  let r1_port = 44883;
+  let r2_port = 44885;
+  let _r1 = spawn_relay(r1_port).await;
+
+  // Publisher at R1: both tracks registered (PUBLISH), no data yet.
+  let mut publisher = Peer::connect(r1_port).await;
+  publish_track(&mut publisher, TRACK_A, ALIAS_A).await;
+  publish_track(&mut publisher, TRACK_B, ALIAS_B).await;
+
+  // R2 comes up chained to R1 (R1 is provably up: the publisher connected).
+  let _r2 = spawn_chained_relay(r2_port, r1_port).await;
+
+  // Subscriber at R2. Give the R2->R1 upstream link a beat to establish —
+  // the fallback returns nothing while the dial is still in flight.
+  let mut subscriber = Peer::connect(r2_port).await;
+  let mut data = spawn_data_plane(subscriber.connection.clone());
+  sleep(Duration::from_millis(500)).await;
+
+  // SUBSCRIBE A at R2: unknown there -> resolved through the chain.
+  subscriber
+    .control
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(1, TRACK_A))))
+    .await
+    .expect("send SUBSCRIBE");
+  subscriber
+    .expect(Duration::from_secs(5), "SubscribeOk(1) across the chain", |m| {
+      match m {
+        ControlMessage::SubscribeOk(ok) => Some(ok),
+        _ => None,
+      }
+    })
+    .await;
+
+  // Live A data flows publisher -> R1 -> R2 -> subscriber.
+  publish_complete_groups(&publisher.connection, ALIAS_A, 0..=1, 0..=2).await;
+  sleep(Duration::from_millis(500)).await; // let delivery settle through both hops
+
+  // SWITCH to B at R2: also unknown there -> R2 establishes the upstream
+  // subscription for B on demand, then completes the switch once B's data
+  // arrives. A single B group keeps the seam deterministic at {0, 0}.
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 0))))
+    .await
+    .expect("send SWITCH across the chain");
+  // Let the R2->R1 SUBSCRIBE(B) handshake land before B's only group is
+  // published: R1 forwards live objects only to already-registered
+  // subscriptions, so publishing before the handshake would strand the group
+  // at R1 and time the selection out. (Well inside T_switch = 3s.)
+  sleep(Duration::from_millis(700)).await;
+  publish_complete_groups(&publisher.connection, ALIAS_B, 0..=0, 0..=2).await;
+
+  let publish = subscriber
+    .expect(Duration::from_secs(5), "success PUBLISH", |m| match m {
+      ControlMessage::Publish(p) => Some(p),
+      _ => None,
+    })
+    .await;
+  assert_eq!(publish.content_exists, 1, "chained switch must succeed");
+  assert_eq!(
+    publish.track_alias, ALIAS_B,
+    "PUBLISH must carry the alias confirmed by the upstream relay"
+  );
+  let transition = SwitchTransition::from_parameters(&publish.parameters)
+    .expect("success PUBLISH must carry SWITCH_TRANSITION");
+  assert_eq!(transition.switching_group_id, 0, "common boundary at group 0");
+  assert_eq!(
+    transition.live_edge_group_id, 0,
+    "B's live edge at R2 is the single published group"
+  );
+  subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE(1)", |m| match m {
+      ControlMessage::PublishDone(d) if d.request_id == 1 => Some(()),
+      _ => None,
+    })
+    .await;
+
+  // Chained delivery accounting: A's live groups arrived exactly once each
+  // pre-switch; B's group 0 arrives exactly once each via the joining replay
+  // (G_switch == live edge, so there is no catch-up stream anywhere).
+  let seen = collect_until_quiet(&mut data, Duration::from_secs(3)).await;
+  for group in 0..=1u64 {
+    for object in 0..=2u64 {
+      assert_eq!(
+        seen.get(&(Via::Subgroup { alias: ALIAS_A }, group, object)),
+        Some(&1),
+        "chained A object ({group},{object}) must arrive exactly once"
+      );
+    }
+  }
+  assert!(
+    !seen.keys().any(|(via, _, _)| *via == Via::Catchup),
+    "no catch-up range when G_switch == live edge"
+  );
+  for object in 0..=2u64 {
+    assert_eq!(
+      seen.get(&(Via::Subgroup { alias: ALIAS_B }, 0, object)),
+      Some(&1),
+      "chained B object (0,{object}) must arrive exactly once"
     );
   }
 }

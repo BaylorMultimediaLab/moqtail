@@ -338,6 +338,21 @@ async fn handle_subscribe_message(
     }
   };
 
+  // Relay chaining: fall back to the upstream link — the
+  // publisher-of-last-resort — so tracks unknown to this relay are resolved
+  // by subscribing upstream on demand. Never route a request arriving on the
+  // upstream link back to itself.
+  let publisher = match publisher {
+    Some(p) => Some(p),
+    None => context
+      .client_manager
+      .read()
+      .await
+      .get_upstream()
+      .await
+      .filter(|u| u.connection_id != context.connection_id),
+  };
+
   let publisher = if let Some(publisher) = publisher {
     publisher.clone()
   } else {
@@ -925,12 +940,23 @@ async fn establish_switch_target_upstream(
 ) -> Option<Arc<tokio::sync::RwLock<Track>>> {
   let publisher = {
     let m = context.client_manager.read().await;
-    match m.get_publisher_by_full_track_name(target).await {
+    let found = match m.get_publisher_by_full_track_name(target).await {
       Some(p) => Some(p),
       None => {
         m.get_publisher_by_announced_track_namespace(&target.namespace)
           .await
       }
+    };
+    // Relay chaining: fall back to the upstream link — the
+    // publisher-of-last-resort — so a switch target unknown to this relay is
+    // established across the chain. Never route a SWITCH arriving on the
+    // upstream link back to itself.
+    match found {
+      Some(p) => Some(p),
+      None => m
+        .get_upstream()
+        .await
+        .filter(|u| u.connection_id != context.connection_id),
     }
   }?;
 

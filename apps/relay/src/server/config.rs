@@ -71,6 +71,18 @@ pub struct Cli {
   /// Initial maximum request ID
   #[arg(long, default_value_t = u64::MAX / 8)]
   pub initial_max_request_id: u64,
+
+  /// Optional upstream relay URL (e.g. https://host:4433) for relay chaining.
+  /// Tracks unknown to this relay are resolved by subscribing upstream on
+  /// demand: SUBSCRIBE and SWITCH fall back to the upstream link when no
+  /// connected publisher supplies the requested track.
+  #[arg(long)]
+  pub upstream_url: Option<String>,
+
+  /// Skip TLS certificate validation when dialing the upstream relay
+  /// (self-signed development/test certificates only).
+  #[arg(long, default_value_t = false)]
+  pub upstream_no_cert_validation: bool,
 }
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -88,6 +100,8 @@ pub struct AppConfig {
   pub enable_token_logging: bool,
   pub token_log_path: String,
   pub initial_max_request_id: u64,
+  pub upstream_url: Option<String>,
+  pub upstream_no_cert_validation: bool,
 }
 
 impl AppConfig {
@@ -110,6 +124,8 @@ impl AppConfig {
         enable_token_logging: cli.enable_token_logging,
         token_log_path: cli.token_log_path,
         initial_max_request_id: cli.initial_max_request_id,
+        upstream_url: cli.upstream_url,
+        upstream_no_cert_validation: cli.upstream_no_cert_validation,
       }
     })
   }
@@ -174,6 +190,8 @@ mod tests {
       enable_token_logging: false,
       token_log_path: "/tmp/moqtail_relay_tokens.csv".to_string(),
       initial_max_request_id: u64::MAX / 8,
+      upstream_url: None,
+      upstream_no_cert_validation: false,
     };
 
     let config = AppConfig {
@@ -191,6 +209,8 @@ mod tests {
       enable_token_logging: cli.enable_token_logging,
       token_log_path: cli.token_log_path,
       initial_max_request_id: cli.initial_max_request_id,
+      upstream_url: cli.upstream_url,
+      upstream_no_cert_validation: cli.upstream_no_cert_validation,
     };
 
     assert_eq!(config.initial_max_request_id, u64::MAX / 8);

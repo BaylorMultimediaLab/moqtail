@@ -403,6 +403,8 @@ mod tests_oldest_group {
       enable_token_logging: false,
       token_log_path: String::new(),
       initial_max_request_id: 100,
+      upstream_url: None,
+      upstream_no_cert_validation: false,
     }
   }
 
@@ -468,6 +470,8 @@ mod tests_newest_group {
       enable_token_logging: false,
       token_log_path: String::new(),
       initial_max_request_id: 100,
+      upstream_url: None,
+      upstream_no_cert_validation: false,
     }
   }
 
@@ -537,6 +541,8 @@ mod tests_available_group_ids {
       enable_token_logging: false,
       token_log_path: String::new(),
       initial_max_request_id: 100,
+      upstream_url: None,
+      upstream_no_cert_validation: false,
     }
   }
 

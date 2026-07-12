@@ -31,6 +31,7 @@ mod token_logger;
 mod track;
 mod track_cache;
 mod track_manager;
+mod upstream;
 mod utils;
 
 use crate::server::{config::AppConfig, session::Session};
@@ -95,6 +96,13 @@ impl Server {
       self.app_config.host,
       self.app_config.port
     );
+
+    // Relay chaining: maintain the outbound upstream link for the server's
+    // lifetime when configured. Tracks unknown to this relay resolve through
+    // it on demand (see server/upstream.rs).
+    if self.app_config.upstream_url.is_some() {
+      tokio::spawn(upstream::run(self.clone()));
+    }
 
     let shutdown_notify = Arc::new(Notify::new());
     let notify_clone = shutdown_notify.clone();

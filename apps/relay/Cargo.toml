@@ -8,7 +8,10 @@ build="build.rs"
 anyhow = "1.0.97"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wtransport = { workspace = true }
+# dangerous-configuration: the upstream relay link (--upstream-url) can dial a
+# relay presenting a self-signed certificate when --upstream-no-cert-validation
+# is set; validation stays on by default at runtime.
+wtransport = { workspace = true, features = ["dangerous-configuration"] }
 tokio = { version = "1.0", features = ["full"] }
 serde_json = "1.0.140"
 bytes = "1.10.1"

@@ -20,12 +20,18 @@ use tracing::{debug, info};
 
 pub(crate) struct ClientManager {
   pub clients: Arc<RwLock<BTreeMap<usize, Arc<MOQTClient>>>>,
+  /// Connection id of the outbound upstream relay link (relay chaining), if
+  /// one is configured and currently established. Used as the
+  /// publisher-of-last-resort: SUBSCRIBE/SWITCH resolution falls back to it
+  /// when no connected publisher supplies the requested track.
+  upstream_connection_id: Arc<RwLock<Option<usize>>>,
 }
 
 impl ClientManager {
   pub(crate) fn new() -> Self {
     ClientManager {
       clients: Arc::new(RwLock::new(BTreeMap::new())),
+      upstream_connection_id: Arc::new(RwLock::new(None)),
     }
   }
 
@@ -37,8 +43,34 @@ impl ClientManager {
   }
 
   pub(crate) async fn remove(&self, connection_id: usize) -> Option<Arc<MOQTClient>> {
+    {
+      let mut upstream = self.upstream_connection_id.write().await;
+      if *upstream == Some(connection_id) {
+        *upstream = None;
+      }
+    }
     let mut clients = self.clients.write().await;
     clients.remove(&connection_id)
+  }
+
+  /// Marks `connection_id` as the upstream relay link.
+  pub(crate) async fn set_upstream(&self, connection_id: usize) {
+    *self.upstream_connection_id.write().await = Some(connection_id);
+    info!("Upstream relay link registered: connection {}", connection_id);
+  }
+
+  /// Clears the upstream marker if it still points at `connection_id`.
+  pub(crate) async fn clear_upstream(&self, connection_id: usize) {
+    let mut upstream = self.upstream_connection_id.write().await;
+    if *upstream == Some(connection_id) {
+      *upstream = None;
+    }
+  }
+
+  /// The upstream relay link, when configured and connected.
+  pub(crate) async fn get_upstream(&self) -> Option<Arc<MOQTClient>> {
+    let id = (*self.upstream_connection_id.read().await)?;
+    self.get(id).await
   }
 
   pub(crate) async fn get(&self, connection_id: usize) -> Option<Arc<MOQTClient>> {

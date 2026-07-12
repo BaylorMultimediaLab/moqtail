@@ -143,6 +143,20 @@ impl Session {
       }
     };
 
+    Self::run_session(context, client, control_stream_handler).await
+  }
+
+  /// Drives a fully negotiated session: registers the client on the context,
+  /// starts the data-plane accept loop, and multiplexes the control stream
+  /// (incoming peer messages vs. the client's outbound queue) until the peer
+  /// disconnects or a handler fails. Shared by inbound sessions (after the
+  /// server-side SETUP in `negotiate`) and the outbound upstream relay link
+  /// (after the client-side SETUP in `upstream.rs`).
+  pub(crate) async fn run_session(
+    context: Arc<SessionContext>,
+    client: Arc<MOQTClient>,
+    mut control_stream_handler: ControlStreamHandler,
+  ) -> core::result::Result<(), TerminationCode> {
     // Set the client in the context
     context.set_client(client.clone()).await;
 
@@ -318,7 +332,7 @@ impl Session {
     }
   }
 
-  async fn handle_connection_close(context: Arc<SessionContext>) -> Result<()> {
+  pub(crate) async fn handle_connection_close(context: Arc<SessionContext>) -> Result<()> {
     let client_manager_cleanup = context.client_manager.clone();
     let track_manager_cleanup = context.track_manager.clone();
 
