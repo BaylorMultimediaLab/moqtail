@@ -398,9 +398,14 @@ pub(crate) async fn poll_select_switch_group(
 /// upstream. This task waits (bounded by the switch's T_switch deadline) for
 /// the upstream confirmation, then issues one standalone upstream FETCH for
 /// `[floor, end]`, where `end` stops below the oldest locally held group (a
-/// refetch of held groups would append duplicate objects into the cache) or,
-/// when nothing is held, at the upstream's advertised live edge (seeded into
-/// `largest_location` by `Track::confirm`). The response's FETCH_HEADER stream
+/// refetch of held groups would waste upstream bandwidth) or, when nothing is
+/// held, at the upstream's advertised live edge (seeded into
+/// `largest_location` by `Track::confirm`). The fetch range and the lazy
+/// subscription's live-forwarding may overlap — an object arriving upstream
+/// between the subscription registering and the fetch-cache read reaches this
+/// relay twice — which is safe: `TrackCache::add_object` is idempotent and
+/// order-restoring, so the double ingest collapses in the cache instead of
+/// reaching subscribers. The response's FETCH_HEADER stream
 /// is ingested by the ordinary data plane (`handle_uni_stream` routes it via
 /// the upstream client's `fetch_requests` into `new_subgroup_object`), so the
 /// backfilled Groups land in the cache and the concurrently polling G_switch

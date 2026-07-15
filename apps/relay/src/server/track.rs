@@ -253,7 +253,18 @@ impl Track {
     }
 
     if let Ok(fetch_object) = object.clone().try_into_fetch() {
-      self.cache.add_object(fetch_object).await;
+      if !self.cache.add_object(fetch_object).await {
+        // Duplicate ingest: concurrent paths (live-forward from the upstream
+        // subscription racing an upstream backfill FETCH) can deliver the same
+        // object twice. The cache collapsed it; forwarding it again would hand
+        // subscribers a duplicate the replay watermark cannot catch (it only
+        // guards replay-vs-live, not live-vs-live).
+        debug!(
+          "new_subgroup_object: duplicate ingest skipped | track: {:?} location: {:?}",
+          object.track_alias, object.location
+        );
+        return Ok(());
+      }
     } else {
       warn!(
         "new_subgroup_object: object cannot be cached | track: {:?} location: {:?} stream_id: {} diff_ms: {} object: {:?}",
@@ -328,7 +339,14 @@ impl Track {
         }
 
         if let Ok(fetch_object) = object.clone().try_into_fetch() {
-          self.cache.add_object(fetch_object).await;
+          if !self.cache.add_object(fetch_object).await {
+            // Duplicate ingest — see new_subgroup_object: forward once only.
+            debug!(
+              "new_datagram_object: duplicate ingest skipped | track: {:?} group: {:?} object_id: {}",
+              datagram_object.track_alias, datagram_object.group_id, datagram_object.object_id
+            );
+            return Ok(());
+          }
         } else {
           warn!(
             "new_datagram_object: object cannot be cached | track: {:?} group: {:?} object_id: {} diff_ms: {} object: {:?}",

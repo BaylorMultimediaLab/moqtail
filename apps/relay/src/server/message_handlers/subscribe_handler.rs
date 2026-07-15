@@ -991,6 +991,21 @@ async fn establish_switch_target_upstream(
   if is_creator {
     let relay_request_id =
       Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+    // Join at the CURRENT group, not the latest object: a moqtail upstream
+    // resolves DELAY_GROUPS=0 to an absolute start at its live group with the
+    // joining replay, which (a) replays the in-progress group's cached head
+    // and (b) creates that group's forwarding stream — without it, a plain
+    // LatestObject subscription strands the mid-flight group's tail at the
+    // upstream ("stream already started, wait for the next group"). A foreign
+    // upstream ignores the project-local parameter and degrades to
+    // LatestObject. Duplicates with the backfill FETCH collapse in the
+    // idempotent cache.
+    let mut upstream_parameters = target_parameters.to_vec();
+    if let Ok(delay_groups) =
+      KeyValuePair::try_new_varint(VersionSpecificParameterType::DelayGroups as u64, 0)
+    {
+      upstream_parameters.push(delay_groups);
+    }
     let upstream = Subscribe::new_latest_object(
       relay_request_id,
       target.namespace.clone(),
@@ -998,7 +1013,7 @@ async fn establish_switch_target_upstream(
       0,
       GroupOrder::Original,
       true,
-      target_parameters.to_vec(),
+      upstream_parameters,
     );
     info!(
       "switch: establishing upstream subscription for target {:?} (relay request id {})",

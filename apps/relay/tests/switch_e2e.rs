@@ -63,8 +63,16 @@
 //!    target history exists only at the upstream relay: the lazy upstream
 //!    subscription live-forwards nothing for a static track, so the relay
 //!    issues an upstream FETCH bounded by the upstream-advertised live edge
-//!    and serves the catch-up range from the backfilled cache (the SWITCH PR 
-//   #1378's "and/or FETCH requests").
+//!    and serves the catch-up range from the backfilled cache (the SWITCH PR
+//!    #1378's "and/or FETCH requests").
+//!
+//! 9. `switch_backfill_overlapping_live_ingest_stays_exactly_once` — the
+//!    backfill FETCH range and the upstream subscription's delivery overlap
+//!    on the mid-flight live-edge group; the downstream cache must collapse
+//!    the double ingest (idempotent, sorted insert; duplicate fan-out
+//!    suppressed) and the upstream subscription must join at the current
+//!    group (DELAY_GROUPS=0 joining replay) so the in-progress group's tail
+//!    is not stranded upstream — everything exactly once.
 //!
 //! The harness spawns the relay binary (`CARGO_BIN_EXE_relay`) with a
 //! self-signed certificate written to a temp dir, then drives a publisher
@@ -1374,6 +1382,119 @@ async fn switch_backfills_history_via_upstream_fetch() {
       seen.get(&(Via::Subgroup { alias: ALIAS_B }, 2, object)),
       Some(&1),
       "live-edge group object (2,{object}) must arrive exactly once"
+    );
+  }
+}
+
+/// The backfill FETCH range and the lazy upstream subscription's
+/// live-forwarding overlap by design: an object arriving at the upstream
+/// between the subscription registering and the fetch-cache read reaches the
+/// downstream twice (once live, once in the fetch response), in either order.
+/// The downstream cache must collapse the double ingest (idempotent, sorted
+/// insert) or the joining replay emits non-increasing object ids and
+/// underflows the subgroup delta encoder.
+///
+/// The scenario schedules that overlap: B's live-edge group is mid-flight at
+/// R1 when the SWITCH lands, and its tail is published right into the
+/// establishment window. Exactly-once must hold no matter which path wins
+/// each object.
+#[tokio::test]
+async fn switch_backfill_overlapping_live_ingest_stays_exactly_once() {
+  let r1_port = 44891;
+  let r2_port = 44893;
+  let _r1 = spawn_relay(r1_port).await;
+
+  let mut publisher = Peer::connect(r1_port).await;
+  publish_track(&mut publisher, TRACK_A, ALIAS_A).await;
+  publish_track(&mut publisher, TRACK_B, ALIAS_B).await;
+  // B: two complete groups of history plus the live-edge group mid-flight
+  // (head cached at R1, stream still open).
+  publish_complete_groups(&publisher.connection, ALIAS_B, 0..=1, 0..=2).await;
+  let mut b_group2 = open_group_stream(&publisher.connection, ALIAS_B, 2).await;
+  send_objects(&mut b_group2, ALIAS_B, 2, 0..=2, None).await;
+
+  let _r2 = spawn_chained_relay(r2_port, r1_port).await;
+
+  let mut subscriber = Peer::connect(r2_port).await;
+  let mut data = spawn_data_plane(subscriber.connection.clone());
+  sleep(Duration::from_millis(500)).await; // upstream link settle
+
+  subscriber
+    .control
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(1, TRACK_A))))
+    .await
+    .expect("send SUBSCRIBE");
+  subscriber
+    .expect(Duration::from_secs(5), "SubscribeOk(1) across the chain", |m| {
+      match m {
+        ControlMessage::SubscribeOk(ok) => Some(ok),
+        _ => None,
+      }
+    })
+    .await;
+  publish_complete_groups(&publisher.connection, ALIAS_A, 0..=2, 0..=2).await;
+  sleep(Duration::from_millis(500)).await;
+
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(1, TRACK_B, 0))))
+    .await
+    .expect("send SWITCH");
+
+  // Land the edge group's tail inside the establishment window: R1
+  // live-forwards it to R2's fresh subscription while R2's backfill FETCH may
+  // also include it in the cache read — the double-ingest overlap under test.
+  sleep(Duration::from_millis(150)).await;
+  send_objects(&mut b_group2, ALIAS_B, 2, 3..=5, Some(2)).await;
+  b_group2.finish().await.expect("finish B group 2");
+
+  let publish = subscriber
+    .expect(Duration::from_secs(5), "success PUBLISH", |m| match m {
+      ControlMessage::Publish(p) => Some(p),
+      _ => None,
+    })
+    .await;
+  assert_eq!(publish.content_exists, 1, "overlapped switch must succeed");
+  let transition = SwitchTransition::from_parameters(&publish.parameters)
+    .expect("success PUBLISH must carry SWITCH_TRANSITION");
+  assert_eq!(transition.switching_group_id, 0, "floor honored via backfill");
+  assert_eq!(
+    transition.live_edge_group_id, 2,
+    "live edge = the mid-flight group (its tail does not advance the group id)"
+  );
+  subscriber
+    .expect(Duration::from_secs(5), "PUBLISH_DONE(1)", |m| match m {
+      ControlMessage::PublishDone(d) if d.request_id == 1 => Some(()),
+      _ => None,
+    })
+    .await;
+
+  let seen = collect_until_quiet(&mut data, Duration::from_secs(3)).await;
+
+  // Catch-up [0, 2): backfill-supplied history, exactly once each.
+  for group in 0..=1u64 {
+    for object in 0..=2u64 {
+      assert_eq!(
+        seen.get(&(Via::Catchup, group, object)),
+        Some(&1),
+        "backfilled catch-up ({group},{object}) must arrive exactly once"
+      );
+    }
+  }
+  assert!(
+    !seen
+      .keys()
+      .any(|(via, group, _)| *via == Via::Catchup && *group >= 2),
+    "catch-up must stop below the live edge"
+  );
+  // THE pin: the overlapped live-edge group — head backfilled, tail raced
+  // between live-forward and the fetch response — exactly once each, in spite
+  // of the double ingest.
+  for object in 0..=5u64 {
+    assert_eq!(
+      seen.get(&(Via::Subgroup { alias: ALIAS_B }, 2, object)),
+      Some(&1),
+      "overlapped live-edge object (2,{object}) must arrive exactly once"
     );
   }
 }

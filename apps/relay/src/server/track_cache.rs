@@ -170,29 +170,59 @@ impl TrackCache {
     }
   }
 
-  pub async fn add_object(&self, object: FetchObject) {
+  /// Inserts `object` into its group, keeping two invariants every consumer
+  /// (the catch-up/FETCH range read and the joining replay, whose subgroup
+  /// delta-encoding requires strictly increasing object ids) depends on:
+  ///
+  /// 1. **Idempotent** — a group may be fed by several concurrent ingest paths
+  ///    (live-forward from the upstream subscription racing the upstream
+  ///    backfill FETCH covering the same groups). An object already present
+  ///    (same subgroup_id + object_id) is silently skipped; appending it
+  ///    blindly would later replay non-increasing ids, underflowing the
+  ///    subgroup delta encoder.
+  /// 2. **Sorted by (subgroup_id, object_id)** — the racing paths interleave
+  ///    arbitrarily, so arrival order is not delivery order. For a single
+  ///    well-formed stream (ids strictly increasing) the sort is a no-op.
+  ///
+  /// The group entry itself is created via moka's atomic entry API: the old
+  /// get-else-insert raced concurrent ingest into creating two vecs, the
+  /// second silently replacing (and losing) the first.
+  ///
+  /// Returns `true` when the object was inserted, `false` for a duplicate —
+  /// callers use this to suppress double fan-out of a re-ingested object.
+  pub async fn add_object(&self, object: FetchObject) -> bool {
     let cache_key = CacheKey::new(self.track_alias, object.group_id);
 
-    // Check if group al  y exists in cache
-    if let Some(existing_objects) = self.cache.get(&cache_key).await {
-      // Add object to existing group
-      let mut objects = existing_objects.write().await;
-      objects.push(object.clone());
-      debug!(
-        "track_cache::add_object | added object to existing group | track: {} group: {} object_id: {} total_objects: {}",
-        self.track_alias,
-        object.group_id,
-        object.object_id,
-        objects.len()
-      );
-    } else {
-      // Create new group with this object
-      let new_group_objects = Arc::new(RwLock::new(vec![object.clone()]));
-      self.cache.insert(cache_key, new_group_objects).await;
-      debug!(
-        "track_cache::add_object | created new group | track: {} group: {} object_id: {}",
-        self.track_alias, object.group_id, object.object_id
-      );
+    let entry = self
+      .cache
+      .entry(cache_key)
+      .or_insert_with(async { Arc::new(RwLock::new(Vec::new())) })
+      .await;
+    let group_objects = entry.into_value();
+
+    let mut objects = group_objects.write().await;
+    let position = objects.binary_search_by(|existing| {
+      (existing.subgroup_id, existing.object_id).cmp(&(object.subgroup_id, object.object_id))
+    });
+    match position {
+      Ok(_) => {
+        debug!(
+          "track_cache::add_object | duplicate skipped | track: {} group: {} subgroup: {} object_id: {}",
+          self.track_alias, object.group_id, object.subgroup_id, object.object_id
+        );
+        false
+      }
+      Err(index) => {
+        objects.insert(index, object.clone());
+        debug!(
+          "track_cache::add_object | inserted | track: {} group: {} object_id: {} total_objects: {}",
+          self.track_alias,
+          object.group_id,
+          object.object_id,
+          objects.len()
+        );
+        true
+      }
     }
   }
 
@@ -577,5 +607,114 @@ mod tests_available_group_ids {
       cache.available_group_ids().await,
       BTreeSet::from([3, 5, 6])
     );
+  }
+}
+
+#[cfg(test)]
+mod tests_add_object_invariants {
+  use super::*;
+  use bytes::Bytes;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      initial_max_request_id: 100,
+      upstream_url: None,
+      upstream_no_cert_validation: false,
+    }
+  }
+
+  fn obj(group_id: u64, subgroup_id: u64, object_id: u64) -> FetchObject {
+    FetchObject {
+      group_id,
+      subgroup_id,
+      object_id,
+      publisher_priority: 0,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    }
+  }
+
+  async fn group_ids(cache: &TrackCache, group: u64) -> Vec<(u64, u64)> {
+    let objects = cache.get_group(group).await.expect("group present");
+    let objects = objects.read().await;
+    objects.iter().map(|o| (o.subgroup_id, o.object_id)).collect()
+  }
+
+  /// Concurrent ingest paths (live-forward racing the upstream backfill FETCH)
+  /// can feed the same object twice; the second insert must be a no-op, or the
+  /// joining replay later emits non-increasing ids and underflows the subgroup
+  /// delta encoder.
+  #[tokio::test]
+  async fn duplicate_insert_is_idempotent() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    cache.add_object(obj(0, 0, 1)).await;
+    cache.add_object(obj(0, 0, 1)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(group_ids(&cache, 0).await, vec![(0, 1)]);
+  }
+
+  /// The racing paths interleave arbitrarily, so arrival order is not delivery
+  /// order: the group must come back sorted for the range read and the replay.
+  #[tokio::test]
+  async fn out_of_order_inserts_are_sorted() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    // Live tail lands first, backfilled head afterwards.
+    cache.add_object(obj(0, 0, 4)).await;
+    cache.add_object(obj(0, 0, 0)).await;
+    cache.add_object(obj(0, 0, 2)).await;
+    cache.add_object(obj(0, 0, 1)).await;
+    cache.add_object(obj(0, 0, 3)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(
+      group_ids(&cache, 0).await,
+      vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]
+    );
+  }
+
+  /// Identity is (subgroup_id, object_id): the same object id in different
+  /// subgroups is two distinct objects, not a duplicate.
+  #[tokio::test]
+  async fn same_object_id_across_subgroups_is_kept() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    cache.add_object(obj(0, 1, 0)).await;
+    cache.add_object(obj(0, 0, 0)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(group_ids(&cache, 0).await, vec![(0, 0), (1, 0)]);
+  }
+
+  /// The old get-else-insert raced concurrent group creation into two vecs,
+  /// the second replacing (and losing) the first; the atomic entry API must
+  /// keep every distinct object regardless of interleaving.
+  #[tokio::test]
+  async fn concurrent_ingest_loses_nothing() {
+    let cache = std::sync::Arc::new(TrackCache::new(1, 100, &test_config()));
+    let mut handles = Vec::new();
+    for object_id in 0..16u64 {
+      let cache = cache.clone();
+      handles.push(tokio::spawn(async move {
+        cache.add_object(obj(7, 0, object_id)).await;
+      }));
+    }
+    for h in handles {
+      h.await.expect("ingest task");
+    }
+    cache.run_pending_tasks().await;
+    let ids = group_ids(&cache, 7).await;
+    assert_eq!(ids.len(), 16, "no object may be lost to a creation race");
+    assert_eq!(ids, (0..16u64).map(|o| (0, o)).collect::<Vec<_>>());
   }
 }
