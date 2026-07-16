@@ -74,6 +74,16 @@ pub struct SubscriptionState {
   pub replay_watermarks: HashMap<(u64, u64), u64>,
 }
 
+/// True iff writing `object_id` onto a per-(group, subgroup) send stream whose
+/// last successfully sent object id is `previous` would break the stream's
+/// monotonicity — equal means a duplicate, lower means a late arrival. The
+/// subgroup delta encoder (`wire = id - previous - 1`) underflows on either,
+/// and a strict MOQT receiver must treat a non-increasing subgroup stream as
+/// malformed. `previous == None` (nothing sent yet) never blocks.
+pub(crate) fn breaks_stream_monotonicity(previous: Option<u64>, object_id: u64) -> bool {
+  previous.is_some_and(|prev| object_id <= prev)
+}
+
 impl SubscriptionState {
   /// True iff the joining cache replay already delivered this exact object,
   /// i.e. the object's subgroup has a replay watermark at or above its
@@ -746,6 +756,28 @@ impl Subscription {
               .flatten()
           };
 
+          // Foreign-upstream fan-out guard: a fetch-backfilled object can be
+          // fanned out after live objects of the same (group, subgroup) were
+          // already forwarded on this stream. Reachable when a non-moqtail
+          // upstream ignores DELAY_GROUPS=0 and degrades the lazy upstream
+          // subscription to LatestObject: the mid-flight group's head then
+          // arrives only via the backfill FETCH, behind its own tail. Writing
+          // a lower (or equal) object id onto an already-advanced subgroup
+          // stream underflows the delta encoder and is malformed for any
+          // strict receiver — skip the write. The object itself is not lost:
+          // it sits in the (idempotent, sorted) cache, so joining replays and
+          // catch-up/FETCH range reads still deliver it in order.
+          if breaks_stream_monotonicity(previous_object_id, object.location.object) {
+            debug!(
+              "Non-monotonic object for already-advanced stream; skipping fan-out - subscriber: {} stream_id: {} previous: {:?} object: {:?}",
+              self.client_connection_id,
+              stream_id,
+              previous_object_id,
+              object.location
+            );
+            return;
+          }
+
           debug!(
             "Received Object event: subscriber: {} stream_id: {} track: {} previous_object_id: {:?} object: {:?} now: {} received time: {}",
             self.client_connection_id,
@@ -1333,5 +1365,43 @@ mod tests_end_group_bound {
   #[test]
   fn update_wire_nonzero_maps_to_bound() {
     assert_eq!(SubscriptionState::end_group_from_update_wire(7), Some(7));
+  }
+}
+
+#[cfg(test)]
+mod tests_stream_monotonicity_guard {
+  use super::*;
+
+  #[test]
+  fn fresh_stream_never_blocks() {
+    // Nothing sent yet: any first object id is valid, including 0 and
+    // arbitrary mid-group ids (a joining replay's fake-header streams start
+    // wherever the replay starts).
+    assert!(!breaks_stream_monotonicity(None, 0));
+    assert!(!breaks_stream_monotonicity(None, u64::MAX));
+  }
+
+  #[test]
+  fn increasing_ids_pass() {
+    assert!(!breaks_stream_monotonicity(Some(2), 3));
+    // Gaps are legal on a subgroup stream (the delta encoder expresses them).
+    assert!(!breaks_stream_monotonicity(Some(2), 10));
+  }
+
+  #[test]
+  fn duplicate_id_is_blocked() {
+    // Equal = live-vs-fetch duplicate that slipped past cache-level
+    // suppression ordering; re-sending it is a protocol violation.
+    assert!(breaks_stream_monotonicity(Some(3), 3));
+  }
+
+  #[test]
+  fn late_lower_id_is_blocked() {
+    // THE foreign-upstream case: the mid-flight group's head arrives via the
+    // backfill FETCH after its tail was live-forwarded on the same stream.
+    // wire = id - previous - 1 would underflow; the head must be dropped from
+    // THIS stream (the sorted cache still serves it to replays and fetches).
+    assert!(breaks_stream_monotonicity(Some(3), 0));
+    assert!(breaks_stream_monotonicity(Some(3), 2));
   }
 }
