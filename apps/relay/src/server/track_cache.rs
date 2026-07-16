@@ -377,6 +377,32 @@ impl TrackCache {
       .min()
   }
 
+  /// The greatest `(group, max object_id)` location held for any group
+  /// strictly below `group_bound` — the switch drain's completion target
+  /// (SWITCH PR #1378: "once all Objects from the current Track for Groups
+  /// with GroupID less than G_switch have been delivered"). `None` when
+  /// nothing below the bound is held (nothing to drain). Using the highest
+  /// AVAILABLE group (not `group_bound - 1`) is what makes the drain converge
+  /// when `G_switch - 1` is a hole shared by both Tracks — the relaxed
+  /// selection permits that, and waiting for a group that will never exist
+  /// would spin the drain into a spurious TIMEOUT. The object component is
+  /// the group's max object_id (delivery-completeness proxy; exact for the
+  /// single-subgroup groups this relay produces, approximate under subgroup
+  /// interleaving).
+  pub async fn max_location_below_group(&self, group_bound: u64) -> Option<Location> {
+    let group_id = self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.track_alias == self.track_alias && k.group_id < group_bound)
+      .map(|(k, _)| k.group_id)
+      .max()?;
+    let key = CacheKey::new(self.track_alias, group_id);
+    let objects_arc = self.cache.get(&key).await?;
+    let objects = objects_arc.read().await;
+    let object_id = objects.iter().map(|o| o.object_id).max()?;
+    Some(Location::new(group_id, object_id))
+  }
+
   /// Returns the set of group_ids currently cached for this track.
   ///
   /// Feeds the SWITCH handler's `compute_switch_group` (PR #1378): the relay
@@ -716,5 +742,83 @@ mod tests_add_object_invariants {
     let ids = group_ids(&cache, 7).await;
     assert_eq!(ids.len(), 16, "no object may be lost to a creation race");
     assert_eq!(ids, (0..16u64).map(|o| (0, o)).collect::<Vec<_>>());
+  }
+}
+
+#[cfg(test)]
+mod tests_max_location_below_group {
+  use super::*;
+  use bytes::Bytes;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      initial_max_request_id: 100,
+      upstream_url: None,
+      upstream_no_cert_validation: false,
+    }
+  }
+
+  fn obj(group_id: u64, subgroup_id: u64, object_id: u64) -> FetchObject {
+    FetchObject {
+      group_id,
+      subgroup_id,
+      object_id,
+      publisher_priority: 0,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    }
+  }
+
+  async fn cache_with(groups: &[(u64, u64, u64)]) -> TrackCache {
+    let config = Box::leak(Box::new(test_config()));
+    let cache = TrackCache::new(1, 100, config);
+    for &(g, sg, o) in groups {
+      cache.add_object(obj(g, sg, o)).await;
+    }
+    cache
+  }
+
+  #[tokio::test]
+  async fn empty_cache_has_no_target() {
+    let cache = cache_with(&[]).await;
+    assert_eq!(cache.max_location_below_group(5).await, None);
+  }
+
+  #[tokio::test]
+  async fn picks_highest_available_group_and_its_max_object() {
+    // Groups 0 and 2 held (1 and 4 are holes), bound 5: the drain target is
+    // the last object of the highest AVAILABLE group below the seam — (2, 7)
+    // — not a location in the nonexistent Group 4.
+    let cache = cache_with(&[(0, 0, 0), (2, 0, 3), (2, 0, 7), (2, 0, 5)]).await;
+    assert_eq!(
+      cache.max_location_below_group(5).await,
+      Some(Location::new(2, 7))
+    );
+  }
+
+  #[tokio::test]
+  async fn bound_is_exclusive_and_zero_yields_none() {
+    let cache = cache_with(&[(3, 0, 1), (4, 0, 9)]).await;
+    // Group 3 is below bound 4; Group 4 itself is not.
+    assert_eq!(
+      cache.max_location_below_group(4).await,
+      Some(Location::new(3, 1))
+    );
+    // Nothing exists below Group 0.
+    assert_eq!(cache.max_location_below_group(0).await, None);
   }
 }

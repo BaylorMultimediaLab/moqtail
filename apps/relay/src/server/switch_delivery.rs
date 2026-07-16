@@ -207,14 +207,24 @@ pub(crate) fn seam_end_group_bound(g_switch: u64) -> Option<u64> {
   g_switch.checked_sub(1)
 }
 
-/// True once the source's last-sent object sits in Group `G_switch - 1` or
-/// beyond. Note this is a heuristic, not proof that every object below the
-/// seam was delivered — see the drain-completeness caveat on
-/// [`drain_source_below`]. Callers guarantee `g_switch >= 1`.
-pub(crate) fn drain_complete(last_sent: Option<&Location>, g_switch: u64) -> bool {
-  last_sent
-    .map(|loc| loc.group + 1 >= g_switch)
-    .unwrap_or(false)
+/// True once the source has delivered everything below the seam that the
+/// relay holds: its last-sent location has reached `drain_target`, the
+/// greatest cached location strictly below `G_switch` on the current Track
+/// (re-evaluated by the caller each poll, so a still-growing group keeps
+/// moving the bar). `None` target = nothing below the seam is held = nothing
+/// to drain. This replaces the old `last_sent.group + 1 >= g_switch` check,
+/// which (a) opened the PUBLISH while the tail of Group `G_switch - 1` was
+/// still queued (last-sent being IN the group is not having FINISHED it), and
+/// (b) stalled to a spurious TIMEOUT when `G_switch - 1` is a hole shared by
+/// both Tracks — which the relaxed selection expressly permits. Residual
+/// approximation, documented rather than hidden: when the group below the
+/// seam is still growing, objects can arrive after the last poll observed the
+/// cache; the target chases the cache, not the (unknowable) end of group.
+pub(crate) fn drain_complete(last_sent: Option<&Location>, drain_target: Option<&Location>) -> bool {
+  match drain_target {
+    None => true,
+    Some(target) => last_sent.is_some_and(|sent| sent >= target),
+  }
 }
 
 /// Builds the live subscription opened for the target Track of a switch.
@@ -588,9 +598,18 @@ pub(crate) async fn drain_source_below(
       return DrainOutcome::Abandoned;
     }
     let drained = {
+      // Re-read the drain target each poll: below-seam groups can still be
+      // growing (a switch at the next boundary drains the current live
+      // group), and holes must not be waited on.
+      let drain_target = current_track
+        .read()
+        .await
+        .cache
+        .max_location_below_group(g_switch)
+        .await;
       let sub = sub_arc.read().await;
       let state = sub.subscription_state.read().await;
-      drain_complete(state.last_sent_max_location.as_ref(), g_switch)
+      drain_complete(state.last_sent_max_location.as_ref(), drain_target.as_ref())
     };
     if drained {
       // Drain confirmed: bound the source at the seam so it does not forward
@@ -749,25 +768,45 @@ mod tests_switch_seam_helpers {
   // ---- drain_complete ----
 
   #[test]
-  fn drain_not_complete_when_nothing_sent() {
-    assert!(!drain_complete(None, 1));
-    assert!(!drain_complete(None, 5));
+  fn drain_not_complete_when_nothing_sent_but_target_exists() {
+    assert!(!drain_complete(None, Some(&loc(0, 2))));
+    assert!(!drain_complete(None, Some(&loc(3, 7))));
   }
 
   #[test]
-  fn drain_complete_when_last_sent_reaches_seam_minus_one() {
-    // G_switch == 1: anything sent in Group 0 completes the drain.
-    assert!(drain_complete(Some(&loc(0, 5)), 1));
-    // G_switch == 5: Group 4 completes, Group 3 does not.
-    assert!(drain_complete(Some(&loc(4, 0)), 5));
-    assert!(!drain_complete(Some(&loc(3, 7)), 5));
+  fn drain_complete_when_nothing_below_seam_is_held() {
+    // No target = nothing below G_switch in the cache = nothing to drain —
+    // even if the source has sent nothing at all.
+    assert!(drain_complete(None, None));
+    assert!(drain_complete(Some(&loc(9, 9)), None));
+  }
+
+  #[test]
+  fn mid_group_tail_holds_the_drain() {
+    // THE flaw the old `group + 1 >= g_switch` check had: last-sent being IN
+    // Group G_switch-1 is not having finished it. With the cache holding
+    // (4, 7), a last-sent of (4, 3) must keep the PUBLISH closed until the
+    // tail is delivered.
+    assert!(!drain_complete(Some(&loc(4, 3)), Some(&loc(4, 7))));
+    assert!(drain_complete(Some(&loc(4, 7)), Some(&loc(4, 7))));
+  }
+
+  #[test]
+  fn shared_hole_below_seam_converges() {
+    // G_switch - 1 is a hole on the current Track (the relaxed selection
+    // permits shared holes): the target is the highest AVAILABLE group below
+    // the seam, so the drain completes at (2, 5) instead of waiting forever
+    // for a Group 4 that will never exist (the old check's spurious TIMEOUT).
+    assert!(drain_complete(Some(&loc(2, 5)), Some(&loc(2, 5))));
+    assert!(!drain_complete(Some(&loc(2, 4)), Some(&loc(2, 5))));
   }
 
   #[test]
   fn drain_complete_when_source_already_past_seam() {
     // Behind-live / buffer-replacement switch: the source forwarded past
-    // G_switch before the SWITCH arrived; the drain is immediately complete.
-    assert!(drain_complete(Some(&loc(7, 2)), 5));
+    // G_switch before the SWITCH arrived; last-sent dominates any below-seam
+    // target and the drain is immediately complete.
+    assert!(drain_complete(Some(&loc(7, 2)), Some(&loc(4, 9))));
   }
 
   // ---- switch_catchup_range ----
