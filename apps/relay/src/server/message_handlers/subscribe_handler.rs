@@ -1425,7 +1425,18 @@ async fn handle_switch_message(
       target_parameters.clone(),
     );
 
-    // (3) Live-only subscription on the target Track (objects from the live edge
+    // (3) Close-After-Switch: terminate the source with PUBLISH_DONE on the
+    // current Request ID and drop relay state.
+    terminate_source(
+      &client,
+      &current_track_arc,
+      &current_full_track_name,
+      connection_id,
+      current_sub_req_id,
+    )
+    .await;
+
+    // (4) Live-only subscription on the target Track (objects from the live edge
     // onward, on SUBGROUP streams) + relay-side request mapping.
     {
       let target_track = target_track_arc.read().await;
@@ -1436,7 +1447,7 @@ async fn handle_switch_message(
       SubscribeRequest::new(target_request_id, connection_id, live_sub, None),
     );
 
-    // (4) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
+    // (5) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
     spawn_switch_catchup_stream(
       client.clone(),
       target_track_arc.clone(),
@@ -1444,17 +1455,6 @@ async fn handle_switch_message(
       g_switch,
       live_edge,
     );
-
-    // (5) Close-After-Switch: terminate the source with PUBLISH_DONE on the
-    // current Request ID and drop relay state.
-    terminate_source(
-      &client,
-      &current_track_arc,
-      &current_full_track_name,
-      connection_id,
-      current_sub_req_id,
-    )
-    .await;
 
     // (6) Release the in-flight guard.
     client.switch_in_flight.lock().await.complete(current_sub_req_id);
