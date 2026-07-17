@@ -103,7 +103,10 @@ impl MoqConnection {
     );
 
     let publish = Publish::new(
-      track_alias, // request_id
+      // Request ids of client-initiated requests must be EVEN (draft-14
+      // parity; the relay enforces it). Aliases start at 1, so derive an
+      // even, still-unique-per-alias id instead of using the alias directly.
+      track_alias * 2,
       ns,
       TupleField::from_utf8(track_name),
       track_alias,

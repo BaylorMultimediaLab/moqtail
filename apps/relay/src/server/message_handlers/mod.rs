@@ -30,6 +30,19 @@ mod subscribe_namespace_handler;
 mod track_status_handler;
 use super::utils;
 
+/// Draft-14 request-id parity: client-initiated requests use EVEN request ids,
+/// server-initiated ODD. `peer_is_server` is the role of the session's peer
+/// (false for inbound sessions, true for the outbound upstream link). True =
+/// the peer used an id from the wrong space — a protocol violation, and left
+/// unchecked a collision hazard: this relay allocates its own request ids in
+/// the odd space and keys shared request maps by id, so an off-parity peer id
+/// can address relay-internal request state (e.g. the post-switch subscription
+/// registered under a relay-allocated target request id).
+pub(crate) fn request_id_parity_violation(peer_is_server: bool, request_id: u64) -> bool {
+  let id_is_odd = request_id % 2 == 1;
+  id_is_odd != peer_is_server
+}
+
 pub struct MessageHandler {}
 
 impl MessageHandler {
@@ -56,6 +69,15 @@ impl MessageHandler {
     };
 
     if let Some(request_id) = request_id {
+      if request_id_parity_violation(context.peer_is_server, request_id) {
+        warn!(
+          "request id ({}) violates parity (peer is {}, expected {} ids) — terminating session",
+          request_id,
+          if context.peer_is_server { "a server" } else { "a client" },
+          if context.peer_is_server { "odd" } else { "even" },
+        );
+        return Err(TerminationCode::ProtocolViolation);
+      }
       let max_request_id = context.max_request_id.load(Ordering::Relaxed);
       if request_id >= max_request_id {
         warn!(
@@ -127,5 +149,29 @@ impl MessageHandler {
     } else {
       Ok(())
     }
+  }
+}
+
+#[cfg(test)]
+mod tests_request_id_parity {
+  use super::*;
+
+  #[test]
+  fn inbound_peer_is_a_client_and_must_use_even_ids() {
+    assert!(!request_id_parity_violation(false, 0));
+    assert!(!request_id_parity_violation(false, 2));
+    // Odd ids collide with the relay's own (odd) allocation space.
+    assert!(request_id_parity_violation(false, 1));
+    assert!(request_id_parity_violation(false, 3));
+  }
+
+  #[test]
+  fn upstream_peer_is_a_server_and_must_use_odd_ids() {
+    assert!(!request_id_parity_violation(true, 1));
+    assert!(!request_id_parity_violation(true, 7));
+    // Even ids from the upstream would collide with the ids this relay
+    // allocates as a client on that same link.
+    assert!(request_id_parity_violation(true, 0));
+    assert!(request_id_parity_violation(true, 4));
   }
 }

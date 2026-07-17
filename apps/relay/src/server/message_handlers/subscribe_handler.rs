@@ -487,8 +487,21 @@ async fn handle_subscribe_message(
 
     let mut new_sub = sub.clone();
     new_sub.forward = true;
-    new_sub.request_id =
-      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+    // Request-id parity: toward a downstream-connected publisher the relay is
+    // the SERVER (odd ids); toward the upstream link it is the CLIENT (even
+    // ids) — the upstream's own parity gate enforces this.
+    let forwarding_upstream = context
+      .client_manager
+      .read()
+      .await
+      .get_upstream()
+      .await
+      .is_some_and(|u| u.connection_id == publisher.connection_id);
+    new_sub.request_id = if forwarding_upstream {
+      Session::get_next_upstream_request_id(context.upstream_next_request_id.clone()).await
+    } else {
+      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await
+    };
 
     publisher
       .queue_message(ControlMessage::Subscribe(Box::new(new_sub.clone())))
@@ -989,8 +1002,21 @@ async fn establish_switch_target_upstream(
     .await;
 
   if is_creator {
-    let relay_request_id =
-      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+    // Request-id parity: toward the upstream link the relay is the CLIENT
+    // (even ids); toward a directly connected publisher it is the SERVER
+    // (odd ids).
+    let subscribing_upstream = context
+      .client_manager
+      .read()
+      .await
+      .get_upstream()
+      .await
+      .is_some_and(|u| u.connection_id == publisher.connection_id);
+    let relay_request_id = if subscribing_upstream {
+      Session::get_next_upstream_request_id(context.upstream_next_request_id.clone()).await
+    } else {
+      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await
+    };
     // Join at the CURRENT group, not the latest object: a moqtail upstream
     // resolves DELAY_GROUPS=0 to an absolute start at its live group with the
     // joining replay, which (a) replays the in-progress group's cached head

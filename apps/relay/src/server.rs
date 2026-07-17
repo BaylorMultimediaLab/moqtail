@@ -59,6 +59,10 @@ pub(crate) struct Server {
   pub relay_track_status_requests: Arc<RwLock<BTreeMap<u64, SubscribeRequest>>>,
   pub app_config: &'static AppConfig,
   pub relay_next_request_id: Arc<AtomicU64>,
+  /// Even-space request-id allocator for the upstream link, where this relay
+  /// is the CLIENT (draft-14 parity: client-initiated even, server-initiated
+  /// odd). Disjoint from `relay_next_request_id` by parity.
+  pub upstream_next_request_id: Arc<AtomicU64>,
 }
 
 impl Server {
@@ -77,6 +81,7 @@ impl Server {
       relay_track_status_requests: Arc::new(RwLock::new(BTreeMap::new())),
       app_config: config,
       relay_next_request_id: Arc::new(AtomicU64::new(1u64)), // relay's request id starts at 1 and are odd
+      upstream_next_request_id: Arc::new(AtomicU64::new(0u64)), // client-role ids start at 0 and are even
     }
   }
 

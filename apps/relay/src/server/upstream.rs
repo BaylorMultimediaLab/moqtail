@@ -129,6 +129,8 @@ async fn connect_and_run(server: &Server, url: &str) -> anyhow::Result<()> {
     request_maps,
     connection,
     server.relay_next_request_id.clone(),
+    server.upstream_next_request_id.clone(),
+    true, // upstream link: the peer is a server (odd request ids)
   ));
 
   // The upstream never sends us a ClientSetup (we are the client on this

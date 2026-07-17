@@ -72,6 +72,8 @@ impl Session {
       request_maps,
       connection,
       relay_next_request_id,
+      server.upstream_next_request_id.clone(),
+      false, // inbound session: the peer is a client (even request ids)
     ));
 
     tokio::spawn(Self::handle_connection_close(context.clone()));
@@ -585,6 +587,16 @@ impl Session {
 
   pub(crate) async fn get_next_relay_request_id(relay_next_request_id: Arc<AtomicU64>) -> u64 {
     relay_next_request_id.fetch_add(2, std::sync::atomic::Ordering::Relaxed)
+  }
+
+  /// Even-space allocator for requests the relay initiates as a CLIENT on the
+  /// upstream link (draft-14 parity: client-initiated request ids are even).
+  /// Requests toward downstream sessions — where the relay is the server —
+  /// use [`Self::get_next_relay_request_id`] (odd) instead.
+  pub(crate) async fn get_next_upstream_request_id(
+    upstream_next_request_id: Arc<AtomicU64>,
+  ) -> u64 {
+    upstream_next_request_id.fetch_add(2, std::sync::atomic::Ordering::Relaxed)
   }
 
   async fn negotiate(

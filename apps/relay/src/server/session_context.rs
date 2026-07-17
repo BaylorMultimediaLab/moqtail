@@ -46,7 +46,17 @@ pub struct SessionContext {
   pub(crate) server_config: &'static AppConfig,
   pub(crate) is_connection_closed: Arc<AtomicBool>,
   pub(crate) relay_next_request_id: Arc<AtomicU64>,
+  /// Even-space allocator for requests the relay initiates AS a CLIENT on the
+  /// upstream link (draft-14 parity: client-initiated request ids are even,
+  /// server-initiated odd). Requests toward downstream sessions — where the
+  /// relay is the server — keep using the odd `relay_next_request_id`.
+  pub(crate) upstream_next_request_id: Arc<AtomicU64>,
   pub(crate) max_request_id: Arc<AtomicU64>,
+  /// Role of the peer on this session: `false` for inbound sessions (the peer
+  /// is a client and must use even request ids), `true` for the outbound
+  /// upstream link (the peer is a server and must use odd request ids). Drives
+  /// the request-id parity gate in the message handler.
+  pub(crate) peer_is_server: bool,
 }
 
 impl SessionContext {
@@ -57,6 +67,8 @@ impl SessionContext {
     request_maps: RequestMaps,
     connection: Connection,
     relay_next_request_id: Arc<AtomicU64>,
+    upstream_next_request_id: Arc<AtomicU64>,
+    peer_is_server: bool,
   ) -> Self {
     Self {
       client_manager,
@@ -70,7 +82,9 @@ impl SessionContext {
       server_config,
       is_connection_closed: Arc::new(AtomicBool::new(false)),
       relay_next_request_id,
+      upstream_next_request_id,
       max_request_id: Arc::new(AtomicU64::new(server_config.initial_max_request_id)),
+      peer_is_server,
     }
   }
 

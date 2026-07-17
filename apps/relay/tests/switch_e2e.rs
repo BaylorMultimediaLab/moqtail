@@ -74,6 +74,12 @@
 //!    group (DELAY_GROUPS=0 joining replay) so the in-progress group's tail
 //!    is not stranded upstream — everything exactly once.
 //!
+//! 10. `odd_client_request_id_is_a_protocol_violation` — request-id parity:
+//!     client-initiated requests use even ids (the relay allocates odd, and
+//!     as a client on its upstream link allocates even); an off-parity id can
+//!     collide with relay-allocated request state and must terminate the
+//!     session instead of being processed.
+//!
 //! The harness spawns the relay binary (`CARGO_BIN_EXE_relay`) with a
 //! self-signed certificate written to a temp dir, then drives a publisher
 //! peer and a subscriber peer built from `moqtail::transport`.
@@ -677,27 +683,27 @@ async fn stale_switch_request_id_is_silently_dropped() {
   subscriber.assert_no_publish_within(Duration::from_secs(4)).await;
 
   // Phase 3: same contract for an UNSUBSCRIBE'd id. SUBSCRIBE A again
-  // (id 5), UNSUBSCRIBE it, then SWITCH naming id 5.
+  // (id 6 — client ids are even), UNSUBSCRIBE it, then SWITCH naming id 6.
   subscriber
     .control
-    .send(&ControlMessage::Subscribe(Box::new(subscribe(5, TRACK_A))))
+    .send(&ControlMessage::Subscribe(Box::new(subscribe(6, TRACK_A))))
     .await
-    .expect("send SUBSCRIBE(5)");
+    .expect("send SUBSCRIBE(6)");
   subscriber
-    .expect(Duration::from_secs(5), "SubscribeOk(5)", |m| match m {
+    .expect(Duration::from_secs(5), "SubscribeOk(6)", |m| match m {
       ControlMessage::SubscribeOk(ok) => Some(ok),
       _ => None,
     })
     .await;
   subscriber
     .control
-    .send(&ControlMessage::Unsubscribe(Box::new(Unsubscribe::new(5))))
+    .send(&ControlMessage::Unsubscribe(Box::new(Unsubscribe::new(6))))
     .await
-    .expect("send UNSUBSCRIBE(5)");
-  sleep(Duration::from_millis(500)).await; // let the relay tear down id 5
+    .expect("send UNSUBSCRIBE(6)");
+  sleep(Duration::from_millis(500)).await; // let the relay tear down id 6
   subscriber
     .control
-    .send(&ControlMessage::Switch(Box::new(switch_to(5, TRACK_B))))
+    .send(&ControlMessage::Switch(Box::new(switch_to(6, TRACK_B))))
     .await
     .expect("send SWITCH on unsubscribed id");
   subscriber.assert_no_publish_within(Duration::from_secs(4)).await;
@@ -1496,5 +1502,47 @@ async fn switch_backfill_overlapping_live_ingest_stays_exactly_once() {
       Some(&1),
       "overlapped live-edge object (2,{object}) must arrive exactly once"
     );
+  }
+}
+
+/// Draft-14 request-id parity: client-initiated requests use even ids; the
+/// relay allocates odd. An off-parity client id is not just non-conforming —
+/// it can collide with relay-allocated request state (the post-switch
+/// subscription is registered under a relay-allocated odd target request id
+/// in the same per-client request map), letting a "stale" id address a live
+/// internal subscription. The relay must terminate the session with a
+/// protocol violation instead of processing the request.
+#[tokio::test]
+async fn odd_client_request_id_is_a_protocol_violation() {
+  let port = 44895;
+  let _relay = spawn_relay(port).await;
+
+  // A publisher so the SUBSCRIBE would otherwise be serviceable — proving the
+  // rejection is the parity gate, not a missing track.
+  let mut publisher = Peer::connect(port).await;
+  publish_track(&mut publisher, TRACK_A, ALIAS_A).await;
+
+  let mut subscriber = Peer::connect(port).await;
+  subscriber
+    .control
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(3, TRACK_A))))
+    .await
+    .expect("send odd-id SUBSCRIBE");
+
+  // The relay must terminate the session: the control stream ends in an
+  // error, and the request is never answered.
+  let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let remaining = deadline
+      .checked_duration_since(tokio::time::Instant::now())
+      .expect("session must be terminated for a parity violation");
+    match timeout(remaining, subscriber.control.next_message()).await {
+      Err(_) => panic!("session must be terminated for a parity violation"),
+      Ok(Ok(ControlMessage::SubscribeOk(_) | ControlMessage::SubscribeError(_))) => {
+        panic!("an odd-id request must not be processed")
+      }
+      Ok(Ok(_)) => continue, // unrelated traffic
+      Ok(Err(_)) => return,  // control stream error: session terminated
+    }
   }
 }

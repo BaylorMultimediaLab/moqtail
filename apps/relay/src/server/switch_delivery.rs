@@ -473,8 +473,10 @@ pub(crate) fn spawn_upstream_backfill(
       return;
     }
 
+    // Request-id parity: this FETCH goes to the upstream link, where the
+    // relay is the CLIENT — even ids (the upstream's parity gate enforces it).
     let request_id =
-      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+      Session::get_next_upstream_request_id(context.upstream_next_request_id.clone()).await;
     let fetch = Fetch::new_standalone(
       request_id,
       0,
