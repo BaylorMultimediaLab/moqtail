@@ -33,7 +33,14 @@ export class Switch {
     /** The Established subscription being replaced ("Current Subscribe Request ID"). */
     public currentSubscribeRequestId: bigint,
     public fullTrackName: FullTrackName,
-    /** Lower bound on the transition group; 0 means "no floor" (switch at the live edge). */
+    /**
+     * Lower bound on the transition group ("Minimum Switching Group ID").
+     * An ordinary floor — the draft has NO live-edge sentinel: `0n` means
+     * "any group is acceptable" and resolves to the OLDEST common gap-free
+     * boundary, i.e. full buffer replacement with a maximal catch-up range.
+     * To switch near live, pass the latest group id received on the current
+     * subscription.
+     */
     public minimumSwitchingGroupId: bigint,
     public parameters: KeyValuePair[],
   ) {}

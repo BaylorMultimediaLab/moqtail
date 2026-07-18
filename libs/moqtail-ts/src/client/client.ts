@@ -1235,7 +1235,11 @@ export class MOQtailClient {
    *
    * @example Switch to a different track
    * ```ts
-   * const r = await client.switch({ subscriptionRequestId, fullTrackName: newTrackName });
+   * const r = await client.switch({
+   *   subscriptionRequestId,
+   *   fullTrackName: newTrackName,
+   *   minimumSwitchingGroupId: latestReceivedGroupId, // floor: no live-edge sentinel exists
+   * });
    * if (r instanceof SwitchFailure) {
    *   // relay could not switch; current subscription is untouched
    * } else {
@@ -1248,9 +1252,12 @@ export class MOQtailClient {
    */
   async switch(args: SwitchOptions): Promise<SwitchSuccess | SwitchFailure> {
     this.#ensureActive()
-    const { fullTrackName, subscriptionRequestId } = args
+    // minimumSwitchingGroupId is required (no `?? 0n` default): an omitted
+    // floor silently requested full buffer replacement — the relay resolves
+    // 0n to the OLDEST common boundary — which is the most expensive
+    // transition the protocol can express. Callers must state their floor.
+    const { fullTrackName, subscriptionRequestId, minimumSwitchingGroupId } = args
     const parameters = args.parameters ?? new VersionSpecificParameters()
-    const minimumSwitchingGroupId = args.minimumSwitchingGroupId ?? 0n
     const key = fullTrackName.toString()
 
     // Remove exactly this call's resolver from the FIFO (other concurrent

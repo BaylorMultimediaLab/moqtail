@@ -255,11 +255,14 @@ export type SubscribeUpdateOptions = {
 /**
  * Parameters for {@link MOQtailClient.switch | switching} an existing SUBSCRIBE to a new track.
  *
- * @example Switching subscription to a new track
+ * @example Switching subscription to a new track near the live edge
  * ```ts
  * await client.switch({
  *   fullTrackName: newFullTrackName,
- *   subscriptionRequestId
+ *   subscriptionRequestId,
+ *   // floor at the latest group received on the current subscription;
+ *   // pass an older group id instead to replace buffered content
+ *   minimumSwitchingGroupId: latestReceivedGroupId
  * })
  * ```
  */
@@ -273,14 +276,15 @@ export type SwitchOptions = {
   /**
    * Lower bound on the transition group (SWITCH PR #1378 "Minimum Switching Group ID").
    * The relay must not switch before this group and selects the smallest
-   * feasible boundary at or above it. `0n` (also the default when omitted) is
-   * an ordinary floor meaning "any group is acceptable": the relay resolves it
-   * to the OLDEST common gap-free boundary, i.e. full buffer replacement with
-   * a maximal catch-up range. To switch as close to live as possible, pass the
-   * latest group id received on the current subscription instead — there is no
-   * live-edge sentinel in the draft.
+   * feasible boundary at or above it. REQUIRED — there is no safe library
+   * default: `0n` is an ordinary floor meaning "any group is acceptable",
+   * which the relay resolves to the OLDEST common gap-free boundary, i.e.
+   * full buffer replacement with a maximal catch-up range (the most
+   * expensive transition the protocol can express). To switch as close to
+   * live as possible, pass the latest group id received on the current
+   * subscription — there is no live-edge sentinel in the draft.
    */
-  minimumSwitchingGroupId?: bigint
+  minimumSwitchingGroupId: bigint
 }
 
 /**
