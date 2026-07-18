@@ -208,11 +208,28 @@ export class MOQtailClient {
    */
   readonly pendingSwitchFailures: Map<bigint, (result: SwitchFailure) => void> = new Map()
   /**
+   * Expiry timestamps (ms epoch) of SWITCH requests that hit the local
+   * response deadline, keyed by target-track key; one entry per timed-out
+   * SWITCH. Per SWITCH PR #1378, a PUBLISH carrying SWITCH_TRANSITION with no
+   * pending SWITCH requires closing the session with PROTOCOL_VIOLATION. A
+   * relay answer that arrives after the local deadline is late, not
+   * unsolicited, so handlerPublish consumes one unexpired entry and declines
+   * the PUBLISH instead (see handler/publish.ts). An unmatched
+   * SWITCH_TRANSITION with no tombstone remains a protocol violation.
+   */
+  readonly lateSwitchTombstones: Map<string, number[]> = new Map()
+  /**
    * Client-side deadline for the relay to answer a SWITCH with a PUBLISH.
    * Sized at 2x the relay's DEFAULT_T_SWITCH (3000 ms) so a relay operating
    * within its own budget always wins the race. See {@link MOQtailClient.switch}.
    */
   static readonly SWITCH_RESPONSE_TIMEOUT_MS = 6000
+  /**
+   * Retention window for {@link lateSwitchTombstones} entries. Must cover the
+   * relay's T_switch plus worst-case network delay; kept bounded so
+   * unsolicited SWITCH_TRANSITION detection is only deferred, not disabled.
+   */
+  static readonly SWITCH_TOMBSTONE_TTL_MS = 30_000
   /**
    * How long an incoming data stream will wait for its routing state before
    * the missing route is treated as a protocol violation. Control and data
@@ -1284,19 +1301,20 @@ export class MOQtailClient {
       // Close-After-Switch; on failure it is left untouched).
       const result = new Promise<SwitchSuccess | SwitchFailure>((resolve) => {
         let settled = false
-        // Safety net: the relay answers every post-validation SWITCH with a
-        // PUBLISH within its T_switch budget, but a pre-validation failure
-        // (unknown Current Subscribe Request ID) is answered with nothing at
-        // all per the draft, so without a local deadline this promise could
-        // hang forever. Sized at 2x the relay's DEFAULT_T_SWITCH (3000 ms).
-        // Note: if a success PUBLISH arrives after this fires, its
-        // SWITCH_TRANSITION finds no pending SWITCH and the stray check
-        // closes the session with PROTOCOL_VIOLATION — client and relay
-        // genuinely disagree about subscription state at that point.
+        // Local response deadline. Required because a pre-validation SWITCH
+        // failure (unknown Current Subscribe Request ID) is answered with no
+        // PUBLISH at all per the draft, so the promise would otherwise hang.
+        // Sized at 2x the relay's DEFAULT_T_SWITCH (3000 ms). A tombstone is
+        // recorded so a PUBLISH arriving after the deadline is declined as a
+        // late answer rather than treated as an unsolicited SWITCH_TRANSITION
+        // (see handler/publish.ts).
         const timer = setTimeout(() => {
           if (settled) return
           settled = true
           removeOwnResolver()
+          const tombstones = this.lateSwitchTombstones.get(key) ?? []
+          tombstones.push(Date.now() + MOQtailClient.SWITCH_TOMBSTONE_TTL_MS)
+          this.lateSwitchTombstones.set(key, tombstones)
           resolve(
             new SwitchFailure(
               PublishDoneStatusCode.Timeout,

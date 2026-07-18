@@ -20,6 +20,15 @@ import { SwitchTransition } from '../../model/parameter/switch_transition'
 import { ProtocolViolationError } from '../../model/error/error'
 
 /**
+ * Delay before unsubscribing a PUBLISH that answered an already-timed-out
+ * SWITCH (see the tombstone branch in {@link handlerPublish}). Must exceed
+ * MOQtailClient.DATA_ROUTE_WAIT_TIMEOUT_MS (2000 ms) so in-flight data
+ * streams resolve their route before local routing state is removed.
+ * It's a module-local constant to avoid a runtime import cycle with client.ts.
+ */
+const LATE_SWITCH_UNSUBSCRIBE_DELAY_MS = 5000
+
+/**
  * Register the receiver-side plumbing for a PUBLISH-delivered track: the
  * pushed object stream, alias/name routing for incoming data streams, and —
  * per SWITCH PR #1378 — the mapping from the PUBLISH's own request id to the track
@@ -87,6 +96,44 @@ export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg
   if (queue && queue.length === 0) client.pendingSwitches.delete(switchKey)
 
   if (!resolver) {
+    // No pending SWITCH for this target track: either a late answer to a
+    // SWITCH that hit the local response deadline, or an unsolicited
+    // SWITCH_TRANSITION. Distinguish via the tombstones recorded at timeout
+    // (see MOQtailClient.lateSwitchTombstones); consume one unexpired entry
+    // and decline the PUBLISH, otherwise fall through to the protocol
+    // violation below.
+    const tombstones = client.lateSwitchTombstones.get(switchKey)
+    if (tombstones) {
+      const now = Date.now()
+      const live = tombstones.filter((expiry) => expiry > now)
+      if (live.length > 0) {
+        live.pop()
+        if (live.length > 0) client.lateSwitchTombstones.set(switchKey, live)
+        else client.lateSwitchTombstones.delete(switchKey)
+
+        if (msg.contentExists === 0) {
+          // Failure PUBLISH: no subscription was established and no data
+          // streams follow. The trailing PUBLISH_DONE is a no-op for an
+          // unknown request id in handlerPublishDone.
+          return
+        }
+        // Success PUBLISH: the relay completed the switch, but switch()
+        // already resolved as a failure and the application retained its
+        // current-subscription state. Register routing first so data streams
+        // the relay has already opened (catch-up FETCH_HEADER, target
+        // SUBGROUP) are accepted rather than failing route resolution, then
+        // unsubscribe once the route-wait window has passed. The pushed
+        // ReadableStream is not exposed to the application.
+        registerPublishReceiver(client, msg)
+        setTimeout(() => {
+          void client.unsubscribe(msg.requestId).catch(() => {
+            // Session closed or teardown raced; nothing left to clean up.
+          })
+        }, LATE_SWITCH_UNSUBSCRIBE_DELAY_MS)
+        return
+      }
+      client.lateSwitchTombstones.delete(switchKey)
+    }
     // SWITCH PR #1378: "If a PUBLISH contains a SWITCH_TRANSITION parameter but no
     // pending SWITCH exists for that target Track, the receiver MUST close
     // the session with PROTOCOL_VIOLATION." Throwing propagates to the
