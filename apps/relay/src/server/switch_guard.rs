@@ -42,7 +42,6 @@ use moqtail::model::control::constant::PublishDoneStatusCode;
 /// Default relay-side `T_switch` budget. Kept at/under the client's ABR switch
 /// guard (`AbrController.SWITCH_TIMEOUT_MS` = 3000 ms) so the relay reclaims a
 /// stuck switch before the subscriber gives up on the transition.
-#[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
 pub(crate) const DEFAULT_T_SWITCH: Duration = Duration::from_millis(3000);
 
 /// Result of trying to admit a new SWITCH for a subscription.
@@ -234,7 +233,6 @@ impl SwitchInFlight {
 /// passed. Each variant maps to the draft `PUBLISH_DONE` status reported on the
 /// target Track's PUBLISH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
 pub(crate) enum SwitchFailure {
   /// The target Track is unknown / not announced.
   TargetTrackMissing,
@@ -266,7 +264,6 @@ pub(crate) enum SwitchFailure {
   Superseded,
 }
 
-#[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
 impl SwitchFailure {
   /// Draft PR #1378 `PUBLISH_DONE` status code for this failure.
   pub fn status_code(self) -> PublishDoneStatusCode {

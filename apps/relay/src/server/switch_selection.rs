@@ -53,7 +53,6 @@ use crate::server::track::Track;
 
 /// Outcome of `compute_switch_group`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by relay switch handler, not yet wired
 pub(crate) enum SwitchSelection {
   /// A valid common boundary satisfying (a) to (c) was found; carry out the
   /// switch here.
@@ -78,7 +77,6 @@ pub(crate) enum SwitchSelection {
 /// smallest common boundary at or above `max(min, B + 1)`. With no blocking
 /// group, (c) holds everywhere (shared holes included) and the floor is just
 /// the client's minimum.
-#[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
 pub(crate) fn compute_switch_group(
   min_switch_group: u64,
   current_available: &BTreeSet<u64>,
@@ -114,7 +112,6 @@ pub(crate) fn compute_switch_group(
 /// this after the Current-Subscribe-Request-ID gate passes and before opening
 /// the target PUBLISH. Kept thin and side-effect-free beyond the reads so the
 /// decision logic stays in the unit-tested core.
-#[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
 pub(crate) async fn select_switch_group(
   current_track: &Arc<RwLock<Track>>,
   target_track: &Arc<RwLock<Track>>,

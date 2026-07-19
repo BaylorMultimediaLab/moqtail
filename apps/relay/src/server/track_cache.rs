@@ -409,7 +409,6 @@ impl TrackCache {
   /// needs the full availability set on both the current and target Tracks to
   /// test the common-boundary and gap-free-to-live-edge conditions, which the
   /// scalar `oldest`/`newest` accessors can't express. O(n) over cache entries.
-  #[allow(dead_code)] // not yet wired; consumed by the relay's SWITCH handler
   pub async fn available_group_ids(&self) -> BTreeSet<u64> {
     self
       .cache

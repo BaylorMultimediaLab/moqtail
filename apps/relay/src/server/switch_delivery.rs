@@ -17,14 +17,16 @@
 //!
 //! Under PR #1378 the relay carries out a switch by *opening a PUBLISH* toward
 //! the subscriber for the target Track — it does not mutate the existing
-//! subscription. These helpers build the two control-message shapes that flow
-//! on success and on failure; the catch-up `FETCH_HEADER` data stream and the
-//! `handle_switch_message` integration that drives them are a later step
-//! verified against the network harness.
+//! subscription. This module holds the delivery machinery `handle_switch_message`
+//! (message_handlers/subscribe_handler.rs) drives: the success/failure
+//! control-message shapes, the T_switch-bounded selection and drain waits, the
+//! seam bound and its unwind, the catch-up `FETCH_HEADER` stream, the upstream
+//! backfill, and source termination — all verified end-to-end over real QUIC
+//! in tests/switch_e2e.rs.
 //!
-//! Both helpers are side-effect-free beyond enqueuing a control message on the
-//! subscriber, so they are safe to call from the switch handler before any data
-//! stream is opened.
+//! The two control-message helpers (`send_switch_publish`,
+//! `send_switch_failure`) are side-effect-free beyond enqueuing on the
+//! subscriber, so they are safe to call before any data stream is opened.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -122,7 +124,6 @@ pub(crate) async fn send_switch_publish(
 /// immediately `PUBLISH_DONE` it with the mapped status code. The current
 /// subscription is left untouched — no disconnect, replacing today's
 /// `ProtocolViolation` teardown.
-#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) async fn send_switch_failure(
   subscriber: &Arc<MOQTClient>,
   publish_request_id: u64,
@@ -264,7 +265,6 @@ pub(crate) fn build_switch_live_sub(
   )
 }
 
-#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) fn spawn_switch_catchup_stream(
   subscriber: Arc<MOQTClient>,
   target_track: Arc<RwLock<Track>>,
@@ -334,7 +334,6 @@ pub(crate) fn spawn_switch_catchup_stream(
 
 /// Outcome of identifying G_switch within the T_switch window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by handle_switch_message
 pub(crate) enum SelectOutcome {
   /// A qualifying common boundary was identified.
   Ready(u64),
@@ -363,7 +362,6 @@ pub(crate) enum SelectOutcome {
 /// completely untouched). Re-evaluates the selection every
 /// [`SWITCH_DRAIN_POLL`] against the tracks' live cache state, and exits early
 /// if the switch is abandoned by an UNSUBSCRIBE.
-#[allow(dead_code)] // consumed by handle_switch_message
 pub(crate) async fn poll_select_switch_group(
   subscriber: &Arc<MOQTClient>,
   current_track: &Arc<RwLock<Track>>,
@@ -658,7 +656,6 @@ pub(crate) async fn apply_seam_bound(
 /// SUBSCRIBE is also possible, which is why the captured value is restored
 /// rather than blindly clearing to `0`. A no-op if the subscription vanished
 /// meanwhile (its teardown owns the state then).
-#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) async fn restore_source_end_group(
   current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
@@ -683,7 +680,6 @@ pub(crate) async fn restore_source_end_group(
 /// Terminate the source subscription after the handover (SWITCH PR #1378
 /// Close-After-Switch): send PUBLISH_DONE on its (the current) Request ID, then
 /// drop relay state.
-#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) async fn terminate_source(
   subscriber: &Arc<MOQTClient>,
   current_track: &Arc<RwLock<Track>>,
