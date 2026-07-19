@@ -41,32 +41,37 @@
 //!    in progress must fail with EXCESSIVE_LOAD while the first completes
 //!    untouched (the single-in-flight guard).
 //!
-//! 5. `switch_waits_for_future_boundary_within_t_switch` — a floor naming a
+//! 5. `concurrent_switch_to_unknown_target_still_fails_excessive_load` - a
+//!     colliding SWITCH into an unannounced namespace must fail on the gate
+//!     (EXCESSIVE_LOAD), not on resolution (DOES_NOT_EXIST),
+//!     and the in-flight switch must complete undisturbed afterwards.
+//!
+//! 6. `switch_waits_for_future_boundary_within_t_switch` — a floor naming a
 //!    group the target has not produced yet is held, with the current
 //!    subscription still forwarding, until the boundary materializes; TIMEOUT
 //!    means "could not identify G_switch within T_switch", not a failed
 //!    one-shot selection at receipt.
 //!
-//! 6. `switch_establishes_upstream_subscription_for_unknown_target` — a
+//! 7. `switch_establishes_upstream_subscription_for_unknown_target` — a
 //!    target the relay does not yet carry is not DOES_NOT_EXIST: the relay
 //!    establishes an upstream subscription (publisher located via the
 //!    announced namespace) and completes the switch once the upstream
 //!    delivers, with the PUBLISH carrying the upstream-assigned alias.
 //!
-//! 7. `switch_across_relay_chain` — a two-relay chain (publisher -> R1 -> R2
+//! 8. `switch_across_relay_chain` — a two-relay chain (publisher -> R1 -> R2
 //!    -> subscriber, R2 running with --upstream-url): both SUBSCRIBE and
 //!    SWITCH name tracks R2 has never seen and are resolved by subscribing to
 //!    R1 on demand through the upstream link (the publisher-of-last-resort
 //!    fallback).
 //!
-//! 8. `switch_backfills_history_via_upstream_fetch` — a chained switch whose
+//! 9. `switch_backfills_history_via_upstream_fetch` — a chained switch whose
 //!    target history exists only at the upstream relay: the lazy upstream
 //!    subscription live-forwards nothing for a static track, so the relay
 //!    issues an upstream FETCH bounded by the upstream-advertised live edge
 //!    and serves the catch-up range from the backfilled cache (the SWITCH PR
 //!    #1378's "and/or FETCH requests").
 //!
-//! 9. `switch_backfill_overlapping_live_ingest_stays_exactly_once` — the
+//! 10. `switch_backfill_overlapping_live_ingest_stays_exactly_once` — the
 //!    backfill FETCH range and the upstream subscription's delivery overlap
 //!    on the mid-flight live-edge group; the downstream cache must collapse
 //!    the double ingest (idempotent, sorted insert; duplicate fan-out
@@ -74,7 +79,7 @@
 //!    group (DELAY_GROUPS=0 joining replay) so the in-progress group's tail
 //!    is not stranded upstream — everything exactly once.
 //!
-//! 10. `odd_client_request_id_is_a_protocol_violation` — request-id parity:
+//! 11. `odd_client_request_id_is_a_protocol_violation` — request-id parity:
 //!     client-initiated requests use even ids (the relay allocates odd, and
 //!     as a client on its upstream link allocates even); an off-parity id can
 //!     collide with relay-allocated request state and must terminate the
@@ -225,7 +230,12 @@ impl Peer {
           let client_setup = ClientSetup::new(vec![constant::DRAFT_14], vec![max_request_id]);
           control.send_impl(&client_setup).await.expect("send setup");
           match control.next_message().await {
-            Ok(ControlMessage::ServerSetup(_)) => return Peer { connection, control },
+            Ok(ControlMessage::ServerSetup(_)) => {
+              return Peer {
+                connection,
+                control,
+              };
+            }
             other => panic!("expected ServerSetup, got {other:?}"),
           }
         }
@@ -326,9 +336,12 @@ async fn open_group_stream(
     .await
     .expect("open uni");
   let header = SubgroupHeader::new_with_explicit_id(alias, group_id, 0, 128, false, true);
-  SendDataStream::new(Arc::new(Mutex::new(stream)), HeaderInfo::Subgroup { header })
-    .await
-    .expect("subgroup stream")
+  SendDataStream::new(
+    Arc::new(Mutex::new(stream)),
+    HeaderInfo::Subgroup { header },
+  )
+  .await
+  .expect("subgroup stream")
 }
 
 /// Sends `object_ids` on an open subgroup stream. `previous` is the id of the
@@ -351,8 +364,8 @@ async fn send_objects(
       object_status: None,
       payload: Some(Bytes::from(format!("g{group_id}o{object_id}"))),
     };
-    let object = Object::try_from_subgroup(sub_obj, alias, group_id, Some(0), 128)
-      .expect("build object");
+    let object =
+      Object::try_from_subgroup(sub_obj, alias, group_id, Some(0), 128).expect("build object");
     stream
       .send_object(&object, previous)
       .await
@@ -532,7 +545,10 @@ async fn switch_midgroup_seam_delivers_exactly_once() {
     .await;
   let transition = SwitchTransition::from_parameters(&publish.parameters)
     .expect("PUBLISH opened for a SWITCH must carry SWITCH_TRANSITION");
-  assert_eq!(transition.switching_group_id, 0, "shared boundaries + min 0");
+  assert_eq!(
+    transition.switching_group_id, 0,
+    "shared boundaries + min 0"
+  );
   assert_eq!(
     transition.live_edge_group_id, 4,
     "live edge at PUBLISH-open is B's mid-flight group"
@@ -567,7 +583,9 @@ async fn switch_midgroup_seam_delivers_exactly_once() {
     }
   }
   assert!(
-    !seen.keys().any(|(via, group, _)| *via == Via::Catchup && *group >= 4),
+    !seen
+      .keys()
+      .any(|(via, group, _)| *via == Via::Catchup && *group >= 4),
     "catch-up must stop below the live edge"
   );
 
@@ -597,7 +615,10 @@ async fn switch_midgroup_seam_delivers_exactly_once() {
   // duplicated across catch-up and live delivery.
   for ((via, group, object), count) in &seen {
     if matches!(via, Via::Subgroup { alias } if *alias == b_alias) || *via == Via::Catchup {
-      assert_eq!(*count, 1, "duplicate delivery of {via:?} ({group},{object})");
+      assert_eq!(
+        *count, 1,
+        "duplicate delivery of {via:?} ({group},{object})"
+      );
     }
   }
 }
@@ -680,7 +701,9 @@ async fn stale_switch_request_id_is_silently_dropped() {
     .send(&ControlMessage::Switch(Box::new(switch_to(2, TRACK_A))))
     .await
     .expect("send stale SWITCH");
-  subscriber.assert_no_publish_within(Duration::from_secs(4)).await;
+  subscriber
+    .assert_no_publish_within(Duration::from_secs(4))
+    .await;
 
   // Phase 3: same contract for an UNSUBSCRIBE'd id. SUBSCRIBE A again
   // (id 6 — client ids are even), UNSUBSCRIBE it, then SWITCH naming id 6.
@@ -706,7 +729,9 @@ async fn stale_switch_request_id_is_silently_dropped() {
     .send(&ControlMessage::Switch(Box::new(switch_to(6, TRACK_B))))
     .await
     .expect("send SWITCH on unsubscribed id");
-  subscriber.assert_no_publish_within(Duration::from_secs(4)).await;
+  subscriber
+    .assert_no_publish_within(Duration::from_secs(4))
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +782,9 @@ async fn setup_held_drain(port: u16) -> (RelayGuard, Peer, Peer) {
   let mut subscriber = Peer::connect(port).await;
   subscriber
     .control
-    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(2, TRACK_A))))
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(
+      2, TRACK_A,
+    ))))
     .await
     .expect("send SUBSCRIBE");
   subscriber
@@ -803,10 +830,14 @@ async fn unsubscribe_during_drain_yields_subscription_ended_failure() {
   // immediately followed by PUBLISH_DONE(SUBSCRIPTION_ENDED) on the SAME
   // relay-allocated request id.
   let publish = subscriber
-    .expect(Duration::from_secs(5), "abandon failure PUBLISH", |m| match m {
-      ControlMessage::Publish(p) => Some(p),
-      _ => None,
-    })
+    .expect(
+      Duration::from_secs(5),
+      "abandon failure PUBLISH",
+      |m| match m {
+        ControlMessage::Publish(p) => Some(p),
+        _ => None,
+      },
+    )
     .await;
   assert_eq!(
     publish.content_exists, 0,
@@ -814,12 +845,14 @@ async fn unsubscribe_during_drain_yields_subscription_ended_failure() {
   );
   let failure_rid = publish.request_id;
   let done = subscriber
-    .expect(Duration::from_secs(5), "PUBLISH_DONE for the failure", |m| {
-      match m {
+    .expect(
+      Duration::from_secs(5),
+      "PUBLISH_DONE for the failure",
+      |m| match m {
         ControlMessage::PublishDone(d) if d.request_id == failure_rid => Some(d),
         _ => None,
-      }
-    })
+      },
+    )
     .await;
   assert_eq!(
     done.status_code,
@@ -836,7 +869,9 @@ async fn unsubscribe_during_drain_yields_subscription_ended_failure() {
     .send(&ControlMessage::Switch(Box::new(switch_msg(2, TRACK_B, 1))))
     .await
     .expect("send SWITCH on unsubscribed id");
-  subscriber.assert_no_publish_within(Duration::from_secs(4)).await;
+  subscriber
+    .assert_no_publish_within(Duration::from_secs(4))
+    .await;
 }
 
 /// SWITCH PR #1378: "If the Relay receives a SWITCH message for a subscription
@@ -871,12 +906,14 @@ async fn concurrent_switch_same_request_id_fails_excessive_load() {
     .expect("send concurrent SWITCH");
 
   let failure = subscriber
-    .expect(Duration::from_secs(5), "EXCESSIVE_LOAD failure PUBLISH", |m| {
-      match m {
+    .expect(
+      Duration::from_secs(5),
+      "EXCESSIVE_LOAD failure PUBLISH",
+      |m| match m {
         ControlMessage::Publish(p) => Some(p),
         _ => None,
-      }
-    })
+      },
+    )
     .await;
   assert_eq!(
     failure.content_exists, 0,
@@ -884,12 +921,14 @@ async fn concurrent_switch_same_request_id_fails_excessive_load() {
   );
   let failure_rid = failure.request_id;
   let done = subscriber
-    .expect(Duration::from_secs(5), "PUBLISH_DONE(EXCESSIVE_LOAD)", |m| {
-      match m {
+    .expect(
+      Duration::from_secs(5),
+      "PUBLISH_DONE(EXCESSIVE_LOAD)",
+      |m| match m {
         ControlMessage::PublishDone(d) if d.request_id == failure_rid => Some(d),
         _ => None,
-      }
-    })
+      },
+    )
     .await;
   assert_eq!(done.status_code, PublishDoneStatusCode::ExcessiveLoad);
 
@@ -909,7 +948,10 @@ async fn concurrent_switch_same_request_id_fails_excessive_load() {
   let transition = SwitchTransition::from_parameters(&publish.parameters)
     .expect("success PUBLISH must carry SWITCH_TRANSITION");
   assert_eq!(transition.switching_group_id, 1, "common boundary at min");
-  assert_eq!(transition.live_edge_group_id, 2, "B's live edge is untouched");
+  assert_eq!(
+    transition.live_edge_group_id, 2,
+    "B's live edge is untouched"
+  );
   subscriber
     .expect(Duration::from_secs(5), "PUBLISH_DONE(2)", |m| match m {
       ControlMessage::PublishDone(d) if d.request_id == 2 => Some(()),
@@ -947,6 +989,90 @@ async fn concurrent_switch_same_request_id_fails_excessive_load() {
       "live-edge group object (2,{object}) must be replayed exactly once"
     );
   }
+}
+
+/// The single-in-flight gate is a property of the Current Subscribe Request ID
+/// alone and must be evaluated BEFORE the target Track is resolved. A
+/// colliding SWITCH naming a target no publisher can supply must therefore
+/// still fail EXCESSIVE_LOAD — under the old order (target resolution first)
+/// it answered DOES_NOT_EXIST without ever consulting the guard, and a SWITCH
+/// about to be rejected could fire target-resolution side effects (an
+/// upstream SUBSCRIBE) on the way.
+#[tokio::test]
+async fn concurrent_switch_to_unknown_target_still_fails_excessive_load() {
+  let port = 44897;
+  let (_relay, publisher, mut subscriber) = setup_held_drain(port).await;
+
+  // First SWITCH (known target B) is admitted and parks in its drain.
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(switch_msg(2, TRACK_B, 1))))
+    .await
+    .expect("send first SWITCH");
+  // Second SWITCH on the same Current Subscribe Request ID, naming a target
+  // in a namespace nobody announced (so target resolution, if consulted
+  // first, would fail with DOES_NOT_EXIST).
+  let unknown_target = Switch::new(
+    2,
+    Tuple::from_utf8_path("no/such/namespace"),
+    TupleField::from_utf8("nope"),
+    1,
+    vec![],
+  );
+  subscriber
+    .control
+    .send(&ControlMessage::Switch(Box::new(unknown_target)))
+    .await
+    .expect("send colliding SWITCH to unknown target");
+
+  let failure = subscriber
+    .expect(
+      Duration::from_secs(5),
+      "failure PUBLISH for the colliding SWITCH",
+      |m| match m {
+        ControlMessage::Publish(p) if p.content_exists == 0 => Some(p),
+        _ => None,
+      },
+    )
+    .await;
+  assert_eq!(
+    failure.track_name,
+    TupleField::from_utf8("nope"),
+    "the failure PUBLISH must name the colliding SWITCH's target"
+  );
+  let failure_rid = failure.request_id;
+  let done = subscriber
+    .expect(
+      Duration::from_secs(5),
+      "PUBLISH_DONE for the colliding SWITCH",
+      |m| match m {
+        ControlMessage::PublishDone(d) if d.request_id == failure_rid => Some(d),
+        _ => None,
+      },
+    )
+    .await;
+  assert_eq!(
+    done.status_code,
+    PublishDoneStatusCode::ExcessiveLoad,
+    "a colliding SWITCH must fail on the in-flight gate (EXCESSIVE_LOAD), \
+     not on target resolution (DOES_NOT_EXIST)"
+  );
+
+  // The rejection must leave the first switch undisturbed: release its drain
+  // and watch it complete with a real seam.
+  publish_complete_groups(&publisher.connection, ALIAS_A, 3..=3, 0..=0).await;
+  let publish = subscriber
+    .expect(
+      Duration::from_secs(5),
+      "success PUBLISH for the first switch",
+      |m| match m {
+        ControlMessage::Publish(p) if p.content_exists == 1 => Some(p),
+        _ => None,
+      },
+    )
+    .await;
+  SwitchTransition::from_parameters(&publish.parameters)
+    .expect("the first switch's PUBLISH must carry SWITCH_TRANSITION");
 }
 
 /// SWITCH PR #1378 frames T_switch as the window the relay has to IDENTIFY
@@ -999,7 +1125,10 @@ async fn switch_waits_for_future_boundary_within_t_switch() {
   );
   let transition = SwitchTransition::from_parameters(&publish.parameters)
     .expect("success PUBLISH must carry SWITCH_TRANSITION");
-  assert_eq!(transition.switching_group_id, 3, "seam at the awaited boundary");
+  assert_eq!(
+    transition.switching_group_id, 3,
+    "seam at the awaited boundary"
+  );
   assert_eq!(
     transition.live_edge_group_id, 3,
     "live edge at PUBLISH-open is the just-started group"
@@ -1065,7 +1194,9 @@ async fn switch_establishes_upstream_subscription_for_unknown_target() {
   let mut data = spawn_data_plane(subscriber.connection.clone());
   subscriber
     .control
-    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(2, TRACK_A))))
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(
+      2, TRACK_A,
+    ))))
     .await
     .expect("send SUBSCRIBE");
   subscriber
@@ -1085,16 +1216,14 @@ async fn switch_establishes_upstream_subscription_for_unknown_target() {
   // The relay must reach upstream: expect its SUBSCRIBE for track B, confirm
   // it, and start supplying the track.
   let upstream = publisher
-    .expect(Duration::from_secs(5), "relay upstream SUBSCRIBE for B", |m| {
-      match m {
-        ControlMessage::Subscribe(s)
-          if s.track_name == TupleField::from_utf8(TRACK_B) =>
-        {
-          Some(s)
-        }
+    .expect(
+      Duration::from_secs(5),
+      "relay upstream SUBSCRIBE for B",
+      |m| match m {
+        ControlMessage::Subscribe(s) if s.track_name == TupleField::from_utf8(TRACK_B) => Some(s),
         _ => None,
-      }
-    })
+      },
+    )
     .await;
   publisher
     .control
@@ -1193,16 +1322,20 @@ async fn switch_across_relay_chain() {
   // SUBSCRIBE A at R2: unknown there -> resolved through the chain.
   subscriber
     .control
-    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(2, TRACK_A))))
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(
+      2, TRACK_A,
+    ))))
     .await
     .expect("send SUBSCRIBE");
   subscriber
-    .expect(Duration::from_secs(5), "SubscribeOk(2) across the chain", |m| {
-      match m {
+    .expect(
+      Duration::from_secs(5),
+      "SubscribeOk(2) across the chain",
+      |m| match m {
         ControlMessage::SubscribeOk(ok) => Some(ok),
         _ => None,
-      }
-    })
+      },
+    )
     .await;
 
   // Live A data flows publisher -> R1 -> R2 -> subscriber.
@@ -1237,7 +1370,10 @@ async fn switch_across_relay_chain() {
   );
   let transition = SwitchTransition::from_parameters(&publish.parameters)
     .expect("success PUBLISH must carry SWITCH_TRANSITION");
-  assert_eq!(transition.switching_group_id, 0, "common boundary at group 0");
+  assert_eq!(
+    transition.switching_group_id, 0,
+    "common boundary at group 0"
+  );
   assert_eq!(
     transition.live_edge_group_id, 0,
     "B's live edge at R2 is the single published group"
@@ -1302,16 +1438,20 @@ async fn switch_backfills_history_via_upstream_fetch() {
 
   subscriber
     .control
-    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(2, TRACK_A))))
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(
+      2, TRACK_A,
+    ))))
     .await
     .expect("send SUBSCRIBE");
   subscriber
-    .expect(Duration::from_secs(5), "SubscribeOk(2) across the chain", |m| {
-      match m {
+    .expect(
+      Duration::from_secs(5),
+      "SubscribeOk(2) across the chain",
+      |m| match m {
         ControlMessage::SubscribeOk(ok) => Some(ok),
         _ => None,
-      }
-    })
+      },
+    )
     .await;
 
   // A flows live through both hops so the seam has a common boundary at R2.
@@ -1427,16 +1567,20 @@ async fn switch_backfill_overlapping_live_ingest_stays_exactly_once() {
 
   subscriber
     .control
-    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(2, TRACK_A))))
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(
+      2, TRACK_A,
+    ))))
     .await
     .expect("send SUBSCRIBE");
   subscriber
-    .expect(Duration::from_secs(5), "SubscribeOk(2) across the chain", |m| {
-      match m {
+    .expect(
+      Duration::from_secs(5),
+      "SubscribeOk(2) across the chain",
+      |m| match m {
         ControlMessage::SubscribeOk(ok) => Some(ok),
         _ => None,
-      }
-    })
+      },
+    )
     .await;
   publish_complete_groups(&publisher.connection, ALIAS_A, 0..=2, 0..=2).await;
   sleep(Duration::from_millis(500)).await;
@@ -1463,7 +1607,10 @@ async fn switch_backfill_overlapping_live_ingest_stays_exactly_once() {
   assert_eq!(publish.content_exists, 1, "overlapped switch must succeed");
   let transition = SwitchTransition::from_parameters(&publish.parameters)
     .expect("success PUBLISH must carry SWITCH_TRANSITION");
-  assert_eq!(transition.switching_group_id, 0, "floor honored via backfill");
+  assert_eq!(
+    transition.switching_group_id, 0,
+    "floor honored via backfill"
+  );
   assert_eq!(
     transition.live_edge_group_id, 2,
     "live edge = the mid-flight group (its tail does not advance the group id)"
@@ -1525,7 +1672,9 @@ async fn odd_client_request_id_is_a_protocol_violation() {
   let mut subscriber = Peer::connect(port).await;
   subscriber
     .control
-    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(3, TRACK_A))))
+    .send(&ControlMessage::Subscribe(Box::new(subscribe_msg(
+      3, TRACK_A,
+    ))))
     .await
     .expect("send odd-id SUBSCRIBE");
 

@@ -259,10 +259,7 @@ async fn add_subscription(
   track: &Track,
   subscriber: Arc<MOQTClient>,
 ) -> bool {
-  match track
-    .add_subscription(subscriber.clone(), subscribe)
-    .await
-  {
+  match track.add_subscription(subscriber.clone(), subscribe).await {
     Ok(subscription) => {
       subscriber
         .subscriptions
@@ -731,7 +728,7 @@ async fn handle_unsubscribe_message(
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
   info!("received Unsubscribe message: {:?}", unsubscribe_message);
-  
+
   // SWITCH PR #1378 UNSUBSCRIBE race: "If the subscriber sends UNSUBSCRIBE for the
   // Current Subscribe Request ID before the Relay has opened a PUBLISH for the
   // target Track, the Relay MUST abandon the SWITCH and MUST open a PUBLISH
@@ -763,7 +760,10 @@ async fn handle_unsubscribe_message(
     match requests.get(&unsubscribe_message.request_id) {
       Some(req) => req.original_subscribe_request.get_full_track_name(),
       None => {
-        warn!("request not found for request id: {:?}", unsubscribe_message.request_id);
+        warn!(
+          "request not found for request id: {:?}",
+          unsubscribe_message.request_id
+        );
         return Ok(());
       }
     }
@@ -1136,11 +1136,57 @@ async fn handle_switch_message(
     return Ok(());
   }
 
+  // Single in-flight SWITCH per Current Subscribe Request ID -> EXCESSIVE_LOAD.
+  // Checked IMMEDIATELY after the Established gate, BEFORE the target Track is
+  // resolved: the SWITCH PR #1378 frames the concurrent-SWITCH rule as a property of the
+  // Current Subscribe Request ID alone, and resolving the target first had two
+  // wrong effects — a colliding SWITCH to an unknown target reported
+  // DOES_NOT_EXIST instead of EXCESSIVE_LOAD, and a SWITCH about to be
+  // rejected could still fire upstream side effects (an upstream SUBSCRIBE via
+  // establish_switch_target_upstream). The failure PUBLISH uses the
+  // placeholder alias 0, matching the other pre-resolution failure path.
+  //
+  // One T_switch deadline for the whole operation, anchored at SWITCH receipt:
+  // the same `admitted_at` seeds both the guard entry's expiry and the task's
+  // deadline, so the instant the slot becomes reclaimable by a newer SWITCH is
+  // exactly the instant this task's own polls start reporting TimedOut — no
+  // skew window in which both switches believe they own the budget. Both
+  // T_switch-bounded phases inside the task — G_switch identification and the
+  // source drain — poll against this same deadline, honoring the SWITCH PR #1378's
+  // "MUST complete the operation within an implementation-specific timeout
+  // T_switch". `generation` is this admission's ownership token: every guard
+  // interaction below passes it back, so a task whose slot was reclaimed
+  // after the deadline is told `Superseded` instead of corrupting the newer
+  // switch's state.
+  let admitted_at = Instant::now();
+  let t_switch_deadline = admitted_at + DEFAULT_T_SWITCH;
+  let generation = {
+    let mut guard = client.switch_in_flight.lock().await;
+    match guard.try_admit(current_sub_req_id, admitted_at, DEFAULT_T_SWITCH) {
+      AdmitResult::Admitted { generation } => generation,
+      AdmitResult::Rejected => {
+        drop(guard);
+        let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+        send_switch_failure(
+          &client,
+          rid,
+          &target_full_track_name,
+          0,
+          SwitchFailure::AlreadyInFlight,
+        )
+        .await;
+        return Ok(());
+      }
+    }
+  };
+
   // Resolve the target Track, establishing an upstream subscription when this
   // relay does not yet carry it (see establish_switch_target_upstream).
   // DOES_NOT_EXIST — a post-validation failure that DOES open the failure
   // PUBLISH — is reserved for a target no publisher can supply; "unknown to
-  // this relay" alone is not that.
+  // this relay" alone is not that. This runs after admission, so its failure
+  // path must release the guard slot it occupies — otherwise a retry within
+  // T_switch would be spuriously rejected with EXCESSIVE_LOAD.
   let target_track_arc = match context
     .track_manager
     .get_track(&target_full_track_name)
@@ -1161,8 +1207,7 @@ async fn handle_switch_message(
             "switch: no publisher can supply target track {:?}",
             target_full_track_name
           );
-          let rid =
-            Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+          let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
           send_switch_failure(
             &client,
             rid,
@@ -1171,6 +1216,11 @@ async fn handle_switch_message(
             SwitchFailure::TargetTrackMissing,
           )
           .await;
+          client
+            .switch_in_flight
+            .lock()
+            .await
+            .complete(current_sub_req_id, generation);
           return Ok(());
         }
       }
@@ -1181,41 +1231,6 @@ async fn handle_switch_message(
   // succeeds (upstream confirmation set the publisher's real alias before any
   // object could reach the cache).
   let target_alias = target_track_arc.read().await.track_alias;
-
-  // Single in-flight SWITCH per Current Subscribe Request ID -> EXCESSIVE_LOAD.
-  // One T_switch deadline for the whole operation, anchored at SWITCH receipt:
-  // the SAME `admitted_at` seeds both the guard entry's expiry and the task's
-  // deadline, so the instant the slot becomes reclaimable by a newer SWITCH is
-  // exactly the instant this task's own polls start reporting TimedOut — no
-  // skew window in which both switches believe they own the budget. Both
-  // T_switch-bounded phases inside the task — G_switch identification and the
-  // source drain — poll against this same deadline, honoring the draft's
-  // "MUST complete the operation within an implementation-specific timeout
-  // T_switch". `generation` is this admission's ownership token: every guard
-  // interaction below passes it back, so a task whose slot was reclaimed
-  // after the deadline is told `Superseded` instead of corrupting the newer
-  // switch's state.
-  let admitted_at = Instant::now();
-  let t_switch_deadline = admitted_at + DEFAULT_T_SWITCH;
-  let generation = {
-    let mut guard = client.switch_in_flight.lock().await;
-    match guard.try_admit(current_sub_req_id, admitted_at, DEFAULT_T_SWITCH) {
-      AdmitResult::Admitted { generation } => generation,
-      AdmitResult::Rejected => {
-        drop(guard);
-        let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
-        send_switch_failure(
-          &client,
-          rid,
-          &target_full_track_name,
-          target_alias,
-          SwitchFailure::AlreadyInFlight,
-        )
-        .await;
-        return Ok(());
-      }
-    }
-  };
 
   // The relay (not the subscriber) allocates the target delivery's Request ID.
   let target_request_id =
@@ -1713,4 +1728,3 @@ mod tests_compute_delayed_start {
     assert_eq!(result, DelayedStart::Ready(loc(20, 0)));
   }
 }
-
