@@ -216,6 +216,13 @@ export class MOQtailClient {
    * unsolicited, so handlerPublish consumes one unexpired entry and declines
    * the PUBLISH instead (see handler/publish.ts). An unmatched
    * SWITCH_TRANSITION with no tombstone remains a protocol violation.
+   *
+   * This softening of the spec's letter is a documented, deliberate
+   * deviation — the deadline these tombstones compensate for is a
+   * client-side invention the spec's silent pre-validation failure forces on
+   * us. Rationale, exact behavior per late-PUBLISH kind, and the
+   * application-visible consequence of a late SUCCESS answer live in
+   * docs/switch-pr1378-conformance.md.
    */
   readonly lateSwitchTombstones: Map<string, number[]> = new Map()
   /**
@@ -225,7 +232,7 @@ export class MOQtailClient {
    */
   static readonly SWITCH_RESPONSE_TIMEOUT_MS = 6000
   /**
-   * Retention window for {@link lateSwitchTombstones} entries. Must cover the
+   * Retention window for {@link MOQtailClient.lateSwitchTombstones} entries. Must cover the
    * relay's T_switch plus worst-case network delay; kept bounded so
    * unsolicited SWITCH_TRANSITION detection is only deferred, not disabled.
    */
@@ -392,7 +399,7 @@ export class MOQtailClient {
    * Pre-allocate a client-originated request id for an outbound control message.
    *
    * Pass the result back via the matching options' `requestId` field (e.g.
-   * {@link SwitchOptions.requestId}). This lets the caller update its own
+   * {@link SwitchOptions.subscriptionRequestId}). This lets the caller update its own
    * subscription-id state synchronously *before* awaiting the operation —
    * required when multiple concurrent calls would otherwise read a stale
    * subscription_request_id and the relay would reject the racing message.
@@ -1259,6 +1266,13 @@ export class MOQtailClient {
    *   PR #1378 the SWITCH's parameter set is the COMPLETE parameter set for
    *   the target PUBLISH; omitting {@link SwitchOptions.parameters} sends an
    *   empty set. Restate anything (e.g. auth tokens) the target track needs.
+   * - A local-timeout {@link SwitchFailure} (status `Timeout`, no relay
+   *   answer) is NOT proof the switch didn't happen: the relay may still
+   *   complete it late, in which case it has already terminated the current
+   *   subscription and this client quietly declines the late answer. Treat a
+   *   Timeout failure as "the source subscription may be gone" and handle a
+   *   subsequent PUBLISH_DONE for `subscriptionRequestId` (e.g. by
+   *   re-subscribing). See docs/switch-pr1378-conformance.md.
    *
    * @example Switch to a different track
    * ```ts

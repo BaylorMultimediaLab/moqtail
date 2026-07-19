@@ -12,17 +12,18 @@ the Jupyter notebooks that turn raw results into the published figures.
 
 ## What's in here
 
-| Path                                     | Role                                                                               |
-| ---------------------------------------- | ---------------------------------------------------------------------------------- |
-| [apps/publisher/](apps/publisher/)       | Rust live publisher (FFmpeg-encoded ABR ladder over MOQT)                          |
-| [apps/relay/](apps/relay/)               | Rust MOQT relay with bounded per-track cache                                       |
-| [apps/client-js/](apps/client-js/)       | Browser subscriber (TypeScript/Vite) — filtered & unfiltered modes, ABR controller |
-| [apps/client/](apps/client/)             | Native subscriber (Rust)                                                           |
-| [libs/moqtail-rs/](libs/moqtail-rs/)     | Rust MOQT protocol library                                                         |
-| [libs/moqtail-ts/](libs/moqtail-ts/)     | TypeScript MOQT protocol library                                                   |
-| [tests/network/](tests/network/)         | Mininet harness — single-relay topology, link shaping, Playwright-driven Chromium  |
-| [tests/experiments/](tests/experiments/) | Paper experiments E1–E6 (parametrized pytest, builds on `tests/network/`)          |
-| [paper/](paper/)                         | Figure notebooks, Makefile, and `figures/` outputs                                 |
+| Path                                     | Role                                                                                            |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| [apps/publisher/](apps/publisher/)       | Rust live publisher (FFmpeg-encoded ABR ladder over MOQT)                                       |
+| [apps/relay/](apps/relay/)               | Rust MOQT relay with bounded per-track cache                                                    |
+| [apps/client-js/](apps/client-js/)       | Browser subscriber (TypeScript/Vite) — filtered & unfiltered modes, ABR controller              |
+| [apps/client/](apps/client/)             | Native subscriber (Rust)                                                                        |
+| [libs/moqtail-rs/](libs/moqtail-rs/)     | Rust MOQT protocol library                                                                      |
+| [libs/moqtail-ts/](libs/moqtail-ts/)     | TypeScript MOQT protocol library                                                                |
+| [tests/network/](tests/network/)         | Mininet harness — single-relay topology, link shaping, Playwright-driven Chromium               |
+| [tests/experiments/](tests/experiments/) | Paper experiments E1–E6 (parametrized pytest, builds on `tests/network/`)                       |
+| [paper/](paper/)                         | Figure notebooks, Makefile, and `figures/` outputs                                              |
+| [docs/](docs/)                           | Design/conformance notes (e.g. [SWITCH PR #1378 deviations](docs/switch-pr1378-conformance.md)) |
 
 ## Reproducing the paper
 

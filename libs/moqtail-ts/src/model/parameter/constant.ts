@@ -64,8 +64,8 @@ export enum VersionSpecificParameterType {
   StartLocationGroup = 0x72,
   /** Project-local extension; non-MoQT-standard.
    *  SWITCH_TRANSITION (PR #1378): carried on the target Track's PUBLISH so the
-   *  subscriber learns the seam. Bytes value = two varints
-   *  { Switching Group ID (G_switch), Live Edge Group ID }. */
+   *  subscriber learns the seam. Bytes value = two varints:
+   *  Switching Group ID (G_switch), then Live Edge Group ID. */
   SwitchTransition = 0x73,
 }
 

@@ -249,6 +249,8 @@ logs/*
 
 ### Superpowers ###
 docs/*
+# hand-written conformance notes are tracked, unlike the rest of docs/
+!docs/switch-pr1378-conformance.md
 apps/client-js/specs/
 apps/relay/cert/cert.pem.bak
 apps/relay/cert/key.pem.bak

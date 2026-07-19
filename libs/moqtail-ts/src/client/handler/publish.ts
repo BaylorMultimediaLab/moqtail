@@ -46,11 +46,10 @@ function registerPublishReceiver(client: Parameters<ControlMessageHandler<Publis
 
   const localPseudoRequestId = client.allocatePseudoRequestId()
 
-  
   client.requestIdMap.addMapping(localPseudoRequestId, msg.fullTrackName)
   client.subscriptionAliasMap.set(localPseudoRequestId, msg.trackAlias)
   client.aliasFullTrackNameMap.set(msg.trackAlias, msg.fullTrackName)
-  
+
   client.subscriptionAliasMap.set(msg.requestId, msg.trackAlias)
 
   // This object mimics a SubscribeRequest so #handleRecvStreams can use it
@@ -102,6 +101,18 @@ export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg
     // (see MOQtailClient.lateSwitchTombstones); consume one unexpired entry
     // and decline the PUBLISH, otherwise fall through to the protocol
     // violation below.
+    //
+    // DELIBERATE SPEC DEVIATION (documented in
+    // docs/switch-pr1378-conformance.md): read literally, SWITCH PR #1378
+    // says ANY SWITCH_TRANSITION PUBLISH without a pending SWITCH closes the
+    // session with PROTOCOL_VIOLATION. But the pending switch here expired at
+    // a deadline the CLIENT invented (the spec's silent pre-validation
+    // failure forces a local timeout; the spec itself has no client-timeout
+    // concept, so from its viewpoint this SWITCH is still pending). Killing
+    // the session — and every other subscription on it — because a correct
+    // relay's answer was slow would punish network delay, so a tombstoned
+    // late answer is declined instead. The strict rule still applies whenever
+    // no tombstone vouches for the track.
     const tombstones = client.lateSwitchTombstones.get(switchKey)
     if (tombstones) {
       const now = Date.now()
@@ -124,6 +135,15 @@ export const handlerPublish: ControlMessageHandler<Publish> = async (client, msg
         // SUBGROUP) are accepted rather than failing route resolution, then
         // unsubscribe once the route-wait window has passed. The pushed
         // ReadableStream is not exposed to the application.
+        //
+        // NOTE the application-visible consequence (see
+        // docs/switch-pr1378-conformance.md): the relay's Close-After-Switch
+        // has ALREADY terminated the current subscription, so the app that
+        // was told "switch failed, keep your state" holds state for a
+        // torn-down track. It learns via the old request id's
+        // PUBLISH_DONE(SUBSCRIPTION_ENDED); a Timeout SwitchFailure must
+        // therefore be treated as "the source subscription may be gone",
+        // not as proof the pre-switch world is intact.
         registerPublishReceiver(client, msg)
         setTimeout(() => {
           void client.unsubscribe(msg.requestId).catch(() => {
