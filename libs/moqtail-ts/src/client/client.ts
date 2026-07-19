@@ -1237,18 +1237,28 @@ export class MOQtailClient {
   }
 
   /**
-   * Switches an active subscription to a different track while retaining the same subscription parameters.
+   * Switches an active subscription to a different track (SWITCH PR #1378).
    *
    * Use this to change the subscribed track without tearing down and re-establishing a new subscription.
+   * The relay answers by opening a PUBLISH for the target track; on success it
+   * terminates the replaced subscription (Close-After-Switch), on failure the
+   * current subscription is left untouched.
    *
    * @param args - {@link SwitchOptions} referencing the original subscription `requestId` and new track name.
-   * @returns Promise that resolves when the switch control frame is sent.
+   * @returns Promise resolving with the relay's answer: a {@link SwitchSuccess}
+   *   (relay-allocated request id, pushed object stream, and the seam via
+   *   SWITCH_TRANSITION) or a {@link SwitchFailure} carrying the PUBLISH_DONE
+   *   status code — or a local-timeout {@link SwitchFailure} when no answer
+   *   arrives within {@link MOQtailClient.SWITCH_RESPONSE_TIMEOUT_MS}.
    * @throws :{@link MOQtailError} If the client is destroyed.
    * @throws :{@link InternalError} On transport/control failure (disconnect is triggered before rethrow).
    *
    * @remarks
    * - Only applies to active SUBSCRIBE requests; ignored if the request is not a subscription.
-   * - All other subscription parameters (window, forwarding, priority) remain unchanged.
+   * - Parameters are NOT inherited from the current subscription. Per SWITCH
+   *   PR #1378 the SWITCH's parameter set is the COMPLETE parameter set for
+   *   the target PUBLISH; omitting {@link SwitchOptions.parameters} sends an
+   *   empty set. Restate anything (e.g. auth tokens) the target track needs.
    *
    * @example Switch to a different track
    * ```ts

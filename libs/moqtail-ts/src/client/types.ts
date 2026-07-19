@@ -271,7 +271,15 @@ export type SwitchOptions = {
   fullTrackName: FullTrackName
   /** The original SUBSCRIBE request id (bigint) being updated. */
   subscriptionRequestId: bigint
-  /** Optional additional {@link VersionSpecificParameters}; existing parameters persist if omitted. */
+  /**
+   * The complete parameter set for the target track's PUBLISH (SWITCH PR
+   * #1378): the relay uses exactly these parameters and MUST NOT inherit any
+   * from the current subscription. If omitted, an EMPTY set is sent — the
+   * target PUBLISH then carries no AUTHORIZATION TOKEN, DELAY_GROUPS, etc.,
+   * regardless of what the current subscription negotiated. Callers that need
+   * the current subscription's parameters on the target track must restate
+   * them here.
+   */
   parameters?: VersionSpecificParameters
   /**
    * Lower bound on the transition group (SWITCH PR #1378 "Minimum Switching Group ID").
