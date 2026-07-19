@@ -34,8 +34,8 @@
 //! half-open: the live-edge group itself is delivered by the target's live
 //! SUBGROUP streams, not the catch-up range, so its cache availability is not
 //! a precondition. An earlier revision required the target to be contiguous
-//! from g through (and including) the live edge which inflated `G_switch` past 
-//! the spec's smallest (shrinking the buffer-replacement window) and spuriously 
+//! from g through (and including) the live edge which inflated `G_switch` past
+//! the spec's smallest (shrinking the buffer-replacement window) and spuriously
 //! failed when only the live-edge group was missing.
 //!
 //! This module is the pure, side-effect-free core of that decision so it can be
@@ -287,7 +287,7 @@ mod tests {
 
   #[test]
   fn shared_hole_permits_smallest_boundary() {
-    // Both Tracks are missing 3 and 4. Condition (c) is conditional — a group 
+    // Both Tracks are missing 3 and 4. Condition (c) is conditional — a group
     // absent on the Current Track cannot block,
     // because the subscriber was never going to receive it from the current
     // Track either. The spec's smallest valid boundary is therefore 0 (full

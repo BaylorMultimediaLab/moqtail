@@ -220,7 +220,10 @@ pub(crate) fn seam_end_group_bound(g_switch: u64) -> Option<u64> {
 /// approximation, documented rather than hidden: when the group below the
 /// seam is still growing, objects can arrive after the last poll observed the
 /// cache; the target chases the cache, not the (unknowable) end of group.
-pub(crate) fn drain_complete(last_sent: Option<&Location>, drain_target: Option<&Location>) -> bool {
+pub(crate) fn drain_complete(
+  last_sent: Option<&Location>,
+  drain_target: Option<&Location>,
+) -> bool {
   match drain_target {
     None => true,
     Some(target) => last_sent.is_some_and(|sent| sent >= target),
@@ -826,10 +829,7 @@ mod tests_switch_seam_helpers {
   fn catchup_range_is_half_open() {
     // [G_switch, live_edge): end group is live_edge - 1, and end.object == 0
     // means "the whole end group" in read_objects' range semantics.
-    assert_eq!(
-      switch_catchup_range(2, 6),
-      Some((loc(2, 0), loc(5, 0)))
-    );
+    assert_eq!(switch_catchup_range(2, 6), Some((loc(2, 0), loc(5, 0))));
   }
 
   #[test]
@@ -845,10 +845,7 @@ mod tests_switch_seam_helpers {
     // live_edge == 1 with g_switch == 0 is the smallest non-empty range:
     // exactly Group 0. Pins the `live_edge - 1` underflow guard (the
     // subtraction is only reachable when live_edge >= 1).
-    assert_eq!(
-      switch_catchup_range(0, 1),
-      Some((loc(0, 0), loc(0, 0)))
-    );
+    assert_eq!(switch_catchup_range(0, 1), Some((loc(0, 0), loc(0, 0))));
   }
 
   // ---- build_switch_live_sub ----

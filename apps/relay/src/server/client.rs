@@ -14,6 +14,7 @@
 
 pub(crate) mod track_subscription_map;
 
+use crate::server::switch_guard::SwitchInFlight;
 use crate::server::{
   client::track_subscription_map::TrackSubscriptionMap,
   stream_id::{StreamId, StreamType},
@@ -30,7 +31,6 @@ use moqtail::{
   },
   transport::data_stream_handler::{FetchRequest, SubscribeRequest},
 };
-use crate::server::switch_guard::SwitchInFlight;
 
 use std::{
   collections::{BTreeMap, HashMap, VecDeque},
@@ -77,7 +77,6 @@ pub(crate) struct MOQTClient {
 
   // this contains the subscriptions made by the client
   pub subscriptions: TrackSubscriptionMap,
-
 
   // PR #1378 single-in-flight SWITCH guard, keyed by Current Subscribe Request
   // ID. Admitted/rejected (EXCESSIVE_LOAD) by the switch handler; entries

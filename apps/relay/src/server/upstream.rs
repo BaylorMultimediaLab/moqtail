@@ -81,7 +81,9 @@ async fn connect_and_run(server: &Server, url: &str) -> anyhow::Result<()> {
       .keep_alive_interval(Some(Duration::from_secs(
         server.app_config.keep_alive_interval,
       )))
-      .max_idle_timeout(Some(Duration::from_secs(server.app_config.max_idle_timeout)))?
+      .max_idle_timeout(Some(Duration::from_secs(
+        server.app_config.max_idle_timeout,
+      )))?
       .build()
   } else {
     builder
@@ -89,7 +91,9 @@ async fn connect_and_run(server: &Server, url: &str) -> anyhow::Result<()> {
       .keep_alive_interval(Some(Duration::from_secs(
         server.app_config.keep_alive_interval,
       )))
-      .max_idle_timeout(Some(Duration::from_secs(server.app_config.max_idle_timeout)))?
+      .max_idle_timeout(Some(Duration::from_secs(
+        server.app_config.max_idle_timeout,
+      )))?
       .build()
   };
 

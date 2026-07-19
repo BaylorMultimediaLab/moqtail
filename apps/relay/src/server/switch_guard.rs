@@ -306,7 +306,10 @@ mod tests {
   #[test]
   fn admits_first_switch() {
     let mut g = SwitchInFlight::new();
-    assert!(matches!(g.try_admit(1, t0(), T), AdmitResult::Admitted { .. }));
+    assert!(matches!(
+      g.try_admit(1, t0(), T),
+      AdmitResult::Admitted { .. }
+    ));
   }
 
   #[test]
@@ -358,7 +361,10 @@ mod tests {
     let now = t0();
     admit(&mut g, 1, now);
     // A different subscription is unaffected by sub 1's in-flight switch.
-    assert!(matches!(g.try_admit(2, now, T), AdmitResult::Admitted { .. }));
+    assert!(matches!(
+      g.try_admit(2, now, T),
+      AdmitResult::Admitted { .. }
+    ));
     assert_eq!(g.try_admit(1, now, T), AdmitResult::Rejected);
   }
 
@@ -494,9 +500,15 @@ mod tests {
   #[test]
   fn failure_status_code_mapping() {
     use PublishDoneStatusCode as S;
-    assert_eq!(SwitchFailure::TargetTrackMissing.status_code(), S::DoesNotExist);
+    assert_eq!(
+      SwitchFailure::TargetTrackMissing.status_code(),
+      S::DoesNotExist
+    );
     assert_eq!(SwitchFailure::NoCommonBoundary.status_code(), S::Timeout);
-    assert_eq!(SwitchFailure::AlreadyInFlight.status_code(), S::ExcessiveLoad);
+    assert_eq!(
+      SwitchFailure::AlreadyInFlight.status_code(),
+      S::ExcessiveLoad
+    );
     assert_eq!(SwitchFailure::Unauthorized.status_code(), S::Unauthorized);
     assert_eq!(SwitchFailure::NotSupported.status_code(), S::NotSupported);
     assert_eq!(

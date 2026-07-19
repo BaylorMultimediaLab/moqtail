@@ -73,8 +73,16 @@ impl MessageHandler {
         warn!(
           "request id ({}) violates parity (peer is {}, expected {} ids) — terminating session",
           request_id,
-          if context.peer_is_server { "a server" } else { "a client" },
-          if context.peer_is_server { "odd" } else { "even" },
+          if context.peer_is_server {
+            "a server"
+          } else {
+            "a client"
+          },
+          if context.peer_is_server {
+            "odd"
+          } else {
+            "even"
+          },
         );
         return Err(TerminationCode::ProtocolViolation);
       }

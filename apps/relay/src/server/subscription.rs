@@ -770,10 +770,7 @@ impl Subscription {
           if breaks_stream_monotonicity(previous_object_id, object.location.object) {
             debug!(
               "Non-monotonic object for already-advanced stream; skipping fan-out - subscriber: {} stream_id: {} previous: {:?} object: {:?}",
-              self.client_connection_id,
-              stream_id,
-              previous_object_id,
-              object.location
+              self.client_connection_id, stream_id, previous_object_id, object.location
             );
             return;
           }
@@ -1239,7 +1236,9 @@ mod tests_replay_watermark_dedup {
       Vec::<KeyValuePair>::new(),
     );
     let mut state = SubscriptionState::from(sub);
-    state.replay_watermarks.insert((group, subgroup), max_object);
+    state
+      .replay_watermarks
+      .insert((group, subgroup), max_object);
     state
   }
 
@@ -1251,15 +1250,33 @@ mod tests_replay_watermark_dedup {
     // subgroup StreamId, and a second write means non-increasing object IDs
     // on one QUIC stream, which a strict MOQT receiver treats as malformed.
     let state = state_with_watermark(10, 0, 5);
-    assert!(state.is_replay_duplicate(&Location { group: 10, object: 5 }, Some(0)));
-    assert!(state.is_replay_duplicate(&Location { group: 10, object: 0 }, Some(0)));
+    assert!(state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 5
+      },
+      Some(0)
+    ));
+    assert!(state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 0
+      },
+      Some(0)
+    ));
   }
 
   #[test]
   fn object_above_watermark_passes() {
     // Cached after the snapshot: only the live event exists; must pass.
     let state = state_with_watermark(10, 0, 5);
-    assert!(!state.is_replay_duplicate(&Location { group: 10, object: 6 }, Some(0)));
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 6
+      },
+      Some(0)
+    ));
   }
 
   #[test]
@@ -1270,7 +1287,13 @@ mod tests_replay_watermark_dedup {
     // a single max-location threshold (e.g. (group, u64::MAX)) would
     // swallow it and re-open a seam gap.
     let state = state_with_watermark(10, 0, 9);
-    assert!(!state.is_replay_duplicate(&Location { group: 10, object: 3 }, Some(1)));
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 3
+      },
+      Some(1)
+    ));
   }
 
   #[test]
@@ -1278,7 +1301,13 @@ mod tests_replay_watermark_dedup {
     // Same argument across groups: a late object in a group the replay
     // never saw has no watermark and must pass.
     let state = state_with_watermark(10, 0, 9);
-    assert!(!state.is_replay_duplicate(&Location { group: 9, object: 2 }, Some(0)));
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 9,
+        object: 2
+      },
+      Some(0)
+    ));
   }
 
   #[test]
@@ -1286,7 +1315,13 @@ mod tests_replay_watermark_dedup {
     // try_from_fetch always sets Some(subgroup_id), so a replay can never
     // have delivered a subgroup-less object; never treat one as a duplicate.
     let state = state_with_watermark(10, 0, 9);
-    assert!(!state.is_replay_duplicate(&Location { group: 10, object: 1 }, None));
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 1
+      },
+      None
+    ));
   }
 
   #[test]
@@ -1302,7 +1337,13 @@ mod tests_replay_watermark_dedup {
       Vec::<KeyValuePair>::new(),
     );
     let state = SubscriptionState::from(sub);
-    assert!(!state.is_replay_duplicate(&Location { group: 0, object: 0 }, Some(0)));
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 0,
+        object: 0
+      },
+      Some(0)
+    ));
   }
 }
 

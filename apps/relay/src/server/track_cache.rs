@@ -629,10 +629,7 @@ mod tests_available_group_ids {
     cache.add_object(fetch_object(5, 1)).await;
     cache.add_object(fetch_object(6, 0)).await;
     cache.run_pending_tasks().await;
-    assert_eq!(
-      cache.available_group_ids().await,
-      BTreeSet::from([3, 5, 6])
-    );
+    assert_eq!(cache.available_group_ids().await, BTreeSet::from([3, 5, 6]));
   }
 }
 
@@ -677,7 +674,10 @@ mod tests_add_object_invariants {
   async fn group_ids(cache: &TrackCache, group: u64) -> Vec<(u64, u64)> {
     let objects = cache.get_group(group).await.expect("group present");
     let objects = objects.read().await;
-    objects.iter().map(|o| (o.subgroup_id, o.object_id)).collect()
+    objects
+      .iter()
+      .map(|o| (o.subgroup_id, o.object_id))
+      .collect()
   }
 
   /// Concurrent ingest paths (live-forward racing the upstream backfill FETCH)

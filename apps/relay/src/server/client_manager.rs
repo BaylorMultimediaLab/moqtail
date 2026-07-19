@@ -56,7 +56,10 @@ impl ClientManager {
   /// Marks `connection_id` as the upstream relay link.
   pub(crate) async fn set_upstream(&self, connection_id: usize) {
     *self.upstream_connection_id.write().await = Some(connection_id);
-    info!("Upstream relay link registered: connection {}", connection_id);
+    info!(
+      "Upstream relay link registered: connection {}",
+      connection_id
+    );
   }
 
   /// Clears the upstream marker if it still points at `connection_id`.
