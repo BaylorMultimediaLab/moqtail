@@ -204,7 +204,11 @@ export class MOQtailClient {
    * content_exists = 0), keyed by that PUBLISH's request id. The relay
    * immediately follows such a PUBLISH with PUBLISH_DONE carrying the failure
    * status code; handlerPublishDone completes the resolver with a
-   * {@link SwitchFailure} built from it.
+   * {@link SwitchFailure} built from it. If that PUBLISH_DONE never arrives
+   * (relay crash or teardown between the two control messages), the entry is
+   * reaped when the owning switch()'s local response deadline settles the
+   * promise — see removeOwnResolver — so a parked resolver can never outlive
+   * its switch() call.
    */
   readonly pendingSwitchFailures: Map<bigint, (result: SwitchFailure) => void> = new Map()
   /**
@@ -1301,16 +1305,27 @@ export class MOQtailClient {
     const parameters = args.parameters ?? new VersionSpecificParameters()
     const key = fullTrackName.toString()
 
-    // Remove exactly this call's resolver from the FIFO (other concurrent
-    // switches to the same target track keep theirs).
+    // Remove exactly this call's resolver from every map it may sit in
+    // (other concurrent switches to the same target track keep theirs):
+    // the pendingSwitches FIFO while awaiting the PUBLISH, or — when a
+    // failure PUBLISH arrived but its PUBLISH_DONE never did (relay crash or
+    // session teardown between the two control messages) — the parked entry
+    // in pendingSwitchFailures, which nothing else would ever reap.
     let ownResolver: ((result: SwitchSuccess | SwitchFailure) => void) | undefined
     const removeOwnResolver = () => {
       if (!ownResolver) return
       const queue = this.pendingSwitches.get(key)
-      if (!queue) return
-      const i = queue.indexOf(ownResolver)
-      if (i !== -1) queue.splice(i, 1)
-      if (queue.length === 0) this.pendingSwitches.delete(key)
+      if (queue) {
+        const i = queue.indexOf(ownResolver)
+        if (i !== -1) queue.splice(i, 1)
+        if (queue.length === 0) this.pendingSwitches.delete(key)
+      }
+      for (const [publishRequestId, parked] of this.pendingSwitchFailures) {
+        if (parked === ownResolver) {
+          this.pendingSwitchFailures.delete(publishRequestId)
+          break
+        }
+      }
     }
 
     try {
@@ -1336,8 +1351,17 @@ export class MOQtailClient {
           if (settled) return
           settled = true
           removeOwnResolver()
+          // Sweep expired tombstones (all keys) while adding this one, so
+          // tracks that never see another SWITCH or PUBLISH don't accumulate
+          // dead entries forever.
+          const now = Date.now()
+          for (const [trackKey, entries] of this.lateSwitchTombstones) {
+            const live = entries.filter((expiry) => expiry > now)
+            if (live.length === 0) this.lateSwitchTombstones.delete(trackKey)
+            else this.lateSwitchTombstones.set(trackKey, live)
+          }
           const tombstones = this.lateSwitchTombstones.get(key) ?? []
-          tombstones.push(Date.now() + MOQtailClient.SWITCH_TOMBSTONE_TTL_MS)
+          tombstones.push(now + MOQtailClient.SWITCH_TOMBSTONE_TTL_MS)
           this.lateSwitchTombstones.set(key, tombstones)
           resolve(
             new SwitchFailure(
