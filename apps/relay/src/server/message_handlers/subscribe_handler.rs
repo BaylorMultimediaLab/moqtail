@@ -1076,11 +1076,11 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure — no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    DrainOutcome, SeamBoundUndo, SelectOutcome, build_switch_live_sub, drain_source_below,
-    poll_select_switch_group, restore_source_end_group, send_switch_failure, send_switch_publish,
-    spawn_switch_catchup_stream, spawn_upstream_backfill, terminate_source,
+    DrainOutcome, SeamBoundUndo, SelectOutcome, apply_seam_bound, build_switch_live_sub,
+    drain_source_below, poll_select_switch_group, restore_source_end_group, send_switch_failure,
+    send_switch_publish, spawn_switch_catchup_stream, spawn_upstream_backfill, terminate_source,
   };
-  use crate::server::switch_guard::{AdmitResult, DEFAULT_T_SWITCH, SwitchFailure};
+  use crate::server::switch_guard::{AdmitResult, ClaimResult, DEFAULT_T_SWITCH, SwitchFailure};
   use moqtail::model::parameter::switch_transition::SwitchTransition;
   use std::time::Instant;
 
@@ -1183,35 +1183,43 @@ async fn handle_switch_message(
   let target_alias = target_track_arc.read().await.track_alias;
 
   // Single in-flight SWITCH per Current Subscribe Request ID -> EXCESSIVE_LOAD.
-  {
+  // One T_switch deadline for the whole operation, anchored at SWITCH receipt:
+  // the SAME `admitted_at` seeds both the guard entry's expiry and the task's
+  // deadline, so the instant the slot becomes reclaimable by a newer SWITCH is
+  // exactly the instant this task's own polls start reporting TimedOut — no
+  // skew window in which both switches believe they own the budget. Both
+  // T_switch-bounded phases inside the task — G_switch identification and the
+  // source drain — poll against this same deadline, honoring the draft's
+  // "MUST complete the operation within an implementation-specific timeout
+  // T_switch". `generation` is this admission's ownership token: every guard
+  // interaction below passes it back, so a task whose slot was reclaimed
+  // after the deadline is told `Superseded` instead of corrupting the newer
+  // switch's state.
+  let admitted_at = Instant::now();
+  let t_switch_deadline = admitted_at + DEFAULT_T_SWITCH;
+  let generation = {
     let mut guard = client.switch_in_flight.lock().await;
-    if guard.try_admit(current_sub_req_id, Instant::now(), DEFAULT_T_SWITCH) == AdmitResult::Rejected
-    {
-      drop(guard);
-      let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
-      send_switch_failure(
-        &client,
-        rid,
-        &target_full_track_name,
-        target_alias,
-        SwitchFailure::AlreadyInFlight,
-      )
-      .await;
-      return Ok(());
+    match guard.try_admit(current_sub_req_id, admitted_at, DEFAULT_T_SWITCH) {
+      AdmitResult::Admitted { generation } => generation,
+      AdmitResult::Rejected => {
+        drop(guard);
+        let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+        send_switch_failure(
+          &client,
+          rid,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::AlreadyInFlight,
+        )
+        .await;
+        return Ok(());
+      }
     }
-  }
+  };
 
   // The relay (not the subscriber) allocates the target delivery's Request ID.
   let target_request_id =
     Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
-
-  // One T_switch deadline for the whole operation, anchored at SWITCH receipt
-  // (aligned with the guard entry's own expiry from try_admit above). Both
-  // T_switch-bounded phases inside the task — G_switch identification and the
-  // source drain — poll against this same deadline, honoring the draft's
-  // "MUST complete the operation within an implementation-specific timeout
-  // T_switch".
-  let t_switch_deadline = Instant::now() + DEFAULT_T_SWITCH;
 
   // Relay chaining (SWITCH PR #1378 "and/or FETCH requests"): when the target is
   // served by the upstream link, backfill missing history below the client's
@@ -1259,6 +1267,7 @@ async fn handle_switch_message(
       &target_track_arc,
       minimum_switching_group_id,
       current_sub_req_id,
+      generation,
       t_switch_deadline,
     )
     .await
@@ -1277,7 +1286,11 @@ async fn handle_switch_message(
           SwitchFailure::NoCommonBoundary,
         )
         .await;
-        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
         return;
       }
       SelectOutcome::Abandoned => {
@@ -1292,7 +1305,11 @@ async fn handle_switch_message(
           SwitchFailure::SubscriptionEnded,
         )
         .await;
-        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
         return;
       }
       SelectOutcome::TargetRejected => {
@@ -1308,7 +1325,11 @@ async fn handle_switch_message(
           SwitchFailure::TargetTrackMissing,
         )
         .await;
-        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
         return;
       }
     };
@@ -1328,22 +1349,23 @@ async fn handle_switch_message(
     // current subscription unchanged — do NOT terminate it (which would truncate
     // undelivered source Objects below G_switch). An Abandoned outcome (an
     // UNSUBSCRIBE for the Current Subscribe Request ID arrived mid-drain)
-    // falls through to the claim below, which resolves it. On success,
-    // `drain_undo` holds the source's pre-bound end_group so a later PUBLISH
-    // failure can unwind the seam bound (draft: on any failure the relay
-    // "MUST NOT alter the current subscription").
-    let drain_undo = match drain_source_below(
+    // falls through to the claim below, which resolves it. The drain itself
+    // no longer mutates the source: the seam bound is applied AFTER the claim
+    // in (1b) succeeds, so every non-Claimed outcome leaves the current
+    // subscription untouched (draft: on any failure the relay "MUST NOT alter
+    // the current subscription").
+    match drain_source_below(
       &client,
       &current_track_arc,
       connection_id,
       g_switch,
       current_sub_req_id,
+      generation,
       t_switch_deadline,
     )
     .await
     {
-      DrainOutcome::Drained { undo } => undo,
-      DrainOutcome::Abandoned => None,
+      DrainOutcome::Drained | DrainOutcome::Abandoned => {}
       DrainOutcome::TimedOut => {
         warn!(
           "switch: source drain timed out below g_switch={g_switch}; aborting, current subscription unchanged"
@@ -1356,7 +1378,11 @@ async fn handle_switch_message(
           SwitchFailure::DrainTimeout,
         )
         .await;
-        client.switch_in_flight.lock().await.complete(current_sub_req_id);
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
         return;
       }
     };
@@ -1367,26 +1393,64 @@ async fn handle_switch_message(
     // the UNSUBSCRIBE won — it arrived before this point — the draft mandates:
     // "the Relay MUST abandon the SWITCH and MUST open a PUBLISH for the
     // target Track and immediately send PUBLISH_DONE with Status Code
-    // SUBSCRIPTION_ENDED."
-    let claimed = {
+    // SUBSCRIPTION_ENDED." A Superseded claim means this task's T_switch
+    // deadline passed and a newer SWITCH reclaimed the slot: the newer switch
+    // owns the source subscription now, so this task reports the draft's
+    // TIMEOUT and touches nothing.
+    let claim = {
       let mut guard = client.switch_in_flight.lock().await;
-      guard.mark_published(current_sub_req_id)
+      guard.mark_published(current_sub_req_id, generation)
     };
-    if !claimed {
-      info!(
-        "switch: abandoned by UNSUBSCRIBE for request id {current_sub_req_id} before target PUBLISH; reporting SUBSCRIPTION_ENDED"
-      );
-      send_switch_failure(
-        &client,
-        target_request_id,
-        &target_full_track_name,
-        target_alias,
-        SwitchFailure::SubscriptionEnded,
-      )
-      .await;
-      client.switch_in_flight.lock().await.complete(current_sub_req_id);
-      return;
+    match claim {
+      ClaimResult::Claimed => {}
+      ClaimResult::Abandoned => {
+        info!(
+          "switch: abandoned by UNSUBSCRIBE for request id {current_sub_req_id} before target PUBLISH; reporting SUBSCRIPTION_ENDED"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::SubscriptionEnded,
+        )
+        .await;
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
+      ClaimResult::Superseded => {
+        warn!(
+          "switch: T_switch elapsed and a newer SWITCH took over request id {current_sub_req_id}; reporting TIMEOUT"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::Superseded,
+        )
+        .await;
+        // complete() with a stale generation is a no-op by design: the slot
+        // belongs to the newer switch.
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
     }
+
+    // (1d) Claim won: bound the source at the seam so it does not forward
+    // Groups >= G_switch concurrently with the target before teardown.
+    // Sequenced after the claim so no abandoned/superseded task ever mutates
+    // the source; `drain_undo` holds the pre-bound end_group so a PUBLISH
+    // failure below can unwind it.
+    let drain_undo = apply_seam_bound(&current_track_arc, connection_id, g_switch).await;
 
     // (1c) SWITCH PR #1378: re-read the target's live edge NOW — the draft pins
     // SWITCH_TRANSITION's Live Edge Group ID to the live edge "at the time the
@@ -1418,7 +1482,7 @@ async fn handle_switch_message(
     .await
     {
       error!("switch: failed to build target PUBLISH: {e:?}");
-      // SWITCH PR #1378 failure discipline: the drain already bounded the source at
+      // SWITCH PR #1378 failure discipline: (1d) already bounded the source at
       // the seam; a failure here must leave the current subscription unaltered
       // ("MUST NOT alter the current subscription"), so unwind the bound, then
       // still answer with the failure PUBLISH + PUBLISH_DONE (the failure
@@ -1435,7 +1499,11 @@ async fn handle_switch_message(
         SwitchFailure::PublishBuildFailed,
       )
       .await;
-      client.switch_in_flight.lock().await.complete(current_sub_req_id);
+      client
+        .switch_in_flight
+        .lock()
+        .await
+        .complete(current_sub_req_id, generation);
       return;
     }
 
@@ -1483,7 +1551,11 @@ async fn handle_switch_message(
     );
 
     // (6) Release the in-flight guard.
-    client.switch_in_flight.lock().await.complete(current_sub_req_id);
+    client
+      .switch_in_flight
+      .lock()
+      .await
+      .complete(current_sub_req_id, generation);
   });
 
   Ok(())

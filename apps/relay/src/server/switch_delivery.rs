@@ -367,6 +367,7 @@ pub(crate) async fn poll_select_switch_group(
   target_track: &Arc<RwLock<Track>>,
   minimum_switching_group_id: u64,
   current_sub_req_id: u64,
+  generation: u64,
   deadline: Instant,
 ) -> SelectOutcome {
   loop {
@@ -374,7 +375,7 @@ pub(crate) async fn poll_select_switch_group(
       .switch_in_flight
       .lock()
       .await
-      .is_abandoned(current_sub_req_id)
+      .is_abandoned(current_sub_req_id, generation)
     {
       return SelectOutcome::Abandoned;
     }
@@ -521,18 +522,14 @@ pub(crate) struct SeamBoundUndo {
 
 /// Outcome of draining the source Track below the switch boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) enum DrainOutcome {
-  /// All source Objects in Groups below `g_switch` were delivered; the source
-  /// is now bounded at the seam and the target PUBLISH may open.
-  /// `prior_end_group` is the source's `end_group` before the seam bound was
-  /// applied (`None` when nothing was bounded — `g_switch == 0` or no source
-  /// subscription), so a caller whose PUBLISH subsequently fails can unwind
-  /// the bound via [`restore_source_end_group`] and leave the current
-  /// subscription unaltered, as the draft's failure discipline requires.
-  /// `undo` is `Some` iff a seam bound was applied (its inner value may be
-  /// `None` = previously unbounded); `None` when nothing was bounded.
-  Drained { undo: Option<SeamBoundUndo> },
+  /// All source Objects in Groups below `g_switch` were delivered. The source
+  /// is NOT yet bounded at the seam: the caller must first win the publish
+  /// claim (`mark_published`) and only then apply the bound via
+  /// [`apply_seam_bound`] — so an abandoned or superseded task never mutates
+  /// the source subscription at all (draft: on any failure the relay "MUST
+  /// NOT alter the current subscription").
+  Drained,
   /// The drain did not finish within the T_switch deadline. The source is
   /// left completely unchanged; the caller aborts with TIMEOUT.
   TimedOut,
@@ -550,30 +547,29 @@ pub(crate) enum DrainOutcome {
 /// concurrent source/target transmission across the seam, even when the source
 /// is itself lagging under congestion).
 ///
-/// Returns [`DrainOutcome::Drained`] if the source drained in time. On success
-/// — and ONLY on success — the source is bounded to Groups below `g_switch` so
-/// it cannot then forward across the seam. Returns [`DrainOutcome::TimedOut`]
-/// on timeout WITHOUT mutating the source, so the caller can abort the switch
-/// and leave the current subscription unchanged (rather than terminating it
-/// and truncating undelivered source Objects below `g_switch`). Each poll also
-/// checks the subscriber's abandon mark and returns
+/// Returns [`DrainOutcome::Drained`] if the source drained in time. The drain
+/// itself never mutates the source: the seam bound is applied by the caller
+/// via [`apply_seam_bound`], AFTER it wins the publish claim, so that every
+/// non-Claimed outcome (timeout, abandon, supersede) leaves the current
+/// subscription untouched. Returns [`DrainOutcome::TimedOut`] on timeout, so
+/// the caller can abort the switch (rather than terminating the source and
+/// truncating undelivered Objects below `g_switch`). Each poll also checks
+/// the subscriber's abandon mark for this switch's `generation` and returns
 /// [`DrainOutcome::Abandoned`] as soon as an UNSUBSCRIBE for
 /// `current_sub_req_id` abandons the switch — without this the loop would spin
 /// to the deadline (a removed subscription's last-sent stops advancing) and
 /// misreport the UNSUBSCRIBE race as TIMEOUT.
-#[allow(dead_code)] // not yet wired; consumed by handle_switch_message
 pub(crate) async fn drain_source_below(
   subscriber: &Arc<MOQTClient>,
   current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
   g_switch: u64,
   current_sub_req_id: u64,
+  generation: u64,
   deadline: Instant,
 ) -> DrainOutcome {
   if g_switch == 0 {
-    return DrainOutcome::Drained {
-      undo: None,
-    };
+    return DrainOutcome::Drained;
   }
   let Some(sub_arc) = current_track
     .read()
@@ -582,12 +578,10 @@ pub(crate) async fn drain_source_below(
     .await
   else {
     // No source subscription to drain; nothing to truncate.
-    return DrainOutcome::Drained { undo: None };
+    return DrainOutcome::Drained;
   };
 
-  // Wait until last-sent reaches G_switch-1 (or timeout/abandon). The source
-  // is NOT bounded during the wait so that a timeout leaves it completely
-  // unchanged.
+  // Wait until last-sent reaches G_switch-1 (or timeout/abandon).
   loop {
     // SWITCH PR #1378 UNSUBSCRIBE race: exit as soon as the switch is abandoned so
     // the caller can emit the SUBSCRIPTION_ENDED failure PUBLISH promptly.
@@ -595,7 +589,7 @@ pub(crate) async fn drain_source_below(
       .switch_in_flight
       .lock()
       .await
-      .is_abandoned(current_sub_req_id)
+      .is_abandoned(current_sub_req_id, generation)
     {
       return DrainOutcome::Abandoned;
     }
@@ -614,23 +608,7 @@ pub(crate) async fn drain_source_below(
       drain_complete(state.last_sent_max_location.as_ref(), drain_target.as_ref())
     };
     if drained {
-      // Drain confirmed: bound the source at the seam so it does not forward
-      // Groups >= G_switch concurrently with the target before teardown.
-      // Capture the prior bound under the same write lock so the caller can
-      // unwind exactly what was replaced if the target PUBLISH fails.
-      let prior_end_group = {
-        let sub = sub_arc.read().await;
-        let mut state = sub.subscription_state.write().await;
-        let prior = state.end_group;
-        // g_switch >= 1 here (0 early-returned above), so this is always
-        // Some(g_switch - 1); see seam_end_group_bound for the g_switch == 1
-        // sentinel-collision case this encoding fixes.
-        state.end_group = seam_end_group_bound(g_switch);
-        prior
-      };
-      return DrainOutcome::Drained {
-        undo: Some(SeamBoundUndo { prior_end_group })
-      };
+      return DrainOutcome::Drained;
     }
     if Instant::now() >= deadline {
       return DrainOutcome::TimedOut;
@@ -639,7 +617,38 @@ pub(crate) async fn drain_source_below(
   }
 }
 
-/// Unwind the seam bound applied by a successful [`drain_source_below`] after
+/// Bound the source subscription at the seam — forward nothing at/above
+/// `g_switch` — capturing the prior `end_group` for unwind. Called by the
+/// switch task AFTER the drain confirmed AND the publish claim was won
+/// (`ClaimResult::Claimed`): sequencing the bound after the claim guarantees
+/// an abandoned or superseded task has not touched the source subscription,
+/// and that two racing switch tasks can never both apply (or unwind) a bound.
+/// Returns `None` — nothing mutated, nothing to unwind — when `g_switch == 0`
+/// (nothing exists below Group 0) or the subscription is already gone; the
+/// small window between the drain's last poll and this bound is covered by
+/// the same residual-approximation argument as [`drain_complete`].
+pub(crate) async fn apply_seam_bound(
+  current_track: &Arc<RwLock<Track>>,
+  connection_id: usize,
+  g_switch: u64,
+) -> Option<SeamBoundUndo> {
+  let bound = seam_end_group_bound(g_switch)?;
+  let sub_arc = current_track
+    .read()
+    .await
+    .get_subscription(connection_id)
+    .await?;
+  let prior_end_group = {
+    let sub = sub_arc.read().await;
+    let mut state = sub.subscription_state.write().await;
+    let prior = state.end_group;
+    state.end_group = Some(bound);
+    prior
+  };
+  Some(SeamBoundUndo { prior_end_group })
+}
+
+/// Unwind the seam bound applied by [`apply_seam_bound`] after
 /// the target PUBLISH failed to open (SWITCH PR #1378: on any failure the relay
 /// "MUST NOT alter the current subscription"). Restores the exact prior
 /// `end_group` — `0` means "no limit", but a genuine bound from the original
