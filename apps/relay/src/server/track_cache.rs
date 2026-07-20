@@ -18,6 +18,7 @@ use moqtail::model::common::location::Location;
 use moqtail::model::data::fetch_object::FetchObject;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{
@@ -61,6 +62,13 @@ pub struct TrackCache {
   cache: Cache<CacheKey, GroupObjects>,
   #[allow(dead_code)] // Used in eviction listener closure
   log_folder: String,
+  /// Availability generation: bumped on every event that can change which
+  /// groups/objects this cache holds — a successful `add_object` insert
+  /// (duplicates don't count) and an eviction. Consumers that derive state
+  /// from availability (the SWITCH selection/drain polls) compare snapshots
+  /// of this counter to skip recomputing O(n) scans when nothing changed;
+  /// see `switch_delivery::poll_select_switch_group`.
+  generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,10 +82,17 @@ impl TrackCache {
   pub fn new(track_alias: u64, cache_size: usize, config: &AppConfig) -> Self {
     let log_folder = config.log_folder.clone();
     let log_folder_for_listener = log_folder.clone();
+    let generation = Arc::new(AtomicU64::new(0));
+    let generation_for_listener = generation.clone();
 
     let cache_builder = Cache::builder()
       .max_capacity(cache_size as u64)
       .eviction_listener(move |key: Arc<CacheKey>, value: GroupObjects, cause| {
+        // Eviction changes availability, so it must bump the generation:
+        // gated consumers (SWITCH selection) can flip on group REMOVAL too —
+        // e.g. a blocking group evicted from the current track unblocks a
+        // lower boundary.
+        generation_for_listener.fetch_add(1, Ordering::Release);
         let track_alias = key.track_alias;
         let group_id = key.group_id;
         let log_folder = log_folder_for_listener.clone();
@@ -114,7 +129,15 @@ impl TrackCache {
       track_alias,
       cache,
       log_folder,
+      generation,
     }
+  }
+
+  /// Current availability generation (see the field doc). Compare two loads
+  /// to decide whether availability-derived state must be recomputed;
+  /// unchanged means no insert or eviction happened in between.
+  pub fn generation(&self) -> u64 {
+    self.generation.load(Ordering::Acquire)
   }
 
   /// Log cache eviction events to cache_eviction.log
@@ -214,6 +237,10 @@ impl TrackCache {
       }
       Err(index) => {
         objects.insert(index, object.clone());
+        // Availability changed: wake gated consumers (bump after the insert
+        // is visible under the group's write lock, so a consumer that sees
+        // the new generation also sees the object).
+        self.generation.fetch_add(1, Ordering::Release);
         debug!(
           "track_cache::add_object | inserted | track: {} group: {} object_id: {} total_objects: {}",
           self.track_alias,
@@ -226,6 +253,17 @@ impl TrackCache {
     }
   }
 
+  /// Stream cached objects in `[start, end]`, where `end.object == 0` means
+  /// "the whole end group".
+  ///
+  /// Snapshot semantics, part of the contract: the set of groups in range is
+  /// collected once at call time; each group's object vector is then read as
+  /// that group is streamed. A group that lands in the cache after the
+  /// snapshot is never delivered, and objects appended to a group the stream
+  /// has already passed are missed. Callers that ride on this (the switch
+  /// catch-up stream, FETCH responses) accept the approximation because
+  /// re-scanning would break their in-order delivery guarantees — see the
+  /// caveat on `switch_delivery::spawn_switch_catchup_stream`.
   pub async fn read_objects(
     &self,
     start: Location,
@@ -460,6 +498,7 @@ mod tests_oldest_group {
       initial_max_request_id: 100,
       upstream_url: None,
       upstream_no_cert_validation: false,
+      t_switch_ms: 3000,
     }
   }
 
@@ -527,6 +566,7 @@ mod tests_newest_group {
       initial_max_request_id: 100,
       upstream_url: None,
       upstream_no_cert_validation: false,
+      t_switch_ms: 3000,
     }
   }
 
@@ -598,6 +638,7 @@ mod tests_available_group_ids {
       initial_max_request_id: 100,
       upstream_url: None,
       upstream_no_cert_validation: false,
+      t_switch_ms: 3000,
     }
   }
 
@@ -655,6 +696,7 @@ mod tests_add_object_invariants {
       initial_max_request_id: 100,
       upstream_url: None,
       upstream_no_cert_validation: false,
+      t_switch_ms: 3000,
     }
   }
 
@@ -767,6 +809,7 @@ mod tests_max_location_below_group {
       initial_max_request_id: 100,
       upstream_url: None,
       upstream_no_cert_validation: false,
+      t_switch_ms: 3000,
     }
   }
 
@@ -819,5 +862,75 @@ mod tests_max_location_below_group {
     );
     // Nothing exists below Group 0.
     assert_eq!(cache.max_location_below_group(0).await, None);
+  }
+}
+
+#[cfg(test)]
+mod tests_generation {
+  use super::*;
+  use bytes::Bytes;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      initial_max_request_id: 100,
+      upstream_url: None,
+      upstream_no_cert_validation: false,
+      t_switch_ms: 3000,
+    }
+  }
+
+  fn fetch_object(group_id: u64, object_id: u64) -> FetchObject {
+    FetchObject {
+      group_id,
+      subgroup_id: 0,
+      object_id,
+      publisher_priority: 0,
+      extension_headers: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    }
+  }
+
+  #[tokio::test]
+  async fn insert_bumps_generation() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    let g0 = cache.generation();
+    cache.add_object(fetch_object(0, 0)).await;
+    let g1 = cache.generation();
+    assert!(g1 > g0, "a successful insert must move the generation");
+    cache.add_object(fetch_object(0, 1)).await;
+    assert!(cache.generation() > g1, "each insert moves it again");
+  }
+
+  #[tokio::test]
+  async fn duplicate_insert_does_not_bump_generation() {
+    // A duplicate changes nothing about availability, so gated consumers
+    // (the SWITCH selection/drain polls) must not be woken into an O(n)
+    // recompute by re-ingested objects (backfill racing live-forward).
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(3, 0)).await;
+    let before = cache.generation();
+    let inserted = cache.add_object(fetch_object(3, 0)).await;
+    assert!(!inserted);
+    assert_eq!(
+      cache.generation(),
+      before,
+      "duplicate skip must leave the generation unchanged"
+    );
   }
 }

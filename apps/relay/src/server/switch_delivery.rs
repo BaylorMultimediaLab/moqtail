@@ -60,10 +60,14 @@ use moqtail::model::control::fetch::{Fetch, StandAloneFetchProps};
 use moqtail::transport::data_stream_handler::FetchRequest;
 
 /// Poll cadence for the T_switch-bounded waits (G_switch identification and
-/// the source drain). The budget itself is the guard's `DEFAULT_T_SWITCH`:
-/// the switch handler computes ONE deadline at SWITCH receipt and threads it
-/// through both phases, so together they honor the draft's "MUST complete the
-/// operation within an implementation-specific timeout T_switch".
+/// the source drain). The budget itself is `AppConfig::get_t_switch()`
+/// (`--t-switch-ms`, default 3000): the switch handler computes ONE deadline
+/// at SWITCH receipt and threads it through both phases, so together they
+/// honor the draft's "MUST complete the operation within an
+/// implementation-specific timeout T_switch". Both loops additionally gate
+/// their O(n) cache scans on `TrackCache::generation()` so a full recompute
+/// only runs when the relevant cache actually changed between ticks — see
+/// `poll_select_switch_group` and `drain_source_below`.
 const SWITCH_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 /// QUIC send priority for the SWITCH catch-up stream, derived from the shared
@@ -286,6 +290,27 @@ pub(crate) fn build_switch_live_sub(
   )
 }
 
+/// Open the catch-up FETCH_HEADER stream and deliver `[g_switch, live_edge)`
+/// from the target Track's cache (see the range/eager-open/FIN rationale on
+/// [`switch_catchup_range`] above).
+///
+/// Residual approximation, documented rather than hidden — the same one
+/// [`drain_complete`] carries on the source side: `read_objects` snapshots the
+/// cache's group list once at spawn time and reads each group's object vector
+/// as it streams. A whole group inside the range that lands in the cache
+/// after the snapshot (an upstream backfill FETCH racing the switch, or
+/// out-of-order upstream arrival), or objects appended to a group already
+/// streamed past, are not delivered on this stream. A second sweep could not
+/// fix this without violating the draft's MUST that the catch-up stream
+/// deliver "in Group and Object order" — late arrivals would trail groups
+/// already sent — so the correct fix is a hole-aware ordered cache reader
+/// (the standing TODO on `read_objects`), not a re-scan here. In practice the
+/// window is benign: below-live-edge groups are complete by construction in
+/// the single-hop flow (a publisher opens a new group only after finishing
+/// the previous one), the chained case backfills history before selection
+/// accepts a boundary, and the live-edge group's already-received head is
+/// covered separately by the live sub's joining replay
+/// ([`build_switch_live_sub`]).
 pub(crate) fn spawn_switch_catchup_stream(
   subscriber: Arc<MOQTClient>,
   target_track: Arc<RwLock<Track>>,
@@ -389,6 +414,20 @@ pub(crate) async fn poll_select_switch_group(
   generation: u64,
   deadline: Instant,
 ) -> SelectOutcome {
+  // Cache-generation gate: the O(n) availability scans in
+  // select_switch_group (a fresh BTreeSet per track per call) run only when
+  // either cache's availability generation moved — an insert or eviction
+  // actually happened — not on every 50 ms tick. Generations are sampled
+  // before the recompute, so an insert landing mid-compute re-runs once on
+  // the next tick instead of being missed. The tick itself stays: its
+  // remaining work is O(1) (a mutex flag, a status read, two atomic loads),
+  // and it bounds abandon/reject/deadline detection at SWITCH_DRAIN_POLL —
+  // which a pure insertion-notify wakeup could not do without extra wake
+  // plumbing on the UNSUBSCRIBE and upstream-reject paths. (A target
+  // live-edge move without a cache event — Track::confirm seeding — cannot
+  // flip the selection to Ready: extending [g, live_edge) only ever adds
+  // blocking constraints, so gating on cache generations alone is sound.)
+  let mut last_avail: Option<(u64, u64)> = None;
   loop {
     if subscriber
       .switch_in_flight
@@ -407,15 +446,22 @@ pub(crate) async fn poll_select_switch_group(
     ) {
       return SelectOutcome::TargetRejected;
     }
-    match select_switch_group(current_track, target_track, minimum_switching_group_id).await {
-      SwitchSelection::Ready(g) => return SelectOutcome::Ready(g),
-      SwitchSelection::NoCommonBoundary => {
-        if Instant::now() >= deadline {
-          return SelectOutcome::TimedOut;
-        }
-        tokio::time::sleep(SWITCH_DRAIN_POLL).await;
+    let avail = (
+      current_track.read().await.cache.generation(),
+      target_track.read().await.cache.generation(),
+    );
+    if last_avail != Some(avail) {
+      last_avail = Some(avail);
+      if let SwitchSelection::Ready(g) =
+        select_switch_group(current_track, target_track, minimum_switching_group_id).await
+      {
+        return SelectOutcome::Ready(g);
       }
     }
+    if Instant::now() >= deadline {
+      return SelectOutcome::TimedOut;
+    }
+    tokio::time::sleep(SWITCH_DRAIN_POLL).await;
   }
 }
 
@@ -601,6 +647,14 @@ pub(crate) async fn drain_source_below(
   };
 
   // Wait until last-sent reaches G_switch-1 (or timeout/abandon).
+  // The drain target (an O(n) cache scan) is re-read only when the current
+  // track's availability generation moved — below-seam groups can still be
+  // growing (a switch at the next boundary drains the current live group),
+  // and each growth bumps the generation. Delivery progress
+  // (last_sent_max_location) is NOT a cache event, so drain_complete itself
+  // is re-evaluated on every tick against the cached target.
+  let mut drain_target: Option<Location> = None;
+  let mut last_avail: Option<u64> = None;
   loop {
     // SWITCH PR #1378 UNSUBSCRIBE race: exit as soon as the switch is abandoned so
     // the caller can emit the SUBSCRIPTION_ENDED failure PUBLISH promptly.
@@ -612,16 +666,15 @@ pub(crate) async fn drain_source_below(
     {
       return DrainOutcome::Abandoned;
     }
+    {
+      let track = current_track.read().await;
+      let avail = track.cache.generation();
+      if last_avail != Some(avail) {
+        last_avail = Some(avail);
+        drain_target = track.cache.max_location_below_group(g_switch).await;
+      }
+    }
     let drained = {
-      // Re-read the drain target each poll: below-seam groups can still be
-      // growing (a switch at the next boundary drains the current live
-      // group), and holes must not be waited on.
-      let drain_target = current_track
-        .read()
-        .await
-        .cache
-        .max_location_below_group(g_switch)
-        .await;
       let sub = sub_arc.read().await;
       let state = sub.subscription_state.read().await;
       drain_complete(state.last_sent_max_location.as_ref(), drain_target.as_ref())
