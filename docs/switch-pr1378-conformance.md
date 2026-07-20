@@ -23,8 +23,12 @@ Established subscription — the relay must stay silent). A subscriber therefore
 cannot distinguish "my SWITCH was dropped at the gate; no answer will ever
 come" from "the answer is still in flight" except by a local deadline.
 `MOQtailClient.switch()` resolves as a `SwitchFailure(Timeout)` after
-`SWITCH_RESPONSE_TIMEOUT_MS` (6000 ms, 2x the relay's `DEFAULT_T_SWITCH` of
+`SWITCH_RESPONSE_TIMEOUT_MS` (6000 ms, 2x the relay's default T_switch of
 3000 ms, so a relay operating within its own budget always wins the race).
+T_switch is configurable on the relay (`--t-switch-ms`, default 3000);
+operators raising it past 3000 must raise the client's
+`SWITCH_RESPONSE_TIMEOUT_MS` in step, or the client will time out switches
+the relay would still complete — landing in the late-answer path below.
 
 **The deviation.** A relay answer that arrives _after_ that local deadline is,
 from the spec's viewpoint, still answering a pending SWITCH (the spec has no

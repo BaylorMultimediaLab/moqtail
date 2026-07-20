@@ -83,6 +83,15 @@ pub struct Cli {
   /// (self-signed development/test certificates only).
   #[arg(long, default_value_t = false)]
   pub upstream_no_cert_validation: bool,
+
+  /// T_switch (ms): budget for completing a SWITCH (SWITCH PR #1378) —
+  /// G_switch identification plus the source drain share one deadline, and
+  /// the single-in-flight guard slot self-expires at the same instant.
+  /// Operators raising this past 3000 must raise the TS client's
+  /// SWITCH_RESPONSE_TIMEOUT_MS (2x this value by default) in step, or the
+  /// client will time out switches the relay would still complete.
+  #[arg(long, default_value_t = 3000)]
+  pub t_switch_ms: u64,
 }
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -102,6 +111,7 @@ pub struct AppConfig {
   pub initial_max_request_id: u64,
   pub upstream_url: Option<String>,
   pub upstream_no_cert_validation: bool,
+  pub t_switch_ms: u64,
 }
 
 impl AppConfig {
@@ -126,8 +136,14 @@ impl AppConfig {
         initial_max_request_id: cli.initial_max_request_id,
         upstream_url: cli.upstream_url,
         upstream_no_cert_validation: cli.upstream_no_cert_validation,
+        t_switch_ms: cli.t_switch_ms,
       }
     })
+  }
+
+  /// The SWITCH operation budget (SWITCH PR #1378 T_switch) as a Duration.
+  pub fn get_t_switch(&self) -> Duration {
+    Duration::from_millis(self.t_switch_ms)
   }
 
   pub async fn build_server_config(&self) -> Result<ServerConfig> {
@@ -192,6 +208,7 @@ mod tests {
       initial_max_request_id: u64::MAX / 8,
       upstream_url: None,
       upstream_no_cert_validation: false,
+      t_switch_ms: 3000,
     };
 
     let config = AppConfig {
@@ -211,6 +228,7 @@ mod tests {
       initial_max_request_id: cli.initial_max_request_id,
       upstream_url: cli.upstream_url,
       upstream_no_cert_validation: cli.upstream_no_cert_validation,
+      t_switch_ms: cli.t_switch_ms,
     };
 
     assert_eq!(config.initial_max_request_id, u64::MAX / 8);

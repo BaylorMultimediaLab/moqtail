@@ -39,9 +39,15 @@ use std::time::{Duration, Instant};
 
 use moqtail::model::control::constant::PublishDoneStatusCode;
 
-/// Default relay-side `T_switch` budget. Kept at/under the client's ABR switch
-/// guard (`AbrController.SWITCH_TIMEOUT_MS` = 3000 ms) so the relay reclaims a
-/// stuck switch before the subscriber gives up on the transition.
+/// Default relay-side `T_switch` budget — the default of the `--t-switch-ms`
+/// CLI flag; the SWITCH handler reads the live value via
+/// `AppConfig::get_t_switch()`, so this constant only anchors the default and
+/// the guard's unit tests. Kept at/under the client's ABR switch guard
+/// (`AbrController.SWITCH_TIMEOUT_MS` = 3000 ms) so the relay reclaims a
+/// stuck switch before the subscriber gives up on the transition; operators
+/// raising `--t-switch-ms` must raise the TS client's
+/// `SWITCH_RESPONSE_TIMEOUT_MS` (2x this by default) in step.
+#[allow(dead_code)] // default anchor + guard unit tests; handler reads AppConfig
 pub(crate) const DEFAULT_T_SWITCH: Duration = Duration::from_millis(3000);
 
 /// Result of trying to admit a new SWITCH for a subscription.

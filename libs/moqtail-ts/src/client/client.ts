@@ -231,8 +231,12 @@ export class MOQtailClient {
   readonly lateSwitchTombstones: Map<string, number[]> = new Map()
   /**
    * Client-side deadline for the relay to answer a SWITCH with a PUBLISH.
-   * Sized at 2x the relay's DEFAULT_T_SWITCH (3000 ms) so a relay operating
-   * within its own budget always wins the race. See {@link MOQtailClient.switch}.
+   * Sized at 2x the relay's default T_switch (`--t-switch-ms`, 3000 ms) so a
+   * relay operating within its own budget always wins the race. Deployments
+   * that raise the relay's `--t-switch-ms` past 3000 must raise this in
+   * step, or switches the relay would still complete resolve as local
+   * Timeout failures (the late-answer tombstone path).
+   * See {@link MOQtailClient.switch}.
    */
   static readonly SWITCH_RESPONSE_TIMEOUT_MS = 6000
   /**

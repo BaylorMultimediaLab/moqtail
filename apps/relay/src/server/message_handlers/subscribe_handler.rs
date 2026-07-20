@@ -1081,7 +1081,7 @@ async fn handle_switch_message(
     send_switch_publish, spawn_switch_catchup_stream, spawn_upstream_backfill,
     switch_catchup_priority, terminate_source,
   };
-  use crate::server::switch_guard::{AdmitResult, ClaimResult, DEFAULT_T_SWITCH, SwitchFailure};
+  use crate::server::switch_guard::{AdmitResult, ClaimResult, SwitchFailure};
   use moqtail::model::parameter::switch_transition::SwitchTransition;
   use std::time::Instant;
 
@@ -1159,11 +1159,12 @@ async fn handle_switch_message(
   // interaction below passes it back, so a task whose slot was reclaimed
   // after the deadline is told `Superseded` instead of corrupting the newer
   // switch's state.
+  let t_switch = context.server_config.get_t_switch();
   let admitted_at = Instant::now();
-  let t_switch_deadline = admitted_at + DEFAULT_T_SWITCH;
+  let t_switch_deadline = admitted_at + t_switch;
   let generation = {
     let mut guard = client.switch_in_flight.lock().await;
-    match guard.try_admit(current_sub_req_id, admitted_at, DEFAULT_T_SWITCH) {
+    match guard.try_admit(current_sub_req_id, admitted_at, t_switch) {
       AdmitResult::Admitted { generation } => generation,
       AdmitResult::Rejected => {
         drop(guard);
