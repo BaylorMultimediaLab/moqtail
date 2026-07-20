@@ -242,9 +242,13 @@ pub(crate) enum SwitchFailure {
   NoCommonBoundary,
   /// Another SWITCH for the same Current Subscribe Request ID is in flight.
   AlreadyInFlight,
-  /// Authorization failed for the target Track.
+  /// Authorization failed for the target Track. This relay has no target-track
+  /// authorization subsystem; kept to mirror the recommended status-code set in SWITCH PR #1378.
+  #[allow(dead_code)]
   Unauthorized,
-  /// This relay does not implement the SWITCH message.
+  /// This relay does not implement the SWITCH message. Never constructed by
+  /// definition here (the handler exists); kept to mirror the recommended status-code set in SWITCH PR #1378.
+  #[allow(dead_code)]
   NotSupported,
   /// The subscription being switched from has ended.
   SubscriptionEnded,
