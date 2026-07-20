@@ -1078,7 +1078,8 @@ async fn handle_switch_message(
   use crate::server::switch_delivery::{
     DrainOutcome, SeamBoundUndo, SelectOutcome, apply_seam_bound, build_switch_live_sub,
     drain_source_below, poll_select_switch_group, restore_source_end_group, send_switch_failure,
-    send_switch_publish, spawn_switch_catchup_stream, spawn_upstream_backfill, terminate_source,
+    send_switch_publish, spawn_switch_catchup_stream, spawn_upstream_backfill,
+    switch_catchup_priority, terminate_source,
   };
   use crate::server::switch_guard::{AdmitResult, ClaimResult, DEFAULT_T_SWITCH, SwitchFailure};
   use moqtail::model::parameter::switch_transition::SwitchTransition;
@@ -1547,6 +1548,13 @@ async fn handle_switch_message(
 
     // (4) Live-only subscription on the target Track (objects from the live edge
     // onward, on SUBGROUP streams) + relay-side request mapping.
+    // Capture the catch-up stream's priority FIRST: it is one tick above the
+    // shared decaying band at this instant, and every target subgroup stream
+    // can only open after add_subscription below — i.e. strictly later in the
+    // band, strictly lower — which is exactly the draft's scoped SHOULD
+    // (outrank the TARGET's concurrent SUBGROUP streams, not the whole
+    // connection; see switch_catchup_priority).
+    let catchup_priority = switch_catchup_priority(crate::server::utils::current_stream_priority());
     {
       let target_track = target_track_arc.read().await;
       add_subscription(live_sub.clone(), &target_track, client.clone()).await;
@@ -1563,6 +1571,7 @@ async fn handle_switch_message(
       target_request_id,
       g_switch,
       live_edge,
+      catchup_priority,
     );
 
     // (6) Release the in-flight guard.

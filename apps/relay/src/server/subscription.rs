@@ -910,7 +910,7 @@ impl Subscription {
 
       // set priority based on the current time
       // TODO: revisit this logic to set priority based on the subscription
-      let priority = i32::MAX - (utils::passed_time_since_start() % i32::MAX as u128) as i32;
+      let priority = utils::current_stream_priority();
 
       let send_stream = match self
         .subscriber

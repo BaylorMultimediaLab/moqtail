@@ -66,18 +66,39 @@ use moqtail::transport::data_stream_handler::FetchRequest;
 /// operation within an implementation-specific timeout T_switch".
 const SWITCH_DRAIN_POLL: Duration = Duration::from_millis(50);
 
-/// QUIC send priority for the SWITCH catch-up stream. SWITCH PR #1378: the relay
-/// SHOULD give the catch-up stream a HIGHER priority than concurrent SUBGROUP
-/// streams for the target track until the catch-up stream closes — the
-/// subscriber needs `[G_switch, live_edge)` first to assemble a gap-free
-/// buffer; live objects are only playable once the seam is filled. Subgroup
-/// streams are opened with `i32::MAX - elapsed_ms_since_start`
-/// (subscription.rs), which is strictly below `i32::MAX` for any stream opened
-/// after process start, so `i32::MAX` statically outranks them all for this
-/// stream's whole lifetime. Ordinary client-issued FETCH responses keep
+/// QUIC send priority for the SWITCH catch-up stream, derived from the shared
+/// decaying band subgroup streams use (`utils::current_stream_priority`,
+/// 1 tick per millisecond of uptime).
+///
+/// SWITCH PR #1378 scopes the elevation precisely: the relay SHOULD give the
+/// catch-up stream a higher priority than concurrent SUBGROUP streams *for
+/// the target Track* until the catch-up stream closes — the subscriber needs
+/// `[G_switch, live_edge)` first to assemble a gap-free buffer. An earlier
+/// revision used a static `i32::MAX`, which outranked the band's every
+/// subgroup stream on the CONNECTION, not just the target's: during a video
+/// catch-up, another track's (audio's) live streams were starved — the exact
+/// stall the rule exists to prevent.
+///
+/// Instead, `band_priority_at_capture` is the band value sampled by the
+/// switch handler BEFORE the target's live subscription is added (so before
+/// any target subgroup stream can open), and the catch-up gets that value
+/// plus one:
+///
+/// * every target subgroup stream opens after the capture, lands strictly
+///   lower in the decaying band, and stays outranked for the catch-up's whole
+///   lifetime (the band only decays) — the draft's SHOULD, in full;
+/// * streams of other tracks that were already open keep their older, higher
+///   band positions — no cross-track starvation; streams any track opens
+///   after the capture rank below it exactly as they would below any
+///   equally-aged subgroup stream, so no new priority class is introduced.
+///
+/// Saturating: a capture in the process's very first millisecond would sit at
+/// the band ceiling already. Ordinary client-issued FETCH responses keep
 /// priority 0 in fetch_handler.rs — the draft's SHOULD covers only the switch
 /// catch-up stream.
-const SWITCH_CATCHUP_STREAM_PRIORITY: i32 = i32::MAX;
+pub(crate) fn switch_catchup_priority(band_priority_at_capture: i32) -> i32 {
+  band_priority_at_capture.saturating_add(1)
+}
 
 /// Open the target Track's PUBLISH for a successful SWITCH.
 ///
@@ -271,6 +292,7 @@ pub(crate) fn spawn_switch_catchup_stream(
   publish_request_id: u64,
   g_switch: u64,
   live_edge: u64,
+  priority: i32,
 ) {
   let Some((start, end)) = switch_catchup_range(g_switch, live_edge) else {
     return;
@@ -286,11 +308,7 @@ pub(crate) fn spawn_switch_catchup_stream(
     // Open eagerly (see doc comment): the FETCH_HEADER announces the range and
     // the trailing FIN terminates it even when zero objects follow.
     let send_stream = match subscriber
-      .open_stream(
-        &stream_id,
-        fetch_header.serialize().unwrap(),
-        SWITCH_CATCHUP_STREAM_PRIORITY,
-      )
+      .open_stream(&stream_id, fetch_header.serialize().unwrap(), priority)
       .await
     {
       Ok(ss) => ss,
@@ -842,6 +860,47 @@ mod tests_switch_seam_helpers {
     // exactly Group 0. Pins the `live_edge - 1` underflow guard (the
     // subtraction is only reachable when live_edge >= 1).
     assert_eq!(switch_catchup_range(0, 1), Some((loc(0, 0), loc(0, 0))));
+  }
+
+  // ---- switch_catchup_priority ----
+
+  #[test]
+  fn catchup_priority_outranks_every_later_band_value() {
+    // The band decays by 1/ms, so any target subgroup stream — which can
+    // only open after the capture — gets a band value <= the captured one,
+    // and the catch-up's +1 strictly outranks it. A stream from another
+    // track that was already open (band value > capture) keeps outranking
+    // the catch-up: no cross-track starvation.
+    let capture = 1_000_000;
+    let p = switch_catchup_priority(capture);
+    assert!(p > capture, "must outrank streams opened at the capture ms");
+    assert!(
+      p <= capture + 1,
+      "must NOT outrank streams older than the capture (the i32::MAX bug)"
+    );
+  }
+
+  #[test]
+  fn catchup_priority_saturates_at_band_ceiling() {
+    // A capture in the process's first millisecond sits at the ceiling
+    // already; +1 must not overflow.
+    assert_eq!(switch_catchup_priority(i32::MAX), i32::MAX);
+  }
+
+  #[test]
+  fn catchup_priority_tracks_the_shared_band() {
+    // The capture comes from the same clock subgroup streams use: a band
+    // value sampled later can never exceed one sampled earlier (the band
+    // only decays), so the +1 margin keeps holding for the catch-up's
+    // lifetime. Samples in the same millisecond can tie at the saturated
+    // ceiling (i32::MAX) — a tie is fair-share, not starvation, and fine for
+    // the draft's SHOULD — so put a real millisecond between the samples to
+    // assert the strict case.
+    let earlier = crate::server::utils::current_stream_priority();
+    std::thread::sleep(Duration::from_millis(2));
+    let later = crate::server::utils::current_stream_priority();
+    assert!(later < earlier);
+    assert!(switch_catchup_priority(earlier) > later);
   }
 
   // ---- build_switch_live_sub ----

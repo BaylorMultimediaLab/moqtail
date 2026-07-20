@@ -61,6 +61,19 @@ pub fn passed_time_since_start() -> u128 {
   (Instant::now() - *BASE_TIME).as_millis()
 }
 
+/// QUIC send priority for a data stream opened "now": a single band shared by
+/// every subgroup stream on the connection, decaying by 1 per millisecond of
+/// process uptime, so an older stream always outranks a newer one. Any code
+/// that needs to slot a stream relative to subgroup streams (e.g. the SWITCH
+/// catch-up stream, which must sit just above the target track's subgroup
+/// streams without starving other tracks) must derive its value from this
+/// same band, never from an absolute constant. Wraps every ~24.8 days
+/// (i32::MAX ms) — at the wrap instant relative ordering across the seam
+/// inverts; a pre-existing artifact of the scheme, shared by all users.
+pub fn current_stream_priority() -> i32 {
+  i32::MAX - (passed_time_since_start() % i32::MAX as u128) as i32
+}
+
 pub fn fnv_hash(bytes: &[u8]) -> u64 {
   let mut hasher = FnvHasher::default();
   hasher.write(bytes);
