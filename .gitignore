@@ -261,3 +261,5 @@ data/video/tears_of_steel_*
 data/video/.cache/
 CLAUDE.md
 .antigravitycli/
+# Short-lived ECDSA dev certificate (scripts/gen-dev-cert.sh)
+apps/relay/cert/ecdsa/

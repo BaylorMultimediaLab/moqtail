@@ -307,6 +307,33 @@ export function computeStartupTarget(opts: {
   return Math.max(opts.baseTarget, opts.end - offset);
 }
 
+/**
+ * Reads a `?certHash=` query parameter (base64url SHA-256 of the relay's DER
+ * certificate) and turns it into WebTransport `serverCertificateHashes`.
+ *
+ * Firefox's HTTP/3 stack rejects a certificate issued by a locally-installed
+ * CA even when that CA is trusted, so pinning the leaf hash is the only way to
+ * reach a dev relay from Firefox. Chrome accepts either route. Browsers honour
+ * a pinned hash only for ECDSA P-256 certificates valid 14 days or less — see
+ * scripts/gen-dev-cert.sh.
+ *
+ * Returns undefined when the parameter is absent, leaving the default
+ * CA-trusted path untouched.
+ */
+function serverCertificateHashesFromUrl(): { transportOptions: WebTransportOptions } | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const raw = new URLSearchParams(window.location.search).get('certHash');
+  if (!raw) return undefined;
+  try {
+    const bin = atob(raw.replace(/-/g, '+').replace(/_/g, '/'));
+    const value = Uint8Array.from(bin, c => c.charCodeAt(0));
+    return { transportOptions: { serverCertificateHashes: [{ algorithm: 'sha-256', value }] } };
+  } catch {
+    logger.error('media', 'certHash query parameter is not valid base64url; ignoring it');
+    return undefined;
+  }
+}
+
 export class Player {
   catalog: CMSFCatalog | null = null;
   client: MOQtailClient | null = null;
@@ -347,6 +374,7 @@ export class Player {
       this.client = await MOQtailClient.new({
         url: this.#options.relayUrl,
         supportedVersions: [DRAFT_14],
+        ...(serverCertificateHashesFromUrl() ?? {}),
       });
     } catch (error) {
       logger.error('media', 'Failed to connect to relay', (error as Error).message);
