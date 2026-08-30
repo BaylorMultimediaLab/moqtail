@@ -133,7 +133,16 @@ interface PendingSwitch {
 
 interface MOQStreamStruct {
   trackName: string;
+  /**
+   * Current data route. Replaced on every SWITCH: under SWITCH PR #1378 the
+   * relay terminates the old subscription (PUBLISH_DONE) and delivers the
+   * target track on a fresh relay-initiated PUBLISH route, surfaced as
+   * `SwitchSuccess.stream`. The pump in startMedia() re-pipes whenever this
+   * changes, so the write handler (and its SourceBuffer) survives the seam.
+   */
   source: ReadableStream<MoqtObject>;
+  /** Aborts only the in-flight pipe, so a SWITCH can re-bind `source` without tearing down the track. */
+  pipeAc?: AbortController;
   requestId: bigint;
   tracker: GoodputTracker;
   lastGroupId: bigint;
@@ -265,8 +274,10 @@ export function computeSwitchMinimumGroup(opts: {
   latestGroup: bigint;
 }): { minimumSwitchingGroupId: number; timeMapMiss: boolean } {
   const naiveFloor = opts.latestGroup >= 0n ? Number(opts.latestGroup) + 1 : 0;
-  if (opts.switchMode !== 'aligned') return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: false };
-  if (opts.targetGroup === undefined) return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: true };
+  if (opts.switchMode !== 'aligned')
+    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: false };
+  if (opts.targetGroup === undefined)
+    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: true };
   return { minimumSwitchingGroupId: opts.targetGroup, timeMapMiss: false };
 }
 
@@ -886,19 +897,46 @@ export class Player {
         },
       });
 
-      // Pipe to the writable stream
-      const promise = struct.source.pipeTo(writable, { signal: ac.signal });
-
-      // Cleanup stream — for live streams, do NOT call endOfStream() when the
-      // pipe ends. The readable stream can close transiently (e.g., during a
-      // SWITCH, relay reconnection, or subscription update). Calling endOfStream()
-      // permanently seals the MediaSource, preventing any further data from being
-      // appended. Only call endOfStream() when the player is being disposed.
-      promise.catch(error => {
-        if (!['AbortError', 'InternalError'].includes(error.name)) {
-          logger.error('media', 'Stream pipe error:', error);
+      // Pump the current data route into `writable`, re-piping whenever a
+      // SWITCH replaces `struct.source`.
+      //
+      // A single pipeTo() was correct while a switch kept one subscription
+      // alive and merely changed what flowed through it. Under SWITCH PR #1378
+      // the relay tears the old subscription down (PUBLISH_DONE) and opens a
+      // new PUBLISH route for the target, so the post-switch objects arrive on
+      // a different ReadableStream. Piping only the original one left every
+      // post-switch object unread: no appends, the pending init segment never
+      // applied, and playback froze at the seam with no error anywhere.
+      //
+      // preventClose/preventAbort keep `writable` — and with it the
+      // SourceBuffer, the pendingSwitch bookkeeping and the discontinuity
+      // records — alive across the seam. Only call endOfStream() on dispose.
+      const pump = async () => {
+        while (!ac.signal.aborted) {
+          const current = struct.source;
+          const pipeAc = new AbortController();
+          struct.pipeAc = pipeAc;
+          try {
+            await current.pipeTo(writable, {
+              signal: AbortSignal.any([ac.signal, pipeAc.signal]),
+              preventClose: true,
+              preventAbort: true,
+              preventCancel: true,
+            });
+          } catch (error) {
+            const name = (error as Error)?.name;
+            if (!['AbortError', 'InternalError'].includes(name)) {
+              logger.error('media', 'Stream pipe error:', error);
+            }
+          }
+          if (ac.signal.aborted) break;
+          // The route was replaced by switchTrack() — pick up the new stream.
+          // Otherwise the source ended on its own and there is nothing to pump.
+          if (struct.source === current) break;
+          logger.info('media', `pump: re-binding to post-switch stream for ${struct.trackName}`);
         }
-      });
+      };
+      void pump();
     }
   }
 
@@ -1207,7 +1245,10 @@ export class Player {
     // the discipline PR #1378 prescribes. The switchInFlight flag below keeps
     // the player from issuing that duplicate in the first place.
     if (videoStruct.switchInFlight) {
-      logger.warn('media', `switchTrack: SWITCH already in flight; ignoring request for ${trackName}`);
+      logger.warn(
+        'media',
+        `switchTrack: SWITCH already in flight; ignoring request for ${trackName}`,
+      );
       return;
     }
     const subscriptionRequestId = videoStruct.requestId;
@@ -1240,6 +1281,13 @@ export class Player {
       // the relay registered the post-switch subscription under, and the id
       // the NEXT SWITCH must reference as its Current Subscribe Request ID.
       videoStruct.requestId = result.requestId;
+
+      // Adopt the relay's new data route. SwitchSuccess extends SubscribeResult,
+      // and `stream` is where the catch-up range and the post-switch live
+      // objects arrive; the old subscription's stream is finished. Aborting the
+      // in-flight pipe makes the pump re-bind to it.
+      videoStruct.source = result.stream;
+      videoStruct.pipeAc?.abort();
       logger.info(
         'media',
         `switchTrack: seam at group ${result.switchTransition.switchingGroupId}, ` +
