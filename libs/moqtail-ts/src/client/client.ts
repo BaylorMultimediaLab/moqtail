@@ -1967,14 +1967,20 @@ export class MOQtailClient {
    * else. A genuinely bogus stream still ends in a protocol violation — just
    * after the deadline instead of instantly.
    */
-  async #waitForDataRoute<T>(lookup: () => T | undefined): Promise<T | undefined> {
+  async #waitForDataRoute<T>(lookup: () => T | undefined): Promise<{ value: T } | undefined> {
     const deadline = Date.now() + MOQtailClient.DATA_ROUTE_WAIT_TIMEOUT_MS
     let result = lookup()
     while (result === undefined && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, MOQtailClient.DATA_ROUTE_POLL_INTERVAL_MS))
       result = lookup()
     }
-    return result
+    // Boxed on purpose: SubscribeRequest is a thenable (it implements
+    // PromiseLike so callers can `await` a SUBSCRIBE's response). Returning it
+    // bare from an async function makes the await chain adopt it, so the
+    // caller would receive the resolved SubscribeOk instead of the routing
+    // object it asked for — dropping `controller` and silently discarding
+    // every object on the track.
+    return result === undefined ? undefined : { value: result }
   }
 
   async #handleRecvStreams(incomingUniStream: ReadableStream): Promise<void> {
@@ -2043,13 +2049,15 @@ export class MOQtailClient {
         // stream and data streams — so this FETCH_HEADER can arrive before
         // handlerPublish has installed the route. Wait briefly for it rather
         // than tearing the session down on a benign race.
-        const catchupRoute = await this.#waitForDataRoute(() => {
-          const alias = this.subscriptionAliasMap.get(header.requestId)
-          if (alias === undefined) return undefined
-          const receiver = this.subscriptions.get(alias)
-          const name = this.aliasFullTrackNameMap.get(alias)
-          return receiver && name ? { receiver, name } : undefined
-        })
+        const catchupRoute = (
+          await this.#waitForDataRoute(() => {
+            const alias = this.subscriptionAliasMap.get(header.requestId)
+            if (alias === undefined) return undefined
+            const receiver = this.subscriptions.get(alias)
+            const name = this.aliasFullTrackNameMap.get(alias)
+            return receiver && name ? { receiver, name } : undefined
+          })
+        )?.value
         if (catchupRoute) {
           const { receiver: catchupReceiver, name: catchupName } = catchupRoute
           try {
@@ -2075,20 +2083,22 @@ export class MOQtailClient {
         // handler registers the subscription for this alias. The pending
         // state-update callbacks are folded into the retried lookup so either
         // path can resolve the route within the wait window.
-        const subscription = await this.#waitForDataRoute(() => {
-          let sub = this.subscriptions.get(header.trackAlias)
-          if (!sub) {
-            for (const [subscriptionId, callback] of this.pendingStateUpdates) {
-              const matched = callback(header.trackAlias)
-              if (matched) {
-                sub = this.subscriptions.get(header.trackAlias)
-                this.pendingStateUpdates.delete(subscriptionId)
-                break
+        const subscription = (
+          await this.#waitForDataRoute(() => {
+            let sub = this.subscriptions.get(header.trackAlias)
+            if (!sub) {
+              for (const [subscriptionId, callback] of this.pendingStateUpdates) {
+                const matched = callback(header.trackAlias)
+                if (matched) {
+                  sub = this.subscriptions.get(header.trackAlias)
+                  this.pendingStateUpdates.delete(subscriptionId)
+                  break
+                }
               }
             }
-          }
-          return sub ?? undefined
-        })
+            return sub ?? undefined
+          })
+        )?.value
 
         if (subscription) {
           subscription.streamsAccepted++
