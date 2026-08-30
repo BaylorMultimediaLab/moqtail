@@ -36,5 +36,11 @@
     "@tensorflow-models/coco-ssd": "^2.2.3",
     "@tensorflow/tfjs": "^4.22.0",
     "@tensorflow/tfjs-backend-webgpu": "^4.22.0"
+  },
+  "overrides": {
+    "typescript": "5.9.3",
+    "@microsoft/api-extractor": {
+      "typescript": "5.8.2"
+    }
   }
 }
