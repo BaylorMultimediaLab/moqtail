@@ -401,11 +401,20 @@ export class Player {
       transport as unknown as { getStats: () => Promise<StatsResult> }
     ).getStats.bind(transport);
 
-    const s1 = await getStats();
-    const t1 = Date.now();
-    await new Promise(r => setTimeout(r, 200));
-    const s2 = await getStats();
-    const t2 = Date.now();
+    // Firefox ships getStats() as a stub that rejects with
+    // NS_ERROR_NOT_IMPLEMENTED, so a typeof check alone is not enough — an
+    // unhandled rejection here aborts the whole connect before attachMedia().
+    // Any failure just means "no estimate", which the caller already handles.
+    let s1: StatsResult, s2: StatsResult, t1: number, t2: number;
+    try {
+      s1 = await getStats();
+      t1 = Date.now();
+      await new Promise(r => setTimeout(r, 200));
+      s2 = await getStats();
+      t2 = Date.now();
+    } catch {
+      return 0;
+    }
 
     const deltaBytes = (s2.bytesReceived ?? 0) - (s1.bytesReceived ?? 0);
     const deltaMs = t2 - t1;
