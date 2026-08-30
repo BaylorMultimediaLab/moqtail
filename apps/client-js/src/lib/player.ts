@@ -38,6 +38,13 @@ import { TimeMap } from '@/lib/abr/TimeMap';
 const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
 
 /**
+ * Guard band for seam replacement. The seam must sit far enough ahead of the
+ * playhead that removing at it cannot strand the playhead in an unbuffered
+ * region; an overlap is a lesser evil than a stall.
+ */
+const SEAM_REMOVE_GUARD_SECONDS = 0.05;
+
+/**
  * If the chunk starts with a PRFT (Producer Reference Time) box per
  * ISO/IEC 14496-12 §8.16.5, return the publisher's wall-clock at chunk
  * production as UNIX milliseconds. Returns null otherwise.
@@ -698,6 +705,55 @@ export class Player {
               struct.postSwitchSentAt = switchSentAt;
               struct.postSwitchToTrack = newTrackName;
 
+              // Seam replacement (SWITCH PR #1378): the relay's catch-up range starts
+              // at switchTransition.switchingGroupId, so whatever is already
+              // buffered at or above that point is old-track media about to be
+              // re-delivered. Discard it first — otherwise both tracks' samples
+              // occupy the same span of the SourceBuffer, which is what fragments
+              // the buffered timeline and, on a large enough overlap, trips the
+              // demuxer.
+              //
+              // The first object of the new track begins exactly at the seam, so
+              // its baseMediaDecodeTime is the removal point. Parsed once here and
+              // reused below for the discontinuity record.
+              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const newStartPTS_ms =
+                newTimescale && newTimescale > 0
+                  ? parseMoofBaseMediaDecodeTime(
+                      new Uint8Array(
+                        object.payload.buffer,
+                        object.payload.byteOffset,
+                        object.payload.byteLength,
+                      ),
+                      newTimescale,
+                    )
+                  : undefined;
+
+              if (newStartPTS_ms !== undefined) {
+                const seamSeconds = newStartPTS_ms / 1000;
+                const playheadSeconds = this.#element?.currentTime ?? 0;
+                if (seamSeconds > playheadSeconds + SEAM_REMOVE_GUARD_SECONDS) {
+                  try {
+                    if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+                    sourceBuffer.remove(seamSeconds, Infinity);
+                    await waitForBufferUpdate(sourceBuffer);
+                  } catch (removeError) {
+                    // Non-fatal: the append below still succeeds, it just overlaps.
+                    logger.warn(
+                      'media',
+                      `switchTrack: seam removal at ${seamSeconds.toFixed(2)}s failed`,
+                      removeError,
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    'media',
+                    `switchTrack: seam ${seamSeconds.toFixed(2)}s is at or behind the ` +
+                      `playhead ${playheadSeconds.toFixed(2)}s; keeping the old-track buffer`,
+                  );
+                }
+              }
+
               // changeType() must not be called while the SourceBuffer is updating
               if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
               try {
@@ -717,22 +773,10 @@ export class Player {
                 return;
               }
 
-              // Compute and push the discontinuity record. PTS-gap is the headline
-              // metric: signed difference between the first appended frame's PTS on
-              // the new track and the last appended frame's end PTS on the old track.
-              const newTimescale = this.catalog?.getTimescale(newTrackName);
-              const newStartPTS_ms =
-                newTimescale && newTimescale > 0
-                  ? parseMoofBaseMediaDecodeTime(
-                      new Uint8Array(
-                        object.payload.buffer,
-                        object.payload.byteOffset,
-                        object.payload.byteLength,
-                      ),
-                      newTimescale,
-                    )
-                  : undefined;
-
+              // Push the discontinuity record. PTS-gap is the headline metric:
+              // signed difference between the first appended frame's PTS on the new
+              // track and the last appended frame's end PTS on the old track.
+              // newStartPTS_ms was parsed above for the seam removal.
               if (newStartPTS_ms !== undefined) {
                 const ptsGapMs = oldEndPTS_ms !== undefined ? newStartPTS_ms - oldEndPTS_ms : 0;
                 const playheadGapMs =
