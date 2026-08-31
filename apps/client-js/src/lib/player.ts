@@ -551,7 +551,17 @@ export class Player {
       for (let i = 0; i < buf.length - 1; i++) {
         const end = buf.end(i);
         const nextStart = buf.start(i + 1);
-        if (el.currentTime >= end - 0.05 && nextStart > end && nextStart - end < 1.5) {
+        // currentTime must be inside *this* gap, not merely past some earlier
+        // range's end: without the upper bound any earlier gap matches and the
+        // seek runs backwards. Visible once the timeline has several ranges —
+        // e.g. playhead at 199.69 with ranges [[170.7,179.7],[180.7,199.7],...]
+        // matched range 0 and seeked back to 180.7.
+        if (
+          el.currentTime >= end - 0.05 &&
+          el.currentTime < nextStart &&
+          nextStart > end &&
+          nextStart - end < 1.5
+        ) {
           logger.info(
             'media',
             `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
