@@ -1,0 +1,360 @@
+//! Builds CMAF (fMP4) media segments: one moof+mdat per encoded access unit.
+//!
+//! Each MoQ object delivered to the browser's MSE SourceBuffer must be a valid
+//! ISO BMFF media segment (moof + mdat). This module wraps raw HEVC packets
+//! (HVCC length-prefixed NAL units, as produced by FFmpeg with GLOBAL_HEADER)
+//! into that format.
+
+use bytes::Bytes;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// NTP epoch (1900) is 70 years + 17 leap days = 2_208_988_800 seconds
+// before the UNIX epoch (1970). RFC 5905.
+const NTP_UNIX_DELTA_SECONDS: u64 = 2_208_988_800;
+
+/// PRFT (Producer Reference Time) box per ISO/IEC 14496-12 §8.16.5.
+///
+/// CMAF receivers use this box to learn the producer's wall-clock time at
+/// the moment a chunk was produced. The receiver reads `ntp_timestamp`,
+/// converts to local epoch, and computes per-frame end-to-end latency.
+///
+/// Layout (version 1, 32 bytes total):
+///   0..4   box size (32, big-endian)
+///   4..8   "prft"
+///   8      version (1 — 64-bit media_time)
+///   9..12  flags (0)
+///   12..16 reference_track_ID
+///   16..24 ntp_timestamp (64-bit NTP fixed point)
+///   24..32 media_time (u64, version=1)
+///
+/// `ntp_timestamp` is the NTP "short format": upper 32 bits = seconds
+/// since 1900-01-01 UTC, lower 32 bits = fractional seconds (×2^-32).
+fn prft_box(reference_track_id: u32, ntp_timestamp: u64, media_time: u64) -> [u8; 32] {
+  let mut buf = [0u8; 32];
+  buf[0..4].copy_from_slice(&32u32.to_be_bytes());
+  buf[4..8].copy_from_slice(b"prft");
+  buf[8] = 1; // version
+  // bytes 9..12 are flags, already zero
+  buf[12..16].copy_from_slice(&reference_track_id.to_be_bytes());
+  buf[16..24].copy_from_slice(&ntp_timestamp.to_be_bytes());
+  buf[24..32].copy_from_slice(&media_time.to_be_bytes());
+  buf
+}
+
+/// Convert the current UNIX wall clock to NTP fixed-point format.
+///
+/// Public so the replay path ([crate::replay]) can stamp pre-encoded chunks
+/// with the wall-clock time at which they're being emitted, instead of the
+/// (stale) encode-time NTP that was baked into the cached bytes — otherwise
+/// the receiver's per-frame latency metric reads "this was encoded hours ago"
+/// and the player drains its buffer.
+pub fn now_ntp_timestamp() -> u64 {
+  let d = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default();
+  let seconds = d.as_secs() + NTP_UNIX_DELTA_SECONDS;
+  // Fractional part of one second as Q32: (nanos / 1e9) * 2^32.
+  let nanos = d.subsec_nanos() as u64;
+  let fraction = (nanos << 32) / 1_000_000_000;
+  (seconds << 32) | (fraction & 0xFFFF_FFFF)
+}
+
+/// Wraps a single encoded HEVC access unit in a CMAF chunk (prft + moof + mdat).
+///
+/// A `prft` box is prepended so receivers can compute end-to-end latency
+/// per frame (see `LatencyTrendRule` on the client). PRFT is a top-level
+/// ISOBMFF box; CMAF receivers that don't care about it skip it cleanly.
+///
+/// * `sequence_number` — increments per fragment (usually per frame).
+/// * `decode_time` — in timescale ticks (e.g. 90 000 Hz).
+/// * `duration` — sample duration in timescale ticks.
+/// * `is_keyframe` — true for IDR/keyframe; sets sync-sample flag.
+/// * `data` — raw HEVC payload (HVCC length-prefixed NALs from FFmpeg).
+pub fn wrap_cmaf_chunk(
+  sequence_number: u32,
+  decode_time: u64,
+  duration: u32,
+  is_keyframe: bool,
+  data: &[u8],
+) -> Bytes {
+  // Pre-calculate sizes bottom-up so we can write everything in one pass.
+  let mdat_payload_len = data.len();
+  let mdat_size = 8 + mdat_payload_len; // box header (8) + payload
+
+  // trun: fullbox(12) + sample_count(4) + data_offset(4) + per-sample(duration 4 + size 4 + flags 4) = 32
+  let trun_size: u32 = 32;
+  // tfdt: fullbox(12) + baseMediaDecodeTime(8) = 20  (version 1 for u64 time)
+  let tfdt_size: u32 = 20;
+  // tfhd: fullbox(12) + track_id(4) = 16
+  let tfhd_size: u32 = 16;
+  // traf: box(8) + children
+  let traf_size: u32 = 8 + tfhd_size + tfdt_size + trun_size;
+  // mfhd: fullbox(12) + sequence_number(4) = 16
+  let mfhd_size: u32 = 16;
+  // moof: box(8) + children
+  let moof_size: u32 = 8 + mfhd_size + traf_size;
+
+  // trun data_offset: bytes from the start of moof to the start of mdat payload
+  let data_offset: i32 = moof_size as i32 + 8; // +8 for mdat box header
+
+  let prft = prft_box(1, now_ntp_timestamp(), decode_time);
+  let total = prft.len() + moof_size as usize + mdat_size;
+  let mut buf = Vec::with_capacity(total);
+
+  // ---- prft (producer reference time, ISO/IEC 14496-12 §8.16.5) ----
+  buf.extend_from_slice(&prft);
+
+  // ---- moof ----
+  write_u32(&mut buf, moof_size);
+  buf.extend_from_slice(b"moof");
+
+  // mfhd
+  write_u32(&mut buf, mfhd_size);
+  buf.extend_from_slice(b"mfhd");
+  write_u32(&mut buf, 0); // version + flags
+  write_u32(&mut buf, sequence_number);
+
+  // traf
+  write_u32(&mut buf, traf_size);
+  buf.extend_from_slice(b"traf");
+
+  // tfhd — flags: 0x020000 = default-base-is-moof
+  write_u32(&mut buf, tfhd_size);
+  buf.extend_from_slice(b"tfhd");
+  write_u32(&mut buf, 0x00_02_00_00); // version 0, flags=default-base-is-moof
+  write_u32(&mut buf, 1); // track_ID
+
+  // tfdt — version 1 (64-bit baseMediaDecodeTime)
+  write_u32(&mut buf, tfdt_size);
+  buf.extend_from_slice(b"tfdt");
+  write_u32(&mut buf, 0x01_00_00_00); // version 1, flags 0
+  write_u64(&mut buf, decode_time);
+
+  // trun — flags: 0x000301 = data-offset-present | first-sample-flags-present | sample-duration-present | sample-size-present
+  // Actually the exact flag bits:
+  //   0x000001 = data-offset-present
+  //   0x000004 = first-sample-flags-present  (not needed if we use per-sample flags)
+  //   0x000100 = sample-duration-present
+  //   0x000200 = sample-size-present
+  //   0x000400 = sample-flags-present (per sample)
+  // We use per-sample: duration + size + flags = 0x000701
+  let trun_flags: u32 = 0x00_00_07_01; // data-offset + duration + size + flags per sample
+  write_u32(&mut buf, trun_size);
+  buf.extend_from_slice(b"trun");
+  write_u32(&mut buf, trun_flags); // version 0 + flags
+  write_u32(&mut buf, 1); // sample_count
+  write_i32(&mut buf, data_offset);
+  // Per-sample fields:
+  write_u32(&mut buf, duration);
+  write_u32(&mut buf, mdat_payload_len as u32);
+  // Sample flags: for keyframe = 0x02000000 (depends_on_nothing),
+  // for non-key = 0x01010000 (is_non_sync | depends_on_other)
+  let sample_flags: u32 = if is_keyframe { 0x02000000 } else { 0x01010000 };
+  write_u32(&mut buf, sample_flags);
+
+  // ---- mdat ----
+  write_u32(&mut buf, mdat_size as u32);
+  buf.extend_from_slice(b"mdat");
+  buf.extend_from_slice(data);
+
+  debug_assert_eq!(buf.len(), total);
+  Bytes::from(buf)
+}
+
+/// Replaces the 8-byte NTP timestamp inside the leading `prft` box of a
+/// CMAF chunk produced by [`wrap_cmaf_chunk`]. Returns the original `Bytes`
+/// unchanged if the input doesn't begin with a valid prft box (length and
+/// fourcc check). Tries to mutate in place when the `Bytes` is uniquely
+/// owned (the common case after reading a cached `.gop` file) to avoid a
+/// per-packet allocation.
+pub fn replace_prft_ntp(pkt: Bytes, ntp: u64) -> Bytes {
+  if pkt.len() < 32 || &pkt[4..8] != b"prft" {
+    return pkt;
+  }
+  let mut bm = match pkt.try_into_mut() {
+    Ok(bm) => bm,
+    Err(b) => bytes::BytesMut::from(b.as_ref()),
+  };
+  bm[16..24].copy_from_slice(&ntp.to_be_bytes());
+  bm.freeze()
+}
+
+/// Converts Annex B HEVC bitstream (start-code delimited) to HVCC/AVCC format
+/// (4-byte big-endian length prefix per NAL unit).
+///
+/// FFmpeg with `GLOBAL_HEADER` flag + `hevc_videotoolbox` already produces
+/// HVCC-format output (length-prefixed). `libx265` may produce Annex B
+/// (00 00 00 01 or 00 00 01 delimiters). This function handles both cases:
+/// if the data already looks like length-prefixed NALs, it returns it as-is.
+pub fn annex_b_to_hvcc(data: &[u8]) -> Vec<u8> {
+  // Quick heuristic: if first 4 bytes don't look like a start code,
+  // assume it's already length-prefixed (HVCC format).
+  if data.len() < 4 {
+    return data.to_vec();
+  }
+  if data[0..3] != [0, 0, 1] && data[0..4] != [0, 0, 0, 1] {
+    return data.to_vec();
+  }
+
+  // Split on Annex B start codes and re-prefix with 4-byte lengths.
+  let mut out = Vec::with_capacity(data.len());
+  let mut i = 0;
+  let len = data.len();
+
+  while i < len {
+    // Skip start code
+    let start;
+    if i + 3 < len && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+      start = i + 4;
+    } else if i + 2 < len && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+      start = i + 3;
+    } else {
+      // No start code at current position — skip byte
+      i += 1;
+      continue;
+    }
+
+    // Find next start code (or end of data)
+    let mut end = start;
+    while end < len {
+      if end + 3 < len
+        && data[end] == 0
+        && data[end + 1] == 0
+        && data[end + 2] == 0
+        && data[end + 3] == 1
+      {
+        break;
+      }
+      if end + 2 < len && data[end] == 0 && data[end + 1] == 0 && data[end + 2] == 1 {
+        break;
+      }
+      end += 1;
+    }
+
+    // Strip trailing zeros that belong to the next start code
+    let mut nal_end = end;
+    while nal_end > start && data[nal_end - 1] == 0 {
+      nal_end -= 1;
+    }
+
+    let nal_len = nal_end - start;
+    if nal_len > 0 {
+      out.extend_from_slice(&(nal_len as u32).to_be_bytes());
+      out.extend_from_slice(&data[start..nal_end]);
+    }
+
+    i = end;
+  }
+
+  out
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn write_u32(buf: &mut Vec<u8>, v: u32) {
+  buf.extend_from_slice(&v.to_be_bytes());
+}
+
+fn write_u64(buf: &mut Vec<u8>, v: u64) {
+  buf.extend_from_slice(&v.to_be_bytes());
+}
+
+fn write_i32(buf: &mut Vec<u8>, v: i32) {
+  buf.extend_from_slice(&v.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_cmaf_chunk_starts_with_prft() {
+    // PRFT box is prepended so receivers can compute per-frame latency.
+    let chunk = wrap_cmaf_chunk(1, 0, 3000, true, &[0xAA; 16]);
+    assert!(chunk.len() > 32);
+    assert_eq!(&chunk[0..4], &32u32.to_be_bytes());
+    assert_eq!(&chunk[4..8], b"prft");
+  }
+
+  #[test]
+  fn test_cmaf_chunk_moof_follows_prft() {
+    let chunk = wrap_cmaf_chunk(1, 0, 3000, true, &[0xAA; 16]);
+    // moof immediately follows the 32-byte prft box.
+    assert_eq!(&chunk[32 + 4..32 + 8], b"moof");
+  }
+
+  #[test]
+  fn test_cmaf_chunk_ends_with_mdat_payload() {
+    let payload = [0xBB; 32];
+    let chunk = wrap_cmaf_chunk(1, 0, 3000, true, &payload);
+    // Last 32 bytes should be our payload
+    assert_eq!(&chunk[chunk.len() - 32..], &payload);
+  }
+
+  #[test]
+  fn test_prft_box_layout() {
+    let b = prft_box(7, 0xABCD_1234_DEAD_BEEF, 0x1122_3344);
+    assert_eq!(&b[0..4], &32u32.to_be_bytes());
+    assert_eq!(&b[4..8], b"prft");
+    assert_eq!(b[8], 1); // version
+    assert_eq!(&b[12..16], &7u32.to_be_bytes());
+    assert_eq!(&b[16..24], &0xABCD_1234_DEAD_BEEFu64.to_be_bytes());
+    assert_eq!(&b[24..32], &0x1122_3344u64.to_be_bytes());
+  }
+
+  #[test]
+  fn test_replace_prft_ntp_patches_only_ntp_bytes() {
+    let pkt = wrap_cmaf_chunk(7, 0x1234, 1500, true, &[0xAA; 16]);
+    let original = pkt.clone();
+    let new_ntp: u64 = 0x4242_4242_4242_4242;
+    let patched = replace_prft_ntp(pkt, new_ntp);
+    assert_eq!(patched.len(), original.len());
+    assert_eq!(&patched[16..24], &new_ntp.to_be_bytes());
+    assert_eq!(&patched[0..16], &original[0..16]);
+    assert_eq!(&patched[24..], &original[24..]);
+  }
+
+  #[test]
+  fn test_replace_prft_ntp_passes_through_when_no_prft() {
+    let bogus = Bytes::from(vec![0u8; 32]);
+    let result = replace_prft_ntp(bogus.clone(), 0x12345678);
+    assert_eq!(result, bogus);
+  }
+
+  #[test]
+  fn test_ntp_timestamp_above_unix_epoch() {
+    // Sanity: produced NTP timestamp should be >> NTP_UNIX_DELTA (i.e., we're
+    // past 1970 in UNIX terms — which is always true on a real system).
+    let ntp = now_ntp_timestamp();
+    let seconds = ntp >> 32;
+    assert!(seconds > NTP_UNIX_DELTA_SECONDS);
+  }
+
+  #[test]
+  fn test_annex_b_passthrough_for_hvcc() {
+    // Already length-prefixed: first bytes are a length, not a start code
+    let data = vec![0x00, 0x00, 0x00, 0x05, 0x40, 0x01, 0x0C, 0x01, 0x00];
+    let result = annex_b_to_hvcc(&data);
+    assert_eq!(result, data);
+  }
+
+  #[test]
+  fn test_annex_b_conversion() {
+    // Annex B with 4-byte start code + 3 bytes NAL + 4-byte start code + 2 bytes NAL
+    let mut data = vec![];
+    data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+    data.extend_from_slice(&[0x40, 0x01, 0x0C]); // NAL 1 (3 bytes)
+    data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+    data.extend_from_slice(&[0x42, 0x01]); // NAL 2 (2 bytes)
+
+    let result = annex_b_to_hvcc(&data);
+    // Should be: 4-byte len(3) + NAL1 + 4-byte len(2) + NAL2
+    assert_eq!(result.len(), 4 + 3 + 4 + 2);
+    assert_eq!(&result[0..4], &[0, 0, 0, 3]); // length 3
+    assert_eq!(&result[4..7], &[0x40, 0x01, 0x0C]); // NAL 1
+    assert_eq!(&result[7..11], &[0, 0, 0, 2]); // length 2
+    assert_eq!(&result[11..13], &[0x42, 0x01]); // NAL 2
+  }
+}

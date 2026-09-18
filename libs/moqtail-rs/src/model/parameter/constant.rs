@@ -64,6 +64,12 @@ pub enum MessageParameterType {
   GroupOrder = 0x22,
   NewGroupRequest = 0x32,
   TrackNamespacePrefix = 0x34,
+  /// Project-local extension; non-MoQT-standard.
+  /// Behind-live offset in groups for filtered (delay-mode) clients.
+  DelayGroups = 0x70,
+  /// Project-local extension; non-MoQT-standard.
+  /// Absolute group_id where a Switch should start delivering the new track.
+  StartLocationGroup = 0x72,
 }
 
 impl TryFrom<u64> for MessageParameterType {
@@ -84,6 +90,8 @@ impl TryFrom<u64> for MessageParameterType {
       0x22 => Ok(MessageParameterType::GroupOrder),
       0x32 => Ok(MessageParameterType::NewGroupRequest),
       0x34 => Ok(MessageParameterType::TrackNamespacePrefix),
+      0x70 => Ok(MessageParameterType::DelayGroups),
+      0x72 => Ok(MessageParameterType::StartLocationGroup),
       _ => Err(ParseError::InvalidType {
         context: "MessageParameterType::try_from(u64)",
         details: format!("Unknown parameter type, got {value}"),

@@ -24,6 +24,25 @@ export const DEFAULT_BUFFER_CHECK_INTERVAL = 250; // milliseconds
 export const DEFAULT_STALL_THRESHOLD = 0.5; // seconds
 export const DEFAULT_CATCHUP_PLAYBACK_RATE = 1.05; // 5% faster
 
+/**
+ * Computes the target latency (seconds behind live edge) for the MSEBuffer's
+ * catch-up loop. Filtered clients should hold the playhead at
+ * `filterDelaySeconds` behind live (matching the wire-level DELAY_GROUPS);
+ * unfiltered clients use the default 1.25s for buffer runway.
+ *
+ * Defensive: filtered + non-positive delay falls back to DEFAULT to avoid
+ * parking the playhead at zero buffer (which immediately stalls MSE).
+ */
+export function computeLiveEdgeDelay(
+  clientMode: 'filtered' | 'unfiltered',
+  filterDelaySeconds: number,
+): number {
+  if (clientMode === 'filtered' && filterDelaySeconds > 0) {
+    return filterDelaySeconds;
+  }
+  return DEFAULT_LIVE_EDGE_DELAY;
+}
+
 interface MSEBufferConfig {
   /** Delay from live edge in seconds (default: 0.6) */
   liveEdgeDelay: number;
@@ -133,9 +152,9 @@ class MSEBuffer {
   }
 
   private periodicBufferCheck() {
-    // Only check for live streams
-    if (!this.video.duration || isFinite(this.video.duration)) {
-      return; // Not a live stream
+    // Check for live streams: either Infinity duration or MediaSource-backed (no finite duration set)
+    if (this.video.duration && isFinite(this.video.duration) && this.video.duration > 0) {
+      return; // VOD stream with known duration — skip live edge management
     }
 
     this.checkBufferedRegions(false);

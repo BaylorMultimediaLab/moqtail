@@ -17,14 +17,21 @@ use crate::server::client::switch_context::SwitchStatus;
 use crate::server::message_handlers::parameters;
 use crate::server::session::Session;
 use crate::server::session_context::{PendingRequest, SessionContext};
+use crate::server::stream_id::StreamId;
 use crate::server::track::{Track, TrackOrigin, TrackStatus, await_publisher_streams};
+use bytes::Bytes;
 use core::result::Result;
+use moqtail::model::common::location::Location;
+use moqtail::model::control::constant::FilterType;
 use moqtail::model::control::constant::PublishDoneStatusCode;
 use moqtail::model::control::publish_done::PublishDone;
 use moqtail::model::control::request_error::RequestError;
 use moqtail::model::control::request_ok::RequestOk;
 use moqtail::model::control::subscribe::Subscribe;
+use moqtail::model::control::subscribe_ok::SubscribeOk;
 use moqtail::model::data::full_track_name::FullTrackName;
+use moqtail::model::data::subgroup_header::SubgroupHeader;
+use moqtail::model::data::subgroup_object::SubgroupObject;
 use moqtail::model::error::RequestErrorCode;
 use moqtail::model::error::StreamResetCode;
 use moqtail::model::error::TerminationCode;
@@ -38,9 +45,229 @@ use moqtail::model::{
 use moqtail::transport::control_stream_handler::ControlStreamHandler;
 use moqtail::transport::data_stream_handler::SubscribeRequest;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
+
+/// Search a SUBSCRIBE message's parameters for the project-local DELAY_GROUPS
+/// parameter. Returns the first match's value, or None if not present.
+///
+/// Used by the SUBSCRIBE handler when computing a delay-mode start location:
+/// the relay puts a filtered client `delay_groups` behind the live edge.
+fn parse_delay_groups(params: &[MessageParameter]) -> Option<u64> {
+  params.iter().find_map(|p| match p {
+    MessageParameter::DelayGroups { groups } => Some(*groups),
+    _ => None,
+  })
+}
+
+/// Search a SWITCH's parameters for the project-local START_LOCATION_GROUP
+/// parameter. Returns the first match's value, or None if not present. Used by
+/// handle_switch_message to start the new track at an absolute group_id rather
+/// than at the live edge.
+fn parse_start_location_group(params: &[MessageParameter]) -> Option<u64> {
+  params.iter().find_map(|p| match p {
+    MessageParameter::StartLocationGroup { group } => Some(*group),
+    _ => None,
+  })
+}
+
+/// The relay's decision after applying a `DELAY_GROUPS` parameter to a SUBSCRIBE.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DelayedStart {
+  /// The requested target is in-window; deliver from this location.
+  Ready(Location),
+  /// The requested target predates the cache; deliver from the oldest available.
+  ClampedToOldest(Location),
+  /// `largest_location.group < delay_groups` (stream too young) -- register the
+  /// subscribe in a pending state and resolve once the live edge advances.
+  Hold { delay_groups: u64 },
+}
+
+/// Decide what start_location a delayed (filtered) SUBSCRIBE should use.
+///
+/// Pure function: no I/O, no async, no side effects. Inputs are the relay's
+/// current view of the live edge (`largest`), the delay the client requested
+/// (`delay_groups`), and the oldest group currently in the cache (or None
+/// if the relay hasn't started caching yet).
+pub(crate) fn compute_delayed_start(
+  largest: Option<Location>,
+  delay_groups: u64,
+  oldest_cached_group: Option<u64>,
+) -> DelayedStart {
+  let Some(largest_loc) = largest else {
+    return DelayedStart::Hold { delay_groups };
+  };
+  if largest_loc.group < delay_groups {
+    return DelayedStart::Hold { delay_groups };
+  }
+  let target_group = largest_loc.group - delay_groups;
+  let target = Location {
+    group: target_group,
+    object: 0,
+  };
+  if let Some(oldest) = oldest_cached_group
+    && target_group < oldest
+  {
+    return DelayedStart::ClampedToOldest(Location {
+      group: oldest,
+      object: 0,
+    });
+  }
+  DelayedStart::Ready(target)
+}
+
+// Synthetic-probe track aliases live well above any plausible relay-assigned
+// alias so they can't collide with real video tracks. Per IETF 119 MoQ
+// bandwidth-measurement slides, a subscriber can request a one-shot payload of
+// arbitrary size by subscribing to `.probe:<size>:<priority>`.
+//
+// QUIC varints (RFC 9000 §16) can only encode values up to 2^62 - 1, so the
+// alias must stay below that. 2^60 is far above any plausible relay track id
+// and well within varint range.
+const PROBE_ALIAS_BASE: u64 = 1u64 << 60;
+static PROBE_ALIAS_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PROBE_MAX_SIZE: usize = 16 * 1024 * 1024;
+// Per-object chunk size. WebTransport's read() returns once per MoQ object,
+// so the receiver only sees inter-arrival timing if the probe is split into
+// multiple objects. 4 KB ≈ a few MTU-sized packets per object -- small
+// enough to give SWMA-style timing samples, large enough that overhead
+// per object is negligible.
+const PROBE_CHUNK_SIZE: usize = 4096;
+
+/// Parse `.probe:<size>:<priority>` from a track-name byte slice.
+/// Returns `(size_bytes, priority_byte)` on match.
+fn parse_probe_track_name(name_bytes: &[u8]) -> Option<(usize, u8)> {
+  let s = std::str::from_utf8(name_bytes).ok()?;
+  let rest = s.strip_prefix(".probe:")?;
+  let mut parts = rest.splitn(3, ':');
+  let size: usize = parts.next()?.parse().ok()?;
+  let priority: u8 = parts.next()?.parse().ok()?;
+  if parts.next().is_some() {
+    return None;
+  }
+  if size == 0 || size > PROBE_MAX_SIZE {
+    return None;
+  }
+  Some((size, priority))
+}
+
+/// Synthesize one object of `size` bytes for a `.probe:` SUBSCRIBE.
+///
+/// Bypasses the normal publisher lookup, track_manager registration, and
+/// switch-context tracking -- the probe is a pure relay-side artifact and
+/// must never collide with real-track state. The relay sends SubscribeOk
+/// (which teaches the client a synthetic track_alias), opens a uni stream
+/// with a SubgroupHeader, writes `size` zero bytes as a run of
+/// SubgroupObjects, and closes the stream.
+async fn handle_probe_subscribe(
+  client: Arc<MOQTClient>,
+  control_stream_handler: &mut ControlStreamHandler,
+  sub: Subscribe,
+  size: usize,
+  probe_priority: u8,
+) -> Result<(), TerminationCode> {
+  info!(
+    "synthetic probe: request_id={} size={} priority={}",
+    sub.request_id, size, probe_priority
+  );
+
+  // Allocate a unique synthetic alias. PROBE_ALIAS_BASE puts these in a
+  // range no real track would ever get.
+  let track_alias = PROBE_ALIAS_BASE + PROBE_ALIAS_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+  // SubscribeOk first so the client maps track_alias before any data lands.
+  let subscribe_ok = SubscribeOk::new(
+    track_alias,
+    vec![MessageParameter::new_largest_object(Location::new(0, 0))],
+    vec![],
+  );
+  if let Err(e) = control_stream_handler.send_impl(&subscribe_ok).await {
+    warn!("probe: failed to send SubscribeOk: {:?}", e);
+    return Ok(());
+  }
+
+  // Translate slide convention (priority byte: 0=low, non-zero=high) to MoQ
+  // publisher_priority (lower numeric = higher priority). 0 → 255 (lowest).
+  let pub_priority: u8 = if probe_priority == 0 { 255 } else { 0 };
+
+  let header = SubgroupHeader::new_with_explicit_id(
+    track_alias,
+    0,                  // group_id
+    0,                  // subgroup_id
+    Some(pub_priority), // publisher_priority
+    false,              // has_properties
+    true,               // contains_end_of_group -- single-subgroup group
+    true,               // first_object -- the stream starts at object 0
+  );
+
+  let header_bytes = match header.serialize(Some(track_alias)) {
+    Ok(b) => b,
+    Err(e) => {
+      warn!("probe: failed to serialize header: {:?}", e);
+      return Ok(());
+    }
+  };
+
+  let stream_id = StreamId::new_subgroup(track_alias, 0, Some(0));
+
+  // Stream-scheduling priority 0 -- yield to real video under congestion.
+  let send_stream = match client.open_stream(&stream_id, header_bytes, 0).await {
+    Ok(s) => s,
+    Err(e) => {
+      warn!("probe: failed to open stream: {:?}", e);
+      return Ok(());
+    }
+  };
+
+  // Split the probe payload across multiple SubgroupObjects so the client
+  // sees several read() events on one stream and can compute inter-arrival
+  // throughput (SWMA-style) rather than a single point sample.
+  let mut bytes_remaining = size;
+  let mut object_id: u64 = 0;
+  let mut prev_object_id: Option<u64> = None;
+  while bytes_remaining > 0 {
+    let chunk = std::cmp::min(bytes_remaining, PROBE_CHUNK_SIZE);
+    let payload = Bytes::from(vec![0u8; chunk]);
+    let sub_object = SubgroupObject {
+      object_id,
+      properties: None,
+      object_status: None,
+      payload: Some(payload),
+    };
+    let object_bytes = match sub_object.serialize(prev_object_id, false) {
+      Ok(b) => b,
+      Err(e) => {
+        warn!("probe: failed to serialize chunk {}: {:?}", object_id, e);
+        let _ = client.close_stream(&stream_id).await;
+        return Ok(());
+      }
+    };
+    if let Err(e) = client
+      .write_stream_object(
+        &stream_id,
+        object_id,
+        object_bytes,
+        Some(send_stream.clone()),
+      )
+      .await
+    {
+      warn!("probe: failed to write chunk {}: {:?}", object_id, e);
+      break;
+    }
+    prev_object_id = Some(object_id);
+    object_id += 1;
+    bytes_remaining -= chunk;
+  }
+
+  let _ = client.close_stream(&stream_id).await;
+
+  info!(
+    "synthetic probe: completed alias={} size={} priority={}",
+    track_alias, size, pub_priority
+  );
+  Ok(())
+}
 
 async fn add_subscription(
   subscribe: Subscribe,
@@ -391,6 +618,15 @@ async fn handle_subscribe_message(
     return Ok(());
   }
 
+  // Synthetic-probe shortcut. A SUBSCRIBE for `.probe:<size>:<priority>` is
+  // not routed to any publisher; the relay generates `size` bytes locally and
+  // ends. This intentionally skips track_manager registration and publisher
+  // lookup so probe traffic can never share a track alias with real video and
+  // corrupt switch_context.
+  if let Some((size, priority)) = parse_probe_track_name(sub.track_name.as_bytes()) {
+    return handle_probe_subscribe(client, stream_handler, sub, size, priority).await;
+  }
+
   // Every publisher of the exact Track, plus every publisher that announced a namespace
   // it falls under. A SUBSCRIBE goes to all of them, not to whichever matched first.
   let publishers = {
@@ -450,6 +686,82 @@ async fn handle_subscribe_message(
       )
     })
     .await;
+
+  // Delay-mode handling: filtered clients subscribe with DELAY_GROUPS asking
+  // the relay to start delivery `delay_groups` behind the live edge. The
+  // SUBSCRIBE is rewritten to AbsoluteStart at the computed group before the
+  // subscription is created, so the cache-replay path serves the backlog.
+  let mut sub = sub;
+  if let Some(delay_groups) = parse_delay_groups(&sub.subscribe_parameters) {
+    info!(
+      "Subscribe has DELAY_GROUPS={} (request_id={})",
+      delay_groups, sub.request_id
+    );
+    // Clone the handles out of the guard: the hold below awaits, and the
+    // track lock must not be held across it.
+    let (live_edge_advanced, cache, holding_subscribes) = {
+      let track = track_arc.read().await;
+      (
+        track.live_edge_advanced.clone(),
+        track.cache.clone(),
+        track.holding_subscribes.clone(),
+      )
+    };
+    // Loop until we can resolve the requested start position.
+    // Mesa-style condition wait: arm the Notify *before* re-reading state
+    // to avoid lost-wakeup races (a notify_waiters between our compute and
+    // our await would otherwise be missed).
+    let mut registered = false;
+    loop {
+      let notified = live_edge_advanced.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+
+      let largest = { track_arc.read().await.largest_object().await };
+      let oldest_cached = cache.oldest_group_id().await;
+      let decision = compute_delayed_start(largest.clone(), delay_groups, oldest_cached);
+
+      match decision {
+        DelayedStart::Ready(loc) | DelayedStart::ClampedToOldest(loc) => {
+          info!(
+            "Subscribe delay-mode resolved: request_id={} largest={:?} \
+             oldest_cached={:?} -> start_location={:?}",
+            sub.request_id, largest, oldest_cached, loc
+          );
+          sub
+            .subscribe_parameters
+            .set_param(MessageParameter::new_subscription_filter(
+              FilterType::AbsoluteStart,
+              Some(loc),
+              None,
+            ));
+          // Drain any holding-state record for this request (informational).
+          if registered && let Some(largest) = largest {
+            let _ = holding_subscribes.write().await.try_resolve(largest);
+          }
+          break;
+        }
+        DelayedStart::Hold { delay_groups: dg } => {
+          if !registered {
+            info!(
+              "Subscribe delay-mode HOLD: request_id={} delay_groups={} \
+               largest={:?}; awaiting live edge advance",
+              sub.request_id, dg, largest
+            );
+            holding_subscribes
+              .write()
+              .await
+              .register(sub.request_id, dg);
+            registered = true;
+          }
+          // Wait for the live edge to advance, then re-check. The Notify arm
+          // placed before the read still covers any notify_waiters that fired
+          // during the read; if one already happened this returns at once.
+          notified.await;
+        }
+      }
+    }
+  }
 
   // Scoped so the guard is gone before anything below reaches for this lock again.
   // tokio's RwLock is not reentrant and hands the lock to a queued writer first, so a
@@ -1212,12 +1524,33 @@ async fn handle_switch_message(
 
   switch_params.set_param(MessageParameter::new_forward(true)); // forward always true for switch
 
-  let subscribe = Subscribe::new_latest_object(
-    switch_message.request_id,
-    switch_message.track_namespace.clone(),
-    switch_message.track_name.clone(),
-    switch_params,
-  );
+  // Inspect for START_LOCATION_GROUP: when present, start the new track at
+  // the requested absolute group (aligned switch). Otherwise default to the
+  // live-edge ("naive switch") semantic.
+  let subscribe = match parse_start_location_group(&switch_params) {
+    Some(start_group) => {
+      info!(
+        "Switch has START_LOCATION_GROUP={}; using new_absolute_start (request_id={})",
+        start_group, switch_message.request_id
+      );
+      Subscribe::new_absolute_start(
+        switch_message.request_id,
+        switch_message.track_namespace.clone(),
+        switch_message.track_name.clone(),
+        Location {
+          group: start_group,
+          object: 0,
+        },
+        switch_params,
+      )
+    }
+    None => Subscribe::new_latest_object(
+      switch_message.request_id,
+      switch_message.track_namespace.clone(),
+      switch_message.track_name.clone(),
+      switch_params,
+    ),
+  };
 
   let new_full_track_name = subscribe.get_full_track_name();
 
@@ -1316,5 +1649,134 @@ mod tests {
     ] {
       assert_eq!(publish_done_status_for(error), status, "for {error:?}");
     }
+  }
+}
+
+#[cfg(test)]
+mod tests_parse_delay_groups {
+  use super::*;
+
+  #[test]
+  fn parse_delay_groups_returns_some_when_present() {
+    let params = vec![MessageParameter::new_delay_groups(5)];
+    assert_eq!(parse_delay_groups(&params), Some(5));
+  }
+
+  #[test]
+  fn parse_delay_groups_returns_none_when_absent() {
+    let params: Vec<MessageParameter> = vec![];
+    assert_eq!(parse_delay_groups(&params), None);
+  }
+
+  #[test]
+  fn parse_delay_groups_ignores_other_params() {
+    let params = vec![MessageParameter::new_object_delivery_timeout(99)];
+    assert_eq!(parse_delay_groups(&params), None);
+  }
+
+  #[test]
+  fn parse_delay_groups_tolerates_duplicate_returns_first() {
+    let params = vec![
+      MessageParameter::new_delay_groups(7),
+      MessageParameter::new_delay_groups(11),
+    ];
+    assert_eq!(parse_delay_groups(&params), Some(7));
+  }
+}
+
+#[cfg(test)]
+mod tests_compute_delayed_start {
+  use super::*;
+
+  fn loc(group: u64, object: u64) -> Location {
+    Location { group, object }
+  }
+
+  #[test]
+  fn ready_when_largest_is_well_above_delay_and_target_in_cache() {
+    let result = compute_delayed_start(Some(loc(100, 0)), 2, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(98, 0)));
+  }
+
+  #[test]
+  fn hold_when_largest_below_delay() {
+    let result = compute_delayed_start(Some(loc(1, 0)), 5, Some(0));
+    assert_eq!(result, DelayedStart::Hold { delay_groups: 5 });
+  }
+
+  #[test]
+  fn ready_when_largest_exactly_equals_delay() {
+    let result = compute_delayed_start(Some(loc(5, 0)), 5, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(0, 0)));
+  }
+
+  #[test]
+  fn hold_when_largest_is_none() {
+    let result = compute_delayed_start(None, 5, None);
+    assert_eq!(result, DelayedStart::Hold { delay_groups: 5 });
+  }
+
+  #[test]
+  fn clamped_to_oldest_when_target_below_cache_window() {
+    let result = compute_delayed_start(Some(loc(100, 0)), 80, Some(50));
+    assert_eq!(result, DelayedStart::ClampedToOldest(loc(50, 0)));
+  }
+
+  #[test]
+  fn ready_when_delay_is_zero() {
+    let result = compute_delayed_start(Some(loc(100, 0)), 0, Some(0));
+    assert_eq!(result, DelayedStart::Ready(loc(100, 0)));
+  }
+
+  #[test]
+  fn ready_when_target_exactly_equals_oldest_cached() {
+    let result = compute_delayed_start(Some(loc(100, 0)), 50, Some(50));
+    assert_eq!(result, DelayedStart::Ready(loc(50, 0)));
+  }
+
+  #[test]
+  fn ready_when_oldest_cached_is_none() {
+    let result = compute_delayed_start(Some(loc(100, 0)), 80, None);
+    assert_eq!(result, DelayedStart::Ready(loc(20, 0)));
+  }
+}
+
+#[cfg(test)]
+mod tests_parse_start_location_group {
+  use super::*;
+
+  #[test]
+  fn parse_returns_some_when_present() {
+    let params = vec![MessageParameter::new_start_location_group(42)];
+    assert_eq!(parse_start_location_group(&params), Some(42));
+  }
+
+  #[test]
+  fn parse_returns_none_when_absent() {
+    let params: Vec<MessageParameter> = vec![];
+    assert_eq!(parse_start_location_group(&params), None);
+  }
+
+  #[test]
+  fn parse_ignores_other_params() {
+    let params = vec![MessageParameter::new_delay_groups(99)];
+    assert_eq!(parse_start_location_group(&params), None);
+  }
+}
+
+#[cfg(test)]
+mod tests_parse_probe_track_name {
+  use super::*;
+
+  #[test]
+  fn parses_size_and_priority() {
+    assert_eq!(parse_probe_track_name(b".probe:4096:1"), Some((4096, 1)));
+  }
+
+  #[test]
+  fn rejects_non_probe_names() {
+    assert_eq!(parse_probe_track_name(b"video-720p"), None);
+    assert_eq!(parse_probe_track_name(b".probe:0:1"), None);
+    assert_eq!(parse_probe_track_name(b".probe:10:1:extra"), None);
   }
 }

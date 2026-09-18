@@ -15,133 +15,359 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
-import { uniqueNamesGenerator, colors, animals } from 'unique-names-generator';
+import type { ComponentChildren } from 'preact';
 import { Player } from '@/lib/player';
-import { Publisher } from '@/lib/publisher';
-import { Tuple, type CMSFTrack } from 'moqtail';
-import MSEBuffer from '@/lib/buffer';
-import type { Track, Status, SourceState, SourceKind, PublishStatus } from '@/types';
-import { Header } from '@/components/Header';
-import { Sidebar } from '@/components/Sidebar';
-import { VideoPlayer } from '@/components/VideoPlayer';
-import { LocalPreview } from '@/components/LocalPreview';
-import { logger } from '@/lib/logger';
-import { applyLogLevel, parseLogLevel } from '@/lib/utils';
-import { parseMsfUrl, buildMsfUrl } from '@/lib/msf-url';
+import { cn } from '@/lib/utils';
+import { Tuple, type CMSF } from 'moqtail';
+import MSEBuffer, { computeLiveEdgeDelay } from '@/lib/buffer';
+import { AbrController, AbrRulesCollection, DEFAULT_ABR_SETTINGS } from '@/lib/abr';
+import type { AbrMetrics, AbrSettings } from '@/lib/abr';
+import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
+import type { MetricsSnapshot } from '@/lib/metrics/types';
+import { SettingsPanel } from '@/components/SettingsPanel';
+import { MetricsPanel } from '@/components/MetricsPanel';
 
-logger.setDefaultLevel('debug');
+type Track = CMSF['tracks'][number];
+type Status = 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
 
-type Tab = 'watch' | 'publish';
+export type BlurMode = 'none' | 'global' | 'localized';
+export interface BlurRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+export interface BlurSettings {
+  mode: BlurMode;
+  strength: number;
+  rect: BlurRect;
+}
+export const DEFAULT_BLUR_SETTINGS: BlurSettings = {
+  mode: 'none',
+  strength: 25,
+  rect: { x: 100, y: 100, w: 300, h: 200 },
+};
 
-function generateNamespace(): string {
-  const slug = uniqueNamesGenerator({
-    dictionaries: [colors, animals],
-    separator: '-',
-    length: 2,
-    style: 'lowerCase',
-  });
-  return `moqtail/${slug}`;
+const GITHUB_REPO = 'moqtail/moqtail';
+
+function GitHubIcon() {
+  return (
+    <svg height="18" viewBox="0 0 16 16" width="18" fill="currentColor" aria-hidden="true">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+    </svg>
+  );
 }
 
-function getWatchUrl(relayUrl: string, namespace: string): string {
-  const msfUrl = buildMsfUrl(relayUrl, namespace);
-  if (!msfUrl) return '';
-  const base = window.location.origin + window.location.pathname;
-  return `${base}?url=${encodeURIComponent(msfUrl)}`;
+const STATUS_CONFIG: Record<Status, { dot: string; label: string }> = {
+  idle: { dot: 'bg-neutral-600', label: 'Idle' },
+  connecting: { dot: 'bg-yellow-400 animate-pulse', label: 'Connecting…' },
+  ready: { dot: 'bg-emerald-400', label: 'Catalog loaded' },
+  restarting: { dot: 'bg-yellow-400 animate-pulse', label: 'Starting…' },
+  playing: { dot: 'bg-blue-400', label: 'Playing' },
+  error: { dot: 'bg-red-400', label: 'Error' },
+};
+
+function StatusDot({ status }: { status: Status }) {
+  const { dot, label } = STATUS_CONFIG[status];
+  return (
+    <span className="flex items-center gap-1.5 text-xs text-neutral-400 select-none">
+      <span className={cn('h-2 w-2 rounded-full', dot)} />
+      {label}
+    </span>
+  );
 }
 
-function sortTracks(tracks: CMSFTrack[]) {
-  return tracks.sort((a, b) => {
-    // sort by bitrate (desc), then resolution (desc), then name (asc)
-    const bitrateA = a.bitrate || 0;
-    const bitrateB = b.bitrate || 0;
-    if (bitrateA !== bitrateB) return bitrateB - bitrateA;
+const inputCls =
+  'w-full rounded-lg bg-neutral-900 border border-neutral-700/80 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all';
 
-    const resA = (a.width || 0) * (a.height || 0);
-    const resB = (b.width || 0) * (b.height || 0);
-    if (resA !== resB) return resB - resA;
-
-    return a.name.localeCompare(b.name);
-  });
+function Field({ label, children }: { label: string; children: ComponentChildren }) {
+  return (
+    <div className="space-y-1">
+      <label className="block text-[11px] font-semibold tracking-widest text-neutral-500 uppercase">
+        {label}
+      </label>
+      {children}
+    </div>
+  );
 }
 
-const DEFAULT_SOURCES: SourceState[] = [
-  { kind: 'camera', enabled: false, available: false, embedTimestamp: false },
-  { kind: 'screen', enabled: false, available: false, embedTimestamp: false },
-  { kind: 'test', enabled: false, available: true, embedTimestamp: true },
-];
+function Checkbox({
+  checked,
+  disabled,
+  onChange,
+}: {
+  checked: boolean;
+  disabled: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <span className="flex shrink-0 items-center">
+      {/* Real input — kept 1 px so it remains in the accessibility tree without position:absolute */}
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        className="size-px overflow-hidden opacity-0"
+        onChange={e => onChange((e.target as HTMLInputElement).checked)}
+      />
+      {/* Visual indicator */}
+      <span
+        aria-hidden="true"
+        className={cn(
+          'flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors',
+          checked ? 'border-blue-500 bg-blue-500' : 'border-neutral-600 bg-neutral-800/60',
+        )}
+      >
+        {checked && (
+          <svg
+            className="h-2.5 w-2.5 text-white"
+            viewBox="0 0 10 10"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
+            <polyline points="2,5 4,8 8,2" />
+          </svg>
+        )}
+      </span>
+    </span>
+  );
+}
+
+function TrackRow({
+  track,
+  checked,
+  disabled,
+  onChange,
+}: {
+  track: Track;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (track: Track, checked: boolean) => void;
+}) {
+  const selectable = !disabled;
+
+  return (
+    <label
+      className={cn(
+        'group flex items-center gap-3 rounded-lg px-3 py-2.5 transition-all select-none',
+        selectable
+          ? checked
+            ? 'cursor-pointer bg-blue-600/15 ring-1 ring-blue-500/40'
+            : 'cursor-pointer hover:bg-neutral-800/70'
+          : 'cursor-not-allowed opacity-30',
+      )}
+    >
+      <Checkbox checked={checked} disabled={disabled} onChange={val => onChange(track, val)} />
+      <span className="min-w-0 flex-1 truncate font-mono text-xs leading-5 text-neutral-200">
+        {track.name}
+      </span>
+      <div className="flex shrink-0 items-center gap-2">
+        {track.bitrate ? (
+          <span className="text-[10px] text-neutral-500 tabular-nums">
+            {Math.round(track.bitrate / 1000)} kbps
+          </span>
+        ) : null}
+        {track.width && track.height ? (
+          <span className="text-[10px] text-neutral-500 tabular-nums">
+            {track.width}&#x00d7;{track.height}
+          </span>
+        ) : null}
+        {track.codec ? (
+          <span className="font-mono text-[10px] text-neutral-500">
+            {track.codec.split('.')[0]}
+          </span>
+        ) : null}
+      </div>
+    </label>
+  );
+}
+
+function TrackGroup({
+  title,
+  color,
+  tracks,
+  selectedVideo,
+  selectedAudio,
+  disabled,
+  onChange,
+}: {
+  title: string;
+  color: string;
+  tracks: Track[];
+  selectedVideo: string | null;
+  selectedAudio: string | null;
+  disabled: boolean;
+  onChange: (track: Track, checked: boolean) => void;
+}) {
+  if (tracks.length === 0) return null;
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-2 px-1">
+        <span className={cn('h-1.5 w-1.5 rounded-full', color)} />
+        <span className="text-[11px] font-semibold tracking-widest text-neutral-500 uppercase">
+          {title}
+        </span>
+        <span className="text-[10px] text-neutral-600">({tracks.length})</span>
+      </div>
+      <div className="space-y-0.5">
+        {tracks.map(track => {
+          const isSelected = track.name === selectedVideo || track.name === selectedAudio;
+          return (
+            <TrackRow
+              key={track.name}
+              track={track}
+              checked={isSelected}
+              disabled={disabled}
+              onChange={onChange}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 export function App() {
-  // Playback state
-  const [relayUrl, setRelayUrl] = useState('moqt://relay.moqtail.dev');
-  const [namespace, setNamespace] = useState('moqtail/testsrc');
+  const [relayUrl, setRelayUrl] = useState('https://127.0.0.1:4433');
+  const [namespace, setNamespace] = useState('moqtail');
   const [status, setStatus] = useState<Status>('idle');
+  const [clientMode, setClientMode] = useState<'filtered' | 'unfiltered'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const cm = params.get('clientMode');
+    return cm === 'filtered' || cm === 'unfiltered' ? cm : 'unfiltered';
+  });
+  const [filterDelaySeconds, setFilterDelaySeconds] = useState<number>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const fd = params.get('filterDelay');
+    if (!fd) return 2;
+    const n = parseFloat(fd);
+    return Number.isFinite(n) && n >= 0 ? n : 2;
+  });
+  const [switchMode, setSwitchMode] = useState<'naive' | 'aligned'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sm = params.get('switchMode');
+    return sm === 'aligned' || sm === 'naive' ? sm : 'naive';
+  });
   const [tracks, setTracks] = useState<Track[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [optionsPanelOpen, setOptionsPanelOpen] = useState(false);
+
+  const [blurSettings, setBlurSettings] = useState<BlurSettings>(DEFAULT_BLUR_SETTINGS);
 
   const playerRef = useRef<Player | null>(null);
   const bufferRef = useRef<MSEBuffer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const blurRafRef = useRef<number | null>(null);
 
-  // Tab state
-  const [tab, setTab] = useState<Tab>('watch');
-
-  // Publish state
-  const [publishRelayUrl, setPublishRelayUrl] = useState('moqt://relay.moqtail.dev');
-  const [publishNamespace, setPublishNamespace] = useState(generateNamespace);
-  const [publishSources, setPublishSources] = useState<SourceState[]>(DEFAULT_SOURCES);
-  const [publishStatus, setPublishStatus] = useState<PublishStatus>('idle');
-  const [publishError, setPublishError] = useState<string | null>(null);
-  const publisherRef = useRef<Publisher | null>(null);
-
-  // Pre-populate watch fields from a ?url=moqt://... query param.
-  useEffect(() => {
-    const raw = new URLSearchParams(window.location.search).get('url');
-    if (!raw) return;
-    const parts = parseMsfUrl(raw);
-    if (!parts) return;
-    setRelayUrl(parts.relayUrl);
-    setNamespace(parts.namespace);
-  }, []);
-
-  // Check device availability when switching to publish tab
-  useEffect(() => {
-    if (tab !== 'publish') return;
-    const check = async () => {
-      const md = navigator.mediaDevices;
-      const hasGetDisplay = typeof md?.getDisplayMedia === 'function';
-
-      let hasCamera = false;
-      let camReason: string | undefined;
-
-      try {
-        const devices = await md.enumerateDevices();
-        hasCamera = devices.some(d => d.kind === 'videoinput');
-        if (!hasCamera) camReason = 'No camera detected';
-      } catch {
-        camReason = 'Cannot enumerate devices';
+  const [abrSettings, setAbrSettings] = useState<AbrSettings>(() => {
+    // Allow tests to override numeric ABR settings via URL query params, e.g.
+    // ?bufferTimeDefault=60. Production defaults are unchanged.
+    const params = new URLSearchParams(window.location.search);
+    const overrides: Partial<AbrSettings> = {};
+    for (const key of [
+      'bufferTimeDefault',
+      'stableBufferTime',
+      'bandwidthSafetyFactor',
+      'initialBitrate',
+      'minBitrate',
+      'maxBitrate',
+    ] as const) {
+      const v = params.get(key);
+      if (v !== null && v !== '') {
+        const n = Number(v);
+        if (Number.isFinite(n)) (overrides as Record<string, number>)[key] = n;
       }
+    }
+    return { ...DEFAULT_ABR_SETTINGS, ...overrides };
+  });
+  const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
+  const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const [catalogTracks, setCatalogTracks] = useState<CMSF['tracks'] | null>(null);
+  const abrRef = useRef<AbrController | null>(null);
+  const rulesRef = useRef<AbrRulesCollection | null>(null);
+  const metricsRef = useRef<MetricsCollector | null>(null);
 
-      setPublishSources(prev =>
-        prev.map(s => {
-          if (s.kind === 'camera')
-            return { ...s, available: hasCamera, unavailableReason: camReason };
-          if (s.kind === 'screen')
-            return {
-              ...s,
-              available: hasGetDisplay,
-              unavailableReason: hasGetDisplay ? undefined : 'Screen capture not supported',
-            };
-          return s; // test source always available
-        }),
-      );
+  useEffect(() => {
+    if (blurSettings.mode !== 'localized') {
+      if (blurRafRef.current !== null) {
+        cancelAnimationFrame(blurRafRef.current);
+        blurRafRef.current = null;
+      }
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
+    }
+    const tick = () => {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (!video || !canvas) {
+        blurRafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      if (video.videoWidth && video.videoHeight) {
+        if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
+        if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const { rect, strength } = blurSettings;
+      const rx = Math.max(0, Math.min(canvas.width, rect.x));
+      const ry = Math.max(0, Math.min(canvas.height, rect.y));
+      const rw = Math.max(0, Math.min(canvas.width - rx, rect.w));
+      const rh = Math.max(0, Math.min(canvas.height - ry, rect.h));
+      if (rw > 0 && rh > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(rx, ry, rw, rh);
+        ctx.clip();
+        ctx.filter = `blur(${Math.max(0, strength)}px)`;
+        ctx.drawImage(video, rx, ry, rw, rh, rx, ry, rw, rh);
+        ctx.restore();
+      }
+      blurRafRef.current = requestAnimationFrame(tick);
     };
-    check();
-  }, [tab]);
+    blurRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (blurRafRef.current !== null) {
+        cancelAnimationFrame(blurRafRef.current);
+        blurRafRef.current = null;
+      }
+    };
+  }, [blurSettings]);
+
+  useEffect(() => {
+    // Preserve fields populated outside React (e.g. firstReceivedGroupId,
+    // switchDiscontinuities — written from player.ts as media objects arrive).
+    const prev = window.__moqtailMetrics;
+    window.__moqtailMetrics = {
+      abr: abrMetrics,
+      samples: metricsSnapshot,
+      firstReceivedGroupId: prev?.firstReceivedGroupId,
+      switchDiscontinuities: prev?.switchDiscontinuities,
+      catalogTracks: catalogTracks ?? prev?.catalogTracks,
+    };
+  }, [abrMetrics, metricsSnapshot, catalogTracks]);
 
   const disposePlayer = useCallback(async () => {
+    if (abrRef.current) {
+      abrRef.current.stop();
+      abrRef.current = null;
+    }
+    if (metricsRef.current) {
+      metricsRef.current.stop();
+      metricsRef.current = null;
+    }
+    rulesRef.current = null;
+    setAbrMetrics(null);
+    setMetricsSnapshot(null);
     if (playerRef.current) {
       try {
         await playerRef.current.dispose();
@@ -156,37 +382,6 @@ export function App() {
     }
   }, []);
 
-  const initializePlaybackSession = useCallback(async () => {
-    if (!videoRef.current) return null;
-
-    const qs = new URLSearchParams(window.location.search).get('logLevel');
-    const raw = qs ?? (window as any).__moqtailLogLevel ?? 'warn';
-    applyLogLevel(parseLogLevel(raw) ?? parseLogLevel('warn')!);
-    logger.info('player', `log level: "${raw}"`);
-
-    logger.info('app', `initializePlaybackSession: relay="${relayUrl}" ns="${namespace}"`);
-    const player = new Player({
-      relayUrl,
-      namespace: Tuple.fromUtf8Path(namespace),
-      receiveCatalogViaSubscribe: true,
-    });
-    playerRef.current = player;
-
-    const catalog = await player.initialize();
-    const allTracks = sortTracks(catalog.getTracks());
-    logger.info(
-      'app',
-      `initializePlaybackSession: ${allTracks.length} track(s): ${allTracks.map(t => `${t.name}(${t.role})`).join(', ')}`,
-    );
-    setTracks(allTracks);
-
-    await player.attachMedia(videoRef.current);
-    bufferRef.current = new MSEBuffer(videoRef.current);
-    logger.info('app', 'initializePlaybackSession: media attached, MSEBuffer created');
-
-    return { player, allTracks };
-  }, [relayUrl, namespace]);
-
   const handleConnect = useCallback(async () => {
     if (!videoRef.current) return;
     setStatus('connecting');
@@ -198,32 +393,124 @@ export function App() {
     await disposePlayer();
 
     try {
-      const session = await initializePlaybackSession();
-      if (!session) return;
+      const player = new Player({
+        relayUrl,
+        namespace: Tuple.fromUtf8Path(namespace),
+        receiveCatalogViaSubscribe: true,
+        clientMode,
+        filterDelaySeconds,
+        switchMode,
+      });
+      playerRef.current = player;
 
-      const { player, allTracks } = session;
+      const catalog = await player.initialize();
+      const allTracks = catalog.getTracks();
+      setTracks(allTracks);
+      setCatalogTracks(allTracks);
 
-      const firstVideo = allTracks.find(t => t.role === 'video');
-      logger.info('app', `handleConnect: firstVideo="${firstVideo?.name ?? 'none'}"`);
+      // Pick startup video track: use WebTransport bandwidth estimate if available,
+      // fall back to lowest-bitrate track when no estimate is possible.
+      const videoTracksAll = allTracks.filter(t => t.role === 'video');
+      const sortedVideoTracks = [...videoTracksAll].sort(
+        (a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0),
+      );
+      let firstVideo = sortedVideoTracks[0]; // default: lowest bitrate
+      const initialBw = await player.estimateInitialBandwidth();
+      if (initialBw > 0 && sortedVideoTracks.length > 0) {
+        const safetyFactor = abrSettings.bandwidthSafetyFactor;
+        const effectiveBw = initialBw * safetyFactor;
+        // Pick highest track that fits within the estimated bandwidth
+        for (const track of sortedVideoTracks) {
+          if ((track.bitrate ?? 0) <= effectiveBw) {
+            firstVideo = track;
+          }
+        }
+      }
       if (firstVideo) {
         setSelectedVideo(firstVideo.name);
         setStatus('restarting');
+        await player.attachMedia(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, {
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+        });
         await player.addMediaTrack(firstVideo.name);
-        logger.info('app', 'handleConnect: addMediaTrack done, calling startMedia');
+        // Anchor the throughput EMA to the startup track's own bitrate so the
+        // first real per-group sample can't seed the EMA from a startup burst
+        // (which over-reads the sustainable rate). The ABR then ramps up only
+        // as sustained evidence accumulates. No-op once real samples exist.
+        player.seedThroughputEstimate(firstVideo.bitrate ?? 0);
         await player.startMedia();
-        logger.info('app', 'handleConnect: startMedia done — status=playing');
         setStatus('playing');
+        const videoTracks = allTracks.filter(t => t.role === 'video');
+        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
+        // before playback starts so we can sweep ABR rule configurations without
+        // shipping a UI control. Production paths leave this undefined and the
+        // deep merge becomes a no-op.
+        type AbrOverride = Partial<typeof abrSettings> & {
+          rules?: Partial<typeof abrSettings.rules>;
+        };
+        const override =
+          typeof window !== 'undefined'
+            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
+            : undefined;
+        const effectiveAbrSettings = override
+          ? {
+              ...abrSettings,
+              ...override,
+              rules: Object.fromEntries(
+                Object.entries({
+                  ...abrSettings.rules,
+                  ...(override.rules ?? {}),
+                }).map(([name, cfg]) => {
+                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
+                  if (!base) return [name, cfg];
+                  return [
+                    name,
+                    {
+                      ...base,
+                      ...cfg,
+                      parameters: {
+                        ...(base.parameters ?? {}),
+                        ...(cfg.parameters ?? {}),
+                      },
+                    },
+                  ];
+                }),
+              ),
+            }
+          : abrSettings;
+        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
+        rulesRef.current = rulesCollection;
+        const abr = new AbrController(
+          player,
+          rulesCollection,
+          videoTracks,
+          effectiveAbrSettings,
+          setAbrMetrics,
+        );
+        abrRef.current = abr;
+        player.setOnTrackSwitched(trackName => {
+          abrRef.current?.releaseSwitchingGuard();
+          setSelectedVideo(trackName);
+        });
+        abr.start();
+
+        const bitrateMap: Record<string, number> = {};
+        for (const t of videoTracks) {
+          if (t.bitrate) bitrateMap[t.name] = Math.round(t.bitrate / 1000);
+        }
+        const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
+        metricsRef.current = mc;
+        mc.start();
       } else {
-        logger.warn('app', 'handleConnect: no video track found in catalog');
         setStatus('ready');
       }
     } catch (err) {
-      logger.error('app', `handleConnect: error — ${(err as Error).message}`);
       setError((err as Error).message);
       setStatus('error');
       await disposePlayer();
     }
-  }, [disposePlayer, initializePlaybackSession]);
+  }, [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode]);
 
   const startPlayback = useCallback(
     async (videoTrack: string | null, audioTrack: string | null) => {
@@ -234,221 +521,470 @@ export function App() {
         return;
       }
 
-      logger.info(
-        'app',
-        `startPlayback: video="${videoTrack ?? 'none'}" audio="${audioTrack ?? 'none'}"`,
-      );
       setStatus('restarting');
       await disposePlayer();
 
       try {
-        const session = await initializePlaybackSession();
-        if (!session) return;
+        const player = new Player({
+          relayUrl,
+          namespace: Tuple.fromUtf8Path(namespace),
+          receiveCatalogViaSubscribe: true,
+          clientMode,
+          filterDelaySeconds,
+          switchMode,
+        });
+        playerRef.current = player;
 
-        const { player } = session;
+        const catalog = await player.initialize();
+        const allTracksForPlayback = catalog.getTracks();
+        setTracks(allTracksForPlayback);
+        setCatalogTracks(allTracksForPlayback);
+
+        await player.attachMedia(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, {
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+        });
 
         if (videoTrack) await player.addMediaTrack(videoTrack);
         if (audioTrack) await player.addMediaTrack(audioTrack);
 
-        logger.info('app', 'startPlayback: calling startMedia');
         await player.startMedia();
-        logger.info('app', 'startPlayback: startMedia done — status=playing');
         setStatus('playing');
+        const videoTracksForAbr = allTracksForPlayback.filter(t => t.role === 'video');
+        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
+        // before playback starts so we can sweep ABR rule configurations without
+        // shipping a UI control. Production paths leave this undefined and the
+        // deep merge becomes a no-op.
+        type AbrOverride = Partial<typeof abrSettings> & {
+          rules?: Partial<typeof abrSettings.rules>;
+        };
+        const override =
+          typeof window !== 'undefined'
+            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
+            : undefined;
+        const effectiveAbrSettings = override
+          ? {
+              ...abrSettings,
+              ...override,
+              rules: Object.fromEntries(
+                Object.entries({
+                  ...abrSettings.rules,
+                  ...(override.rules ?? {}),
+                }).map(([name, cfg]) => {
+                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
+                  if (!base) return [name, cfg];
+                  return [
+                    name,
+                    {
+                      ...base,
+                      ...cfg,
+                      parameters: {
+                        ...(base.parameters ?? {}),
+                        ...(cfg.parameters ?? {}),
+                      },
+                    },
+                  ];
+                }),
+              ),
+            }
+          : abrSettings;
+        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
+        rulesRef.current = rulesCollection;
+        const abr = new AbrController(
+          player,
+          rulesCollection,
+          videoTracksForAbr,
+          effectiveAbrSettings,
+          setAbrMetrics,
+        );
+        abrRef.current = abr;
+        player.setOnTrackSwitched(trackName => {
+          abrRef.current?.releaseSwitchingGuard();
+          setSelectedVideo(trackName);
+        });
+        abr.start();
+
+        const bitrateMap: Record<string, number> = {};
+        for (const t of videoTracksForAbr) {
+          if (t.bitrate) bitrateMap[t.name] = Math.round(t.bitrate / 1000);
+        }
+        const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
+        metricsRef.current = mc;
+        mc.start();
       } catch (err) {
-        logger.error('app', `startPlayback: error — ${(err as Error).message}`);
         setError((err as Error).message);
         setStatus('error');
         await disposePlayer();
       }
     },
-    [disposePlayer, initializePlaybackSession],
+    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode],
   );
 
   const handleTrackChange = useCallback(
     (track: Track, checked: boolean) => {
       if (track.role !== 'video' && track.role !== 'audio') return;
 
-      let newVideo = selectedVideo;
-      let newAudio = selectedAudio;
-
       if (track.role === 'video') {
-        newVideo = track.name === selectedVideo && !checked ? null : track.name;
+        if (abrSettings.videoAutoSwitch) return; // auto mode: track rows are read-only
+        if (abrRef.current?.isSwitching()) return; // switch in-flight: wait for it
+        const newTrackName = track.name === selectedVideo && !checked ? null : track.name;
+        if (!newTrackName) return;
+        setSelectedVideo(newTrackName);
+        abrRef.current?.manualSwitch(newTrackName);
       } else {
+        // Audio tracks still do full restarts (no seamless switch for audio)
+        let newAudio = selectedAudio;
         newAudio = track.name === selectedAudio && !checked ? null : track.name;
+        setSelectedAudio(newAudio);
+        startPlayback(selectedVideo, newAudio);
       }
-
-      setSelectedVideo(newVideo);
-      setSelectedAudio(newAudio);
-      startPlayback(newVideo, newAudio);
     },
-    [selectedVideo, selectedAudio, startPlayback],
+    [selectedVideo, selectedAudio, abrSettings, startPlayback],
   );
 
-  const handleSourceToggle = useCallback(async (kind: SourceKind, enabled: boolean) => {
-    if (enabled) {
-      try {
-        let stream: MediaStream;
-        if (kind === 'camera') {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-              aspectRatio: { ideal: 16 / 9 },
-            },
-          });
-        } else if (kind === 'screen') {
-          stream = await (navigator.mediaDevices as any).getDisplayMedia({
-            video: true,
-            audio: false,
-          });
-        } else {
-          // test source — no stream needed
-          setPublishSources(prev => prev.map(s => (s.kind === kind ? { ...s, enabled: true } : s)));
-          return;
-        }
-
-        setPublishSources(prev =>
-          prev.map(s => (s.kind === kind ? { ...s, enabled: true, stream } : s)),
-        );
-      } catch (err) {
-        // Permission denied or cancelled — leave unchecked
-        logger.warn('app', `source toggle denied for ${kind}: ${(err as Error).message}`);
+  const handleSettingsChange = useCallback((newSettings: AbrSettings) => {
+    setAbrSettings(newSettings);
+    abrRef.current?.updateSettings(newSettings);
+    if (rulesRef.current) {
+      for (const [name, config] of Object.entries(newSettings.rules)) {
+        rulesRef.current.setRuleActive(name, config.active);
       }
-    } else {
-      setPublishSources(prev =>
-        prev.map(s => {
-          if (s.kind !== kind) return s;
-          s.stream?.getTracks().forEach(t => t.stop());
-          return { ...s, enabled: false, stream: undefined };
-        }),
-      );
     }
   }, []);
 
-  const handleTimestampToggle = useCallback((kind: SourceKind, embed: boolean) => {
-    setPublishSources(prev =>
-      prev.map(s => (s.kind === kind ? { ...s, embedTimestamp: embed } : s)),
-    );
-  }, []);
+  const isBusy = status === 'connecting' || status === 'restarting';
 
-  const handlePublish = useCallback(async () => {
-    if (publisherRef.current) return;
-
-    setPublishStatus('connecting');
-    setPublishError(null);
-
-    const nsParts = publishNamespace.split('/').filter(Boolean);
-    const publisher = new Publisher({
-      relayUrl: publishRelayUrl,
-      namespace: nsParts,
-      sources: publishSources,
-      onStatus: (s, err) => {
-        setPublishStatus(s);
-        setPublishError(err ?? null);
-      },
-    });
-    publisherRef.current = publisher;
-    await publisher.start();
-  }, [publishRelayUrl, publishNamespace, publishSources]);
-
-  const handleStop = useCallback(async () => {
-    await publisherRef.current?.stop();
-    publisherRef.current = null;
-    setPublishStatus('idle');
-    setPublishError(null);
-  }, []);
-
-  const handleRefreshNamespace = useCallback(() => {
-    if (publishStatus === 'publishing' || publishStatus === 'connecting') return;
-    setPublishNamespace(generateNamespace());
-  }, [publishStatus]);
-
-  const handleTabChange = useCallback(
-    async (next: Tab) => {
-      if (next === 'publish' && tab === 'watch') {
-        await disposePlayer();
-        setStatus('idle');
-        setError(null);
-        setTracks([]);
-        setSelectedVideo(null);
-        setSelectedAudio(null);
-      }
-      setTab(next);
-    },
-    [tab, disposePlayer],
-  );
-
-  // Derived state
+  const videoTracks = tracks.filter(t => t.role === 'video');
+  const audioTracks = tracks.filter(t => t.role === 'audio');
   const hasTracks = tracks.length > 0;
-  const activeCameraStream =
-    publishSources.find(s => s.kind === 'camera' && s.enabled)?.stream ?? null;
-  const activeScreenStream =
-    publishSources.find(s => s.kind === 'screen' && s.enabled)?.stream ?? null;
-  const isTestSource = publishSources.some(s => s.kind === 'test' && s.enabled);
-  const testStream =
-    isTestSource && publishStatus === 'publishing'
-      ? (publisherRef.current?.testStream ?? null)
-      : null;
-  const previewCameraStream = activeCameraStream ?? testStream;
-  const showPreview =
-    tab === 'publish' &&
-    (publishStatus === 'publishing' || !!activeCameraStream || !!activeScreenStream) &&
-    (!!previewCameraStream || !!activeScreenStream);
 
   return (
     <div className="flex h-dvh w-dvw flex-col bg-neutral-950 font-sans text-neutral-100 antialiased">
-      <Header status={status} />
+      {/* Header */}
+      <header className="flex h-12 shrink-0 items-center justify-between border-b border-white/6 bg-neutral-950/80 px-4 backdrop-blur-sm md:px-5">
+        <div className="flex items-center gap-2.5">
+          <img src="/favicon.svg" alt="MOQtail logo" className="h-5 w-5" />
+          <a
+            href="https://moqtail.dev"
+            target="_blank"
+            rel="noreferrer"
+            className="text-sm font-semibold tracking-tight transition-colors hover:text-neutral-300"
+          >
+            MOQtail Player
+          </a>
+          <button
+            onClick={() => setOptionsPanelOpen(o => !o)}
+            className={cn(
+              'flex items-center gap-1 rounded-md px-1.5 py-1 text-xs transition-colors',
+              optionsPanelOpen
+                ? 'text-blue-400 hover:text-blue-300'
+                : 'text-neutral-500 hover:text-neutral-300',
+            )}
+            title="Options"
+          >
+            <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">
+              <path
+                fillRule="evenodd"
+                d="M7.84 1.804A1 1 0 018.82 1h2.36a1 1 0 01.98.804l.331 1.652a6.993 6.993 0 011.929 1.115l1.598-.54a1 1 0 011.186.447l1.18 2.044a1 1 0 01-.205 1.251l-1.267 1.113a7.047 7.047 0 010 2.228l1.267 1.113a1 1 0 01.206 1.25l-1.18 2.045a1 1 0 01-1.187.447l-1.598-.54a6.993 6.993 0 01-1.929 1.115l-.33 1.652a1 1 0 01-.98.804H8.82a1 1 0 01-.98-.804l-.331-1.652a6.993 6.993 0 01-1.929-1.115l-1.598.54a1 1 0 01-1.186-.447l-1.18-2.044a1 1 0 01.205-1.251l1.267-1.114a7.05 7.05 0 010-2.227L1.821 7.773a1 1 0 01-.206-1.25l1.18-2.045a1 1 0 011.187-.447l1.598.54A6.993 6.993 0 017.51 3.456l.33-1.652zM10 13a3 3 0 100-6 3 3 0 000 6z"
+                clipRule="evenodd"
+              />
+            </svg>
+          </button>
+          <span className="text-neutral-700 select-none">·</span>
+          <StatusDot status={status} />
+        </div>
+        <div className="flex items-center gap-2 md:gap-3">
+          {(import.meta.env.VITE_BUILD_COMMIT || import.meta.env.VITE_BUILD_DATE) && (
+            <span className="hidden font-mono text-[10px] text-neutral-600 tabular-nums select-none sm:block">
+              {[import.meta.env.VITE_BUILD_COMMIT, import.meta.env.VITE_BUILD_DATE]
+                .filter(Boolean)
+                .join(' · ')}
+            </span>
+          )}
+          <a
+            href={`https://github.com/${GITHUB_REPO}`}
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center gap-2 text-sm text-neutral-400 transition-colors hover:text-neutral-100"
+          >
+            <GitHubIcon />
+            <span className="hidden text-xs font-medium sm:block">{GITHUB_REPO}</span>
+          </a>
+        </div>
+      </header>
 
+      {/* Options panel — horizontal cards (dash.js style) */}
+      <SettingsPanel
+        open={optionsPanelOpen}
+        settings={abrSettings}
+        onSettingsChange={handleSettingsChange}
+        blurSettings={blurSettings}
+        onBlurSettingsChange={setBlurSettings}
+        clientMode={clientMode}
+        onClientModeChange={setClientMode}
+        filterDelaySeconds={filterDelaySeconds}
+        onFilterDelaySecondsChange={setFilterDelaySeconds}
+        connectStatus={status}
+        switchMode={switchMode}
+        onSwitchModeChange={setSwitchMode}
+      />
+
+      {/* Body */}
       <div className="flex h-full min-h-0 w-full flex-1 grow flex-col md:flex-row">
-        <Sidebar
-          // Watch tab props
-          relayUrl={relayUrl}
-          onRelayUrlChange={setRelayUrl}
-          namespace={namespace}
-          onNamespaceChange={setNamespace}
-          status={status}
-          tracks={tracks}
-          selectedVideo={selectedVideo}
-          selectedAudio={selectedAudio}
-          onConnect={handleConnect}
-          onTrackChange={handleTrackChange}
-          error={error}
-          // Tab
-          tab={tab}
-          onTabChange={handleTabChange}
-          // Publish tab props
-          publishProps={{
-            relayUrl: publishRelayUrl,
-            onRelayUrlChange: setPublishRelayUrl,
-            namespace: publishNamespace,
-            onNamespaceChange: setPublishNamespace,
-            onRefreshNamespace: handleRefreshNamespace,
-            sources: publishSources,
-            onSourceToggle: handleSourceToggle,
-            onTimestampToggle: handleTimestampToggle,
-            publishStatus,
-            onPublish: handlePublish,
-            onStop: handleStop,
-            error: publishError,
-            watchUrl: getWatchUrl(publishRelayUrl, publishNamespace),
-          }}
-        />
-
-        {/* Main area */}
-        {tab === 'watch' ? (
-          <VideoPlayer ref={videoRef} hasTracks={hasTracks} mode="watch" />
-        ) : showPreview ? (
-          <main className="relative flex flex-1 flex-col items-center justify-center overflow-hidden bg-neutral-950 p-4 md:p-6">
-            <div
-              className="w-full overflow-hidden rounded-xl bg-black shadow-2xl shadow-black/60"
-              style={{ aspectRatio: '16/9' }}
-            >
-              <LocalPreview cameraStream={previewCameraStream} screenStream={activeScreenStream} />
+        {/* Sidebar */}
+        <aside className="order-last flex max-h-full flex-col overflow-auto border-t border-white/6 bg-neutral-950 md:order-first md:w-72 md:border-t-0 md:border-r">
+          {/* Connection */}
+          <div className="space-y-3 border-b border-white/6 p-4">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-1">
+              <Field label="Relay URL">
+                <input
+                  type="url"
+                  value={relayUrl}
+                  onInput={e => setRelayUrl((e.target as HTMLInputElement).value)}
+                  placeholder="https://relay.example.com:443"
+                  class={inputCls}
+                />
+              </Field>
+              <Field label="Namespace">
+                <input
+                  type="text"
+                  value={namespace}
+                  onInput={e => setNamespace((e.target as HTMLInputElement).value)}
+                  placeholder="org/channel"
+                  class={inputCls}
+                />
+              </Field>
             </div>
-          </main>
-        ) : (
-          <VideoPlayer ref={videoRef} hasTracks={false} mode="publish" />
-        )}
+            <button
+              onClick={handleConnect}
+              disabled={isBusy || !relayUrl || !namespace}
+              className="w-full rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium transition-colors hover:bg-blue-500 active:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {status === 'connecting' ? 'Connecting…' : 'Connect'}
+            </button>
+            {status === 'error' && error && (
+              <p className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-400">
+                {error}
+              </p>
+            )}
+          </div>
+
+          {/* Blur Effects — quick toggle (detailed controls in options panel) */}
+          <div className="border-b border-white/6 p-4">
+            <Field label="Blur Effects">
+              <div className="mt-2 flex flex-col gap-2">
+                <button
+                  onClick={() =>
+                    setBlurSettings(s => ({
+                      ...s,
+                      mode: s.mode === 'global' ? 'none' : 'global',
+                    }))
+                  }
+                  disabled={!hasTracks}
+                  className={cn(
+                    'flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all disabled:cursor-not-allowed disabled:opacity-40',
+                    blurSettings.mode === 'global'
+                      ? 'bg-blue-600/20 ring-1 ring-blue-500/50'
+                      : 'bg-neutral-900/50 hover:bg-neutral-800',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'h-2 w-2 rounded-full',
+                      blurSettings.mode === 'global' ? 'bg-blue-400' : 'bg-neutral-600',
+                    )}
+                  />
+                  <span
+                    className={
+                      blurSettings.mode === 'global' ? 'text-blue-100' : 'text-neutral-400'
+                    }
+                  >
+                    Full Video Blur
+                  </span>
+                </button>
+                <button
+                  onClick={() =>
+                    setBlurSettings(s => ({
+                      ...s,
+                      mode: s.mode === 'localized' ? 'none' : 'localized',
+                    }))
+                  }
+                  disabled={!hasTracks}
+                  className={cn(
+                    'flex items-center gap-3 rounded-lg px-3 py-2 text-xs transition-all disabled:cursor-not-allowed disabled:opacity-40',
+                    blurSettings.mode === 'localized'
+                      ? 'bg-violet-600/20 ring-1 ring-violet-500/50'
+                      : 'bg-neutral-900/50 hover:bg-neutral-800',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'h-2 w-2 rounded-full',
+                      blurSettings.mode === 'localized' ? 'bg-violet-400' : 'bg-neutral-600',
+                    )}
+                  />
+                  <span
+                    className={
+                      blurSettings.mode === 'localized' ? 'text-violet-100' : 'text-neutral-400'
+                    }
+                  >
+                    Area Redaction
+                  </span>
+                </button>
+              </div>
+            </Field>
+          </div>
+
+          {/* Tracks */}
+          {hasTracks && (
+            <div className="space-y-4 p-3">
+              <TrackGroup
+                title="Video"
+                color="bg-violet-400"
+                tracks={videoTracks}
+                selectedVideo={selectedVideo}
+                selectedAudio={selectedAudio}
+                disabled={isBusy || abrSettings.videoAutoSwitch || (abrMetrics?.switching ?? false)}
+                onChange={handleTrackChange}
+              />
+              <TrackGroup
+                title="Audio"
+                color="bg-teal-400"
+                tracks={audioTracks}
+                selectedVideo={selectedVideo}
+                selectedAudio={selectedAudio}
+                disabled={isBusy}
+                onChange={handleTrackChange}
+              />
+            </div>
+          )}
+        </aside>
+
+        {/* Main — video */}
+        <main className="relative flex flex-1 flex-col items-center justify-center overflow-hidden bg-neutral-950 p-4 md:p-6">
+          <div
+            className={cn(
+              'relative overflow-hidden rounded-xl bg-black shadow-2xl shadow-black/60',
+              hasTracks ? 'inline-flex' : 'hidden',
+            )}
+          >
+            <video
+              ref={videoRef}
+              controls
+              className={cn(
+                'block max-h-[calc(100dvh-9rem)] max-w-full transition-[filter,transform] duration-300',
+                blurSettings.mode === 'global' ? 'scale-110 blur-3xl' : 'blur-0 scale-100',
+              )}
+            />
+            <canvas
+              ref={canvasRef}
+              className={cn(
+                'pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-300',
+                blurSettings.mode === 'localized' ? 'opacity-100' : 'opacity-0',
+              )}
+            />
+          </div>
+          {!hasTracks && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 px-6 text-center select-none">
+              {/* Icon */}
+              <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-white/6 bg-neutral-900 text-neutral-600">
+                <svg
+                  viewBox="0 0 24 24"
+                  className="h-8 w-8"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.347a1.125 1.125 0 010 1.972l-11.54 6.347c-.75.412-1.667-.13-1.667-.986V5.653z"
+                  />
+                </svg>
+              </div>
+
+              {/* Heading */}
+              <p className="text-sm font-medium text-neutral-300">
+                Connect to a relay to start playback
+              </p>
+
+              {/* Info card */}
+              <div className="w-full max-w-sm space-y-3 rounded-xl border border-white/6 bg-neutral-900/60 p-4 text-left backdrop-blur-sm">
+                <p className="text-xs leading-relaxed text-neutral-400">
+                  A minimal{' '}
+                  <a
+                    href="https://datatracker.ietf.org/doc/draft-ietf-moq-transport/"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-blue-400 underline decoration-blue-400/30 underline-offset-2 transition-colors hover:text-blue-300"
+                  >
+                    MOQT
+                  </a>{' '}
+                  player built on the{' '}
+                  <a
+                    href={`https://github.com/${GITHUB_REPO}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-blue-400 underline decoration-blue-400/30 underline-offset-2 transition-colors hover:text-blue-300"
+                  >
+                    MOQtail library
+                  </a>
+                  . The source for this player lives in{' '}
+                  <a
+                    href={`https://github.com/${GITHUB_REPO}/tree/main/apps/client-js`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-mono text-[11px] text-neutral-300 underline decoration-neutral-600 underline-offset-2 transition-colors hover:text-white"
+                  >
+                    /apps/client-js
+                  </a>{' '}
+                  in the MOQtail repository.
+                </p>
+                <p className="text-xs leading-relaxed text-neutral-400">
+                  Modify the <span className="font-medium text-neutral-300">Relay URL</span> and{' '}
+                  <span className="font-medium text-neutral-300">Namespace</span> in the sidebar to
+                  point to your own stream.
+                </p>
+                <p className="text-xs leading-relaxed text-neutral-400">
+                  Players with more advanced features are available in{' '}
+                  <a
+                    href={`https://moqtail.dev/demo`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-blue-400 underline decoration-blue-400/30 underline-offset-2 transition-colors hover:text-blue-300"
+                  >
+                    MOQtail demos
+                  </a>
+                  .
+                </p>
+                <div className="border-t border-white/6 pt-3">
+                  <a
+                    href={`https://github.com/${GITHUB_REPO}/issues`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs text-neutral-500 transition-colors hover:text-neutral-300"
+                  >
+                    <svg
+                      viewBox="0 0 16 16"
+                      className="h-3.5 w-3.5 shrink-0"
+                      fill="currentColor"
+                      aria-hidden="true"
+                    >
+                      <path d="M8 9.5a1.5 1.5 0 100-3 1.5 1.5 0 000 3z" />
+                      <path d="M8 0a8 8 0 110 16A8 8 0 018 0zM1.5 8a6.5 6.5 0 1013 0 6.5 6.5 0 00-13 0z" />
+                    </svg>
+                    Found a problem? Open an issue on GitHub.
+                  </a>
+                </div>
+              </div>
+            </div>
+          )}
+          {abrMetrics && (
+            <div className="mt-4 w-full max-w-3xl overflow-auto rounded-xl border border-white/6 bg-neutral-900/60 p-4">
+              <MetricsPanel metrics={abrMetrics} snapshot={metricsSnapshot} tracks={videoTracks} />
+            </div>
+          )}
+        </main>
       </div>
     </div>
   );

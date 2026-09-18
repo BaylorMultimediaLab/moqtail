@@ -242,3 +242,20 @@ relay.log.*
 # Local settings for tools/perf-test.sh
 tools/perf-test.env
 .perf-test.env
+logs/*
+
+### `script` command output ###
+/typescript
+
+### Superpowers ###
+docs/*
+apps/client-js/specs/
+apps/relay/cert/cert.pem.bak
+apps/relay/cert/key.pem.bak
+.claude/
+
+### Paper Experiments ###
+data/video/tears_of_steel_*
+data/video/.cache/
+CLAUDE.md
+.antigravitycli/

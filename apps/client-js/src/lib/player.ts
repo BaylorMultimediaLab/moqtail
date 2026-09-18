@@ -21,16 +21,135 @@ import {
   GroupOrder,
   Location,
   MoqtObject,
+  RequestError,
   Tuple,
 } from 'moqtail';
 import { MOQtailClient } from 'moqtail/client';
-import { CMSFCatalog, RequestError } from 'moqtail/model';
+import { CMSFCatalog, MessageParameters, type MessageParameter } from 'moqtail/model';
 import { logger } from '@/lib/logger';
+import { GoodputTracker } from '@/lib/goodput';
+import { LatencyTracker } from '@/lib/latencyTracker';
+import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
+import { TimeMap } from '@/lib/abr/TimeMap';
+
+// NTP epoch (1900) is 2_208_988_800 seconds before the UNIX epoch (1970).
+const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
+
+/**
+ * If the chunk starts with a PRFT (Producer Reference Time) box per
+ * ISO/IEC 14496-12 §8.16.5, return the publisher's wall-clock at chunk
+ * production as UNIX milliseconds. Returns null otherwise.
+ *
+ * PRFT layout (version 1, 32 bytes total):
+ *   0..4   box size (32, big-endian)
+ *   4..8   "prft"
+ *   8      version (1)
+ *   9..12  flags (0)
+ *   12..16 reference_track_ID
+ *   16..24 ntp_timestamp (NTP fixed point: seconds.fraction since 1900)
+ *   24..32 media_time (u64, version=1)
+ */
+function readPrftCaptureMs(buf: Uint8Array): number | null {
+  if (buf.byteLength < 32) return null;
+  // 'p'=0x70, 'r'=0x72, 'f'=0x66, 't'=0x74
+  if (buf[4] !== 0x70 || buf[5] !== 0x72 || buf[6] !== 0x66 || buf[7] !== 0x74) {
+    return null;
+  }
+  // DataView must respect the Uint8Array's byteOffset; otherwise we'd
+  // read from byte 0 of the underlying ArrayBuffer instead of the chunk's
+  // actual start.
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const ntpSeconds = view.getUint32(16, false);
+  const ntpFraction = view.getUint32(20, false);
+  const unixSeconds = ntpSeconds - NTP_UNIX_DELTA_SECONDS;
+  const fractionMs = (ntpFraction / 0x1_0000_0000) * 1000;
+  return unixSeconds * 1000 + fractionMs;
+}
+
+/**
+ * One record per track-switch (or, in C4, per filtered connect).
+ * Pushed to window.__moqtailMetrics.switchDiscontinuities for offline analysis.
+ */
+export interface DiscontinuityRecord {
+  eventType: 'connect' | 'switch';
+  switchSentAt: number;
+  switchAppliedAt: number;
+  fromTrack?: string;
+  toTrack: string;
+
+  // PTS-domain (headline)
+  oldEndPTS_ms?: number;
+  newStartPTS_ms: number;
+  /** Buffer-end gap: newStartPTS_ms - oldEndPTS_ms. Diagnostic only — measures
+   *  buffered-region continuity, NOT user-visible discontinuity. With a fast
+   *  link the buffer reaches the live edge, so both naive and aligned modes
+   *  produce ~0 here. Use `playheadGapMs` for naive-vs-aligned differentiation. */
+  ptsGapMs: number;
+  /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
+  playheadPTS_ms?: number;
+  /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
+   *  jump introduced by the switch — naive on a filtered client lands ~filterDelay×1000
+   *  positive (relay delivers from live edge while playhead is filterDelay s behind);
+   *  aligned lands ~0. Undefined for `connect` records. */
+  playheadGapMs?: number;
+
+  // wall-clock context
+  wallClockMs: number;
+  perceivedPauseMs?: number;
+
+  // connect-time clamp signal (Task C4)
+  expectedStartGroup?: number;
+  actualStartGroup?: number;
+  clampedByRelay?: boolean;
+
+  // miss signal (Task B5)
+  timeMapMiss?: boolean;
+
+  // mode context (every record)
+  switchMode: 'naive' | 'aligned';
+  clientMode: 'filtered' | 'unfiltered';
+  filterDelaySeconds: number;
+}
+
+interface PendingSwitch {
+  trackName: string;
+  initData: ArrayBuffer;
+  mimeType: string;
+  /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
+  oldEndPTS_ms: number | undefined;
+  /** Snapshot of video.currentTime * 1000 at switchTrack() call — used by the discontinuity
+   *  record's `playheadGapMs` (newStart − playhead) which is the headline naive-vs-aligned metric. */
+  playheadPTS_ms: number | undefined;
+  /** performance.now() at switchTrack() call — for wallClockMs and perceivedPauseMs. */
+  switchSentAt: number;
+  /** videoElement.getVideoPlaybackQuality().totalVideoFrames at switch time — for perceivedPauseMs (Task C5). */
+  framesAtSwitch: number;
+}
 
 interface MOQStreamStruct {
   trackName: string;
   source: ReadableStream<MoqtObject>;
   requestId: bigint;
+  tracker: GoodputTracker;
+  lastGroupId: bigint;
+  pendingSwitch: PendingSwitch | null;
+  /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
+  lastAppendedEndPTS_ms: number | undefined;
+  /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
+  firstFrameAfterSwitchSeen?: boolean;
+  /**
+   * When a switch is in progress, this holds the totalVideoFrames count at
+   * switchTrack time. Once totalVideoFrames > this value, the first new-track
+   * frame has rendered and perceivedPauseMs is computed.
+   *
+   * Set in the write handler when the new init segment is applied; consumed
+   * (and cleared) by the rVFC poll.
+   */
+  postSwitchFrameTarget?: number;
+  /** Snapshot of pendingSwitch.switchSentAt at the moment of init-segment application. */
+  postSwitchSentAt?: number;
+  /** Track name to attach perceivedPauseMs to in switchDiscontinuities. */
+  postSwitchToTrack?: string;
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -43,7 +162,7 @@ interface SubscribeOptions {
 }
 
 export interface PlayerOptions {
-  /** The URL of the relay to connect to. `moqt://` or `https://`. */
+  /** The URL of the relay to connect to. */
   relayUrl: string;
   /** The namespace to use for this session. */
   namespace: Tuple;
@@ -51,14 +170,98 @@ export interface PlayerOptions {
   receiveCatalogViaSubscribe?: boolean;
   /** Catalog location (default: group 0, object 1) */
   catalogLocation?: [Location, Location];
+  /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
+  onTrackSwitched?: (trackName: string) => void;
+  /** Pre-connect: 'filtered' clients subscribe behind live by `filterDelaySeconds`; 'unfiltered' is today's behavior. */
+  clientMode?: 'filtered' | 'unfiltered';
+  /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
+  filterDelaySeconds?: number;
+  /** Quality-switch primitive: 'naive' = today (start at latest); 'aligned' = start at group containing player's current PTS. */
+  switchMode?: 'naive' | 'aligned';
 }
 
-const DefaultOptions: Required<PlayerOptions> = {
-  relayUrl: 'moqt://relay.moqtail.dev',
+const DefaultOptions = {
+  relayUrl: 'https://relay.moqtail.dev',
   namespace: Tuple.fromUtf8Path('/moqtail'),
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
-};
+  onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
+  clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
+  filterDelaySeconds: 0,
+  switchMode: 'naive' as 'naive' | 'aligned',
+} satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
+  Pick<PlayerOptions, 'onTrackSwitched'>;
+
+/**
+ * Builds the `parameters` field for a media-track SUBSCRIBE.
+ *
+ * - For unfiltered mode: returns `undefined` (no parameters added — today's behavior).
+ * - For filtered mode: returns a parameter list carrying
+ *   `DELAY_GROUPS = round(filterDelaySeconds * 1000 / gopDurationMs)`.
+ *
+ * The relay reads `DELAY_GROUPS` and starts delivery `delay_groups` behind the live edge.
+ */
+export function buildSubscribeParameters(opts: {
+  clientMode: 'filtered' | 'unfiltered';
+  filterDelaySeconds: number;
+  gopDurationMs: number;
+}): MessageParameter[] | undefined {
+  if (opts.clientMode !== 'filtered') return undefined;
+  if (opts.filterDelaySeconds <= 0) return undefined;
+  const delayGroups = Math.round((opts.filterDelaySeconds * 1000) / opts.gopDurationMs);
+  if (delayGroups <= 0) return undefined;
+  return new MessageParameters().addDelayGroups(delayGroups).build();
+}
+
+/**
+ * Builds the `parameters` field for a SWITCH message based on the active
+ * switchMode and the player's current PTS.
+ *
+ * - 'naive' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
+ * - 'aligned' mode: looks up the group containing `currentTime` via the TimeMap
+ *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
+ *   switch fired before any object was received), returns `{ params: undefined,
+ *   timeMapMiss: true }` so the caller can record the miss.
+ *
+ * Exported for unit testing.
+ */
+export function buildSwitchParameters(opts: {
+  switchMode: 'naive' | 'aligned';
+  targetGroup: number | undefined;
+}): { params: MessageParameter[] | undefined; timeMapMiss: boolean } {
+  if (opts.switchMode !== 'aligned') return { params: undefined, timeMapMiss: false };
+  if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
+  return {
+    params: new MessageParameters().addStartLocationGroup(opts.targetGroup).build(),
+    timeMapMiss: false,
+  };
+}
+
+/**
+ * Compute the seek target for playback startup. Unfiltered clients seek
+ * 1.0s behind the live edge so MSE has buffer runway; filtered clients
+ * are already `filterDelaySeconds` behind live and don't need the extra
+ * offset.
+ *
+ * Exported for unit testing.
+ */
+export const LIVE_EDGE_STARTUP_OFFSET_SECONDS = 1.0;
+
+export function computeStartupTarget(opts: {
+  end: number;
+  baseTarget: number;
+  clientMode: 'filtered' | 'unfiltered';
+  /** Seconds-behind-live-edge target for filtered mode. Ignored when unfiltered.
+   *  Defaults to 0 (today's broken behavior) only when not provided — callers
+   *  in filtered mode SHOULD pass this. */
+  filterDelaySeconds?: number;
+}): number {
+  const offset =
+    opts.clientMode === 'filtered'
+      ? (opts.filterDelaySeconds ?? 0)
+      : LIVE_EDGE_STARTUP_OFFSET_SECONDS;
+  return Math.max(opts.baseTarget, opts.end - offset);
+}
 
 export class Player {
   catalog: CMSFCatalog | null = null;
@@ -67,7 +270,24 @@ export class Player {
   #element: HTMLVideoElement | null = null;
   #mse?: MediaSource;
   #streams: MOQStreamStruct[] = [];
-  #options: Required<PlayerOptions>;
+  #options: Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
+    Pick<PlayerOptions, 'onTrackSwitched'>;
+  #disposers: Array<() => void> = [];
+  // Per-frame end-to-end latency window (last 100 samples ≈ 4 s at 25 fps).
+  // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
+  // `LatencyTrendRule` reads `getTrendRatio()` for downswitch decisions.
+  #latencyTracker = new LatencyTracker();
+  // Connect-time state (Task C4) for filtered-mode clamp detection.
+  // Captured in subscribe(); consumed once on the first received object.
+  #connectSentAt: number | undefined;
+  #expectedStartGroupId: number | undefined;
+  // B4: PTS <-> group lookup populated from incoming object decode times.
+  // Consumed by B5 (aligned switch) to compute START_LOCATION_GROUP.
+  #timeMap: TimeMap | undefined;
+  // B5: latched at switchTrack() time; consumed by the next switch
+  // DiscontinuityRecord emission and reset to false afterwards so it doesn't
+  // leak across switches.
+  #lastSwitchHadTimeMapMiss: boolean = false;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -77,40 +297,97 @@ export class Player {
     // If we already received the catalog, skip initialization
     if (this.catalog) return this.catalog;
 
-    logger.info('player', `Connecting to relay: ${this.#options.relayUrl}`);
     try {
+      // Initialize the client and fetch the catalog
       this.client = await MOQtailClient.new({
         url: this.#options.relayUrl,
-        callbacks: {
-          onMessageSent: msg => logger.debug('player', `control →relay: ${msg.constructor.name}`),
-          onMessageReceived: msg =>
-            logger.debug('player', `control ←relay: ${msg.constructor.name}`),
-        },
       });
-      logger.info('player', 'Connected to relay');
     } catch (error) {
       logger.error('media', 'Failed to connect to relay', (error as Error).message);
       throw error;
     }
 
-    logger.info('player', 'Retrieving catalog...');
+    // Debug-only escape hatch: lets the network test harness force a SWITCH
+    // without going through the AbrController. Used by Slice C/Phase B E2Es
+    // (see tests/network/scenarios/test_naive_switch_discontinuity.py). Not
+    // for production use — direct switchTrack() calls bypass the ABR
+    // switching guard's bookkeeping.
+    if (typeof window !== 'undefined') {
+      (window as Window & { __forceSwitch?: (trackName: string) => Promise<void> }).__forceSwitch =
+        (trackName: string) => this.switchTrack(trackName);
+    }
+
+    // Fetch the catalog
     try {
       this.catalog = await this.retrieveCatalog();
-      logger.info('player', `Catalog retrieved — ${this.catalog.getTracks().length} track(s)`);
     } catch (error) {
       logger.error('media', 'Failed to retrieve catalog', (error as Error).message);
       throw error;
     }
 
+    // B4: construct the TimeMap once, anchored on the video track's GOP duration.
+    // Quality variants share a TimeMap — gopDurationMs is equal across them in practice.
+    const videoTracks = this.catalog?.getTracks('video');
+    const videoTrack = videoTracks?.[0];
+    if (videoTrack) {
+      const gopDurationMs = this.catalog!.getGopDurationMs(videoTrack.name);
+      this.#timeMap = new TimeMap(gopDurationMs);
+    }
+
     return this.catalog;
   }
 
+  /**
+   * Estimate initial bandwidth from WebTransport.getStats().
+   *
+   * By the time initialize() returns, the QUIC handshake + catalog fetch have
+   * already transferred data. We take two getStats() snapshots 200ms apart
+   * and derive throughput from the bytesReceived delta. Returns 0 if the
+   * browser doesn't support getStats() or the measurement is too noisy.
+   */
+  async estimateInitialBandwidth(): Promise<number> {
+    const transport = this.client?.webTransport;
+    if (!transport || typeof (transport as { getStats?: unknown }).getStats !== 'function')
+      return 0;
+
+    type StatsResult = { bytesReceived?: number };
+    const getStats = (
+      transport as unknown as { getStats: () => Promise<StatsResult> }
+    ).getStats.bind(transport);
+
+    const s1 = await getStats();
+    const t1 = Date.now();
+    await new Promise(r => setTimeout(r, 200));
+    const s2 = await getStats();
+    const t2 = Date.now();
+
+    const deltaBytes = (s2.bytesReceived ?? 0) - (s1.bytesReceived ?? 0);
+    const deltaMs = t2 - t1;
+    if (deltaMs < 50 || deltaBytes <= 0) return 0;
+
+    return (deltaBytes * 8 * 1000) / deltaMs;
+  }
+
   async dispose() {
+    for (const d of this.#disposers) {
+      try {
+        d();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.#disposers = [];
+
     // Unsubscribe from all active streams
     await Promise.all(this.#streams.map(s => this.unsubscribe(s.requestId)));
 
     // Close the client connection
     await this.client?.disconnect();
+
+    // Tear down the debug-only force-switch hook installed in initialize().
+    if (typeof window !== 'undefined') {
+      delete (window as Window & { __forceSwitch?: unknown }).__forceSwitch;
+    }
 
     // Reset state
     this.catalog = null;
@@ -133,32 +410,21 @@ export class Player {
     if (!this.catalog) throw new Error('Catalog not loaded');
     if (!this.client) throw new Error('MOQProcessor not initialized');
 
-    logger.info('player', `addMediaTrack: "${trackName}"`);
-
     // We require a catalog entry to be present
     if (!this.catalog?.getByTrackName(trackName))
       throw new Error(`Track not found in catalog: ${trackName}`);
 
-    // Verify packaging is 'cmaf' or 'chunk-per-object'
+    // Verify packaging is playable by this player ('loc', 'cmaf', or 'chunk-per-object').
     if (!this.catalog.isCMAF(trackName))
       throw new Error(
-        `Unsupported packaging type for track ${trackName}, only 'cmaf' and 'chunk-per-object' are supported`,
+        `Unsupported packaging type for track ${trackName}, only 'loc', 'cmaf', and 'chunk-per-object' are supported`,
       );
-
-    const codecString = this.catalog.getCodecString(trackName);
-    const role = this.catalog.getRole(trackName);
-    logger.info('player', `addMediaTrack: "${trackName}" role=${role} codec=${codecString}`);
 
     // Get the stream struct
     const struct = await this.subscribe({ trackName });
 
     // Create new Source Buffer
     await this.#newSourceBufferMSE(struct, trackName);
-
-    logger.info(
-      'player',
-      `addMediaTrack: SourceBuffer created for "${trackName}" requestId=${struct.requestId}`,
-    );
 
     // Return the request ID
     return struct.requestId;
@@ -169,10 +435,44 @@ export class Player {
     if (!this.#element) throw new Error('Media element not attached');
     if (this.#streams.length === 0) throw new Error('No active media streams to start');
 
-    logger.info(
-      'player',
-      `startMedia: ${this.#streams.length} stream(s), MSE state="${this.#mse?.readyState}"`,
-    );
+    // Wedge watchdog. Each ABR switch leaves a ~1-frame gap in the MSE
+    // timeline (the relay activates the new track at the next group boundary,
+    // so a few frames at the boundary are dropped). When currentTime walks
+    // into one of those gaps, MSE goes ready_state=2 and stops advancing
+    // forever even though data is buffered on the far side. Detect that
+    // exact pattern (frames frozen, currentTime sitting at the end of a
+    // buffered range, with another range immediately after) and seek across
+    // the gap.
+    const el = this.#element;
+    let lastFrames = 0;
+    let frozenSince = 0;
+    const wedgeIntervalId = setInterval(() => {
+      const q = el.getVideoPlaybackQuality?.();
+      const frames = q?.totalVideoFrames ?? 0;
+      if (frames > lastFrames) {
+        lastFrames = frames;
+        frozenSince = 0;
+        return;
+      }
+      if (el.paused || el.ended) return;
+      frozenSince += 1;
+      if (frozenSince < 2) return; // wait ~1s of confirmed freeze
+      const buf = el.buffered;
+      for (let i = 0; i < buf.length - 1; i++) {
+        const end = buf.end(i);
+        const nextStart = buf.start(i + 1);
+        if (el.currentTime >= end - 0.05 && nextStart > end && nextStart - end < 1.5) {
+          logger.info(
+            'media',
+            `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
+          );
+          el.currentTime = nextStart + 0.001;
+          frozenSince = 0;
+          return;
+        }
+      }
+    }, 500);
+    this.#disposers.push(() => clearInterval(wedgeIntervalId));
 
     // Convenience function to wait for buffer updates
     const waitForBufferUpdate = (sourceBuffer: SourceBuffer) =>
@@ -180,68 +480,50 @@ export class Player {
         sourceBuffer.addEventListener('updateend', () => resolve(), { once: true }),
       );
 
-    const isInOrder = (a: MoqtObject, b: MoqtObject) => {
-      // First objects are most likely to be RAPs
-      if (b.location.object === 0n) return true;
-      if (a.location.group < b.location.group) return true;
-      if (a.location.group > b.location.group) return false;
-      return a.location.object < b.location.object;
-    };
+    // Seek behind the live edge so the player starts with buffer runway.
+    // Without this offset the player lands on the live edge (0 s buffer),
+    // immediately stalls, recovers for a moment, then stalls again —
+    // creating the "video gets stuck" symptom.
 
-    // Seek to buffer end
     let gotNotification = 0;
     let target = 0;
     const bufferNotification = (end: number) => {
       if (gotNotification >= this.#streams.length) return false;
 
-      // For live, seek to the max end, for VOD seek to the min start
-      target = Math.max(target, end);
+      // Start behind the live edge so there is buffer to consume while
+      // new data continues arriving. The MSEBuffer module then fine-tunes
+      // the distance via playback-rate adjustments (catchup / catchdown).
+      target = computeStartupTarget({
+        end,
+        baseTarget: target,
+        clientMode: this.#options.clientMode,
+        filterDelaySeconds: this.#options.filterDelaySeconds,
+      });
 
       gotNotification++;
-      logger.info(
-        'player',
-        `bufferNotification: stream ${gotNotification}/${this.#streams.length} ready, bufferEnd=${end.toFixed(3)}s`,
-      );
       if (gotNotification === this.#streams.length) {
-        // Don't seek/play if already playing
-        const video = this.#element!;
-        const alreadyPlaying = !video.paused && !video.ended && video.readyState > 2;
-
-        if (alreadyPlaying) {
-          logger.debug('player', 'Already playing, skipping seek/play');
-          return true;
-        }
-
         logger.info(
-          'player',
-          `All buffers ready — seeking to ${target.toFixed(3)}s and calling play()`,
+          'media',
+          `All buffers ready, seeking to ${target.toFixed(2)}s (live edge ${end.toFixed(2)}s)`,
         );
-        video.currentTime = target;
-        video
-          .play()
-          .then(() => logger.info('player', 'play() resolved'))
-          .catch(e => logger.error('player', 'play() rejected', e));
+        this.#element!.currentTime = target;
+        this.#element!.play();
+        // Install the rVFC poll that detects first-frame-rendered post-switch
+        // and computes perceivedPauseMs (Task C5). Safe to install once playback
+        // has started — the element is non-null and ready to render frames.
+        this.#installPerceivedPausePoll();
       }
       return true;
     };
 
     // Iterate over all added roles
     for (const struct of this.#streams) {
-      logger.info(
-        'player',
-        `startMedia: setting up stream for "${struct.trackName}" requestId=${struct.requestId}`,
-      );
-
       // Get the init segment for the track
       const initSegment = this.catalog?.getInitData(struct.trackName);
       if (!initSegment) {
         await this.unsubscribe(struct.requestId);
         throw new Error(`Failed to get init segment for track: ${struct.trackName}`);
       }
-      logger.debug(
-        'player',
-        `startMedia: init segment size=${initSegment.byteLength}B for "${struct.trackName}"`,
-      );
 
       // Get the Buffer and AbortController for this track
       const { sourceBuffer, ac } = struct.buffer!;
@@ -250,7 +532,6 @@ export class Player {
       try {
         sourceBuffer.appendBuffer(initSegment);
         await waitForBufferUpdate(sourceBuffer);
-        logger.info('player', `startMedia: init segment appended for "${struct.trackName}"`);
       } catch (error) {
         await this.unsubscribe(struct.requestId);
         throw new Error(
@@ -261,8 +542,6 @@ export class Player {
       // MSE State
       let lastMSEErrorLogged = 0;
       let kickStarted = false;
-      let objectCount = 0;
-      let previousObject: MoqtObject | null = null;
 
       // Create the WritableStream to handle incoming objects
       const writable = new WritableStream<MoqtObject>({
@@ -270,34 +549,16 @@ export class Player {
           try {
             // Skip end-of-group objects
             if (object.isEndOfGroup()) {
-              logger.debug(
-                'player',
-                `[${struct.trackName}] end-of-group (group=${object.groupId}, obj=${object.objectId})`,
+              logger.info(
+                'media',
+                `Received end-of-group object for track ${struct.trackName}, ignoring`,
               );
               return;
             }
 
-            objectCount++;
-            if (objectCount === 1) {
-              logger.info(
-                'player',
-                `[${struct.trackName}] first object received — group=${object.groupId} obj=${object.objectId} size=${object.payload?.byteLength ?? 0}B`,
-              );
-            } else if (objectCount % 30 === 0) {
-              const buf = sourceBuffer.buffered;
-              const bufEnd = buf.length > 0 ? buf.end(buf.length - 1).toFixed(3) : 'none';
-              logger.debug(
-                'player',
-                `[${struct.trackName}] object #${objectCount} group=${object.groupId} obj=${object.objectId} bufferEnd=${bufEnd}s`,
-              );
-            }
-
             // Make TypeScript happy
             if (!(object.payload?.buffer instanceof ArrayBuffer)) {
-              logger.warn(
-                'player',
-                `[${struct.trackName}] non-ArrayBuffer payload, ignoring (type=${typeof object.payload?.buffer})`,
-              );
+              console.warn('Received non-ArrayBuffer payload, ignoring', object);
               return;
             }
 
@@ -307,22 +568,170 @@ export class Player {
               return;
             }
 
-            // This is a very crude attempt to ensure video playback continues when objects from multiple streams arrive out of order.
-            // Normally we order the objects but this is simpler.
-            if (previousObject && !isInOrder(previousObject, object)) {
-              logger.warn(
-                'player',
-                `[${struct.trackName}] out-of-order object detected (group=${object.groupId}, obj=${object.objectId}), discarding...`,
+            // Resolve the incoming object's track name from its fullTrackName
+            // (wire-side truth). Always compute it — not just during pending
+            // switches — because the relay continues to flush in-flight
+            // old-track streams AFTER a switch completes. Those trailing
+            // packets have different HEVC SPS/PPS than the new init segment,
+            // so appending them would feed the SourceBuffer data it can't
+            // decode and stall MSE.
+            const objectTrackName = new TextDecoder().decode(object.fullTrackName.name);
+
+            // Drop anything that isn't the current track or the pending
+            // switch target. Covers two cases:
+            //   1. Rapid ABR switching (A→B→C) where intermediate-track data
+            //      arrives after pendingSwitch was overwritten to C.
+            //   2. Old-track trailing packets delivered after a switch has
+            //      already activated and pendingSwitch was cleared.
+            if (
+              objectTrackName !== struct.trackName &&
+              objectTrackName !== struct.pendingSwitch?.trackName
+            ) {
+              logger.info(
+                'media',
+                `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
               );
               return;
             }
-            previousObject = object;
+
+            if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
+              const {
+                initData,
+                mimeType,
+                trackName: newTrackName,
+                oldEndPTS_ms,
+                playheadPTS_ms,
+                switchSentAt,
+                framesAtSwitch,
+              } = struct.pendingSwitch;
+              const fromTrack = struct.trackName; // capture BEFORE overwriting
+              struct.trackName = newTrackName;
+              struct.pendingSwitch = null;
+              struct.firstFrameAfterSwitchSeen = false; // reset for C5
+              // Stash C5 state on sibling struct fields that survive the
+              // pendingSwitch clear. The rVFC poll consumes these to compute
+              // perceivedPauseMs and attach it to the discontinuity record.
+              struct.postSwitchFrameTarget = framesAtSwitch;
+              struct.postSwitchSentAt = switchSentAt;
+              struct.postSwitchToTrack = newTrackName;
+
+              // changeType() must not be called while the SourceBuffer is updating
+              if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+              try {
+                sourceBuffer.changeType(mimeType);
+                sourceBuffer.appendBuffer(initData);
+                await waitForBufferUpdate(sourceBuffer);
+              } catch (switchError) {
+                logger.error(
+                  'media',
+                  `switchTrack: failed to apply init segment for ${newTrackName}:`,
+                  switchError,
+                );
+                // Release the guard and abort the write stream — the source buffer
+                // may be in an inconsistent state after a partial changeType/append.
+                this.#options.onTrackSwitched?.(newTrackName);
+                controller.error(switchError);
+                return;
+              }
+
+              // Compute and push the discontinuity record. PTS-gap is the headline
+              // metric: signed difference between the first appended frame's PTS on
+              // the new track and the last appended frame's end PTS on the old track.
+              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const newStartPTS_ms =
+                newTimescale && newTimescale > 0
+                  ? parseMoofBaseMediaDecodeTime(
+                      new Uint8Array(
+                        object.payload.buffer,
+                        object.payload.byteOffset,
+                        object.payload.byteLength,
+                      ),
+                      newTimescale,
+                    )
+                  : undefined;
+
+              if (newStartPTS_ms !== undefined) {
+                const ptsGapMs = oldEndPTS_ms !== undefined ? newStartPTS_ms - oldEndPTS_ms : 0;
+                const playheadGapMs =
+                  playheadPTS_ms !== undefined ? newStartPTS_ms - playheadPTS_ms : undefined;
+                const wallClockMs = performance.now() - switchSentAt;
+                const record: DiscontinuityRecord = {
+                  eventType: 'switch',
+                  switchSentAt,
+                  switchAppliedAt: performance.now(),
+                  fromTrack,
+                  toTrack: newTrackName,
+                  oldEndPTS_ms,
+                  newStartPTS_ms,
+                  ptsGapMs,
+                  playheadPTS_ms,
+                  playheadGapMs,
+                  wallClockMs,
+                  switchMode: this.#options.switchMode,
+                  timeMapMiss: this.#lastSwitchHadTimeMapMiss,
+                  clientMode: this.#options.clientMode,
+                  filterDelaySeconds: this.#options.filterDelaySeconds,
+                };
+                // Reset so the flag doesn't leak across switches.
+                this.#lastSwitchHadTimeMapMiss = false;
+                if (typeof window !== 'undefined') {
+                  const w = window as Window & {
+                    __moqtailMetrics?: {
+                      switchDiscontinuities?: DiscontinuityRecord[];
+                      [k: string]: unknown;
+                    };
+                  };
+                  w.__moqtailMetrics ??= {} as Window['__moqtailMetrics'] & object;
+                  const metrics = w.__moqtailMetrics as Window['__moqtailMetrics'] & {
+                    switchDiscontinuities?: DiscontinuityRecord[];
+                  };
+                  metrics.switchDiscontinuities ??= [];
+                  metrics.switchDiscontinuities.push(record);
+                }
+              }
+
+              // NOW release the ABR switching guard — the relay has completed the
+              // transition and delivered data on the new track. Safe to switch again.
+              this.#options.onTrackSwitched?.(newTrackName);
+            }
+
+            // Update lastAppendedEndPTS_ms before appending. C3 will read this for the
+            // "old end PTS" half of the discontinuity calculation.
+            // Publisher emits one moof+mdat per access unit (see apps/publisher/src/cmaf.rs),
+            // so each moof's tfdt is a per-frame decode time and the trun carries that
+            // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
+            const timescale = this.catalog?.getTimescale(struct.trackName);
+            if (timescale && timescale > 0) {
+              const info = parseMoofMediaInfo(
+                new Uint8Array(
+                  object.payload.buffer,
+                  object.payload.byteOffset,
+                  object.payload.byteLength,
+                ),
+                timescale,
+              );
+              if (info !== undefined) {
+                struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
+                // B4: feed the TimeMap so aligned switch (B5) can resolve playhead -> group.
+                // Only the first object of each group records (idempotent in TimeMap),
+                // and frame 0 of a group has decodeTime == group start PTS.
+                if (this.#timeMap) {
+                  this.#timeMap.recordGroupBoundary(
+                    Number(object.location.group),
+                    info.decodeTimeMs,
+                  );
+                }
+              }
+            }
 
             // Append the data
             let maxRetries = 5;
             while (maxRetries--) {
               try {
+                // Append the data
                 sourceBuffer.appendBuffer(object.payload.buffer);
+
+                // Wait for the source buffer to be consumed
                 await waitForBufferUpdate(sourceBuffer);
                 break;
               } catch (error) {
@@ -330,9 +739,17 @@ export class Player {
                 if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
                 else if (lastMSEErrorLogged + 5000 < performance.now()) {
                   lastMSEErrorLogged = performance.now();
+                  const err = error as Error & { name?: string; code?: number };
+                  const vErr = this.#element?.error;
                   logger.error(
-                    'player',
-                    `[${struct.trackName}] SourceBuffer appendBuffer failed, retrying (${maxRetries} left): ${(error as Error).message}`,
+                    'media',
+                    `Error appending to SourceBuffer, retrying... (${maxRetries} attempts left). ` +
+                      `err.name=${err?.name} err.message=${err?.message} ` +
+                      `sb.updating=${sourceBuffer.updating} ` +
+                      `mse.readyState=${this.#mse?.readyState} ` +
+                      `video.error.code=${vErr?.code} video.error.message=${vErr?.message} ` +
+                      `payload.byteLength=${object.payload.byteLength} ` +
+                      `track=${objectTrackName}`,
                   );
                 }
               }
@@ -343,14 +760,89 @@ export class Player {
               const minStart = sourceBuffer.buffered.start(0);
               const maxEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
               const bufferDuration = maxEnd - minStart;
-              logger.debug(
-                'player',
-                `[${struct.trackName}] buffered ${bufferDuration.toFixed(3)}s (${minStart.toFixed(3)}–${maxEnd.toFixed(3)}s), kickStarted=${kickStarted}`,
-              );
-              if (bufferDuration > 1.0) {
-                kickStarted = true;
-                bufferNotification(maxEnd);
+              if (bufferDuration > 1.0) bufferNotification(maxEnd);
+            }
+
+            // Record goodput sample — SWMA on per-group object timing.
+            // The publisher bursts a GOP's objects back-to-back so the
+            // intra-group rate reflects link capacity, not source bitrate.
+            struct.tracker.recordObject(object.payload.byteLength, object.location.group);
+            struct.lastGroupId = object.location.group;
+
+            // First-received-group export for E2E smoke + connect-time metrics (Phase C).
+            // Only set once across all streams to capture the earliest received group.
+            if (typeof window !== 'undefined') {
+              if (window.__moqtailMetrics === undefined) {
+                window.__moqtailMetrics = { abr: null, samples: null };
               }
+              const isFirstObject = window.__moqtailMetrics.firstReceivedGroupId === undefined;
+              if (isFirstObject) {
+                window.__moqtailMetrics.firstReceivedGroupId = Number(object.location.group);
+
+                // Connect-time discontinuity record (Task C4): emit only if we
+                // were in filtered mode AND we have a known expected start
+                // group (i.e. the relay sent a SubscribeOk with largestLocation
+                // and delay_groups was non-zero).
+                if (
+                  this.#options.clientMode === 'filtered' &&
+                  this.#expectedStartGroupId !== undefined &&
+                  this.#connectSentAt !== undefined
+                ) {
+                  const expected = this.#expectedStartGroupId;
+                  const actual = Number(object.location.group);
+                  // Relay clamps when our requested target was older than the
+                  // oldest cached group: it returns a more-recent group instead.
+                  const clampedByRelay = actual > expected;
+
+                  const connectTimescale = this.catalog?.getTimescale(struct.trackName);
+                  const newStartPTS_ms =
+                    connectTimescale && connectTimescale > 0
+                      ? parseMoofBaseMediaDecodeTime(
+                          new Uint8Array(
+                            object.payload.buffer,
+                            object.payload.byteOffset,
+                            object.payload.byteLength,
+                          ),
+                          connectTimescale,
+                        )
+                      : undefined;
+
+                  const connectGopDurationMs =
+                    this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
+                  const ptsGapMs = (actual - expected) * connectGopDurationMs;
+                  const wallClockMs = performance.now() - this.#connectSentAt;
+
+                  const record: DiscontinuityRecord = {
+                    eventType: 'connect',
+                    switchSentAt: this.#connectSentAt,
+                    switchAppliedAt: performance.now(),
+                    toTrack: struct.trackName,
+                    newStartPTS_ms: newStartPTS_ms ?? 0,
+                    ptsGapMs,
+                    wallClockMs,
+                    expectedStartGroup: expected,
+                    actualStartGroup: actual,
+                    clampedByRelay,
+                    switchMode: this.#options.switchMode,
+                    clientMode: this.#options.clientMode,
+                    filterDelaySeconds: this.#options.filterDelaySeconds,
+                  };
+                  window.__moqtailMetrics.switchDiscontinuities ??= [];
+                  window.__moqtailMetrics.switchDiscontinuities.push(record);
+                }
+              }
+            }
+
+            // Read PRFT box (if any) at the head of the CMAF chunk.
+            // Publisher prepends `prft` per ISO/IEC 14496-12 §8.16.5 so the
+            // receiver can compute end-to-end latency per frame. MSE skips
+            // unknown top-level boxes, so the chunk is appended unchanged.
+            // `object.payload` is already a Uint8Array view at the right
+            // offset — pass it directly so we don't accidentally read from
+            // byte 0 of a shared underlying ArrayBuffer.
+            const captureMs = readPrftCaptureMs(object.payload);
+            if (captureMs !== null) {
+              this.#latencyTracker.record(Date.now() - captureMs);
             }
           } catch (error) {
             logger.error('media', 'Error processing media object:', error);
@@ -360,46 +852,377 @@ export class Player {
       });
 
       // Pipe to the writable stream
-      logger.info('player', `startMedia: piping "${struct.trackName}" stream into WritableStream`);
       const promise = struct.source.pipeTo(writable, { signal: ac.signal });
 
-      // Cleanup stream
-      promise
-        .catch(error => {
-          if (!['AbortError', 'InternalError'].includes(error.name)) {
-            logger.error(
-              'player',
-              `[${struct.trackName}] pipeTo error: ${error.name} — ${error.message}`,
-            );
-            throw error;
+      // Cleanup stream — for live streams, do NOT call endOfStream() when the
+      // pipe ends. The readable stream can close transiently (e.g., during a
+      // SWITCH, relay reconnection, or subscription update). Calling endOfStream()
+      // permanently seals the MediaSource, preventing any further data from being
+      // appended. Only call endOfStream() when the player is being disposed.
+      promise.catch(error => {
+        if (!['AbortError', 'InternalError'].includes(error.name)) {
+          logger.error('media', 'Stream pipe error:', error);
+        }
+      });
+    }
+  }
+
+  getMetrics(): {
+    bandwidthBps: number;
+    fastEmaBps: number;
+    slowEmaBps: number;
+    bufferSeconds: number;
+    activeTrack: string | null;
+    droppedFrames: number;
+    totalFrames: number;
+    playbackRate: number;
+    deliveryTimeMs: number;
+    lastObjectBytes: number;
+    sampleCount: number;
+    readyState: number;
+    paused: boolean;
+    currentTime: number;
+    bufferedRanges: string;
+    mseReadyState: string;
+    videoErrorCode: number;
+    latencyTrendRatio: number;
+    lastLatencyMs: number;
+  } {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    const el = this.#element;
+    const buffered = el?.buffered;
+    const bufferSeconds =
+      buffered && buffered.length > 0 && el
+        ? Math.max(0, buffered.end(buffered.length - 1) - el.currentTime)
+        : 0;
+    const quality = el?.getVideoPlaybackQuality?.();
+    let bufferedRanges = '';
+    if (buffered) {
+      const parts: string[] = [];
+      for (let i = 0; i < buffered.length; i++) {
+        parts.push(`${buffered.start(i).toFixed(2)}-${buffered.end(i).toFixed(2)}`);
+      }
+      bufferedRanges = parts.join(',');
+    }
+    return {
+      bandwidthBps: videoStruct?.tracker.getBandwidthBps() ?? 0,
+      fastEmaBps: videoStruct?.tracker.getFastEmaBps() ?? 0,
+      slowEmaBps: videoStruct?.tracker.getSlowEmaBps() ?? 0,
+      bufferSeconds,
+      activeTrack: videoStruct?.trackName ?? null,
+      droppedFrames: quality?.droppedVideoFrames ?? 0,
+      totalFrames: quality?.totalVideoFrames ?? 0,
+      playbackRate: el?.playbackRate ?? 1,
+      deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
+      lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
+      sampleCount: videoStruct?.tracker.getSampleCount() ?? 0,
+      readyState: el?.readyState ?? 0,
+      paused: el?.paused ?? true,
+      currentTime: el?.currentTime ?? 0,
+      bufferedRanges,
+      mseReadyState: this.#mse?.readyState ?? 'closed',
+      videoErrorCode: el?.error?.code ?? 0,
+      latencyTrendRatio: this.#latencyTracker.getTrendRatio(),
+      lastLatencyMs: this.#latencyTracker.getLastLatencyMs(),
+    };
+  }
+
+  setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    videoStruct?.tracker.setHalfLives(halfLifeFastSec, halfLifeSlowSec);
+  }
+
+  /**
+   * Anchor the active video tracker's throughput EMA to a conservative startup
+   * estimate (bps) so the first real per-group sample can't seed the EMA from a
+   * startup burst. See GoodputTracker.seedEma. No-op once real samples exist.
+   */
+  seedThroughputEstimate(bps: number): void {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    videoStruct?.tracker.seedEma(bps);
+  }
+
+  /**
+   * Recurring requestVideoFrameCallback poll that detects the first new-track
+   * frame actually rendering after a track switch (Task C5).
+   *
+   * Each fired callback fires on every rendered frame. For each stream struct
+   * in the post-switch awaiting state (sibling fields stashed by the write
+   * handler when the new init segment was applied), check whether
+   * totalVideoFrames has advanced past the snapshot taken at switchTrack()
+   * time. If so, the first new-track frame has rendered: compute
+   * perceivedPauseMs = performance.now() - switchSentAt and attach it to the
+   * most recent matching switch record in window.__moqtailMetrics.switchDiscontinuities.
+   *
+   * Re-arms each frame for the lifetime of the player — per-tick work is a
+   * cheap for-loop over streams.
+   */
+  #installPerceivedPausePoll(): void {
+    if (!this.#element) return;
+    const poll = () => {
+      if (!this.#element) return;
+      const total = this.#element.getVideoPlaybackQuality().totalVideoFrames;
+      for (const struct of this.#streams) {
+        if (
+          struct.firstFrameAfterSwitchSeen !== true &&
+          struct.postSwitchFrameTarget !== undefined &&
+          struct.postSwitchSentAt !== undefined &&
+          struct.postSwitchToTrack !== undefined &&
+          total > struct.postSwitchFrameTarget
+        ) {
+          struct.firstFrameAfterSwitchSeen = true;
+          const perceivedPauseMs = performance.now() - struct.postSwitchSentAt;
+          const targetTrack = struct.postSwitchToTrack;
+
+          // Find the most recent matching switch record and attach.
+          if (typeof window !== 'undefined' && window.__moqtailMetrics) {
+            const records = window.__moqtailMetrics.switchDiscontinuities;
+            if (records) {
+              for (let i = records.length - 1; i >= 0; i--) {
+                const r = records[i];
+                if (r && r.eventType === 'switch' && r.toTrack === targetTrack) {
+                  r.perceivedPauseMs = perceivedPauseMs;
+                  break;
+                }
+              }
+            }
           }
-          logger.info('player', `[${struct.trackName}] pipeTo ended: ${error.name}`);
-        })
-        .finally(async () => {
-          logger.info(
-            'player',
-            `[${struct.trackName}] stream finished — MSE readyState="${this.#mse!.readyState}"`,
-          );
-          if (this.#mse!.readyState === 'open') this.#mse!.endOfStream();
-        });
+
+          // Clean up — switch transition complete.
+          struct.postSwitchFrameTarget = undefined;
+          struct.postSwitchSentAt = undefined;
+          struct.postSwitchToTrack = undefined;
+        }
+      }
+      // Re-arm for next frame.
+      this.#element.requestVideoFrameCallback(poll);
+    };
+    this.#element.requestVideoFrameCallback(poll);
+  }
+
+  /**
+   * Active bandwidth probe (per Kuo, KTH MSc 2025 §3.4.3.1 Algorithm 1;
+   * IETF 119 MoQ bandwidth-measurement slides).
+   *
+   * Subscribes to a synthetic `.probe:<size>:<priority>` track that the
+   * relay handles by generating one payload of the requested size and
+   * closing the stream. We measure both the **probe** bytes (p) and the
+   * **video-track** bytes (v) received during the same wall-clock window,
+   * matching Algorithm 1's `BWE = (v + p) / Δt`. Combining v + p
+   * estimates total link throughput rather than just the probe's
+   * residual capacity.
+   *
+   * Returns 0 on subscribe failure or no data.
+   */
+  async probeTrackBandwidth(trackName: string, durationMs: number): Promise<number> {
+    if (!this.client) return 0;
+    const fullTrackName = getFullTrackName(this.#options.namespace, trackName);
+
+    // Snapshot the active video tracker's cumulative bytes before the probe
+    // window opens. Diff at the end gives us v (real-track bytes received
+    // concurrently with the probe).
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    const vBytesStart = videoStruct?.tracker.getCumulativeBytes() ?? 0;
+    const tStart = Date.now();
+
+    const result = await this.client.subscribe({
+      fullTrackName,
+      groupOrder: GroupOrder.Original,
+      filterType: FilterType.LatestObject,
+      forward: true,
+      priority: 255,
+    });
+    if (result instanceof RequestError) return 0;
+
+    const reader = result.stream.getReader();
+    let pBytes = 0;
+    let count = 0;
+
+    try {
+      while (Date.now() - tStart < durationMs) {
+        const remaining = durationMs - (Date.now() - tStart);
+        const timeoutP = new Promise<{ done: true; value: undefined }>(resolve =>
+          setTimeout(() => resolve({ done: true, value: undefined }), remaining),
+        );
+        const readP = reader.read() as Promise<{
+          done: boolean;
+          value: typeof MoqtObject.prototype | undefined;
+        }>;
+        const r = await Promise.race([readP, timeoutP]);
+        if (r.done || !r.value) break;
+        if (r.value.isEndOfGroup()) continue;
+        const len = r.value.payload?.byteLength ?? 0;
+        if (len === 0) continue;
+        pBytes += len;
+        count++;
+      }
+    } catch {
+      /* swallow — return what we have */
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* ignore */
+      }
+      this.client.unsubscribe(result.requestId).catch(() => {});
+    }
+
+    const tEnd = Date.now();
+    const dtSec = (tEnd - tStart) / 1000;
+    if (count === 0 || dtSec <= 0) return 0;
+
+    const vBytesEnd = videoStruct?.tracker.getCumulativeBytes() ?? vBytesStart;
+    const vBytes = Math.max(0, vBytesEnd - vBytesStart);
+
+    // BWE = (v + p) × 8 / Δt — Algorithm 1 line 9.
+    return ((vBytes + pBytes) * 8) / dtSec;
+  }
+
+  /**
+   * Updates the onTrackSwitched callback post-construction.
+   * Called by app.tsx after creating the Player and AbrController,
+   * to wire the ABR switching guard release without a circular dependency.
+   */
+  setOnTrackSwitched(cb: (trackName: string) => void): void {
+    this.#options.onTrackSwitched = cb;
+  }
+
+  /**
+   * Abort an in-flight track switch. Called by AbrController when its
+   * switching-guard timeout fires — meaning the chosen target track is
+   * unfulfillable (typically: upswitch fired right before a regime change
+   * dropped the link below the target's source rate). Clearing
+   * `pendingSwitch` ensures any stale data arriving later on the abandoned
+   * track is dropped by the write handler's `objectTrackName !==
+   * struct.pendingSwitch?.trackName` filter rather than belatedly applied.
+   */
+  abortPendingSwitch(): void {
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    if (!videoStruct) return;
+    videoStruct.pendingSwitch = null;
+  }
+
+  /**
+   * Seamlessly switches the active video track using the MoQ SWITCH message.
+   * The relay will complete delivery of the current group then begin sending
+   * the new track. The WritableStream.write handler detects the group boundary
+   * and re-injects the new init segment before appending the first new payload.
+   *
+   * Fire-and-forget from AbrController: do NOT await this externally.
+   * The #switching guard in AbrController is released via onTrackSwitched callback.
+   */
+  async switchTrack(trackName: string): Promise<void> {
+    if (!this.client) return;
+    if (!this.catalog) return;
+
+    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    if (!videoStruct) return;
+
+    const fullTrackName = getFullTrackName(this.#options.namespace, trackName);
+    const initData = this.catalog.getInitData(trackName);
+    const role = this.catalog.getRole(trackName);
+    const codec = this.catalog.getCodecString(trackName);
+
+    if (!initData || !role || !codec) {
+      logger.error('media', `switchTrack: missing catalog data for track ${trackName}`);
+      this.#options.onTrackSwitched?.(videoStruct.trackName);
+      return;
+    }
+
+    const mimeType = `${role}/mp4; codecs="${codec}"`;
+
+    // Snapshot playhead + wall clock BEFORE sending the SWITCH so that
+    // playheadPTS_ms pairs with the targetGroup decision below. Capturing
+    // these after `await client.switch()` reads playhead AFTER the relay
+    // round-trip — the playhead can advance past a group boundary in that
+    // window (offset30 with mininet ~50ms RTT cleared one GOP, pushing
+    // |playheadGap| just above gopDurationMs even when alignment was
+    // correct at the moment of decision).
+    const playheadPTS_ms = this.#element !== null ? this.#element.currentTime * 1000 : undefined;
+    const switchSentAt = performance.now();
+    const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
+
+    // Compute aligned-switch target group from playhead via TimeMap.
+    let targetGroup: number | undefined;
+    if (this.#options.switchMode === 'aligned' && this.#timeMap && playheadPTS_ms !== undefined) {
+      targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
+    }
+    const { params: switchParams, timeMapMiss } = buildSwitchParameters({
+      switchMode: this.#options.switchMode,
+      targetGroup,
+    });
+    if (timeMapMiss) {
+      logger.warn('media', 'aligned switch: TimeMap miss; falling through to naive');
+    }
+    this.#lastSwitchHadTimeMapMiss = timeMapMiss;
+
+    // Pre-allocate the new request id and update videoStruct.requestId BEFORE
+    // awaiting client.switch(). If a second switchTrack call (ABR tick or
+    // force_switch) starts before this one completes, it will read the
+    // already-incremented requestId and pass it as subscriptionRequestId in
+    // its own SWITCH — preventing the stale-id chain that the relay rejects
+    // as ProtocolViolation and tears the WebTransport down. Concurrency on
+    // the wire is preserved; only the id-state read is moved to before the
+    // await.
+    const subscriptionRequestId = videoStruct.requestId;
+    const newRequestId = this.client.allocateNextRequestId();
+    videoStruct.requestId = newRequestId;
+
+    try {
+      const result = await this.client.switch({
+        requestId: newRequestId,
+        fullTrackName,
+        subscriptionRequestId,
+        parameters: switchParams,
+      });
+
+      if (result instanceof RequestError) {
+        logger.error(
+          'media',
+          `switchTrack: SWITCH rejected for ${trackName}:`,
+          result.reasonPhrase.phrase,
+        );
+        // Roll back the optimistic id update so the next switchTrack attempt
+        // references the still-active subscription rather than the failed one.
+        videoStruct.requestId = subscriptionRequestId;
+        this.#options.onTrackSwitched?.(videoStruct.trackName);
+        return;
+      }
+
+      // Arm the write handler for init segment re-injection at the next group
+      // boundary. The onTrackSwitched callback (which releases the ABR switching
+      // guard) is NOT called here — it fires in the write handler AFTER the relay
+      // has actually delivered data on the new track. This prevents rapid
+      // consecutive SWITCH messages that corrupt the relay's switch context.
+      // Tracker is intentionally not reset — the previous-track bandwidth
+      // estimate is still a valid indicator of network capacity. (dash.js
+      // doesn't reset throughput on quality switches either.)
+      videoStruct.pendingSwitch = {
+        trackName,
+        initData: initData.buffer as ArrayBuffer,
+        mimeType,
+        oldEndPTS_ms: videoStruct.lastAppendedEndPTS_ms,
+        playheadPTS_ms,
+        switchSentAt,
+        framesAtSwitch,
+      };
+      videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
+    } catch (error) {
+      logger.error('media', 'switchTrack: unexpected error', error);
+      // Roll back the optimistic id update on unexpected failure too.
+      videoStruct.requestId = subscriptionRequestId;
+      this.#options.onTrackSwitched?.(videoStruct.trackName);
     }
   }
 
   async #newSourceBufferMSE(struct: MOQStreamStruct, trackName: string) {
     if (!this.#mse) throw new Error('MediaSource not initialized');
 
-    logger.info(
-      'player',
-      `#newSourceBufferMSE: "${trackName}" MSE readyState="${this.#mse.readyState}"`,
-    );
-
     // Wait for media source to be open
     if (this.#mse.readyState === 'closed') {
-      logger.info('player', '#newSourceBufferMSE: waiting for MSE sourceopen...');
       await new Promise(resolve => {
         const onSourceOpen = () => {
           this.#mse!.removeEventListener('sourceopen', onSourceOpen);
-          logger.info('player', '#newSourceBufferMSE: MSE sourceopen fired');
           resolve(true);
         };
         this.#mse!.addEventListener('sourceopen', onSourceOpen);
@@ -416,10 +1239,6 @@ export class Player {
 
     // Check if the MIME type is supported
     const mimeType = `${role}/mp4; codecs="${codecString}"`;
-    logger.info(
-      'player',
-      `#newSourceBufferMSE: mimeType="${mimeType}" supported=${MediaSource.isTypeSupported(mimeType)}`,
-    );
     if (!MediaSource.isTypeSupported(mimeType)) {
       await this.unsubscribe(struct.requestId);
       throw new Error(`MIME type not supported: ${mimeType}`);
@@ -427,7 +1246,6 @@ export class Player {
 
     // Create a new SourceBuffer
     const sourceBuffer = this.#mse.addSourceBuffer(mimeType);
-    logger.info('player', `#newSourceBufferMSE: SourceBuffer added for "${trackName}"`);
 
     // Register the SourceBuffer
     struct.buffer = {
@@ -439,19 +1257,10 @@ export class Player {
   async retrieveCatalog(): Promise<CMSFCatalog> {
     if (!this.client) throw new Error('MOQProcessor not initialized');
 
-    const ns = this.#options.namespace.toUtf8Path();
-    const via = this.#options.receiveCatalogViaSubscribe ? 'SUBSCRIBE' : 'FETCH';
-    logger.info('player', `retrieveCatalog: ns="${ns}" via=${via}`);
-
     let struct: MOQStreamStruct;
     if (this.#options.receiveCatalogViaSubscribe) {
       struct = await this.subscribe({ trackName: 'catalog', priority: 0 });
     } else {
-      const [startLoc, endLoc] = this.#options.catalogLocation;
-      logger.info(
-        'player',
-        `retrieveCatalog: FETCH group=${startLoc.group}:${startLoc.object} → ${endLoc.group}:${endLoc.object}`,
-      );
       const result = await this.client.fetch({
         groupOrder: GroupOrder.Original,
         priority: 0,
@@ -459,65 +1268,52 @@ export class Player {
           type: FetchType.Standalone,
           props: {
             fullTrackName: getFullTrackName(this.#options.namespace, 'catalog'),
-            startLocation: startLoc,
-            endLocation: endLoc,
+            startLocation: this.#options.catalogLocation[0],
+            endLocation: this.#options.catalogLocation[1],
           },
         },
       });
-      if (result instanceof RequestError) {
-        logger.error(
-          'player',
-          `retrieveCatalog: FETCH failed — code=${result.errorCode} reason="${result.reasonPhrase.phrase}"`,
-        );
+      if (result instanceof RequestError)
         throw new Error(`Error occured during catalog fetch: ${result.reasonPhrase.phrase}`);
-      }
-      logger.info('player', `retrieveCatalog: FETCH OK requestId=${result.requestId}`);
+      const tracker = new GoodputTracker();
       struct = {
         trackName: 'catalog',
         requestId: result.requestId,
         source: result.stream,
+        tracker,
+        lastGroupId: -1n,
+        pendingSwitch: null,
+        lastAppendedEndPTS_ms: undefined,
       };
     }
 
     // Pull the latest catalog object
+    if (!struct.source) {
+      throw new Error(
+        'Catalog stream unavailable — the publisher may have disconnected. Restart the relay and publisher, then reconnect.',
+      );
+    }
     const reader = struct.source.getReader();
     let buffer: ArrayBufferLike | undefined;
-    let objectsRead = 0;
     while (!buffer) {
       const result = await reader.read();
       if (result.done) {
-        logger.error(
-          'player',
-          `retrieveCatalog: stream closed after ${objectsRead} object(s) — no catalog data`,
-        );
-        await reader.releaseLock();
+        reader.releaseLock();
         throw new Error('Catalog stream closed unexpectedly while waiting for data');
       }
       const value = result.value;
-      objectsRead++;
-      if (value.isEndOfGroup()) {
-        logger.debug('player', `retrieveCatalog: skipping end-of-group object (#${objectsRead})`);
-        continue;
-      }
+      if (value.isEndOfGroup()) continue;
       if (!value.payload?.buffer) {
         logger.warn('media', 'Received catalog object without payload, ignoring');
         continue;
       }
-      logger.info(
-        'player',
-        `retrieveCatalog: got catalog payload — ${value.payload.byteLength}B (after ${objectsRead} read(s))`,
-      );
       buffer = value.payload.buffer;
     }
 
     // Parse and store the catalog
     const catalog = CMSFCatalog.from(buffer);
-    const tracks = catalog.getTracks();
-    logger.info(
-      'player',
-      `retrieveCatalog: parsed ${tracks.length} track(s): ${tracks.map(t => `${t.name}(${t.role})`).join(', ')}`,
-    );
 
+    // Unsubscribe from the catalog stream since we only needed the latest object
     if (this.#options.receiveCatalogViaSubscribe) await this.unsubscribe(struct.requestId);
     return catalog;
   }
@@ -525,32 +1321,58 @@ export class Player {
   private async subscribe(params: SubscribeOptions): Promise<MOQStreamStruct> {
     if (!this.client) throw new Error('MOQProcessor not initialized');
 
-    const ftn = getFullTrackName(this.#options.namespace, params.trackName);
-    logger.info(
-      'player',
-      `subscribe: "${params.trackName}" ftn="${ftn.toString()}" priority=${params.priority ?? 0}`,
-    );
+    // Build delay-mode parameters only for non-catalog tracks. The catalog
+    // is fetched at startup and has no notion of "live edge"; never delay it.
+    let parameters: MessageParameter[] | undefined;
+    if (params.trackName !== 'catalog' && this.catalog) {
+      const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
+      parameters = buildSubscribeParameters({
+        clientMode: this.#options.clientMode,
+        filterDelaySeconds: this.#options.filterDelaySeconds,
+        gopDurationMs,
+      });
+    }
 
+    // Send the appropriate control message
+    let struct: MOQStreamStruct;
     const result = await this.client.subscribe({
-      fullTrackName: ftn,
+      fullTrackName: getFullTrackName(this.#options.namespace, params.trackName),
       groupOrder: GroupOrder.Original,
-      filterType: FilterType.NextGroupStart,
+      filterType: FilterType.LatestObject,
       forward: true,
       priority: params.priority ?? 0,
+      parameters,
     });
-    if (result instanceof RequestError) {
-      logger.error(
-        'player',
-        `subscribe: "${params.trackName}" failed — code=${result.errorCode} reason="${result.reasonPhrase.phrase}"`,
-      );
+    if (result instanceof RequestError)
       throw new Error(`Error occured during subscription: ${result.reasonPhrase.phrase}`);
-    }
-    logger.info('player', `subscribe: "${params.trackName}" OK requestId=${result.requestId}`);
 
-    const struct: MOQStreamStruct = {
+    // Capture connect-time state for media tracks (not catalog) so C4 can emit
+    // a connect-time discontinuity record on the first arriving object. We only
+    // populate #expectedStartGroupId for filtered mode with a non-zero
+    // delay_groups; otherwise the relay does not clamp and we have nothing to
+    // detect against.
+    if (params.trackName !== 'catalog' && this.catalog) {
+      const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
+      const largest = result.largestLocation;
+      this.#connectSentAt = performance.now();
+      if (this.#options.clientMode === 'filtered' && largest !== undefined) {
+        const delayGroups = Math.round((this.#options.filterDelaySeconds * 1000) / gopDurationMs);
+        if (delayGroups > 0) {
+          // expected = largest - delay_groups (saturating at 0)
+          this.#expectedStartGroupId = Math.max(0, Number(largest.group) - delayGroups);
+        }
+      }
+    }
+
+    const tracker = new GoodputTracker();
+    struct = {
       trackName: params.trackName,
       requestId: result.requestId,
       source: result.stream,
+      tracker,
+      lastGroupId: -1n,
+      pendingSwitch: null,
+      lastAppendedEndPTS_ms: undefined,
     };
 
     // Add the stream to the pool
@@ -567,8 +1389,10 @@ export class Player {
     const struct = this.#streams[index];
     if (!struct) throw new Error(`No active subscription found for requestId ${requestId}`);
 
-    logger.info('player', `unsubscribe: "${struct.trackName}" requestId=${requestId}`);
+    // Send the UNSUBSCRIBE message
     await this.client.unsubscribe(struct.requestId);
+
+    // Remove the stream from the pool
     this.#streams.splice(index, 1);
   }
 }
