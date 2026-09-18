@@ -62,6 +62,8 @@ pub enum MessageParameterType {
   SubscriberPriority = 0x20,
   SubscriptionFilter = 0x21,
   GroupOrder = 0x22,
+  FillParameters = 0x23,
+  SwitchFrom = 0x24,
   NewGroupRequest = 0x32,
   TrackNamespacePrefix = 0x34,
   /// Project-local extension; non-MoQT-standard.
@@ -88,6 +90,8 @@ impl TryFrom<u64> for MessageParameterType {
       0x20 => Ok(MessageParameterType::SubscriberPriority),
       0x21 => Ok(MessageParameterType::SubscriptionFilter),
       0x22 => Ok(MessageParameterType::GroupOrder),
+      0x23 => Ok(MessageParameterType::FillParameters),
+      0x24 => Ok(MessageParameterType::SwitchFrom),
       0x32 => Ok(MessageParameterType::NewGroupRequest),
       0x34 => Ok(MessageParameterType::TrackNamespacePrefix),
       0x70 => Ok(MessageParameterType::DelayGroups),
