@@ -76,6 +76,13 @@ pub enum MessageParameter {
   StartLocationGroup {
     group: u64,
   },
+  /// Project-local extension (moq-transport PR #1378 SWITCH_TRANSITION, odd type
+  /// 0x73, bytes-valued): carried on the PUBLISH a relay opens in answer to a
+  /// SWITCH. Payload is two varints: G_switch, then the target's live edge.
+  SwitchTransition {
+    switching_group_id: u64,
+    live_edge_group_id: u64,
+  },
 }
 
 impl MessageParameter {
@@ -147,6 +154,13 @@ impl MessageParameter {
     Self::StartLocationGroup { group }
   }
 
+  pub fn new_switch_transition(switching_group_id: u64, live_edge_group_id: u64) -> Self {
+    Self::SwitchTransition {
+      switching_group_id,
+      live_edge_group_id,
+    }
+  }
+
   /// Returns the raw wire type value for this parameter.
   pub fn type_value(&self) -> u64 {
     match self {
@@ -165,6 +179,7 @@ impl MessageParameter {
       Self::TrackNamespacePrefix { .. } => MessageParameterType::TrackNamespacePrefix as u64,
       Self::DelayGroups { .. } => MessageParameterType::DelayGroups as u64,
       Self::StartLocationGroup { .. } => MessageParameterType::StartLocationGroup as u64,
+      Self::SwitchTransition { .. } => MessageParameterType::SwitchTransition as u64,
     }
   }
 
@@ -259,6 +274,8 @@ impl MessageParameter {
         msg_type,
         ControlMessageType::Subscribe | ControlMessageType::Switch
       ),
+      // Project-local: only on the PUBLISH a relay opens in answer to a SWITCH.
+      Self::SwitchTransition { .. } => matches!(msg_type, ControlMessageType::Publish),
     }
   }
 
@@ -365,6 +382,15 @@ impl MessageParameter {
               });
             }
             Ok(Self::TrackNamespacePrefix { prefix })
+          }
+          MessageParameterType::SwitchTransition => {
+            let st = crate::model::parameter::switch_transition::SwitchTransition::from_bytes(
+              value.clone(),
+            )?;
+            Ok(Self::SwitchTransition {
+              switching_group_id: st.switching_group_id,
+              live_edge_group_id: st.live_edge_group_id,
+            })
           }
           MessageParameterType::SubscriptionFilter => {
             let mut payload = value.clone();
@@ -521,6 +547,17 @@ impl TryInto<KeyValuePair> for MessageParameter {
           MessageParameterType::SubscriptionFilter as u64,
           buf.freeze(),
         )
+      }
+      Self::SwitchTransition {
+        switching_group_id,
+        live_edge_group_id,
+      } => {
+        let value = crate::model::parameter::switch_transition::SwitchTransition::new(
+          switching_group_id,
+          live_edge_group_id,
+        )
+        .to_bytes()?;
+        KeyValuePair::try_new_bytes(MessageParameterType::SwitchTransition as u64, value)
       }
       // A namespace tuple: length-prefixed, even though the Type is even.
       Self::TrackNamespacePrefix { prefix } => {

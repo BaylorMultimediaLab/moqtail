@@ -53,7 +53,9 @@ pub enum ControlMessageType {
   PublishDone = 0x0B,        // Request
   PublishOk = 0x1E,          // Request; an alias of RequestOk, not its own body
   PublishBlocked = 0x0F,     // Request
-  Switch = 0x22,             // moqtail-local extension, not a standard message type
+  // SWITCH for Client-side ABR (moq-transport PR #1378) assigns 0x1B. Travels on
+  // the request stream of the subscription it replaces; not in draft-18 itself.
+  Switch = 0x1B, // Request (moqtail extension, SWITCH PR #1378)
 }
 
 impl TryFrom<u64> for ControlMessageType {
@@ -80,7 +82,7 @@ impl TryFrom<u64> for ControlMessageType {
       0x1D => Ok(ControlMessageType::Publish),
       0x1E => Ok(ControlMessageType::PublishOk),
       0x0F => Ok(ControlMessageType::PublishBlocked),
-      0x22 => Ok(ControlMessageType::Switch),
+      0x1B => Ok(ControlMessageType::Switch),
       _ => Err(ParseError::InvalidType {
         context: " ControlMessageType::try_from(u64)",
         details: format!("Invalid type, got {value}"),
@@ -289,6 +291,16 @@ pub enum PublishDoneStatusCode {
   UpdateFailed = 0x8,
   ExcessiveLoad = 0x9,
   MalformedTrack = 0x12,
+  // SWITCH failure codes (moq-transport PR #1378). A relay that cannot complete a
+  // SWITCH still opens the target PUBLISH and reports the outcome here, leaving
+  // the current subscription untouched. EXCESSIVE_LOAD reuses draft-18's own
+  // code; the three below are project-local codepoints draft-18 leaves unused.
+  /// The relay could not identify G_switch within its T_switch budget.
+  Timeout = 0xA,
+  /// The target Track is not available.
+  DoesNotExist = 0xB,
+  /// The relay does not support the SWITCH message.
+  NotSupported = 0xC,
 }
 
 impl TryFrom<u64> for PublishDoneStatusCode {
@@ -306,6 +318,9 @@ impl TryFrom<u64> for PublishDoneStatusCode {
       0x8 => Ok(PublishDoneStatusCode::UpdateFailed),
       0x9 => Ok(PublishDoneStatusCode::ExcessiveLoad),
       0x12 => Ok(PublishDoneStatusCode::MalformedTrack),
+      0xA => Ok(PublishDoneStatusCode::Timeout),
+      0xB => Ok(PublishDoneStatusCode::DoesNotExist),
+      0xC => Ok(PublishDoneStatusCode::NotSupported),
       _ => Err(ParseError::InvalidType {
         context: "PublishDoneStatusCode::try_from(u64)",
         details: format!("Invalid type, got {value}"),

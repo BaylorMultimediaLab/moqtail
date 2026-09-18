@@ -179,6 +179,46 @@ pub fn replace_prft_ntp(pkt: Bytes, ntp: u64) -> Bytes {
   bm.freeze()
 }
 
+/// Byte offsets of the media-time fields inside a chunk from [`wrap_cmaf_chunk`].
+///
+/// The chunk layout is fixed: `prft`(32) + `moof`(8) + `mfhd`(16) + `traf`(8) +
+/// `tfhd`(16) + `tfdt`(20) + `trun`(32) + `mdat`.
+const PRFT_MEDIA_TIME: std::ops::Range<usize> = 24..32;
+const TFDT_FOURCC: std::ops::Range<usize> = 84..88;
+const TFDT_BASE_MEDIA_DECODE_TIME: std::ops::Range<usize> = 92..100;
+
+/// Reads `baseMediaDecodeTime` from the `tfdt` of a chunk produced by
+/// [`wrap_cmaf_chunk`], or `None` if the chunk isn't in that exact shape.
+pub fn read_decode_time(pkt: &[u8]) -> Option<u64> {
+  if pkt.len() < 100 || &pkt[4..8] != b"prft" || &pkt[TFDT_FOURCC] != b"tfdt" {
+    return None;
+  }
+  Some(u64::from_be_bytes(
+    pkt[TFDT_BASE_MEDIA_DECODE_TIME].try_into().ok()?,
+  ))
+}
+
+/// Rewrites a chunk's media timeline to `decode_time`, updating both the `tfdt`
+/// `baseMediaDecodeTime` and the `prft` `media_time` so the two stay consistent.
+///
+/// Replay loops the cached GOPs, whose timestamps restart at zero on every pass.
+/// A subscriber appending those into one MSE SourceBuffer sees the timeline jump
+/// backwards, which strands the playhead in the old range and permanently stalls
+/// playback. Shifting each pass past the previous one keeps the timeline
+/// monotonic. Returns the input unchanged if it isn't a chunk this module built.
+pub fn set_decode_time(pkt: Bytes, decode_time: u64) -> Bytes {
+  if pkt.len() < 100 || &pkt[4..8] != b"prft" || &pkt[TFDT_FOURCC] != b"tfdt" {
+    return pkt;
+  }
+  let mut bm = match pkt.try_into_mut() {
+    Ok(bm) => bm,
+    Err(b) => bytes::BytesMut::from(b.as_ref()),
+  };
+  bm[PRFT_MEDIA_TIME].copy_from_slice(&decode_time.to_be_bytes());
+  bm[TFDT_BASE_MEDIA_DECODE_TIME].copy_from_slice(&decode_time.to_be_bytes());
+  bm.freeze()
+}
+
 /// Converts Annex B HEVC bitstream (start-code delimited) to HVCC/AVCC format
 /// (4-byte big-endian length prefix per NAL unit).
 ///

@@ -40,6 +40,7 @@ impl TrackSubscriptionMap {
     map.insert(track_name, subscription);
   }
 
+  #[allow(dead_code)] // retained accessor; unused after the old-pipeline SWITCH removal
   pub async fn get_subscription(
     &self,
     track_name: &FullTrackName,

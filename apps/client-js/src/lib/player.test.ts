@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { buildSubscribeParameters, buildSwitchParameters, computeStartupTarget } from './player';
+import {
+  buildSubscribeParameters,
+  computeSwitchMinimumGroup,
+  computeStartupTarget,
+} from './player';
 
 describe('buildSubscribeParameters', () => {
   it('returns undefined for unfiltered mode', () => {
@@ -52,33 +56,64 @@ describe('buildSubscribeParameters', () => {
   });
 });
 
-describe('buildSwitchParameters', () => {
-  it('returns undefined params for naive mode', () => {
-    const r = buildSwitchParameters({ switchMode: 'naive', targetGroup: 42 });
-    expect(r.params).toBeUndefined();
+describe('computeSwitchMinimumGroup', () => {
+  it('naive mode floors at the next boundary after the latest received group', () => {
+    // latestGroup + 1: the relay identifies G_switch within T_switch, waiting
+    // for a not-yet-started group, so naming the NEXT boundary is safe and
+    // lands the switch with no redelivery and no catch-up.
+    const r = computeSwitchMinimumGroup({ switchMode: 'naive', targetGroup: 42, latestGroup: 17n });
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('encodes START_LOCATION_GROUP for aligned mode with a target', () => {
-    const r = buildSwitchParameters({ switchMode: 'aligned', targetGroup: 42 });
-    expect(r.params).toBeDefined();
-    const kvps = r.params!.map(p => p.toKeyValuePair());
-    expect(kvps).toHaveLength(1);
-    expect(kvps[0]!.typeValue).toBe(0x72n);
-    expect(kvps[0]!.value).toBe(42n);
+  it('naive mode before any object arrives sends the spec floor 0', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'naive',
+      targetGroup: undefined,
+      latestGroup: -1n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(0);
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('flags timeMapMiss when aligned but no target', () => {
-    const r = buildSwitchParameters({ switchMode: 'aligned', targetGroup: undefined });
-    expect(r.params).toBeUndefined();
+  it('uses the target group as the floor for aligned mode with a target', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'aligned',
+      targetGroup: 42,
+      latestGroup: 17n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(42);
+    expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('flags timeMapMiss when aligned but no target, falling through to the naive floor', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'aligned',
+      targetGroup: undefined,
+      latestGroup: 17n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(true);
   });
 
   it("does NOT flag miss when naive + no target (naive doesn't need TimeMap)", () => {
-    const r = buildSwitchParameters({ switchMode: 'naive', targetGroup: undefined });
-    expect(r.params).toBeUndefined();
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'naive',
+      targetGroup: undefined,
+      latestGroup: 17n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('aligned miss before any object arrives falls all the way to 0', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'aligned',
+      targetGroup: undefined,
+      latestGroup: -1n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(0);
+    expect(r.timeMapMiss).toBe(true);
   });
 });
 

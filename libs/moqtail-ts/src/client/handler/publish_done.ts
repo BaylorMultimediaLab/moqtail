@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-import { ProtocolViolationError } from '@/model/error'
 import { PublishDone } from '../../model/control'
 import { RequestStreamMessageHandler } from './handler'
 import { SubscribeRequest } from '../request/subscribe'
 import { logger } from '../../util/logger'
+import { SwitchFailure } from '../types'
 
 export const handlerPublishDone: RequestStreamMessageHandler<PublishDone> = async (
   client,
@@ -26,6 +26,18 @@ export const handlerPublishDone: RequestStreamMessageHandler<PublishDone> = asyn
   _stream,
   openingRequestId,
 ) => {
+  // SWITCH PR #1378: a failure PUBLISH (SWITCH_TRANSITION present, Forward State 0)
+  // parked its switch resolver keyed by the PUBLISH's request id, which is the id
+  // that opened the request stream this PUBLISH_DONE arrives on. It carries the
+  // failure status (TIMEOUT, DOES_NOT_EXIST, EXCESSIVE_LOAD, ...). Complete the
+  // pending client.switch() promise with a typed SwitchFailure so the caller keeps
+  // its current subscription state.
+  const parkedSwitchResolver = client.pendingSwitchFailures.get(openingRequestId)
+  if (parkedSwitchResolver) {
+    client.pendingSwitchFailures.delete(openingRequestId)
+    parkedSwitchResolver(new SwitchFailure(msg.statusCode, msg.errorReason.phrase))
+    return
+  }
   if (client.onPeerPublishDone) {
     client.onPeerPublishDone(msg)
   }

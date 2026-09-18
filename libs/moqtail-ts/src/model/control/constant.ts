@@ -61,7 +61,9 @@ export enum ControlMessageType {
   Publish = 0x1d, // Request, First
   PublishOk = 0x1e, // Request; an alias of RequestOk (§10.5), not its own body
   PublishBlocked = 0x0f, // Request
-  Switch = 0x22, // not in draft-18; moqtail-local extension
+  // SWITCH for Client-side ABR (moq-transport PR #1378) assigns 0x1b. Travels on the
+  // request stream of the subscription it replaces; not in draft-18 itself.
+  Switch = 0x1b, // Request (moqtail extension, SWITCH PR #1378)
 }
 
 /**
@@ -152,6 +154,8 @@ export namespace ControlMessageType {
         return ControlMessageType.PublishOk
       case 0x0fn:
         return ControlMessageType.PublishBlocked
+      case 0x1bn:
+        return ControlMessageType.Switch
       default:
         throw new InvalidEnumValue('ControlMessageType.tryFrom', v)
     }
@@ -306,6 +310,16 @@ export enum PublishDoneStatusCode {
   UpdateFailed = 0x8,
   ExcessiveLoad = 0x9,
   MalformedTrack = 0x12,
+  // SWITCH failure codes (moq-transport PR #1378). A relay that cannot complete a
+  // SWITCH still opens the target PUBLISH and reports the outcome here, leaving the
+  // current subscription untouched. EXCESSIVE_LOAD reuses draft-18's own code; the
+  // three below are project-local codepoints draft-18 leaves unused.
+  /** The relay could not identify G_switch within its T_switch budget. */
+  Timeout = 0xa,
+  /** The target Track is not available. */
+  DoesNotExist = 0xb,
+  /** The relay does not support the SWITCH message. */
+  NotSupported = 0xc,
 }
 
 /**
@@ -337,6 +351,12 @@ export namespace PublishDoneStatusCode {
         return PublishDoneStatusCode.ExcessiveLoad
       case 0x12n:
         return PublishDoneStatusCode.MalformedTrack
+      case 0xan:
+        return PublishDoneStatusCode.Timeout
+      case 0xbn:
+        return PublishDoneStatusCode.DoesNotExist
+      case 0xcn:
+        return PublishDoneStatusCode.NotSupported
       default:
         throw new InvalidEnumValue('PublishDoneStatusCode.tryFrom', v)
     }
