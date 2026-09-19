@@ -15,6 +15,7 @@
 use crate::server::client::MOQTClient;
 use crate::server::client::switch_context::SwitchStatus;
 use crate::server::config::AppConfig;
+use crate::server::events;
 use crate::server::object_logger::ObjectLogger;
 use crate::server::stream_id::StreamId;
 use crate::server::track::ActiveSubgroupHeaderMap;
@@ -866,6 +867,18 @@ impl Subscription {
           }
 
           state.end_group = 0; // remove end group limit
+
+          events::emit(
+            "SWITCH_PROMOTED",
+            serde_json::json!({
+              "conn": self.client_connection_id,
+              "relay_track_id": self.relay_track_id,
+              "track": events::track_name_string(&self.full_track_name),
+              "trigger_group": object_location.group,
+              "trigger_object": object_location.object,
+              "start_group": state.start_location.as_ref().map(|l| l.group),
+            }),
+          );
 
           info!(
             "check_switch_context: Will forward objects for subscriber={} relay_track_id={} starting from group: {}",

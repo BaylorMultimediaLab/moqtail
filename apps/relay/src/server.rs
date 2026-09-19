@@ -16,6 +16,7 @@ mod client;
 mod client_manager;
 mod config;
 mod errors;
+mod events;
 mod holding_subscribes;
 mod message_handlers;
 mod object_logger;
@@ -74,6 +75,7 @@ impl Server {
     let config = AppConfig::load();
 
     init_logging(&config.log_folder);
+    events::init(&config.event_log);
 
     debug!("Server | App. Config.: {:?}", config);
 
@@ -88,6 +90,41 @@ impl Server {
       draining: Arc::new(AtomicBool::new(false)),
       redirect_uri: Arc::new(RwLock::new(config.redirect_uri.clone())),
     }
+  }
+
+  /// Experiment instrumentation: once per second, record the size of every
+  /// track cache (groups, bytes, oldest/newest group) to the event log so the
+  /// cost of holding several representations can be reported.
+  fn spawn_cache_stats_task(&self, mut shutdown: watch::Receiver<bool>) {
+    let track_manager = self.track_manager.clone();
+    tokio::spawn(async move {
+      let mut ticker = tokio::time::interval(Duration::from_secs(1));
+      loop {
+        tokio::select! {
+          _ = ticker.tick() => {
+            let tracks: Vec<_> = track_manager.tracks.read().await.values().cloned().collect();
+            for track in tracks {
+              let (relay_track_id, name, stats) = {
+                let t = track.read().await;
+                (t.relay_track_id, events::track_name_string(&t.full_track_name), t.cache.stats().await)
+              };
+              events::emit(
+                "CACHE_STATS",
+                serde_json::json!({
+                  "relay_track_id": relay_track_id,
+                  "track": name,
+                  "groups": stats.groups,
+                  "bytes": stats.bytes,
+                  "oldest_group": stats.oldest_group,
+                  "newest_group": stats.newest_group,
+                }),
+              );
+            }
+          }
+          _ = shutdown.changed() => break,
+        }
+      }
+    });
   }
 
   /// The redirect URI advertised in GOAWAY. Reads the runtime value; the config
@@ -112,6 +149,10 @@ impl Server {
     // Level-triggered, so an accept loop between two iterations when shutdown is
     // signalled still sees it, which a Notify would not guarantee.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    if events::enabled() {
+      self.spawn_cache_stats_task(shutdown_rx.clone());
+    }
     // Only used to correlate log lines, so any unique value will do.
     let session_id_counter = Arc::new(AtomicU64::new(0));
 

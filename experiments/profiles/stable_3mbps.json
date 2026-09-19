@@ -1,0 +1,7 @@
+{
+  "name": "stable_3mbps",
+  "description": "Constrained regime: constant 3 Mbps, 40 ms RTT, tail-drop queue of 100 packets.",
+  "queue": "tail-drop",
+  "queue_pkts": 100,
+  "steps": [{ "at_s": 0, "rate_mbps": 3, "delay_ms": 40, "loss_pct": 0 }]
+}

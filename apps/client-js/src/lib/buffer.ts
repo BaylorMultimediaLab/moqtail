@@ -15,6 +15,7 @@
  */
 
 import { logger } from '@/lib/logger';
+import { events } from '@/lib/events/EventLog';
 
 // MSE Buffer Configuration
 export const MSE_IMMEDIATE_SEEK_THRESHOLD = 0.1; // seconds
@@ -109,6 +110,7 @@ class MSEBuffer {
         const liveEdge = buffered.end(buffered.length - 1);
         this.seek(
           Math.max(liveEdge - this.config.liveEdgeDelay, buffered.start(buffered.length - 1)),
+          'visibility',
         );
         this.video.playbackRate = this.originalPlaybackRate;
         this.isCatchingUp = false;
@@ -192,7 +194,7 @@ class MSEBuffer {
 
       // Perform the seek, only if targetTime is ahead of currentTime
       if (shouldSeek.targetTime <= currentTime) return;
-      this.seek(shouldSeek.targetTime);
+      this.seek(shouldSeek.targetTime, 'range-jump');
 
       // Resume the video if it was paused
       if (this.video.paused) {
@@ -335,6 +337,12 @@ class MSEBuffer {
         this.isCatchingUp = true;
         this.isCatchingDown = false;
         this.video.playbackRate = this.config.catchupPlaybackRate;
+        events.emit('PLAYBACK_RATE', {
+          rate: this.config.catchupPlaybackRate,
+          reason: 'catchup',
+          latency_s: currentLatency,
+          target_s: targetDistance,
+        });
       }
     } else if (currentLatency < targetDistance - this.config.liveEdgeTolerance) {
       // We're too close to the live edge, slow down slightly
@@ -347,6 +355,12 @@ class MSEBuffer {
         this.isCatchingUp = false;
         this.isCatchingDown = true;
         this.video.playbackRate = slowdownRate;
+        events.emit('PLAYBACK_RATE', {
+          rate: slowdownRate,
+          reason: 'catchdown',
+          latency_s: currentLatency,
+          target_s: targetDistance,
+        });
       }
     } else if (
       (this.isCatchingUp || this.isCatchingDown) &&
@@ -371,10 +385,16 @@ class MSEBuffer {
       this.isCatchingUp = false;
       this.isCatchingDown = false;
       logger.info('buffer', `[mseBuffer] Playback rate reset to ${this.originalPlaybackRate}x`);
+      events.emit('PLAYBACK_RATE', { rate: this.originalPlaybackRate, reason: 'reset' });
     }
   }
 
-  private seek(time: number) {
+  private seek(time: number, reason: 'range-jump' | 'visibility') {
+    events.emit('SEEK', {
+      reason,
+      from_ms: this.video.currentTime * 1000,
+      to_ms: time * 1000,
+    });
     this.video.currentTime = time;
   }
 

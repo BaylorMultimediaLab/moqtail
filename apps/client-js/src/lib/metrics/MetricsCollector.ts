@@ -1,4 +1,5 @@
 import type { Player } from '@/lib/player';
+import { events } from '@/lib/events/EventLog';
 import type { MetricsSample, MetricsSnapshot } from './types';
 
 const MAX_SAMPLES = 240;
@@ -7,7 +8,8 @@ const INTERVAL_MS = 250;
 const LOG_FLUSH_INTERVAL = 4; // every 1 second (4 * 250ms)
 
 const CSV_HEADER =
-  'timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms';
+  'timestamp,elapsed_s,buffer_s,bitrate_kbps,bandwidth_kbps,fast_ema_kbps,slow_ema_kbps,dropped_frames,total_frames,playback_rate,delivery_time_ms,' +
+  'playhead_ms,buffered_end_ms,live_edge_distance_ms,time_shift_error_ms,last_latency_ms,active_track,active_group';
 
 export class MetricsCollector {
   readonly #player: Player;
@@ -65,7 +67,39 @@ export class MetricsCollector {
       totalFrames: m.totalFrames,
       playbackRate: m.playbackRate,
       deliveryTimeMs: m.deliveryTimeMs,
+      playheadMs: m.playheadMs,
+      bufferedEndMs: m.bufferedEndMs,
+      liveEdgeDistanceMs: m.liveEdgeDistanceMs,
+      timeShiftErrorMs: m.timeShiftErrorMs,
+      lastLatencyMs: m.lastLatencyMs,
+      activeTrack: m.activeTrack,
+      activeGroup: m.activeGroup,
     };
+
+    events.emit('SAMPLE', {
+      buffer_s: sample.bufferSeconds,
+      bitrate_kbps: sample.bitrateKbps,
+      bandwidth_bps: sample.bandwidthBps,
+      fast_ema_bps: sample.fastEmaBps,
+      slow_ema_bps: sample.slowEmaBps,
+      dropped_frames: sample.droppedFrames,
+      total_frames: sample.totalFrames,
+      playback_rate: sample.playbackRate,
+      delivery_time_ms: sample.deliveryTimeMs,
+      playhead_ms: sample.playheadMs,
+      buffered_end_ms: sample.bufferedEndMs,
+      live_edge_distance_ms: Number.isFinite(sample.liveEdgeDistanceMs)
+        ? sample.liveEdgeDistanceMs
+        : null,
+      time_shift_error_ms: Number.isFinite(sample.timeShiftErrorMs)
+        ? sample.timeShiftErrorMs
+        : null,
+      last_latency_ms: sample.lastLatencyMs,
+      track: sample.activeTrack,
+      group: sample.activeGroup,
+      ready_state: m.readyState,
+      paused: m.paused,
+    });
 
     this.#samples.push(sample);
     if (this.#samples.length > MAX_SAMPLES) {
@@ -97,6 +131,13 @@ export class MetricsCollector {
       s.totalFrames,
       s.playbackRate.toFixed(4),
       s.deliveryTimeMs.toFixed(1),
+      s.playheadMs.toFixed(1),
+      s.bufferedEndMs.toFixed(1),
+      Number.isFinite(s.liveEdgeDistanceMs) ? s.liveEdgeDistanceMs.toFixed(1) : '',
+      Number.isFinite(s.timeShiftErrorMs) ? s.timeShiftErrorMs.toFixed(1) : '',
+      s.lastLatencyMs.toFixed(1),
+      s.activeTrack ?? '',
+      s.activeGroup ?? '',
     ].join(',');
   }
 
