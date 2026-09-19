@@ -332,4 +332,119 @@ impl TrackCache {
     let cache_key = CacheKey::new(self.relay_track_id, group_id);
     self.cache.contains_key(&cache_key)
   }
+
+  /// Returns the smallest group_id currently in the cache, or None if empty.
+  /// Used by the SUBSCRIBE handler to clamp delay-mode start_locations to the
+  /// oldest available group when the requested target predates the cache window.
+  #[allow(dead_code)]
+  pub async fn oldest_group_id(&self) -> Option<u64> {
+    self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.relay_track_id == self.relay_track_id)
+      .map(|(k, _)| k.group_id)
+      .min()
+  }
+
+  /// Returns the largest group_id currently in the cache for this track,
+  /// or None if empty. Mirror of `oldest_group_id`.
+  ///
+  /// Used by the SUBSCRIBE/replay path: when a delay-mode subscribe has no
+  /// prior `last_received_object_location` (initial subscribe), this gives
+  /// the upper bound for cache replay so the subscriber receives objects in
+  /// the range [start_location, newest_group_id] before live forwarding takes
+  /// over.
+  #[allow(dead_code)]
+  pub async fn newest_group_id(&self) -> Option<u64> {
+    self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.relay_track_id == self.relay_track_id)
+      .map(|(k, _)| k.group_id)
+      .max()
+  }
+}
+
+#[cfg(test)]
+mod tests_group_bounds {
+  use super::*;
+  use crate::server::config::CacheExpirationType;
+  use bytes::Bytes;
+  use moqtail::model::data::constant::ObjectForwardingPreference;
+  use std::time::Duration;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      io_sockets: 1,
+      max_request_streams: 10,
+      max_active_requests: 0,
+      max_subscriber_lag: 0,
+      max_publish_streams: 0,
+      write_kbps_limit: 0,
+      redirect_uri: None,
+      max_upstream_fetch_gaps: 10,
+      upstream_fetch_timeout: Duration::from_secs(10),
+      upstream_subscribe_timeout: Duration::from_secs(10),
+      track_alias_resolution_timeout: Duration::from_millis(500),
+      downstream_alias_timeout: Duration::from_millis(3000),
+      publish_done_stream_timeout: Duration::from_millis(2000),
+      dedup_retained_groups: 30,
+    }
+  }
+
+  fn fetch_object(group_id: u64, object_id: u64) -> FetchObjectPayload {
+    FetchObjectPayload {
+      group_id,
+      subgroup_id: 0,
+      object_id,
+      publisher_priority: 0,
+      forwarding_preference: ObjectForwardingPreference::Subgroup,
+      properties: None,
+      payload: Bytes::from_static(b"x"),
+    }
+  }
+
+  #[tokio::test]
+  async fn oldest_group_id_returns_none_when_empty() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    assert_eq!(cache.oldest_group_id().await, None);
+    assert_eq!(cache.newest_group_id().await, None);
+  }
+
+  #[tokio::test]
+  async fn oldest_and_newest_group_id_track_the_present_groups() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(7, 0)).await;
+    cache.add_object(fetch_object(5, 0)).await;
+    cache.add_object(fetch_object(9, 0)).await;
+    // moka inserts may be eventually-consistent; force pending tasks
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.oldest_group_id().await, Some(5));
+    assert_eq!(cache.newest_group_id().await, Some(9));
+  }
+
+  #[tokio::test]
+  async fn group_bounds_handle_single_group() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(42, 0)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.oldest_group_id().await, Some(42));
+    assert_eq!(cache.newest_group_id().await, Some(42));
+  }
 }

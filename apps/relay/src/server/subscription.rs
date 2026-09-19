@@ -180,6 +180,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           })
           .unwrap_or((FilterType::LatestObject, None, 0));
 
+        let is_joining = start_location.is_some();
         Self {
           subscriber_priority,
           group_order,
@@ -190,7 +191,12 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           subscribe_parameters: subscribe.subscribe_parameters,
           last_sent_max_location: None,
           last_received_object_location: None,
-          is_joining: false,
+          // A SUBSCRIBE that names an explicit start location (delay-mode,
+          // AbsoluteStart, or a SWITCH carrying START_LOCATION_GROUP) must have
+          // the cached objects in [start_location, live edge] replayed before
+          // live objects flow. The replay path below is gated on `is_joining`;
+          // without it those cached objects are silently dropped.
+          is_joining,
         }
       }
       SubscriptionOrigin::Publish(publish) => {
@@ -260,6 +266,65 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           is_joining: false,
         }
       }
+    }
+  }
+}
+
+/// Decide whether the new (Next-status) track should promote to Current right
+/// now, given OLD's progress and the new track's incoming object.
+///
+/// For live-edge switches the new sub was started with `LatestObject` and OLD has
+/// been catching up via cache; we wait until NEW's incoming live object passes
+/// OLD's `last_sent_max.group` before flipping the new track to Current and
+/// snapping its start to the next group boundary. That avoids a mid-GOP
+/// pre-OLD jump on the new track.
+///
+/// For time-shifted switches the new sub was started with `AbsoluteStart(player_target)`;
+/// the player explicitly chose where the new track should begin and *needs*
+/// every cached object from that target onward. The "wait until NEW catches
+/// OLD's last_sent" gate would silently drop those cached objects (NEW sits in
+/// `forward=false` while waiting), so the new track would effectively start at
+/// OLD's buffer position regardless of `START_LOCATION_GROUP`. Honor the
+/// player by promoting immediately.
+fn should_promote_switch(
+  player_start: Option<&Location>,
+  last_sent_max: Option<&Location>,
+  object_location: &Location,
+) -> bool {
+  if player_start.is_some() {
+    return true;
+  }
+  match last_sent_max {
+    Some(last) => object_location.group >= last.group,
+    None => true,
+  }
+}
+
+/// Decide the new track's `start_location` once the relay has accepted that the
+/// switch boundary is crossed.
+///
+/// - `player_start`: what the new subscription was created with. For time-shifted
+///   switches the SWITCH handler set this from the player's `START_LOCATION_GROUP`
+///   (so it's `Some`); for live-edge switches it's `None` (`Subscribe::new_latest_object`).
+/// - `last_sent_next`: `OLD.last_sent_max_location.group + 1` if known, else `None`.
+/// - `object_location`: the object that just triggered the switch-context check.
+///
+/// Time-shifted switches MUST honor `player_start`; otherwise the new track silently
+/// degrades to starting at OLD's last-sent group, which on a filtered client is
+/// `delay_groups` ahead of the playhead.
+fn compute_switch_start_location(
+  player_start: Option<Location>,
+  last_sent_next: Option<Location>,
+  object_location: &Location,
+) -> Location {
+  if let Some(loc) = player_start {
+    loc
+  } else if let Some(loc) = last_sent_next {
+    loc
+  } else {
+    Location {
+      object: 0,
+      group: object_location.group + 1,
     }
   }
 }
@@ -438,18 +503,29 @@ impl Subscription {
           drop(state);
           if is_joining && start_location.is_some() {
             let start_location = start_location.unwrap_or_default();
-            if let Some(last_received_object_location) = last_received_object_location_opt {
+            // Determine the upper bound for cache replay:
+            //   - If last_received_object_location is set (e.g. a SWITCH seam or a
+            //     reconnect), replay up to it.
+            //   - Otherwise (initial subscribe -- the common delay-mode case), replay
+            //     up to the cache's newest group at this moment. Anything newer
+            //     arrives via the live-forward path after `is_joining` clears.
+            let replay_end = match last_received_object_location_opt {
+              Some(loc) => Some(loc),
+              None => cache.newest_group_id().await.map(|g| Location {
+                group: g,
+                object: u64::MAX,
+              }),
+            };
+            if let Some(end) = replay_end
+              && end > start_location
+            {
               info!(
-                "Joining state - subscriber={} relay_track_id={} from location: {:?} to last received location: {:?}",
-                instance.client_connection_id,
-                relay_track_id,
-                start_location,
-                last_received_object_location
+                "Joining state - subscriber={} relay_track_id={} from location: {:?} to end: {:?}",
+                instance.client_connection_id, relay_track_id, start_location, end
               );
-              if last_received_object_location > start_location {
-                let mut object_receiver = cache
-                  .read_objects(start_location, last_received_object_location, false)
-                  .await;
+              {
+                let mut object_receiver =
+                  cache.read_objects(start_location, end.clone(), false).await;
 
                 let mut last_group: u64 = u64::MAX;
                 let mut last_stream_id: Option<StreamId> = None;
@@ -530,6 +606,12 @@ impl Subscription {
                   }
                 }
               }
+              // Record what was replayed up to so the live-forward path knows where
+              // to resume; live objects in [start_location, end] that arrive after
+              // the snapshot would otherwise be duplicates.
+              let mut state = instance.subscription_state.write().await;
+              state.last_received_object_location = Some(end);
+              drop(state);
             }
             let mut state = instance.subscription_state.write().await;
             state.is_joining = false;
@@ -779,38 +861,37 @@ impl Subscription {
         // is equal to or greater than the one of
         // the switch context's current track
         // if so, set this track as current
-        let mut switch_at_next_group = false;
+        // Look up OLD's last_sent_max so we know whether to gate (live-edge) and
+        // where to snap the new start_location. For time-shifted switches the gate
+        // is bypassed in should_promote_switch -- see its doc comment.
+        let mut last_sent_max_location = None;
         let mut new_start_location = None;
 
-        if let Some(current_track_name) = self.subscriber.switch_context.get_current().await {
-          let current_subscription_opt = self
+        if let Some(current_track_name) = self.subscriber.switch_context.get_current().await
+          && let Some(current_subscription_opt) = self
             .subscriber
             .subscriptions
             .get_subscription(&current_track_name)
-            .await;
-
-          if let Some(current_subscription) = current_subscription_opt
-            && let Some(current_subscription) = current_subscription.upgrade()
-          {
-            let current_subscription = current_subscription.read().await;
-            let current_state = current_subscription.subscription_state.read().await;
-            let last_sent_max_location = current_state.last_sent_max_location.clone();
-
-            if let Some(loc) = last_sent_max_location {
-              switch_at_next_group = object_location.group >= loc.group;
-              let mut loc_clone = loc.clone();
-              loc_clone.group += 1; // switch at the next group after the last sent max location of the current track
-              loc_clone.object = 0; // reset object id to 0 to read from the start of the group
-              new_start_location = Some(loc_clone);
-            } else {
-              // if there is no last sent location, we can switch
-              switch_at_next_group = true;
-            }
+            .await
+          && let Some(current_subscription) = current_subscription_opt.upgrade()
+        {
+          let current_subscription = current_subscription.read().await;
+          let current_state = current_subscription.subscription_state.read().await;
+          last_sent_max_location = current_state.last_sent_max_location.clone();
+          if let Some(loc) = &last_sent_max_location {
+            new_start_location = Some(Location {
+              group: loc.group + 1, // next group after OLD's last sent
+              object: 0,            // start of that group
+            });
           }
-        } else {
-          // no current track, we can switch
-          switch_at_next_group = true;
         }
+
+        let player_start = self.subscription_state.read().await.start_location.clone();
+        let switch_at_next_group = should_promote_switch(
+          player_start.as_ref(),
+          last_sent_max_location.as_ref(),
+          object_location,
+        );
 
         if switch_at_next_group {
           // set this track as current
@@ -833,14 +914,15 @@ impl Subscription {
 
           state.is_joining = true;
 
-          if new_start_location.is_some() {
-            state.start_location = new_start_location;
-          } else {
-            state.start_location = Some(Location {
-              object: 0,
-              group: object_location.group + 1,
-            });
-          }
+          // Time-shifted switches arrive with state.start_location already set from
+          // the player's START_LOCATION_GROUP; that target must win over the
+          // last_sent+1 fallback (see compute_switch_start_location).
+          let player_start = state.start_location.clone();
+          state.start_location = Some(compute_switch_start_location(
+            player_start,
+            new_start_location,
+            object_location,
+          ));
 
           state.end_group = 0; // remove end group limit
 
@@ -1617,5 +1699,188 @@ mod tests {
         }
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests_from_subscribe_is_joining {
+  use super::*;
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+
+  fn dummy_namespace() -> Tuple {
+    Tuple::from_utf8_path("/test")
+  }
+
+  fn dummy_track_name() -> TupleField {
+    TupleField::from_utf8("video")
+  }
+
+  #[test]
+  fn is_joining_is_true_when_start_location_is_some() {
+    let sub = Subscribe::new_absolute_start(
+      1,
+      dummy_namespace(),
+      dummy_track_name(),
+      Location {
+        group: 50,
+        object: 0,
+      },
+      vec![],
+    );
+    let state = SubscriptionState::from(SubscriptionOrigin::from(sub));
+    assert_eq!(
+      state.start_location,
+      Some(Location {
+        group: 50,
+        object: 0
+      })
+    );
+    assert!(
+      state.is_joining,
+      "is_joining must be true when start_location is set, otherwise the \
+       cache-replay path silently drops cached objects"
+    );
+  }
+
+  #[test]
+  fn is_joining_is_false_when_start_location_is_none() {
+    let sub = Subscribe::new_latest_object(1, dummy_namespace(), dummy_track_name(), vec![]);
+    let state = SubscriptionState::from(SubscriptionOrigin::from(sub));
+    assert_eq!(state.start_location, None);
+    assert!(!state.is_joining);
+  }
+}
+
+#[cfg(test)]
+mod tests_compute_switch_start_location {
+  use super::*;
+
+  #[test]
+  fn time_shifted_switch_preserves_player_start_location() {
+    let player_start = Some(Location {
+      group: 17,
+      object: 0,
+    });
+    let last_sent_next = Some(Location {
+      group: 24,
+      object: 0,
+    });
+    let object_location = Location {
+      group: 23,
+      object: 0,
+    };
+    let result = compute_switch_start_location(player_start, last_sent_next, &object_location);
+    assert_eq!(
+      result,
+      Location {
+        group: 17,
+        object: 0
+      }
+    );
+  }
+
+  #[test]
+  fn live_edge_switch_with_old_progress_uses_last_sent_next() {
+    let last_sent_next = Some(Location {
+      group: 24,
+      object: 0,
+    });
+    let object_location = Location {
+      group: 23,
+      object: 5,
+    };
+    let result = compute_switch_start_location(None, last_sent_next, &object_location);
+    assert_eq!(
+      result,
+      Location {
+        group: 24,
+        object: 0
+      }
+    );
+  }
+
+  #[test]
+  fn live_edge_switch_without_old_progress_uses_object_next_group() {
+    let object_location = Location {
+      group: 7,
+      object: 3,
+    };
+    let result = compute_switch_start_location(None, None, &object_location);
+    assert_eq!(
+      result,
+      Location {
+        group: 8,
+        object: 0
+      }
+    );
+  }
+}
+
+#[cfg(test)]
+mod tests_should_promote_switch {
+  use super::*;
+
+  #[test]
+  fn time_shifted_switch_promotes_immediately_even_when_object_is_behind_old() {
+    let player_start = Some(Location {
+      group: 17,
+      object: 0,
+    });
+    let last_sent_max = Some(Location {
+      group: 22,
+      object: 23,
+    });
+    let object_location = Location {
+      group: 17,
+      object: 0,
+    };
+    assert!(should_promote_switch(
+      player_start.as_ref(),
+      last_sent_max.as_ref(),
+      &object_location
+    ));
+  }
+
+  #[test]
+  fn live_edge_switch_defers_promotion_when_object_is_behind_old() {
+    let last_sent_max = Some(Location {
+      group: 22,
+      object: 23,
+    });
+    let object_location = Location {
+      group: 17,
+      object: 0,
+    };
+    assert!(!should_promote_switch(
+      None,
+      last_sent_max.as_ref(),
+      &object_location
+    ));
+  }
+
+  #[test]
+  fn live_edge_switch_promotes_when_object_meets_or_exceeds_old() {
+    let last_sent_max = Some(Location {
+      group: 22,
+      object: 23,
+    });
+    let object_location = Location {
+      group: 22,
+      object: 0,
+    };
+    assert!(should_promote_switch(
+      None,
+      last_sent_max.as_ref(),
+      &object_location
+    ));
+  }
+
+  #[test]
+  fn live_edge_switch_promotes_when_no_old_progress() {
+    let object_location = Location {
+      group: 5,
+      object: 0,
+    };
+    assert!(should_promote_switch(None, None, &object_location));
   }
 }

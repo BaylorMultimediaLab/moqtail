@@ -242,3 +242,11 @@ relay.log.*
 # Local settings for tools/perf-test.sh
 tools/perf-test.env
 .perf-test.env
+
+### Experiment stack (BaylorMultimediaLab) ###
+logs/*
+apps/relay/cert/*.bak
+data/video/tears_of_steel_*
+data/video/.cache/
+.claude/
+CLAUDE.md
