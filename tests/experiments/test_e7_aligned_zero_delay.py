@@ -1,7 +1,7 @@
-"""E7: ABR rule composability with aligned switching and zero filter delay.
+"""E7: ABR rule composability with time-shifted switching and zero filter delay.
 
 Same 9 configs x 3 profiles x 5 runs sweep as E6, but with the filtered
-client's delay set to zero. This isolates aligned switching from the deliberate
+client's delay set to zero. This isolates time-shifted switching from the deliberate
 behind-live offset used by E3/E6.
 
 Aligned-mode invariant: max_playhead_gap_ms must be within one GOP across
@@ -63,7 +63,7 @@ def _cell_params():
                         pytest.mark.abr_url_overrides(
                             clientMode="filtered",
                             filterDelay="0",
-                            switchMode="aligned",
+                            switchMode="time-shifted",
                         ),
                         pytest.mark.abr_settings_override(settings),
                         pytest.mark.initial_link_bw(_INITIAL_BW_MBPS[profile_name]),
@@ -128,7 +128,7 @@ async def test_e7_aligned_zero_delay(
     # behind-live cushion to absorb playhead drift. When an ABR config climbs
     # to a tier the link can't sustain (e.g. 1080p-4000k on a 1.5 Mbps link),
     # the player stalls and the playhead falls multiple seconds behind live;
-    # aligned switching still lands on the live group, so the playhead-relative
+    # time-shifted switching still lands on the live group, so the playhead-relative
     # gap tracks the stall depth (observed up to ~16 s) rather than staying
     # within one GOP. That divergence from E6 IS the E7 finding — the cushion,
     # not the alignment mechanism, is what holds sub-GOP continuity. So E7
@@ -136,8 +136,8 @@ async def test_e7_aligned_zero_delay(
     # gap distribution is reported in the figure, not gated here. The 30 s
     # bound mirrors E5's catastrophic-regression threshold.
     assert summary["max_playhead_gap_ms"] <= 30_000, (
-        f"playheadGapMs catastrophically large for filterDelay=0 aligned — "
-        f"likely a regression in the aligned subscribe path. "
+        f"playheadGapMs catastrophically large for filterDelay=0 time-shifted — "
+        f"likely a regression in the time-shifted subscribe path. "
         f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
         f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
     )

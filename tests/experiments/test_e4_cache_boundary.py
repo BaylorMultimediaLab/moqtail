@@ -1,8 +1,8 @@
-"""E4: cache-availability boundary for the aligned primitive.
+"""E4: cache-availability boundary for the time-shifted primitive.
 
 5 delays x 5 runs = 25 parametric cells. Each cell:
 - Filtered client at filterDelay seconds behind live
-- Aligned switching primitive
+- Time-shifted switching primitive
 - Relay --cache-size 20 (so delays > 20 hit the cache-miss path)
 - Forces an upswitch from the lowest variant to the highest at t=30s
 - Parses the relay log for the resolved decision
@@ -12,7 +12,7 @@ The relay's compute_delayed_start treats `target_group == oldest_cached` as
 in-window (Ready), so we test delay=21 to bracket the cache-miss side rather
 than delay=20, which sits on the soft-cap boundary itself and is fuzzy under
 Moka's `max_capacity` (the cache may briefly hold cache_size + a few groups).
-The aligned switch should produce a near-zero PTS gap in the Ready case;
+The time-shifted switch should produce a near-zero PTS gap in the Ready case;
 the ClampedToOldest case is the operating-boundary observation we measure.
 
 Note on videoAutoSwitch:
@@ -52,7 +52,7 @@ def _delay_params():
             marks=pytest.mark.abr_url_overrides(
                 clientMode="filtered",
                 filterDelay=str(delay),
-                switchMode="aligned",
+                switchMode="time-shifted",
             ),
         )
         for delay in _DELAYS

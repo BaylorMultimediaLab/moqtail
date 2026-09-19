@@ -20,7 +20,7 @@ import { Parameter } from '../parameter'
 
 /**
  * Project-local extension (non-MoQT-standard, type 0x72). The absolute group
- * id where a SWITCH should start delivering the new track (aligned switch).
+ * id where a SWITCH should start delivering the new track (time-shifted switch).
  */
 export class StartLocationGroup implements Parameter {
   static readonly TYPE = MessageParameterType.StartLocationGroup

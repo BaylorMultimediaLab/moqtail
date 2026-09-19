@@ -1,7 +1,7 @@
 /**
  * Bidirectional PTS <-> group lookup. Used by the player to compute the
  * SWITCH message's `Minimum Switching Group ID` floor (SWITCH PR #1378) for
- * aligned switches: given the current playhead PTS, find the group_id that
+ * time-shifted switches: given the current playhead PTS, find the group_id that
  * contains it.
  *
  * Recorded boundaries are explicit `(groupId, startPTS_ms)` points

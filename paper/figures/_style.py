@@ -16,7 +16,7 @@ from matplotlib.figure import Figure
 COLUMN_WIDTH_IN = 3.33
 TEXT_WIDTH_IN = 7.0
 
-# Publisher emits 1-second GOPs; this is the aligned-mode envelope referenced
+# Publisher emits 1-second GOPs; this is the time-shifted-mode envelope referenced
 # by Figs 2 and 5 (horizontal dashed line).
 GOP_DURATION_MS = 1000
 
