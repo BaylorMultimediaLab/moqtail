@@ -1,4 +1,5 @@
 import type { Player } from '@/lib/player';
+import { events } from '@/lib/events/EventLog';
 import type { AbrRulesCollection } from './AbrRulesCollection';
 import { ProbeManager } from './ProbeManager';
 import {
@@ -159,6 +160,7 @@ export class AbrController {
     this.#framesAtSwitch = m.totalFrames;
     this.#pendingFrameAdvance = false;
     this.#recordHistory(m.activeTrack ?? '', trackName, 'manual', 0, 0);
+    events.emit('ABR_DECISION', { from: m.activeTrack, to: trackName, reason: 'manual' });
     void this.#player.switchTrack(trackName);
   }
 
@@ -252,6 +254,11 @@ export class AbrController {
       this.#switching = false;
       this.#pendingFrameAdvance = false;
       this.#switchBackoffUntil = Date.now() + AbrController.SWITCH_COOLDOWN_MS;
+      events.emit('ABR_GUARD_TIMEOUT', {
+        track: activeTrack,
+        held_ms: Date.now() - this.#switchingStartTs,
+        cooldown_ms: AbrController.SWITCH_COOLDOWN_MS,
+      });
     }
 
     // Manual mode — don't make automatic decisions
@@ -304,7 +311,42 @@ export class AbrController {
       latencyTrendRatio,
     };
 
-    const switchRequest = this.#rulesCollection.getBestPossibleSwitchRequest(context);
+    const evaluation = this.#rulesCollection.evaluate(context);
+    const switchRequest = evaluation.chosen;
+    // Every rule's output on every tick: a switch is attributed to the rule
+    // and the signal that produced it, and a *missing* switch to the rules
+    // that vetoed it.
+    if (events.active) {
+      const rules: Record<string, unknown> = {};
+      for (const [name, req] of Object.entries(evaluation.byRule)) {
+        rules[name] =
+          req === null
+            ? null
+            : { index: req.representationIndex, priority: req.priority, reason: req.reason };
+      }
+      events.emit('ABR_TICK', {
+        track: activeTrack,
+        active_index: currentIdx,
+        buffer_s: bufferSeconds,
+        bandwidth_bps: bandwidthBps,
+        fast_ema_bps: fastEmaBps,
+        slow_ema_bps: slowEmaBps,
+        probe_bps: context.probeBandwidthBps,
+        latency_trend: latencyTrendRatio,
+        sample_count: sampleCount,
+        using_bola: this.#usingBolaRule,
+        rules,
+        skipped: evaluation.skipped,
+        chosen:
+          switchRequest === null
+            ? null
+            : {
+                index: switchRequest.representationIndex,
+                priority: switchRequest.priority,
+                reason: switchRequest.reason,
+              },
+      });
+    }
     if (switchRequest === null) return;
 
     const targetIndex = switchRequest.representationIndex;
@@ -318,6 +360,13 @@ export class AbrController {
     // conservatively-chosen startup tier. Downswitches are always permitted
     // (an emergency drop on a starved link can't wait for samples).
     if (targetIndex > currentIdx && sampleCount < AbrController.MIN_STARTUP_SAMPLES) {
+      events.emit('ABR_GATED', {
+        why: 'slow-start',
+        from_index: currentIdx,
+        to_index: targetIndex,
+        sample_count: sampleCount,
+        min_samples: AbrController.MIN_STARTUP_SAMPLES,
+      });
       return;
     }
 
@@ -343,6 +392,23 @@ export class AbrController {
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
     this.#recordHistory(activeTrack ?? '', targetTrack.name, reason, bufferSeconds, fastEmaBps);
+    events.emit('ABR_DECISION', {
+      from: activeTrack,
+      to: targetTrack.name,
+      from_index: currentIdx,
+      to_index: targetIndex,
+      from_bitrate: currentBitrate,
+      to_bitrate: targetBitrate,
+      reason,
+      rule_reason: switchRequest.reason,
+      priority: switchRequest.priority,
+      buffer_s: bufferSeconds,
+      bandwidth_bps: bandwidthBps,
+      fast_ema_bps: fastEmaBps,
+      slow_ema_bps: slowEmaBps,
+      probe_bps: context.probeBandwidthBps,
+      latency_trend: latencyTrendRatio,
+    });
     // Update tracksize (Algorithm 1 lines 13/16): after upswitch, carry
     // forward the gap from new current to next-up; after downswitch,
     // carry forward the gap from previous tier to new current. Either
@@ -373,8 +439,12 @@ export class AbrController {
     const switchOffThreshold = 0.5 * this.#settings.bufferTimeDefault; // 9s by default
 
     // Hysteresis: use the current state to pick which threshold to compare against
+    const wasUsingBola = this.#usingBolaRule;
     this.#usingBolaRule =
       bufferLevel >= (this.#usingBolaRule ? switchOffThreshold : switchOnThreshold);
+    if (wasUsingBola !== this.#usingBolaRule) {
+      events.emit('ABR_STRATEGY', { using_bola: this.#usingBolaRule, buffer_s: bufferLevel });
+    }
 
     this.#rulesCollection.setShouldUseBolaRule(this.#usingBolaRule);
   }

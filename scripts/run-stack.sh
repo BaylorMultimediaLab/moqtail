@@ -162,6 +162,7 @@ cargo run --release --manifest-path "$ROOT_DIR/Cargo.toml" --bin relay -- \
   --cert-file "$ROOT_DIR/apps/relay/cert/cert.pem" \
   --key-file "$ROOT_DIR/apps/relay/cert/key.pem" \
   --log-folder "$LOG_DIR" \
+  --event-log "$LOG_DIR/relay-events_${TIMESTAMP}.jsonl" \
   > "$LOG_DIR/relay_${TIMESTAMP}.log" 2>&1 &
 RELAY_PID=$!
 echo "relay=$RELAY_PID" >> "$PID_FILE"
@@ -175,6 +176,7 @@ echo "[publisher] Starting publisher in replay mode from $CACHE_DIR"
 cargo run --release --manifest-path "$ROOT_DIR/Cargo.toml" --bin publisher --features publisher/vaapi -- \
   --max-variants 4 \
   --encoded-dir "$CACHE_DIR" \
+  --event-log "$LOG_DIR/publisher-events_${TIMESTAMP}.jsonl" \
   > "$LOG_DIR/publisher_${TIMESTAMP}.log" 2>&1 &
 PUB_PID=$!
 echo "publisher=$PUB_PID" >> "$PID_FILE"

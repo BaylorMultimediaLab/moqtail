@@ -31,40 +31,9 @@ import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
 import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
-
-// NTP epoch (1900) is 2_208_988_800 seconds before the UNIX epoch (1970).
-const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
-
-/**
- * If the chunk starts with a PRFT (Producer Reference Time) box per
- * ISO/IEC 14496-12 §8.16.5, return the publisher's wall-clock at chunk
- * production as UNIX milliseconds. Returns null otherwise.
- *
- * PRFT layout (version 1, 32 bytes total):
- *   0..4   box size (32, big-endian)
- *   4..8   "prft"
- *   8      version (1)
- *   9..12  flags (0)
- *   12..16 reference_track_ID
- *   16..24 ntp_timestamp (NTP fixed point: seconds.fraction since 1900)
- *   24..32 media_time (u64, version=1)
- */
-function readPrftCaptureMs(buf: Uint8Array): number | null {
-  if (buf.byteLength < 32) return null;
-  // 'p'=0x70, 'r'=0x72, 'f'=0x66, 't'=0x74
-  if (buf[4] !== 0x70 || buf[5] !== 0x72 || buf[6] !== 0x66 || buf[7] !== 0x74) {
-    return null;
-  }
-  // DataView must respect the Uint8Array's byteOffset; otherwise we'd
-  // read from byte 0 of the underlying ArrayBuffer instead of the chunk's
-  // actual start.
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const ntpSeconds = view.getUint32(16, false);
-  const ntpFraction = view.getUint32(20, false);
-  const unixSeconds = ntpSeconds - NTP_UNIX_DELTA_SECONDS;
-  const fractionMs = (ntpFraction / 0x1_0000_0000) * 1000;
-  return unixSeconds * 1000 + fractionMs;
-}
+import { events } from '@/lib/events/EventLog';
+import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
+import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
 
 /**
  * One record per track-switch (or, in C4, per filtered connect).
@@ -102,11 +71,7 @@ export interface DiscontinuityRecord {
   actualStartGroup?: number;
   clampedByRelay?: boolean;
 
-  // miss signal (Task B5)
-  timeMapMiss?: boolean;
-
   // mode context (every record)
-  switchMode: 'live-edge' | 'time-shifted';
   clientMode: 'filtered' | 'unfiltered';
   filterDelaySeconds: number;
 }
@@ -148,6 +113,10 @@ interface MOQStreamStruct {
   postSwitchFrameTarget?: number;
   /** Snapshot of pendingSwitch.switchSentAt at the moment of init-segment application. */
   postSwitchSentAt?: number;
+  /** Source track of the switch whose first frame is awaited (for SWITCH_FIRST_FRAME). */
+  postSwitchFromTrack?: string;
+  /** tracker.getSampleCount() after the previous object; a change means a THROUGHPUT_SAMPLE was finalised. */
+  lastSampleCount?: number;
   /** Track name to attach perceivedPauseMs to in switchDiscontinuities. */
   postSwitchToTrack?: string;
   buffer?: {
@@ -176,8 +145,12 @@ export interface PlayerOptions {
   clientMode?: 'filtered' | 'unfiltered';
   /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
   filterDelaySeconds?: number;
-  /** Quality-switch primitive: 'live-edge' = today (start at latest); 'time-shifted' = start at group containing player's current PTS. */
-  switchMode?: 'live-edge' | 'time-shifted';
+  /** SWITCH_FROM mode (PR #1674 hard = cut at the target's first object from the
+   *  live edge; PR #1675 soft = fill from the playhead group and drain the old
+   *  track up to the boundary). */
+  switchFromMode?: 'hard' | 'soft';
+  /** Experiment log: emit one OBJECT_RECV record per received media object (frame). */
+  logObjects?: boolean;
 }
 
 const DefaultOptions = {
@@ -188,7 +161,8 @@ const DefaultOptions = {
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
   filterDelaySeconds: 0,
-  switchMode: 'live-edge' as 'live-edge' | 'time-shifted',
+  switchFromMode: 'hard' as 'hard' | 'soft',
+  logObjects: false,
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -218,12 +192,11 @@ export function buildSubscribeParameters(opts: {
  * (moq-transport PR #1674 / #1675): a fresh SUBSCRIBE for the target track
  * carrying SWITCH_FROM that names the subscription it replaces.
  *
- * - 'live-edge' mode: a hard switch (PR #1674) that starts the target at the live
- *   edge (LatestObject). The suspended track is cut on the first object the
+ * - 'hard' (PR #1674): starts the target at the live edge (LatestObject). The suspended track is cut on the first object the
  *   target delivers; whatever old-track media is already buffered stays, so a
  *   behind-live client sees the jump to live the paper measures.
- * - 'time-shifted' mode: a soft switch (PR #1675) whose target starts at the group
- *   containing the playhead (AbsoluteStartFill). The relay delivers
+ * - 'soft' (PR #1675): the target starts at the group containing the playhead
+ *   (AbsoluteStartFill). The relay delivers
  *   [start, live edge) on a fill fetch stream and lets the old track drain up
  *   to the group before the boundary, so the seam is contiguous at the
  *   playhead. If the TimeMap has no anchor yet (rare: switch fired before any
@@ -233,7 +206,7 @@ export function buildSubscribeParameters(opts: {
  * Exported for unit testing.
  */
 export function computeSwitchFromPlan(opts: {
-  switchMode: 'live-edge' | 'time-shifted';
+  switchFromMode: 'hard' | 'soft';
   targetGroup: number | undefined;
 }): {
   mode: SwitchMode;
@@ -246,7 +219,7 @@ export function computeSwitchFromPlan(opts: {
     filterType: FilterType.LatestObject,
     startLocation: undefined,
   };
-  if (opts.switchMode !== 'time-shifted') return { ...liveEdge, timeMapMiss: false };
+  if (opts.switchFromMode !== 'soft') return { ...liveEdge, timeMapMiss: false };
   if (opts.targetGroup === undefined) return { ...liveEdge, timeMapMiss: true };
   return {
     mode: SwitchMode.Soft,
@@ -300,13 +273,19 @@ export class Player {
   // Captured in subscribe(); consumed once on the first received object.
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
-  // B4: PTS <-> group lookup populated from incoming object decode times.
-  // Consumed by B5 (time-shifted switch) to compute START_LOCATION_GROUP.
+  // PTS <-> group lookup populated from incoming object decode times.
+  // Measurement only: maps the playhead to the group it is showing.
   #timeMap: TimeMap | undefined;
-  // B5: latched at switchTrack() time; consumed by the next switch
-  // DiscontinuityRecord emission and reset to false afterwards so it doesn't
-  // leak across switches.
-  #lastSwitchHadTimeMapMiss: boolean = false;
+  // Most recent Producer Reference Time seen on the video track; anchors the
+  // live-edge estimate (see lib/events/liveEdge.ts).
+  #prftAnchor: PrftAnchor | undefined;
+  #videoTimescale = 0;
+  // Startup timeline (performance.now()) for the STARTUP record.
+  #tConnectStart: number | undefined;
+  #tFirstObject: number | undefined;
+  #firstFrameSeen = false;
+  // Open stall, if any: STALL_START was emitted and STALL_END is pending.
+  #stall: { startPerf: number; cause: 'waiting' | 'frozen'; playheadMs: number } | null = null;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -316,6 +295,8 @@ export class Player {
     // If we already received the catalog, skip initialization
     if (this.catalog) return this.catalog;
 
+    this.#tConnectStart = performance.now();
+    events.emit('CONNECT_START', { relay_url: this.#options.relayUrl });
     try {
       // Initialize the client and fetch the catalog
       this.client = await MOQtailClient.new({
@@ -323,8 +304,10 @@ export class Player {
       });
     } catch (error) {
       logger.error('media', 'Failed to connect to relay', (error as Error).message);
+      events.emit('ERROR', { where: 'connect', message: (error as Error).message });
       throw error;
     }
+    events.emit('CONNECTED', { connect_ms: performance.now() - this.#tConnectStart });
 
     // Debug-only escape hatch: lets the network test harness force a SWITCH
     // without going through the AbrController. Used by Slice C/Phase B E2Es
@@ -341,16 +324,28 @@ export class Player {
       this.catalog = await this.retrieveCatalog();
     } catch (error) {
       logger.error('media', 'Failed to retrieve catalog', (error as Error).message);
+      events.emit('ERROR', { where: 'catalog', message: (error as Error).message });
       throw error;
     }
+    events.emit('CATALOG', {
+      since_connect_ms: performance.now() - this.#tConnectStart,
+      tracks: this.catalog.getTracks().map(t => ({
+        name: t.name,
+        role: t.role,
+        bitrate: t.bitrate,
+        width: t.width,
+        height: t.height,
+      })),
+    });
 
-    // B4: construct the TimeMap once, anchored on the video track's GOP duration.
+    // Construct the TimeMap once, anchored on the video track's GOP duration.
     // Quality variants share a TimeMap — gopDurationMs is equal across them in practice.
     const videoTracks = this.catalog?.getTracks('video');
     const videoTrack = videoTracks?.[0];
     if (videoTrack) {
       const gopDurationMs = this.catalog!.getGopDurationMs(videoTrack.name);
       this.#timeMap = new TimeMap(gopDurationMs);
+      this.#videoTimescale = this.catalog!.getTimescale(videoTrack.name) ?? 0;
     }
 
     return this.catalog;
@@ -471,11 +466,15 @@ export class Player {
       if (frames > lastFrames) {
         lastFrames = frames;
         frozenSince = 0;
+        this.#closeStall();
         return;
       }
       if (el.paused || el.ended) return;
       frozenSince += 1;
       if (frozenSince < 2) return; // wait ~1s of confirmed freeze
+      // Frozen frames while playing is a stall whether or not the element
+      // fired `waiting`; the interval is credited from the first frozen tick.
+      this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
       const buf = el.buffered;
       for (let i = 0; i < buf.length - 1; i++) {
         const end = buf.end(i);
@@ -485,6 +484,12 @@ export class Player {
             'media',
             `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
           );
+          events.emit('SEEK', {
+            reason: 'wedge',
+            from_ms: el.currentTime * 1000,
+            to_ms: (nextStart + 0.001) * 1000,
+            gap_ms: (nextStart - end) * 1000,
+          });
           el.currentTime = nextStart + 0.001;
           frozenSince = 0;
           return;
@@ -492,6 +497,17 @@ export class Player {
       }
     }, 500);
     this.#disposers.push(() => clearInterval(wedgeIntervalId));
+
+    // Element-reported stalls: `waiting` opens, `playing` closes. Frozen-frame
+    // detection above catches stalls the element never reports.
+    const onWaiting = () => this.#openStall('waiting', performance.now());
+    const onPlaying = () => this.#closeStall();
+    el.addEventListener('waiting', onWaiting);
+    el.addEventListener('playing', onPlaying);
+    this.#disposers.push(() => {
+      el.removeEventListener('waiting', onWaiting);
+      el.removeEventListener('playing', onPlaying);
+    });
 
     // Convenience function to wait for buffer updates
     const waitForBufferUpdate = (sourceBuffer: SourceBuffer) =>
@@ -525,6 +541,12 @@ export class Player {
           'media',
           `All buffers ready, seeking to ${target.toFixed(2)}s (live edge ${end.toFixed(2)}s)`,
         );
+        events.emit('SEEK', {
+          reason: 'startup',
+          from_ms: this.#element!.currentTime * 1000,
+          to_ms: target * 1000,
+          buffered_end_ms: end * 1000,
+        });
         this.#element!.currentTime = target;
         this.#element!.play();
         // Install the rVFC poll that detects first-frame-rendered post-switch
@@ -610,6 +632,13 @@ export class Player {
                 'media',
                 `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
               );
+              events.emit('DROP_STALE', {
+                track: objectTrackName,
+                current: struct.trackName,
+                pending: struct.pendingSwitch?.trackName ?? null,
+                group: object.location.group,
+                object: object.location.object,
+              });
               return;
             }
 
@@ -633,6 +662,14 @@ export class Player {
               struct.postSwitchFrameTarget = framesAtSwitch;
               struct.postSwitchSentAt = switchSentAt;
               struct.postSwitchToTrack = newTrackName;
+              struct.postSwitchFromTrack = fromTrack;
+              events.emit('SWITCH_FIRST_OBJECT', {
+                from: fromTrack,
+                to: newTrackName,
+                group: object.location.group,
+                object: object.location.object,
+                since_sent_ms: performance.now() - switchSentAt,
+              });
 
               // changeType() must not be called while the SourceBuffer is updating
               if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
@@ -669,6 +706,25 @@ export class Player {
                     )
                   : undefined;
 
+              events.emit('SWITCH_APPLIED', {
+                from: fromTrack,
+                to: newTrackName,
+                group: object.location.group,
+                object: object.location.object,
+                new_start_pts_ms: newStartPTS_ms ?? null,
+                old_end_pts_ms: oldEndPTS_ms ?? null,
+                pts_gap_ms:
+                  newStartPTS_ms !== undefined && oldEndPTS_ms !== undefined
+                    ? newStartPTS_ms - oldEndPTS_ms
+                    : null,
+                playhead_ms: playheadPTS_ms ?? null,
+                playhead_gap_ms:
+                  newStartPTS_ms !== undefined && playheadPTS_ms !== undefined
+                    ? newStartPTS_ms - playheadPTS_ms
+                    : null,
+                since_sent_ms: performance.now() - switchSentAt,
+              });
+
               if (newStartPTS_ms !== undefined) {
                 const ptsGapMs = oldEndPTS_ms !== undefined ? newStartPTS_ms - oldEndPTS_ms : 0;
                 const playheadGapMs =
@@ -686,13 +742,9 @@ export class Player {
                   playheadPTS_ms,
                   playheadGapMs,
                   wallClockMs,
-                  switchMode: this.#options.switchMode,
-                  timeMapMiss: this.#lastSwitchHadTimeMapMiss,
                   clientMode: this.#options.clientMode,
                   filterDelaySeconds: this.#options.filterDelaySeconds,
                 };
-                // Reset so the flag doesn't leak across switches.
-                this.#lastSwitchHadTimeMapMiss = false;
                 if (typeof window !== 'undefined') {
                   const w = window as Window & {
                     __moqtailMetrics?: {
@@ -720,6 +772,7 @@ export class Player {
             // so each moof's tfdt is a per-frame decode time and the trun carries that
             // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
             const timescale = this.catalog?.getTimescale(struct.trackName);
+            let decodeTimeMs: number | undefined;
             if (timescale && timescale > 0) {
               const info = parseMoofMediaInfo(
                 new Uint8Array(
@@ -730,8 +783,9 @@ export class Player {
                 timescale,
               );
               if (info !== undefined) {
+                decodeTimeMs = info.decodeTimeMs;
                 struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-                // B4: feed the TimeMap so time-shifted switch (B5) can resolve playhead -> group.
+                // Feed the TimeMap so measurements can resolve playhead -> group.
                 // Only the first object of each group records (idempotent in TimeMap),
                 // and frame 0 of a group has decodeTime == group start PTS.
                 if (this.#timeMap) {
@@ -785,8 +839,25 @@ export class Player {
             // Record goodput sample — SWMA on per-group object timing.
             // The publisher bursts a GOP's objects back-to-back so the
             // intra-group rate reflects link capacity, not source bitrate.
+            const previousGroupId = struct.lastGroupId;
             struct.tracker.recordObject(object.payload.byteLength, object.location.group);
             struct.lastGroupId = object.location.group;
+            // A group roll-over finalises the previous group's throughput sample.
+            const sampleCountNow = struct.tracker.getSampleCount();
+            if (struct.lastSampleCount !== undefined && sampleCountNow > struct.lastSampleCount) {
+              events.emit('THROUGHPUT_SAMPLE', {
+                track: struct.trackName,
+                group: previousGroupId,
+                bytes: struct.tracker.getLastSampleBytes(),
+                duration_ms: struct.tracker.getLastDeliveryTimeMs(),
+                bps: struct.tracker.getLastSampleBps(),
+                swma_bps: struct.tracker.getBandwidthBps(),
+                fast_ema_bps: struct.tracker.getFastEmaBps(),
+                slow_ema_bps: struct.tracker.getSlowEmaBps(),
+                sample_count: sampleCountNow,
+              });
+            }
+            struct.lastSampleCount = sampleCountNow;
 
             // First-received-group export for E2E smoke + connect-time metrics (Phase C).
             // Only set once across all streams to capture the earliest received group.
@@ -797,6 +868,23 @@ export class Player {
               const isFirstObject = window.__moqtailMetrics.firstReceivedGroupId === undefined;
               if (isFirstObject) {
                 window.__moqtailMetrics.firstReceivedGroupId = Number(object.location.group);
+                this.#tFirstObject = performance.now();
+                const expectedGroup = this.#expectedStartGroupId;
+                events.emit('FIRST_OBJECT', {
+                  track: struct.trackName,
+                  group: object.location.group,
+                  object: object.location.object,
+                  pts_ms: decodeTimeMs ?? null,
+                  expected_start_group: expectedGroup ?? null,
+                  clamped:
+                    expectedGroup !== undefined
+                      ? Number(object.location.group) > expectedGroup
+                      : null,
+                  since_connect_ms:
+                    this.#tConnectStart !== undefined
+                      ? this.#tFirstObject - this.#tConnectStart
+                      : null,
+                });
 
                 // Connect-time discontinuity record (Task C4): emit only if we
                 // were in filtered mode AND we have a known expected start
@@ -842,7 +930,6 @@ export class Player {
                     expectedStartGroup: expected,
                     actualStartGroup: actual,
                     clampedByRelay,
-                    switchMode: this.#options.switchMode,
                     clientMode: this.#options.clientMode,
                     filterDelaySeconds: this.#options.filterDelaySeconds,
                   };
@@ -859,9 +946,28 @@ export class Player {
             // `object.payload` is already a Uint8Array view at the right
             // offset — pass it directly so we don't accidentally read from
             // byte 0 of a shared underlying ArrayBuffer.
-            const captureMs = readPrftCaptureMs(object.payload);
-            if (captureMs !== null) {
-              this.#latencyTracker.record(Date.now() - captureMs);
+            const prft = readPrft(object.payload);
+            let latencyMs: number | null = null;
+            if (prft !== null) {
+              latencyMs = Date.now() - prft.captureMs;
+              this.#latencyTracker.record(latencyMs);
+              if (this.#videoTimescale > 0) {
+                this.#prftAnchor = {
+                  captureMs: prft.captureMs,
+                  mediaMs: (prft.mediaTime * 1000) / this.#videoTimescale,
+                };
+              }
+            }
+            if (this.#options.logObjects) {
+              events.emit('OBJECT_RECV', {
+                track: objectTrackName,
+                group: object.location.group,
+                object: object.location.object,
+                bytes: object.payload.byteLength,
+                pts_ms: decodeTimeMs ?? null,
+                prft_capture_ms: prft?.captureMs ?? null,
+                latency_ms: latencyMs,
+              });
             }
           } catch (error) {
             logger.error('media', 'Error processing media object:', error);
@@ -906,6 +1012,11 @@ export class Player {
     videoErrorCode: number;
     latencyTrendRatio: number;
     lastLatencyMs: number;
+    playheadMs: number;
+    bufferedEndMs: number;
+    liveEdgeDistanceMs: number;
+    timeShiftErrorMs: number;
+    activeGroup: number | null;
   } {
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     const el = this.#element;
@@ -914,6 +1025,32 @@ export class Player {
       buffered && buffered.length > 0 && el
         ? Math.max(0, buffered.end(buffered.length - 1) - el.currentTime)
         : 0;
+    const playheadMs = (el?.currentTime ?? 0) * 1000;
+    const bufferedEndMs =
+      buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) * 1000 : 0;
+    let liveEdgeDistanceMs = Number.NaN;
+    let timeShiftErrorMs = Number.NaN;
+    if (this.#prftAnchor && el) {
+      const gopDurationMs = this.#timeMap?.gopDurationMs ?? 0;
+      const target = targetShiftMs({
+        clientMode: this.#options.clientMode,
+        filterDelaySeconds: this.#options.filterDelaySeconds,
+        gopDurationMs,
+        liveEdgeDelaySeconds: DEFAULT_LIVE_EDGE_DELAY,
+      });
+      const est = estimateLiveEdge({
+        anchor: this.#prftAnchor,
+        nowMs: Date.now(),
+        playheadMs,
+        targetShiftMs: target.targetShiftMs,
+      });
+      liveEdgeDistanceMs = est.liveEdgeDistanceMs;
+      timeShiftErrorMs = est.timeShiftErrorMs;
+    }
+    const activeGroup =
+      this.#timeMap && el && this.#timeMap.hasAnchor()
+        ? (this.#timeMap.groupContainingPTS(playheadMs) ?? null)
+        : null;
     const quality = el?.getVideoPlaybackQuality?.();
     let bufferedRanges = '';
     if (buffered) {
@@ -943,7 +1080,35 @@ export class Player {
       videoErrorCode: el?.error?.code ?? 0,
       latencyTrendRatio: this.#latencyTracker.getTrendRatio(),
       lastLatencyMs: this.#latencyTracker.getLastLatencyMs(),
+      playheadMs,
+      bufferedEndMs,
+      liveEdgeDistanceMs,
+      timeShiftErrorMs,
+      activeGroup,
     };
+  }
+
+  #openStall(cause: 'waiting' | 'frozen', startPerf: number): void {
+    if (this.#stall !== null || !this.#element) return;
+    if (!this.#firstFrameSeen) return; // pre-startup waiting is startup delay, not a stall
+    const playheadMs = this.#element.currentTime * 1000;
+    this.#stall = { startPerf, cause, playheadMs };
+    events.emit('STALL_START', {
+      cause,
+      playhead_ms: playheadMs,
+      track: this.getMetrics().activeTrack,
+    });
+  }
+
+  #closeStall(): void {
+    if (this.#stall === null) return;
+    const s = this.#stall;
+    this.#stall = null;
+    events.emit('STALL_END', {
+      cause: s.cause,
+      playhead_ms: s.playheadMs,
+      duration_ms: performance.now() - s.startPerf,
+    });
   }
 
   setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
@@ -981,6 +1146,21 @@ export class Player {
     const poll = () => {
       if (!this.#element) return;
       const total = this.#element.getVideoPlaybackQuality().totalVideoFrames;
+      if (!this.#firstFrameSeen && total > 0) {
+        this.#firstFrameSeen = true;
+        const now = performance.now();
+        events.emit('STARTUP', {
+          track: this.getMetrics().activeTrack,
+          playhead_ms: this.#element.currentTime * 1000,
+          connect_to_first_object_ms:
+            this.#tConnectStart !== undefined && this.#tFirstObject !== undefined
+              ? this.#tFirstObject - this.#tConnectStart
+              : null,
+          first_object_to_first_frame_ms:
+            this.#tFirstObject !== undefined ? now - this.#tFirstObject : null,
+          startup_delay_ms: this.#tConnectStart !== undefined ? now - this.#tConnectStart : null,
+        });
+      }
       for (const struct of this.#streams) {
         if (
           struct.firstFrameAfterSwitchSeen !== true &&
@@ -992,6 +1172,12 @@ export class Player {
           struct.firstFrameAfterSwitchSeen = true;
           const perceivedPauseMs = performance.now() - struct.postSwitchSentAt;
           const targetTrack = struct.postSwitchToTrack;
+          events.emit('SWITCH_FIRST_FRAME', {
+            from: struct.postSwitchFromTrack ?? null,
+            to: targetTrack,
+            perceived_pause_ms: perceivedPauseMs,
+            playhead_ms: this.#element.currentTime * 1000,
+          });
 
           // Find the most recent matching switch record and attach.
           if (typeof window !== 'undefined' && window.__moqtailMetrics) {
@@ -1011,6 +1197,7 @@ export class Player {
           struct.postSwitchFrameTarget = undefined;
           struct.postSwitchSentAt = undefined;
           struct.postSwitchToTrack = undefined;
+          struct.postSwitchFromTrack = undefined;
         }
       }
       // Re-arm for next frame.
@@ -1088,13 +1275,31 @@ export class Player {
 
     const tEnd = Date.now();
     const dtSec = (tEnd - tStart) / 1000;
-    if (count === 0 || dtSec <= 0) return 0;
+    if (count === 0 || dtSec <= 0) {
+      events.emit('PROBE', {
+        track: trackName,
+        p_bytes: pBytes,
+        objects: count,
+        dt_ms: tEnd - tStart,
+        bps: 0,
+      });
+      return 0;
+    }
 
     const vBytesEnd = videoStruct?.tracker.getCumulativeBytes() ?? vBytesStart;
     const vBytes = Math.max(0, vBytesEnd - vBytesStart);
 
     // BWE = (v + p) × 8 / Δt — Algorithm 1 line 9.
-    return ((vBytes + pBytes) * 8) / dtSec;
+    const bps = ((vBytes + pBytes) * 8) / dtSec;
+    events.emit('PROBE', {
+      track: trackName,
+      p_bytes: pBytes,
+      v_bytes: vBytes,
+      objects: count,
+      dt_ms: tEnd - tStart,
+      bps,
+    });
+    return bps;
   }
 
   /**
@@ -1161,23 +1366,18 @@ export class Player {
     const switchSentAt = performance.now();
     const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
 
-    // Compute the time-shifted target group from the playhead via TimeMap.
+    // Compute the playhead group via TimeMap for the soft plan.
     let targetGroup: number | undefined;
-    if (
-      this.#options.switchMode === 'time-shifted' &&
-      this.#timeMap &&
-      playheadPTS_ms !== undefined
-    ) {
+    if (this.#options.switchFromMode === 'soft' && this.#timeMap && playheadPTS_ms !== undefined) {
       targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
     }
     const plan = computeSwitchFromPlan({
-      switchMode: this.#options.switchMode,
+      switchFromMode: this.#options.switchFromMode,
       targetGroup,
     });
     if (plan.timeMapMiss) {
-      logger.warn('media', 'time-shifted switch: TimeMap miss; falling through to live-edge');
+      logger.warn('media', 'soft switch: TimeMap miss; falling through to a hard switch');
     }
-    this.#lastSwitchHadTimeMapMiss = plan.timeMapMiss;
 
     // SWITCH_FROM (PR #1674): the target is a fresh SUBSCRIBE that names the
     // subscription it replaces. The relay answers with SUBSCRIBE_OK and keeps
@@ -1187,6 +1387,23 @@ export class Player {
     // subscription by is the new SUBSCRIBE's, so it is adopted on success and
     // the next switch names it as switchFromRequestId.
     const switchFromRequestId = videoStruct.requestId;
+
+    events.emit('SWITCH_SENT', {
+      from: videoStruct.trackName,
+      to: trackName,
+      request_id: null, // the new SUBSCRIBE's id is adopted on success
+      old_request_id: switchFromRequestId,
+      switch_from_mode: plan.mode === SwitchMode.Soft ? 'soft' : 'hard',
+      start_group: plan.startLocation ? plan.startLocation.group : null,
+      time_map_miss: plan.timeMapMiss,
+      playhead_ms: playheadPTS_ms ?? null,
+      playhead_group:
+        playheadPTS_ms !== undefined && this.#timeMap?.hasAnchor()
+          ? this.#timeMap.groupContainingPTS(playheadPTS_ms)
+          : null,
+      last_received_group: videoStruct.lastGroupId,
+      buffered_end_ms: videoStruct.lastAppendedEndPTS_ms ?? null,
+    });
 
     try {
       const result = await this.client.switch({
@@ -1207,6 +1424,11 @@ export class Player {
           `switchTrack: SWITCH_FROM rejected for ${trackName}:`,
           result.reasonPhrase.phrase,
         );
+        events.emit('SWITCH_ERROR', {
+          to: trackName,
+          reason: result.reasonPhrase.phrase,
+          rtt_ms: performance.now() - switchSentAt,
+        });
         // The relay refused without touching the current subscription, so the
         // next attempt keeps referencing it.
         this.#options.onTrackSwitched?.(videoStruct.trackName);
@@ -1237,8 +1459,18 @@ export class Player {
         framesAtSwitch,
       };
       videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
+      events.emit('SWITCH_OK', {
+        to: trackName,
+        request_id: result.requestId,
+        rtt_ms: performance.now() - switchSentAt,
+      });
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
+      events.emit('SWITCH_ERROR', {
+        to: trackName,
+        reason: String(error),
+        rtt_ms: performance.now() - switchSentAt,
+      });
       this.#options.onTrackSwitched?.(videoStruct.trackName);
     }
   }
@@ -1358,6 +1590,15 @@ export class Player {
 
     // Send the appropriate control message
     let struct: MOQStreamStruct;
+    const subscribeSentAt = performance.now();
+    if (params.trackName !== 'catalog') {
+      events.emit('SUBSCRIBE_SENT', {
+        track: params.trackName,
+        client_mode: this.#options.clientMode,
+        filter_delay_s: this.#options.filterDelaySeconds,
+        delay_groups: parameters ? Number(parameters[0]!.toKeyValuePair().value) : 0,
+      });
+    }
     const result = await this.client.subscribe({
       fullTrackName: getFullTrackName(this.#options.namespace, params.trackName),
       groupOrder: GroupOrder.Original,
@@ -1366,8 +1607,14 @@ export class Player {
       priority: params.priority ?? 0,
       parameters,
     });
-    if (result instanceof RequestError)
+    if (result instanceof RequestError) {
+      events.emit('ERROR', {
+        where: 'subscribe',
+        track: params.trackName,
+        message: result.reasonPhrase.phrase,
+      });
       throw new Error(`Error occured during subscription: ${result.reasonPhrase.phrase}`);
+    }
 
     // Capture connect-time state for media tracks (not catalog) so C4 can emit
     // a connect-time discontinuity record on the first arriving object. We only
@@ -1385,6 +1632,14 @@ export class Player {
           this.#expectedStartGroupId = Math.max(0, Number(largest.group) - delayGroups);
         }
       }
+      events.emit('SUBSCRIBE_OK', {
+        track: params.trackName,
+        request_id: result.requestId,
+        rtt_ms: performance.now() - subscribeSentAt,
+        largest_group: largest !== undefined ? largest.group : null,
+        largest_object: largest !== undefined ? largest.object : null,
+        expected_start_group: this.#expectedStartGroupId ?? null,
+      });
     }
 
     const tracker = new GoodputTracker();

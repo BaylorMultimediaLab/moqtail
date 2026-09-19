@@ -54,16 +54,16 @@ describe('buildSubscribeParameters', () => {
 });
 
 describe('computeSwitchFromPlan', () => {
-  it('live-edge mode is a hard switch starting at the live edge', () => {
-    const r = computeSwitchFromPlan({ switchMode: 'live-edge', targetGroup: 42 });
+  it('hard mode starts the target at the live edge', () => {
+    const r = computeSwitchFromPlan({ switchFromMode: 'hard', targetGroup: 42 });
     expect(r.mode).toBe(SwitchMode.Hard);
     expect(r.filterType).toBe(FilterType.LatestObject);
     expect(r.startLocation).toBeUndefined();
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('time-shifted mode is a soft switch filling from the playhead group', () => {
-    const r = computeSwitchFromPlan({ switchMode: 'time-shifted', targetGroup: 42 });
+  it('soft mode fills from the playhead group', () => {
+    const r = computeSwitchFromPlan({ switchFromMode: 'soft', targetGroup: 42 });
     expect(r.mode).toBe(SwitchMode.Soft);
     expect(r.filterType).toBe(FilterType.AbsoluteStartFill);
     expect(r.startLocation?.group).toBe(42n);
@@ -71,15 +71,15 @@ describe('computeSwitchFromPlan', () => {
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('flags timeMapMiss when time-shifted but no target, falling through to live-edge', () => {
-    const r = computeSwitchFromPlan({ switchMode: 'time-shifted', targetGroup: undefined });
+  it('flags timeMapMiss when soft but no target, falling through to hard', () => {
+    const r = computeSwitchFromPlan({ switchFromMode: 'soft', targetGroup: undefined });
     expect(r.mode).toBe(SwitchMode.Hard);
     expect(r.filterType).toBe(FilterType.LatestObject);
     expect(r.timeMapMiss).toBe(true);
   });
 
-  it("does NOT flag miss when live-edge + no target (live-edge doesn't need TimeMap)", () => {
-    const r = computeSwitchFromPlan({ switchMode: 'live-edge', targetGroup: undefined });
+  it("does NOT flag miss when hard + no target (hard doesn't need TimeMap)", () => {
+    const r = computeSwitchFromPlan({ switchFromMode: 'hard', targetGroup: undefined });
     expect(r.mode).toBe(SwitchMode.Hard);
     expect(r.timeMapMiss).toBe(false);
   });

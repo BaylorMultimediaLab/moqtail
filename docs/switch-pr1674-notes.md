@@ -27,10 +27,10 @@ below.
 `client.switch({ switchFromRequestId, switchMode, newSubscribeOptions })`;
 `computeSwitchFromPlan()` decides the mode and filter:
 
-| harness `switchMode` | SWITCH_FROM mode | target filter                                                              | what the subscriber sees                                                                                                                                                                                                     |
+| player `switchFromMode` | SWITCH_FROM mode | target filter                                                              | what the subscriber sees                                                                                                                                                                                                     |
 | -------------------- | ---------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `live-edge`          | Hard (#1674)     | `LatestObject`                                                             | The target starts at the live edge; the old track is cut on the target's first object. Old-track media already buffered stays, so a behind-live client jumps to live at the seam (the paper's live-edge discontinuity).      |
-| `time-shifted`       | Soft (#1675)     | `AbsoluteStartFill` at the group containing the playhead (via the TimeMap) | The relay delivers `[start, live edge)` on a fill fetch stream and drains the old track up to `start - 1`; the seam lands at the playhead. A TimeMap miss falls back to the live-edge plan and is recorded as `timeMapMiss`. |
+| `hard`                  | Hard (#1674)     | `LatestObject`                                                             | The target starts at the live edge; the old track is cut on the target's first object. Old-track media already buffered stays, so a behind-live client jumps to live at the seam (the paper's live-edge discontinuity).      |
+| `soft`                  | Soft (#1675)     | `AbsoluteStartFill` at the group containing the playhead (via the TimeMap) | The relay delivers `[start, live edge)` on a fill fetch stream and drains the old track up to `start - 1`; the seam lands at the playhead. A TimeMap miss falls back to the hard plan and is recorded in `SWITCH_SENT.time_map_miss`. |
 
 Both modes deliver on the **same** output stream as the original SUBSCRIBE
 (the client re-routes the target's objects onto it), so the MSE pump and the
@@ -53,3 +53,16 @@ harness relied on). The hold-until-the-edge-advances behaviour is unchanged.
   promotion of the draft-14 harness: superseded by SWITCH_FROM.
 - Everything specific to PR #1378 (`switch/pr1378` branch): Minimum Switching
   Group ID, G_switch selection, drain-before-PUBLISH, SWITCH_TRANSITION.
+
+## Experiment knobs and events on this branch
+
+- `switchFromMode` (`hard` | `soft`, URL `?switchFromMode=`, Settings panel
+  "SWITCH_FROM Mode") is the branch-specific mechanism knob; the default is
+  `hard`. The words live-edge and time-shifted only ever describe client
+  types (`clientMode`).
+- Client `SWITCH_SENT` records `switch_from_mode` and the fill `start_group`;
+  `RUN_META` carries `switch_from_mode`. The relay emits `SWITCH_RECV` when a
+  SUBSCRIBE carrying SWITCH_FROM is planned (with the mode and the suspended
+  track) and `SWITCH_PROMOTED` when the activating subscription completes
+  the switch (`start_group` = the seam group). The shared record schema is in
+  `docs/measurement-schema.md`.

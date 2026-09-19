@@ -68,9 +68,6 @@ export enum MessageParameterType {
    * Behind-live offset in groups for filtered (delay-mode) clients.
    */
   DelayGroups = 0x70,
-  /** Project-local extension; non-MoQT-standard.
-   *  Absolute group_id where a Switch should start delivering the new track. */
-  StartLocationGroup = 0x72,
 }
 
 export function messageParameterTypeFromNumber(value: bigint | number): MessageParameterType {
@@ -108,8 +105,6 @@ export function messageParameterTypeFromNumber(value: bigint | number): MessageP
       return MessageParameterType.TrackNamespacePrefix
     case 0x70:
       return MessageParameterType.DelayGroups
-    case 0x72:
-      return MessageParameterType.StartLocationGroup
     default:
       throw new InvalidTypeError('messageParameterTypeFromNumber', `Unknown message parameter type: ${value}`)
   }

@@ -23,6 +23,8 @@ import MSEBuffer, { computeLiveEdgeDelay } from '@/lib/buffer';
 import { AbrController, AbrRulesCollection, DEFAULT_ABR_SETTINGS } from '@/lib/abr';
 import type { AbrMetrics, AbrSettings } from '@/lib/abr';
 import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
+import { events } from '@/lib/events/EventLog';
+import { targetShiftMs } from '@/lib/events/liveEdge';
 import type { MetricsSnapshot } from '@/lib/metrics/types';
 import { SettingsPanel } from '@/components/SettingsPanel';
 import { MetricsPanel } from '@/components/MetricsPanel';
@@ -228,9 +230,31 @@ function TrackGroup({
   );
 }
 
+/**
+ * Experiment-run parameters read once from the URL:
+ *   ?run=<id>        start the event log under this run id (logs/<id>/client-events.jsonl)
+ *   ?autoConnect=1   connect and start playback without a click (headless runs)
+ *   ?logObjects=1    one OBJECT_RECV record per received frame
+ *   ?relay=<url> ?namespace=<ns>  connection defaults
+ * Together with ?clientMode, ?filterDelay and the ABR overrides below.
+ */
+function readRunParams() {
+  const params = new URLSearchParams(window.location.search);
+  const truthy = (v: string | null) => v === '1' || v === 'true';
+  return {
+    runId: params.get('run'),
+    autoConnect: truthy(params.get('autoConnect')),
+    logObjects: truthy(params.get('logObjects')),
+    relay: params.get('relay'),
+    namespace: params.get('namespace'),
+    switchFromMode: params.get('switchFromMode') === 'soft' ? ('soft' as const) : ('hard' as const),
+  };
+}
+
 export function App() {
-  const [relayUrl, setRelayUrl] = useState('https://127.0.0.1:4433');
-  const [namespace, setNamespace] = useState('moqtail');
+  const runParams = useRef(readRunParams()).current;
+  const [relayUrl, setRelayUrl] = useState(runParams.relay ?? 'https://127.0.0.1:4433');
+  const [namespace, setNamespace] = useState(runParams.namespace ?? 'moqtail');
   const [status, setStatus] = useState<Status>('idle');
   const [clientMode, setClientMode] = useState<'filtered' | 'unfiltered'>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -244,11 +268,8 @@ export function App() {
     const n = parseFloat(fd);
     return Number.isFinite(n) && n >= 0 ? n : 2;
   });
-  const [switchMode, setSwitchMode] = useState<'live-edge' | 'time-shifted'>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const sm = params.get('switchMode');
-    return sm === 'time-shifted' || sm === 'live-edge' ? sm : 'live-edge';
-  });
+  // SWITCH_FROM mode (PR #1674 hard / PR #1675 soft): branch-specific mechanism knob.
+  const [switchFromMode, setSwitchFromMode] = useState<'hard' | 'soft'>(runParams.switchFromMode);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
@@ -392,6 +413,12 @@ export function App() {
 
     await disposePlayer();
 
+    // Experiment event log: one run id per page load; a reconnect continues
+    // the same log with a fresh CONNECT_START.
+    if (runParams.runId && !events.active) {
+      events.start(runParams.runId);
+    }
+
     try {
       const player = new Player({
         relayUrl,
@@ -399,7 +426,8 @@ export function App() {
         receiveCatalogViaSubscribe: true,
         clientMode,
         filterDelaySeconds,
-        switchMode,
+        switchFromMode,
+        logObjects: runParams.logObjects,
       });
       playerRef.current = player;
 
@@ -427,6 +455,33 @@ export function App() {
         }
       }
       if (firstVideo) {
+        const gopDurationMs = catalog.getGopDurationMs(firstVideo.name);
+        const shift = targetShiftMs({
+          clientMode,
+          filterDelaySeconds,
+          gopDurationMs,
+          liveEdgeDelaySeconds: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+        });
+        events.emit('RUN_META', {
+          run_id: runParams.runId,
+          relay_url: relayUrl,
+          namespace,
+          client_mode: clientMode,
+          filter_delay_s: filterDelaySeconds,
+          switch_from_mode: switchFromMode,
+          delay_groups: shift.delayGroups,
+          target_shift_ms: shift.targetShiftMs,
+          gop_duration_ms: gopDurationMs,
+          initial_bandwidth_bps: initialBw,
+          startup_track: firstVideo.name,
+          abr_settings: abrSettings,
+          ladder: videoTracksAll.map(t => ({
+            track: t.name,
+            bitrate: t.bitrate,
+            width: t.width,
+            height: t.height,
+          })),
+        });
         setSelectedVideo(firstVideo.name);
         setStatus('restarting');
         await player.attachMedia(videoRef.current);
@@ -508,9 +563,34 @@ export function App() {
     } catch (err) {
       setError((err as Error).message);
       setStatus('error');
+      events.emit('ERROR', { where: 'connect-flow', message: (err as Error).message });
       await disposePlayer();
     }
-  }, [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode]);
+  }, [
+    relayUrl,
+    namespace,
+    disposePlayer,
+    abrSettings,
+    clientMode,
+    filterDelaySeconds,
+    switchFromMode,
+    runParams,
+  ]);
+
+  // Headless / scripted runs: connect once the video element is mounted.
+  const autoConnected = useRef(false);
+  useEffect(() => {
+    if (!runParams.autoConnect || autoConnected.current) return;
+    autoConnected.current = true;
+    void handleConnect();
+  }, [runParams.autoConnect, handleConnect]);
+
+  // Flush the event log when the page goes away (tab close, driver shutdown).
+  useEffect(() => {
+    const onHide = () => events.stop();
+    window.addEventListener('pagehide', onHide);
+    return () => window.removeEventListener('pagehide', onHide);
+  }, []);
 
   const startPlayback = useCallback(
     async (videoTrack: string | null, audioTrack: string | null) => {
@@ -531,7 +611,7 @@ export function App() {
           receiveCatalogViaSubscribe: true,
           clientMode,
           filterDelaySeconds,
-          switchMode,
+          switchFromMode,
         });
         playerRef.current = player;
 
@@ -617,7 +697,15 @@ export function App() {
         await disposePlayer();
       }
     },
-    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode],
+    [
+      relayUrl,
+      namespace,
+      disposePlayer,
+      abrSettings,
+      clientMode,
+      filterDelaySeconds,
+      switchFromMode,
+    ],
   );
 
   const handleTrackChange = useCallback(
@@ -725,8 +813,8 @@ export function App() {
         filterDelaySeconds={filterDelaySeconds}
         onFilterDelaySecondsChange={setFilterDelaySeconds}
         connectStatus={status}
-        switchMode={switchMode}
-        onSwitchModeChange={setSwitchMode}
+        switchFromMode={switchFromMode}
+        onSwitchFromModeChange={setSwitchFromMode}
       />
 
       {/* Body */}

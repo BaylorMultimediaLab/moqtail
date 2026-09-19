@@ -30,11 +30,16 @@ from), `upstream-switch-from/2026-09-12` (the switch-from snapshot merged into
   `.probe:<size>:<priority>` synthetic track for bandwidth probing.
 - `apps/client-js`: the ABR player (rules, metrics, TimeMap, goodput and latency
   trackers) with `clientMode` (`filtered` = time-shifted, `unfiltered` =
-  live-edge) and `switchMode` (`live-edge` | `time-shifted`).
-- Library support for the two project-local parameters, `SubscribeResult.largestLocation`,
+  live-edge). The player never tells the relay _how_ to switch; each
+  `switch/*` branch supplies that.
+- Library support for the project-local `DELAY_GROUPS` parameter, `SubscribeResult.largestLocation`,
   and `gopDurationMs` in the catalog.
 - `scripts/run-stack.sh` (relay + publisher + player) and the `data` submodule
   with test video.
+- The measurement layer: JSON-lines event logs in the client
+  (`apps/client-js/src/lib/events`), relay (`--event-log`) and publisher
+  (`--event-log`), the experiment runner and analyzer in `experiments/`, and
+  the record/metric definitions in `docs/measurement-schema.md`.
 
 ## Working rules
 
@@ -44,5 +49,7 @@ from), `upstream-switch-from/2026-09-12` (the switch-from snapshot merged into
   merge it into `harness`, then merge `harness` into each `switch/*` branch.
   Before merging a newer `switch-from` into `switch/pr1674`, check that its
   merge base with upstream `main` is inside the pinned base.
-- The harness's switch modes are named `live-edge` and `time-shifted` on
-  purpose, so they cannot be confused with SWITCH_FROM's own hard/soft modes.
+- `harness` carries no switching mechanism of its own (the old relay-side
+  `START_LOCATION_GROUP` promotion was removed on 2026-09-19). Client _types_
+  are `live-edge` and `time-shifted`; those words are never used for switch
+  modes, so they cannot be confused with SWITCH_FROM's hard/soft.

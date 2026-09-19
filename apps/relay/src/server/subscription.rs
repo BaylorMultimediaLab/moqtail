@@ -15,6 +15,7 @@
 use crate::server::client::MOQTClient;
 use crate::server::client::switch_context::{SwitchActivation, SwitchPlan};
 use crate::server::config::AppConfig;
+use crate::server::events;
 use crate::server::message_handlers::fetch_handler::FetchStop;
 use crate::server::object_logger::ObjectLogger;
 use crate::server::stream_id::StreamId;
@@ -943,6 +944,15 @@ impl Subscription {
   /// suspending one can be stopped for good, and where no Start Group set a
   /// boundary, the group just delivered is it.
   async fn complete_switch(&self, delivered_group: u64) {
+    events::emit(
+      "SWITCH_PROMOTED",
+      serde_json::json!({
+        "conn": self.client_connection_id,
+        "relay_track_id": self.relay_track_id,
+        "track": events::track_name_string(&self.full_track_name),
+        "start_group": delivered_group,
+      }),
+    );
     let Some(plan) = self
       .subscriber
       .switch_context

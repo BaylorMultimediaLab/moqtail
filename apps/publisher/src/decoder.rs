@@ -174,9 +174,9 @@ fn fanout_blocking(txs: &[mpsc::Sender<RawGop>], gop: RawGop) -> bool {
       // Can't move out of gop here since we borrowed it above; clone is still O(1).
       gop.clone()
     };
-    match tx.blocking_send(g) {
-      Ok(()) => any_alive = true,
-      Err(_) => {} // this pipeline dropped, skip it
+    // A failed send means this pipeline dropped; skip it.
+    if tx.blocking_send(g).is_ok() {
+      any_alive = true;
     }
   }
   any_alive

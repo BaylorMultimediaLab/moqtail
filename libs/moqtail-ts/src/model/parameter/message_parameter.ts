@@ -32,7 +32,6 @@ import { GroupOrderParam } from './message/group_order_param'
 import { LargestObject } from './message/largest_object'
 import { NewGroupRequest } from './message/new_group_request'
 import { DelayGroups } from './message/delay_groups'
-import { StartLocationGroup } from './message/start_location_group'
 import { SubscriberPriority } from './message/subscriber_priority'
 import { SubscriptionFilter } from './message/subscription_filter'
 import { SwitchFrom } from './message/switch_from'
@@ -52,7 +51,6 @@ export type MessageParameter =
   | SubscriptionFilter
   | NewGroupRequest
   | DelayGroups
-  | StartLocationGroup
   | SwitchFrom
   | FillParameters
 
@@ -77,7 +75,6 @@ export namespace MessageParameter {
       SubscriptionFilter.fromKeyValuePair(pair) ??
       NewGroupRequest.fromKeyValuePair(pair) ??
       DelayGroups.fromKeyValuePair(pair) ??
-      StartLocationGroup.fromKeyValuePair(pair) ??
       SwitchFrom.fromKeyValuePair(pair) ??
       FillParameters.fromKeyValuePair(pair)
     )
@@ -142,10 +139,6 @@ export namespace MessageParameter {
 
   export function isDelayGroups(param: MessageParameter): param is DelayGroups {
     return param instanceof DelayGroups
-  }
-
-  export function isStartLocationGroup(param: MessageParameter): param is StartLocationGroup {
-    return param instanceof StartLocationGroup
   }
 
   /** The relay's LARGEST_OBJECT location, if the parameter list carries one. */
@@ -223,11 +216,6 @@ export class MessageParameters {
     return this.add(new DelayGroups(BigInt(delayGroups)))
   }
 
-  /** Project-local: absolute group where a SWITCH should start the new track. */
-  addStartLocationGroup(groupId: bigint | number): this {
-    return this.add(new StartLocationGroup(BigInt(groupId)))
-  }
-
   addSwitchFrom(requestId: bigint | number, mode: SwitchMode, publishDone: boolean): this {
     return this.add(new SwitchFrom(BigInt(requestId), mode, publishDone))
   }
@@ -235,7 +223,6 @@ export class MessageParameters {
   addFillParameters(parameters: MessageParameter[]): this {
     return this.add(new FillParameters(parameters))
   }
-
   build(): MessageParameter[] {
     return [...this.params]
   }

@@ -1,0 +1,11 @@
+{
+  "name": "step_down_up_fqcodel",
+  "description": "Same steps as step_down_up with an fq_codel bottleneck queue (AQM) instead of tail-drop.",
+  "queue": "fq_codel",
+  "queue_pkts": 100,
+  "steps": [
+    { "at_s": 0, "rate_mbps": 6, "delay_ms": 40, "loss_pct": 0 },
+    { "at_s": 60, "rate_mbps": 1.5, "delay_ms": 40, "loss_pct": 0 },
+    { "at_s": 120, "rate_mbps": 6, "delay_ms": 40, "loss_pct": 0 }
+  ]
+}

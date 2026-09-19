@@ -58,6 +58,8 @@ export class GoodputTracker {
   // Diagnostics
   #lastObjectBytes = 0;
   #lastGroupDurationMs = 0;
+  #lastGroupBps = 0;
+  #lastGroupBytes = 0;
   #sampleCount = 0;
   // Monotonic counter of all bytes ever recorded. Used by the active
   // probe (Kuo Algorithm 1) to compute v = video-track bytes received
@@ -133,6 +135,16 @@ export class GoodputTracker {
     return this.#sampleCount;
   }
 
+  /** Throughput (bps) of the most recently finalised group sample. */
+  getLastSampleBps(): number {
+    return this.#lastGroupBps;
+  }
+
+  /** Bytes counted in the most recently finalised group sample. */
+  getLastSampleBytes(): number {
+    return this.#lastGroupBytes;
+  }
+
   /** Monotonic byte counter over all recorded objects. */
   getCumulativeBytes(): number {
     return this.#cumulativeBytes;
@@ -172,6 +184,8 @@ export class GoodputTracker {
     this.#currentGroupObjectCount = 0;
     this.#lastObjectBytes = 0;
     this.#lastGroupDurationMs = 0;
+    this.#lastGroupBps = 0;
+    this.#lastGroupBytes = 0;
     this.#sampleCount = 0;
     this.#emaFast = 0;
     this.#emaSlow = 0;
@@ -196,6 +210,8 @@ export class GoodputTracker {
     if (this.#swma.length > this.#swmaWindowSize) this.#swma.shift();
 
     this.#lastGroupDurationMs = dtMs;
+    this.#lastGroupBps = groupBps;
+    this.#lastGroupBytes = bytes;
     this.#sampleCount++;
 
     this.#updateEma(groupBps, dtMs);

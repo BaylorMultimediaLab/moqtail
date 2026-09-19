@@ -1,7 +1,6 @@
 /**
- * Bidirectional PTS <-> group lookup. Used by the player to compute
- * `START_LOCATION_GROUP` for time-shifted switches: given the current
- * playhead PTS, find the group_id that contains it.
+ * Bidirectional PTS <-> group lookup. Used by the player's measurements to
+ * resolve the current playhead PTS to the group_id that contains it.
  *
  * Recorded boundaries are explicit `(groupId, startPTS_ms)` points
  * fed by the player's write handler as objects arrive. For PTS values
@@ -11,7 +10,7 @@
  */
 export class TimeMap {
   private boundaries: Array<{ groupId: number; startPTS_ms: number }> = [];
-  private gopDurationMs: number;
+  readonly gopDurationMs: number;
 
   constructor(gopDurationMs: number) {
     if (gopDurationMs <= 0) {
@@ -28,6 +27,11 @@ export class TimeMap {
     if (this.boundaries.some(b => b.groupId === groupId)) return;
     this.boundaries.push({ groupId, startPTS_ms });
     this.boundaries.sort((a, b) => a.startPTS_ms - b.startPTS_ms);
+  }
+
+  /** True once at least one group boundary has been recorded. */
+  hasAnchor(): boolean {
+    return this.boundaries.length > 0;
   }
 
   /**
