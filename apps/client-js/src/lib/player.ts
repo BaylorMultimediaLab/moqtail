@@ -180,6 +180,14 @@ export interface PlayerOptions {
   switchFloor?: 'next-group' | 'playhead';
   /** Experiment log: emit one OBJECT_RECV record per received media object (frame). */
   logObjects?: boolean;
+  /**
+   * A pending switch "lands" only once the client library has mapped the
+   * switched subscription's request id to a track alias, i.e. a data stream
+   * for the target arrived after the switch. Without this, trailing objects
+   * of an earlier subscription to the same track (A -> B -> A) are mistaken
+   * for the new track and the next switch fails inside the library.
+   */
+  landingRequiresAliasMapping?: boolean;
 }
 
 const DefaultOptions = {
@@ -192,6 +200,7 @@ const DefaultOptions = {
   filterDelaySeconds: 0,
   switchFloor: 'next-group' as 'next-group' | 'playhead',
   logObjects: false,
+  landingRequiresAliasMapping: true,
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -719,6 +728,28 @@ export class Player {
               return;
             }
 
+            if (
+              struct.pendingSwitch &&
+              objectTrackName === struct.pendingSwitch.trackName &&
+              this.#options.landingRequiresAliasMapping &&
+              objectTrackName !== struct.trackName &&
+              this.client !== null &&
+              !this.client.subscriptionAliasMap.has(struct.requestId)
+            ) {
+              // Same track name, but the library has not yet seen a stream for
+              // the switched subscription: this is a trailing object of the
+              // earlier subscription to that track, not the switch landing.
+              events.emit('DROP_STALE', {
+                track: objectTrackName,
+                current: struct.trackName,
+                pending: struct.pendingSwitch.trackName,
+                group: object.location.group,
+                object: object.location.object,
+                reason: 'pre-landing',
+              });
+              return;
+            }
+
             if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
               const {
                 initData,
@@ -1064,10 +1095,12 @@ export class Player {
             if (prft !== null) {
               latencyMs = Date.now() - prft.captureMs;
               this.#latencyTracker.record(latencyMs);
-              if (this.#videoTimescale > 0) {
+              const anchorTimescale =
+                this.catalog?.getTimescale(objectTrackName) ?? this.#videoTimescale;
+              if (anchorTimescale > 0) {
                 this.#prftAnchor = {
                   captureMs: prft.captureMs,
-                  mediaMs: (prft.mediaTime * 1000) / this.#videoTimescale,
+                  mediaMs: (prft.mediaTime * 1000) / anchorTimescale,
                 };
               }
             }
@@ -1383,24 +1416,44 @@ export class Player {
     const reader = result.stream.getReader();
     let pBytes = 0;
     let count = 0;
+    // The probe is one finite burst; the relay ends the subscription with
+    // PUBLISH_DONE once its stream completes. Read until the stream ends, or
+    // the burst has gone quiet, or a hard cap, so the subscription is never
+    // cancelled while probe data is still in flight (that data would then hit
+    // the library as an unknown track alias).
+    const idleMs = 250;
+    const capMs = Math.max(durationMs * 10, 5000);
+    let streamDone = false;
+    let lastObjectAt = tStart;
 
     try {
-      while (Date.now() - tStart < durationMs) {
-        const remaining = durationMs - (Date.now() - tStart);
-        const timeoutP = new Promise<{ done: true; value: undefined }>(resolve =>
-          setTimeout(() => resolve({ done: true, value: undefined }), remaining),
-        );
+      for (;;) {
+        const now = Date.now();
+        if (now - tStart >= capMs) break;
+        if (count > 0 && now - lastObjectAt >= idleMs) break;
+        const wait = count > 0 ? idleMs - (now - lastObjectAt) : capMs - (now - tStart);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeoutP = new Promise<{ done: false; value: undefined; timeout: true }>(resolve => {
+          timer = setTimeout(() => resolve({ done: false, value: undefined, timeout: true }), wait);
+        });
         const readP = reader.read() as Promise<{
           done: boolean;
           value: typeof MoqtObject.prototype | undefined;
+          timeout?: false;
         }>;
         const r = await Promise.race([readP, timeoutP]);
-        if (r.done || !r.value) break;
-        if (r.value.isEndOfGroup()) continue;
+        if (timer !== undefined) clearTimeout(timer);
+        if ('timeout' in r && r.timeout) continue;
+        if (r.done) {
+          streamDone = true;
+          break;
+        }
+        if (!r.value || r.value.isEndOfGroup()) continue;
         const len = r.value.payload?.byteLength ?? 0;
         if (len === 0) continue;
         pBytes += len;
         count++;
+        lastObjectAt = Date.now();
       }
     } catch {
       /* swallow — return what we have */
@@ -1410,7 +1463,9 @@ export class Player {
       } catch {
         /* ignore */
       }
-      this.client.unsubscribe(result.requestId).catch(() => {});
+      if (!streamDone) {
+        this.client.unsubscribe(result.requestId).catch(() => {});
+      }
     }
 
     const tEnd = Date.now();
@@ -1437,6 +1492,7 @@ export class Player {
       v_bytes: vBytes,
       objects: count,
       dt_ms: tEnd - tStart,
+      stream_done: streamDone,
       bps,
     });
     return bps;

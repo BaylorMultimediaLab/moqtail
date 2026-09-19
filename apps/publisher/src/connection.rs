@@ -57,6 +57,8 @@ pub const CLIENT_SUPPORTED_VERSIONS: &str = "moqt-18";
 
 /// Publisher-side view of a MOQT session.
 pub struct MoqConnection {
+  /// Next client-initiated Request ID (draft-18: even, increasing by 2 per request).
+  next_request_id: u64,
   pub connection: Arc<TransportConnection>,
   /// Held for the session's lifetime: closing the control stream is a
   /// protocol violation. Unused after SETUP.
@@ -151,6 +153,7 @@ impl MoqConnection {
       connection,
       control_stream,
       request_streams: Vec::new(),
+      next_request_id: 0,
       request_acceptor,
     })
   }
@@ -171,8 +174,12 @@ impl MoqConnection {
       namespace, track_name, track_alias
     );
 
+    // Every request needs its own id even though the answer comes back on this
+    // same request stream: the relay keys the publisher's registrations by it.
+    let request_id = self.next_request_id;
+    self.next_request_id += 2;
     let publish = Publish::new(
-      0, // request id: the response returns on this same request stream
+      request_id,
       ns,
       TupleField::from_utf8(track_name),
       track_alias,

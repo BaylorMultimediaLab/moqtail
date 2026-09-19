@@ -81,6 +81,16 @@ def stats(values: list[float]) -> dict:
     }
 
 
+def track_matches(relay_track, client_track) -> bool:
+    """Relay records name tracks as namespace/name; the client uses the bare name."""
+    if client_track is None:
+        return True
+    if relay_track is None:
+        return False
+    s = str(relay_track).replace(".2d", "-")
+    return s == client_track or s.endswith("/" + client_track) or s.endswith("--" + client_track)
+
+
 def first(recs: list[dict], event: str, after: float = -1, pred=None) -> dict | None:
     for r in recs:
         if r.get("event") == event and r.get("ts", 0) >= after and (pred is None or pred(r)):
@@ -159,7 +169,7 @@ def analyze(run: Path, t1_tol: float, offset_tol_ms: float, offset_hold_s: float
         err = first(recs, "SWITCH_ERROR", sent["ts"], lambda r: r.get("request_id") == rid)
         rrecv = next((r for r in switch_recv if r.get("request_id") == rid), None)
         rprom = first(promoted, "SWITCH_PROMOTED", rrecv["ts"] if rrecv else sent["ts"],
-                      lambda r: sent.get("to") is None or sent["to"] in str(r.get("track"))) if rrecv else None
+                      lambda r: track_matches(r.get("track"), sent.get("to"))) if rrecv else None
         fobj = first(recs, "SWITCH_FIRST_OBJECT", sent["ts"], lambda r: r.get("to") == sent.get("to"))
         applied = first(recs, "SWITCH_APPLIED", sent["ts"], lambda r: r.get("to") == sent.get("to"))
         fframe = first(recs, "SWITCH_FIRST_FRAME", sent["ts"], lambda r: r.get("to") == sent.get("to"))

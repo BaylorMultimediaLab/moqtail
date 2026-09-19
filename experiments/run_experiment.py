@@ -175,6 +175,8 @@ def main() -> int:
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
     ap.add_argument("--no-analyze", action="store_true")
+    ap.add_argument("--no-lib-build", action="store_true",
+                    help="skip rebuilding libs/moqtail-ts (the player imports its dist, which goes stale across branches)")
     args = ap.parse_args()
 
     profile = load_profile(args.profile)
@@ -186,6 +188,13 @@ def main() -> int:
     out = args.results / run_id
     out.mkdir(parents=True, exist_ok=False)
     print(f"[run] run_id={run_id}\n[run] out={out}")
+
+    if not args.no_lib_build:
+        # The player imports the built library (libs/moqtail-ts/dist); a checkout
+        # of another mechanism branch leaves a dist that no longer matches.
+        print("[run] building libs/moqtail-ts")
+        subprocess.run(["npm", "run", "--prefix", str(ROOT / "libs/moqtail-ts"), "build"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
     rlog = RunnerLog(out / "runner-events.jsonl")
     backend = make_backend(args.net)
