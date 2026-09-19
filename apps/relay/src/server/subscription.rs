@@ -273,13 +273,13 @@ impl From<SubscriptionOrigin> for SubscriptionState {
 /// Decide whether the new (Next-status) track should promote to Current right
 /// now, given OLD's progress and the new track's incoming object.
 ///
-/// For naive switches the new sub was started with `LatestObject` and OLD has
+/// For live-edge switches the new sub was started with `LatestObject` and OLD has
 /// been catching up via cache; we wait until NEW's incoming live object passes
 /// OLD's `last_sent_max.group` before flipping the new track to Current and
 /// snapping its start to the next group boundary. That avoids a mid-GOP
 /// pre-OLD jump on the new track.
 ///
-/// For aligned switches the new sub was started with `AbsoluteStart(player_target)`;
+/// For time-shifted switches the new sub was started with `AbsoluteStart(player_target)`;
 /// the player explicitly chose where the new track should begin and *needs*
 /// every cached object from that target onward. The "wait until NEW catches
 /// OLD's last_sent" gate would silently drop those cached objects (NEW sits in
@@ -303,13 +303,13 @@ fn should_promote_switch(
 /// Decide the new track's `start_location` once the relay has accepted that the
 /// switch boundary is crossed.
 ///
-/// - `player_start`: what the new subscription was created with. For aligned
+/// - `player_start`: what the new subscription was created with. For time-shifted
 ///   switches the SWITCH handler set this from the player's `START_LOCATION_GROUP`
-///   (so it's `Some`); for naive switches it's `None` (`Subscribe::new_latest_object`).
+///   (so it's `Some`); for live-edge switches it's `None` (`Subscribe::new_latest_object`).
 /// - `last_sent_next`: `OLD.last_sent_max_location.group + 1` if known, else `None`.
 /// - `object_location`: the object that just triggered the switch-context check.
 ///
-/// Aligned switches MUST honor `player_start`; otherwise the new track silently
+/// Time-shifted switches MUST honor `player_start`; otherwise the new track silently
 /// degrades to starting at OLD's last-sent group, which on a filtered client is
 /// `delay_groups` ahead of the playhead.
 fn compute_switch_start_location(
@@ -861,8 +861,8 @@ impl Subscription {
         // is equal to or greater than the one of
         // the switch context's current track
         // if so, set this track as current
-        // Look up OLD's last_sent_max so we know whether to gate (naive) and
-        // where to snap the new start_location. For aligned switches the gate
+        // Look up OLD's last_sent_max so we know whether to gate (live-edge) and
+        // where to snap the new start_location. For time-shifted switches the gate
         // is bypassed in should_promote_switch -- see its doc comment.
         let mut last_sent_max_location = None;
         let mut new_start_location = None;
@@ -914,7 +914,7 @@ impl Subscription {
 
           state.is_joining = true;
 
-          // Aligned switches arrive with state.start_location already set from
+          // Time-shifted switches arrive with state.start_location already set from
           // the player's START_LOCATION_GROUP; that target must win over the
           // last_sent+1 fallback (see compute_switch_start_location).
           let player_start = state.start_location.clone();
@@ -1756,7 +1756,7 @@ mod tests_compute_switch_start_location {
   use super::*;
 
   #[test]
-  fn aligned_switch_preserves_player_start_location() {
+  fn time_shifted_switch_preserves_player_start_location() {
     let player_start = Some(Location {
       group: 17,
       object: 0,
@@ -1780,7 +1780,7 @@ mod tests_compute_switch_start_location {
   }
 
   #[test]
-  fn naive_switch_with_old_progress_uses_last_sent_next() {
+  fn live_edge_switch_with_old_progress_uses_last_sent_next() {
     let last_sent_next = Some(Location {
       group: 24,
       object: 0,
@@ -1800,7 +1800,7 @@ mod tests_compute_switch_start_location {
   }
 
   #[test]
-  fn naive_switch_without_old_progress_uses_object_next_group() {
+  fn live_edge_switch_without_old_progress_uses_object_next_group() {
     let object_location = Location {
       group: 7,
       object: 3,
@@ -1821,7 +1821,7 @@ mod tests_should_promote_switch {
   use super::*;
 
   #[test]
-  fn aligned_switch_promotes_immediately_even_when_object_is_behind_old() {
+  fn time_shifted_switch_promotes_immediately_even_when_object_is_behind_old() {
     let player_start = Some(Location {
       group: 17,
       object: 0,
@@ -1842,7 +1842,7 @@ mod tests_should_promote_switch {
   }
 
   #[test]
-  fn naive_switch_defers_promotion_when_object_is_behind_old() {
+  fn live_edge_switch_defers_promotion_when_object_is_behind_old() {
     let last_sent_max = Some(Location {
       group: 22,
       object: 23,
@@ -1859,7 +1859,7 @@ mod tests_should_promote_switch {
   }
 
   #[test]
-  fn naive_switch_promotes_when_object_meets_or_exceeds_old() {
+  fn live_edge_switch_promotes_when_object_meets_or_exceeds_old() {
     let last_sent_max = Some(Location {
       group: 22,
       object: 23,
@@ -1876,7 +1876,7 @@ mod tests_should_promote_switch {
   }
 
   #[test]
-  fn naive_switch_promotes_when_no_old_progress() {
+  fn live_edge_switch_promotes_when_no_old_progress() {
     let object_location = Location {
       group: 5,
       object: 0,

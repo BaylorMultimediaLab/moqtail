@@ -244,10 +244,10 @@ export function App() {
     const n = parseFloat(fd);
     return Number.isFinite(n) && n >= 0 ? n : 2;
   });
-  const [switchMode, setSwitchMode] = useState<'naive' | 'aligned'>(() => {
+  const [switchMode, setSwitchMode] = useState<'live-edge' | 'time-shifted'>(() => {
     const params = new URLSearchParams(window.location.search);
     const sm = params.get('switchMode');
-    return sm === 'aligned' || sm === 'naive' ? sm : 'naive';
+    return sm === 'time-shifted' || sm === 'live-edge' ? sm : 'live-edge';
   });
   const [tracks, setTracks] = useState<Track[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);

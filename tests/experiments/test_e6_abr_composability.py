@@ -1,7 +1,7 @@
 """E6: ABR rule composability across bandwidth profiles.
 
 9 configs x 3 profiles x 5 runs = 135 cells. Each cell:
-- Filtered client at filterDelay=10, switchMode=aligned (both fixed)
+- Filtered client at filterDelay=10, switchMode=time-shifted (both fixed)
 - ABR config from ABR_CONFIGS injected via window.__abrSettingsOverride
 - Bandwidth profile (stable / step / sinusoidal) driven via tc/netem
 
@@ -65,7 +65,7 @@ def _cell_params():
                         pytest.mark.abr_url_overrides(
                             clientMode="filtered",
                             filterDelay="10",
-                            switchMode="aligned",
+                            switchMode="time-shifted",
                         ),
                         pytest.mark.abr_settings_override(settings),
                         pytest.mark.initial_link_bw(_INITIAL_BW_MBPS[profile_name]),
@@ -132,11 +132,11 @@ async def test_e6_abr_composability(
     # diagnostic here, not assertive. Mirrors E3's invariant.
     GOP_DURATION_MS = 1000  # publisher emits 1-second GOPs
     assert summary["max_playhead_gap_ms"] <= GOP_DURATION_MS, (
-        f"aligned mode should land within one GOP of the playhead, "
+        f"time-shifted mode should land within one GOP of the playhead, "
         f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
         f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
     )
-    # Sanity: a switch must have fired so the aligned-mode invariant above is
+    # Sanity: a switch must have fired so the time-shifted-mode invariant above is
     # meaningful (max_playhead_gap_ms defaults to 0 with no switches). Some
     # cells (e.g. abr_config="all" + stable1.5M) drive the player into 5000k
     # on a 1.5Mbps link, where catch-up redelivery exhausts the 60s window —

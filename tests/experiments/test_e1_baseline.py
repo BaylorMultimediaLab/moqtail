@@ -21,7 +21,7 @@ from summary import build_run_summary, write_run_summary
 
 
 @pytest.mark.asyncio
-@pytest.mark.abr_url_overrides(clientMode="unfiltered", switchMode="aligned")
+@pytest.mark.abr_url_overrides(clientMode="unfiltered", switchMode="time-shifted")
 async def test_e1_baseline(net, relay_proc, publisher_proc, browser_page, collector, results_dir):
     page = browser_page
     _, relay_log_path = relay_proc

@@ -1525,8 +1525,8 @@ async fn handle_switch_message(
   switch_params.set_param(MessageParameter::new_forward(true)); // forward always true for switch
 
   // Inspect for START_LOCATION_GROUP: when present, start the new track at
-  // the requested absolute group (aligned switch). Otherwise default to the
-  // live-edge ("naive switch") semantic.
+  // the requested absolute group (time-shifted switch). Otherwise default to the
+  // live-edge semantic.
   let subscribe = match parse_start_location_group(&switch_params) {
     Some(start_group) => {
       info!(

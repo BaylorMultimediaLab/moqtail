@@ -31,8 +31,8 @@ export interface SettingsPanelProps {
   onFilterDelaySecondsChange: (seconds: number) => void;
   /** When non-'idle', the Connection card is disabled. */
   connectStatus: 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
-  switchMode: 'naive' | 'aligned';
-  onSwitchModeChange: (mode: 'naive' | 'aligned') => void;
+  switchMode: 'live-edge' | 'time-shifted';
+  onSwitchModeChange: (mode: 'live-edge' | 'time-shifted') => void;
 }
 
 function SettingCheckbox({
@@ -96,7 +96,7 @@ function OptionCard({ title, children }: { title: string; children: preact.Compo
           {title}
         </span>
       </div>
-      <div className="scrollbar-thin max-h-[320px] overflow-y-auto px-3 py-2">{children}</div>
+      <div className="max-h-[320px] scrollbar-thin overflow-y-auto px-3 py-2">{children}</div>
     </div>
   );
 }
@@ -164,7 +164,7 @@ export function SettingsPanel({
     >
       {/* Horizontal scroll wrapper */}
       <div className="relative">
-        <div className="scrollbar-thin scrollbar-track-transparent scrollbar-thumb-neutral-700 flex snap-x snap-proximity gap-3 overflow-x-auto pb-2">
+        <div className="flex snap-x snap-proximity scrollbar-thin scrollbar-thumb-neutral-700 scrollbar-track-transparent gap-3 overflow-x-auto pb-2">
           {/* Connection Card (pre-connect only) */}
           <OptionCard title="Connection">
             <SectionLabel>Client Mode</SectionLabel>
@@ -201,7 +201,7 @@ export function SettingsPanel({
             )}
             <SectionLabel>Switch Mode</SectionLabel>
             <div className="mb-2 flex gap-1">
-              {(['naive', 'aligned'] as const).map(m => (
+              {(['live-edge', 'time-shifted'] as const).map(m => (
                 <button
                   key={m}
                   disabled={connectStatus !== 'idle'}

@@ -1,10 +1,10 @@
-"""E5: ABR composability under unfiltered + naive switching.
+"""E5: ABR composability under unfiltered + live-edge switching.
 
 Exact mirror of E6's parameter sweep (9 ABR configs × 3 bandwidth
-profiles × 5 runs) but with clientMode=unfiltered and switchMode=naive
-instead of E6's filtered+aligned.
+profiles × 5 runs) but with clientMode=unfiltered and switchMode=live-edge
+instead of E6's filtered+time-shifted.
 
-Headline finding (vs aligned): naive switching produces a playhead
+Headline finding (vs time-shifted): live-edge switching produces a playhead
 gap equal to the buffer occupancy at switch time, regardless of
 whether the client has a filterDelay applied. With clientMode=
 unfiltered there is no deliberate offset behind live, but the player
@@ -18,11 +18,11 @@ Observed gaps from run0:
   - step3M_500k:       4.2–11.3 s (buffer accumulates during the 3 Mbps phase)
   - sin600k_3M:        3.7–14.0 s (buffer accumulates during the high half-cycle)
 
-Every cell sits well above the 1-GOP envelope that aligned switching
-holds (E3/E6). The takeaway: naive switching is fundamentally unable
+Every cell sits well above the 1-GOP envelope that time-shifted switching
+holds (E3/E6). The takeaway: live-edge switching is fundamentally unable
 to deliver continuous playback for any client carrying a buffer,
 whether that buffer comes from filterDelay (E2) or from normal player
-operation (E5). Aligned switching's 1-GOP bound is the only mechanism
+operation (E5). Time-shifted switching's 1-GOP bound is the only mechanism
 that severs the gap from buffer state.
 
 The assertion bound is 30 s — chosen to catch catastrophic regressions
@@ -77,7 +77,7 @@ def _cell_params():
     abr_url_overrides and abr_settings_override markers.
 
     Same shape as E6's _cell_params() but with clientMode=unfiltered,
-    switchMode=naive, no filterDelay.
+    switchMode=live-edge, no filterDelay.
     """
     params = []
     for config_name, settings in ABR_CONFIGS.items():
@@ -90,7 +90,7 @@ def _cell_params():
                     marks=[
                         pytest.mark.abr_url_overrides(
                             clientMode="unfiltered",
-                            switchMode="naive",
+                            switchMode="live-edge",
                         ),
                         pytest.mark.abr_settings_override(settings),
                         pytest.mark.initial_link_bw(_INITIAL_BW_MBPS[profile_name]),
@@ -150,7 +150,7 @@ async def test_e5_unfiltered_naive(
     )
     write_run_summary(summary, results_dir / "summary.json")
 
-    # Unfiltered + naive: playheadGap ≈ buffer_occupancy_at_switch × 1000.
+    # Unfiltered + live-edge: playheadGap ≈ buffer_occupancy_at_switch × 1000.
     # Buffer can grow to 10+ seconds on bandwidth-dynamic profiles
     # (step, sinusoidal) when the network briefly exceeds the active
     # variant's bitrate. The 30 s bound catches catastrophic regressions
@@ -158,7 +158,7 @@ async def test_e5_unfiltered_naive(
     # the gap past 30 s) without false-flagging the genuine multi-second
     # observations this experiment is designed to measure.
     assert summary["max_playhead_gap_ms"] <= 30_000, (
-        f"playheadGapMs catastrophically large for unfiltered + naive — "
+        f"playheadGapMs catastrophically large for unfiltered + live-edge — "
         f"likely a regression in the unfiltered subscribe path or "
         f"accidental filterDelay re-introduction. "
         f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "

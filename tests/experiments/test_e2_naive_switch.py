@@ -1,4 +1,4 @@
-"""E2: naive switch on a behind-live (filtered) client produces non-zero ptsGapMs.
+"""E2: live-edge switch on a behind-live (filtered) client produces non-zero ptsGapMs.
 
 20 parametric cells: 4 offsets x 5 runs. Each run launches a filtered client
 at the offset, hits the network with a step bandwidth drop at t=30s and
@@ -33,7 +33,7 @@ def _offset_params():
             marks=pytest.mark.abr_url_overrides(
                 clientMode="filtered",
                 filterDelay=str(offset),
-                switchMode="naive",
+                switchMode="live-edge",
             ),
         )
         for offset in _OFFSETS
@@ -114,7 +114,7 @@ async def test_e2_naive_switch(
     # Buffer-end ptsGapMs is ~0 here because the buffer has caught up to live
     # edge — so we assert on playhead-relative gap, not on ptsGapMs.
     assert summary["max_playhead_gap_ms"] > 100, (
-        f"expected positive playheadGapMs (naive switch on filtered client), "
+        f"expected positive playheadGapMs (live-edge switch on filtered client), "
         f"got max_playhead_gap_ms={summary['max_playhead_gap_ms']} "
         f"(diag max_pts_gap_ms={summary['max_pts_gap_ms']})"
     )

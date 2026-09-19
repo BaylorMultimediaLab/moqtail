@@ -83,7 +83,7 @@ export interface DiscontinuityRecord {
   /** Buffer-end gap: newStartPTS_ms - oldEndPTS_ms. Diagnostic only — measures
    *  buffered-region continuity, NOT user-visible discontinuity. With a fast
    *  link the buffer reaches the live edge, so both naive and aligned modes
-   *  produce ~0 here. Use `playheadGapMs` for naive-vs-aligned differentiation. */
+   *  produce ~0 here. Use `playheadGapMs` for live-edge-vs-time-shifted differentiation. */
   ptsGapMs: number;
   /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
   playheadPTS_ms?: number;
@@ -106,7 +106,7 @@ export interface DiscontinuityRecord {
   timeMapMiss?: boolean;
 
   // mode context (every record)
-  switchMode: 'naive' | 'aligned';
+  switchMode: 'live-edge' | 'time-shifted';
   clientMode: 'filtered' | 'unfiltered';
   filterDelaySeconds: number;
 }
@@ -118,7 +118,7 @@ interface PendingSwitch {
   /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
   oldEndPTS_ms: number | undefined;
   /** Snapshot of video.currentTime * 1000 at switchTrack() call — used by the discontinuity
-   *  record's `playheadGapMs` (newStart − playhead) which is the headline naive-vs-aligned metric. */
+   *  record's `playheadGapMs` (newStart − playhead) which is the headline live-edge-vs-time-shifted metric. */
   playheadPTS_ms: number | undefined;
   /** performance.now() at switchTrack() call — for wallClockMs and perceivedPauseMs. */
   switchSentAt: number;
@@ -176,8 +176,8 @@ export interface PlayerOptions {
   clientMode?: 'filtered' | 'unfiltered';
   /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
   filterDelaySeconds?: number;
-  /** Quality-switch primitive: 'naive' = today (start at latest); 'aligned' = start at group containing player's current PTS. */
-  switchMode?: 'naive' | 'aligned';
+  /** Quality-switch primitive: 'live-edge' = today (start at latest); 'time-shifted' = start at group containing player's current PTS. */
+  switchMode?: 'live-edge' | 'time-shifted';
 }
 
 const DefaultOptions = {
@@ -188,7 +188,7 @@ const DefaultOptions = {
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
   filterDelaySeconds: 0,
-  switchMode: 'naive' as 'naive' | 'aligned',
+  switchMode: 'live-edge' as 'live-edge' | 'time-shifted',
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -217,8 +217,8 @@ export function buildSubscribeParameters(opts: {
  * Builds the `parameters` field for a SWITCH message based on the active
  * switchMode and the player's current PTS.
  *
- * - 'naive' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
- * - 'aligned' mode: looks up the group containing `currentTime` via the TimeMap
+ * - 'live-edge' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
+ * - 'time-shifted' mode: looks up the group containing `currentTime` via the TimeMap
  *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
  *   switch fired before any object was received), returns `{ params: undefined,
  *   timeMapMiss: true }` so the caller can record the miss.
@@ -226,10 +226,10 @@ export function buildSubscribeParameters(opts: {
  * Exported for unit testing.
  */
 export function buildSwitchParameters(opts: {
-  switchMode: 'naive' | 'aligned';
+  switchMode: 'live-edge' | 'time-shifted';
   targetGroup: number | undefined;
 }): { params: MessageParameter[] | undefined; timeMapMiss: boolean } {
-  if (opts.switchMode !== 'aligned') return { params: undefined, timeMapMiss: false };
+  if (opts.switchMode !== 'time-shifted') return { params: undefined, timeMapMiss: false };
   if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
   return {
     params: new MessageParameters().addStartLocationGroup(opts.targetGroup).build(),
@@ -282,7 +282,7 @@ export class Player {
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
   // B4: PTS <-> group lookup populated from incoming object decode times.
-  // Consumed by B5 (aligned switch) to compute START_LOCATION_GROUP.
+  // Consumed by B5 (time-shifted switch) to compute START_LOCATION_GROUP.
   #timeMap: TimeMap | undefined;
   // B5: latched at switchTrack() time; consumed by the next switch
   // DiscontinuityRecord emission and reset to false afterwards so it doesn't
@@ -712,7 +712,7 @@ export class Player {
               );
               if (info !== undefined) {
                 struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-                // B4: feed the TimeMap so aligned switch (B5) can resolve playhead -> group.
+                // B4: feed the TimeMap so time-shifted switch (B5) can resolve playhead -> group.
                 // Only the first object of each group records (idempotent in TimeMap),
                 // and frame 0 of a group has decodeTime == group start PTS.
                 if (this.#timeMap) {
@@ -1144,7 +1144,11 @@ export class Player {
 
     // Compute aligned-switch target group from playhead via TimeMap.
     let targetGroup: number | undefined;
-    if (this.#options.switchMode === 'aligned' && this.#timeMap && playheadPTS_ms !== undefined) {
+    if (
+      this.#options.switchMode === 'time-shifted' &&
+      this.#timeMap &&
+      playheadPTS_ms !== undefined
+    ) {
       targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
     }
     const { params: switchParams, timeMapMiss } = buildSwitchParameters({
@@ -1152,7 +1156,7 @@ export class Player {
       targetGroup,
     });
     if (timeMapMiss) {
-      logger.warn('media', 'aligned switch: TimeMap miss; falling through to naive');
+      logger.warn('media', 'time-shifted switch: TimeMap miss; falling through to live-edge');
     }
     this.#lastSwitchHadTimeMapMiss = timeMapMiss;
 

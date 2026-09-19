@@ -53,14 +53,14 @@ describe('buildSubscribeParameters', () => {
 });
 
 describe('buildSwitchParameters', () => {
-  it('returns undefined params for naive mode', () => {
-    const r = buildSwitchParameters({ switchMode: 'naive', targetGroup: 42 });
+  it('returns undefined params for live-edge mode', () => {
+    const r = buildSwitchParameters({ switchMode: 'live-edge', targetGroup: 42 });
     expect(r.params).toBeUndefined();
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('encodes START_LOCATION_GROUP for aligned mode with a target', () => {
-    const r = buildSwitchParameters({ switchMode: 'aligned', targetGroup: 42 });
+  it('encodes START_LOCATION_GROUP for time-shifted mode with a target', () => {
+    const r = buildSwitchParameters({ switchMode: 'time-shifted', targetGroup: 42 });
     expect(r.params).toBeDefined();
     const kvps = r.params!.map(p => p.toKeyValuePair());
     expect(kvps).toHaveLength(1);
@@ -70,13 +70,13 @@ describe('buildSwitchParameters', () => {
   });
 
   it('flags timeMapMiss when aligned but no target', () => {
-    const r = buildSwitchParameters({ switchMode: 'aligned', targetGroup: undefined });
+    const r = buildSwitchParameters({ switchMode: 'time-shifted', targetGroup: undefined });
     expect(r.params).toBeUndefined();
     expect(r.timeMapMiss).toBe(true);
   });
 
   it("does NOT flag miss when naive + no target (naive doesn't need TimeMap)", () => {
-    const r = buildSwitchParameters({ switchMode: 'naive', targetGroup: undefined });
+    const r = buildSwitchParameters({ switchMode: 'live-edge', targetGroup: undefined });
     expect(r.params).toBeUndefined();
     expect(r.timeMapMiss).toBe(false);
   });
