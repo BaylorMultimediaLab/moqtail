@@ -92,7 +92,17 @@ pub fn emit(event: &str, fields: Value) {
 
 /// Render a full track name as a readable string for event records.
 pub fn track_name_string(name: &moqtail::model::data::full_track_name::FullTrackName) -> String {
-  format!("{name:?}")
+  let ns: Vec<String> = name
+    .namespace
+    .fields
+    .iter()
+    .map(|f| f.to_string())
+    .collect();
+  format!(
+    "{}/{}",
+    ns.join("/"),
+    String::from_utf8_lossy(name.name.as_bytes())
+  )
 }
 
 #[cfg(test)]

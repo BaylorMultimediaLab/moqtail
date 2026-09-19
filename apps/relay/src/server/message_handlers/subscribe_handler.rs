@@ -219,6 +219,19 @@ async fn handle_probe_subscribe(
     }
   };
 
+  // The probe is one finite group on one stream: tell the subscriber so on
+  // the request stream now (draft-18 PUBLISH_DONE with Stream Count 1). The
+  // subscriber then ends the subscription itself once that stream completes
+  // instead of cancelling it while probe data may still be in flight.
+  let done = PublishDone::new(
+    PublishDoneStatusCode::TrackEnded,
+    1,
+    ReasonPhrase::try_new("probe complete".to_string()).unwrap(),
+  );
+  if let Err(e) = control_stream_handler.send_impl(&done).await {
+    warn!("probe: failed to send PUBLISH_DONE: {:?}", e);
+  }
+
   // Split the probe payload across multiple SubgroupObjects so the client
   // sees several read() events on one stream and can compute inter-arrival
   // throughput (SWMA-style) rather than a single point sample.

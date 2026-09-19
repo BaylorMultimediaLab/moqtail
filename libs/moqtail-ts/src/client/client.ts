@@ -146,6 +146,9 @@ import { logger, LogLevel, setLogLevel, setLogEnabledModules } from '../util/log
  * await client.disconnect();
  * ```
  */
+/** How long a data stream waits for the subscription it belongs to be registered. */
+const ALIAS_RESOLUTION_TIMEOUT_MS = 500
+
 export class MOQtailClient {
   /**
    * Namespace prefixes (tuples) the peer has requested announce notifications for via SUBSCRIBE_NAMESPACE.
@@ -2354,17 +2357,32 @@ export class MOQtailClient {
         }
         throw new ProtocolViolationError('MOQtailClient', 'No request for received request id')
       } else {
-        let subscription = this.subscriptions.get(header.trackAlias)
-
-        // Check pending state updates for switch operations
-        if (!subscription) {
-          for (const [subscriptionId, callback] of this.pendingStateUpdates) {
-            const matched = callback(header.trackAlias)
-            if (matched) {
-              subscription = this.subscriptions.get(header.trackAlias)
-              this.pendingStateUpdates.delete(subscriptionId)
-              break
+        const lookupSubscription = () => {
+          let found = this.subscriptions.get(header.trackAlias)
+          // Check pending state updates for switch operations
+          if (!found) {
+            for (const [subscriptionId, callback] of this.pendingStateUpdates) {
+              const matched = callback(header.trackAlias)
+              if (matched) {
+                found = this.subscriptions.get(header.trackAlias)
+                this.pendingStateUpdates.delete(subscriptionId)
+                break
+              }
             }
+          }
+          return found
+        }
+        let subscription = lookupSubscription()
+
+        // A data stream can overtake the SUBSCRIBE_OK it belongs to: the relay opens
+        // it right after answering, and the answer's continuation that registers the
+        // alias may not have run yet. Wait briefly before treating the alias as
+        // unknown, as the relay does for aliases on its side.
+        if (!subscription) {
+          const deadline = Date.now() + ALIAS_RESOLUTION_TIMEOUT_MS
+          while (!subscription && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10))
+            subscription = lookupSubscription()
           }
         }
 
