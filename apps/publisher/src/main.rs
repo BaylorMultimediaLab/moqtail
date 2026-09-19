@@ -151,6 +151,7 @@ async fn run_live(cli: Cli) -> Result<()> {
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_live_variant(
   variant: adaptive::QualityVariant,
   source_w: u32,
@@ -335,6 +336,7 @@ async fn run_prepare(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_prepare_variant(
   variant: adaptive::QualityVariant,
   source_w: u32,
@@ -550,6 +552,7 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_replay_variant(
   quality: String,
   variant_dir: PathBuf,

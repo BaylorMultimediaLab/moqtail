@@ -244,11 +244,6 @@ export function App() {
     const n = parseFloat(fd);
     return Number.isFinite(n) && n >= 0 ? n : 2;
   });
-  const [switchMode, setSwitchMode] = useState<'live-edge' | 'time-shifted'>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const sm = params.get('switchMode');
-    return sm === 'time-shifted' || sm === 'live-edge' ? sm : 'live-edge';
-  });
   const [tracks, setTracks] = useState<Track[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
   const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
@@ -399,7 +394,6 @@ export function App() {
         receiveCatalogViaSubscribe: true,
         clientMode,
         filterDelaySeconds,
-        switchMode,
       });
       playerRef.current = player;
 
@@ -510,7 +504,7 @@ export function App() {
       setStatus('error');
       await disposePlayer();
     }
-  }, [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode]);
+  }, [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds]);
 
   const startPlayback = useCallback(
     async (videoTrack: string | null, audioTrack: string | null) => {
@@ -531,7 +525,6 @@ export function App() {
           receiveCatalogViaSubscribe: true,
           clientMode,
           filterDelaySeconds,
-          switchMode,
         });
         playerRef.current = player;
 
@@ -617,7 +610,7 @@ export function App() {
         await disposePlayer();
       }
     },
-    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchMode],
+    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds],
   );
 
   const handleTrackChange = useCallback(
@@ -725,8 +718,6 @@ export function App() {
         filterDelaySeconds={filterDelaySeconds}
         onFilterDelaySecondsChange={setFilterDelaySeconds}
         connectStatus={status}
-        switchMode={switchMode}
-        onSwitchModeChange={setSwitchMode}
       />
 
       {/* Body */}

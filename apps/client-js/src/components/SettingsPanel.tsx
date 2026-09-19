@@ -31,8 +31,6 @@ export interface SettingsPanelProps {
   onFilterDelaySecondsChange: (seconds: number) => void;
   /** When non-'idle', the Connection card is disabled. */
   connectStatus: 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
-  switchMode: 'live-edge' | 'time-shifted';
-  onSwitchModeChange: (mode: 'live-edge' | 'time-shifted') => void;
 }
 
 function SettingCheckbox({
@@ -133,8 +131,6 @@ export function SettingsPanel({
   filterDelaySeconds,
   onFilterDelaySecondsChange,
   connectStatus,
-  switchMode,
-  onSwitchModeChange,
 }: SettingsPanelProps) {
   const setBlurMode = (mode: BlurMode) => onBlurSettingsChange({ ...blurSettings, mode });
   const setBlurStrength = (strength: number) => onBlurSettingsChange({ ...blurSettings, strength });
@@ -199,25 +195,6 @@ export function SettingsPanel({
                 </div>
               </>
             )}
-            <SectionLabel>Switch Mode</SectionLabel>
-            <div className="mb-2 flex gap-1">
-              {(['live-edge', 'time-shifted'] as const).map(m => (
-                <button
-                  key={m}
-                  disabled={connectStatus !== 'idle'}
-                  onClick={() => onSwitchModeChange(m)}
-                  className={cn(
-                    'flex-1 rounded border px-2 py-1 text-[10px] capitalize transition-colors',
-                    switchMode === m
-                      ? 'border-blue-500 bg-blue-500/20 text-blue-200'
-                      : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200',
-                    connectStatus !== 'idle' && 'cursor-not-allowed opacity-50',
-                  )}
-                >
-                  {m}
-                </button>
-              ))}
-            </div>
           </OptionCard>
 
           {/* Blur Card */}

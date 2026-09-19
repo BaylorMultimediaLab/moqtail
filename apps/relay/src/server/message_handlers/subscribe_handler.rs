@@ -61,17 +61,6 @@ fn parse_delay_groups(params: &[MessageParameter]) -> Option<u64> {
   })
 }
 
-/// Search a SWITCH's parameters for the project-local START_LOCATION_GROUP
-/// parameter. Returns the first match's value, or None if not present. Used by
-/// handle_switch_message to start the new track at an absolute group_id rather
-/// than at the live edge.
-fn parse_start_location_group(params: &[MessageParameter]) -> Option<u64> {
-  params.iter().find_map(|p| match p {
-    MessageParameter::StartLocationGroup { group } => Some(*group),
-    _ => None,
-  })
-}
-
 /// The relay's decision after applying a `DELAY_GROUPS` parameter to a SUBSCRIBE.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DelayedStart {
@@ -1524,33 +1513,12 @@ async fn handle_switch_message(
 
   switch_params.set_param(MessageParameter::new_forward(true)); // forward always true for switch
 
-  // Inspect for START_LOCATION_GROUP: when present, start the new track at
-  // the requested absolute group (time-shifted switch). Otherwise default to the
-  // live-edge semantic.
-  let subscribe = match parse_start_location_group(&switch_params) {
-    Some(start_group) => {
-      info!(
-        "Switch has START_LOCATION_GROUP={}; using new_absolute_start (request_id={})",
-        start_group, switch_message.request_id
-      );
-      Subscribe::new_absolute_start(
-        switch_message.request_id,
-        switch_message.track_namespace.clone(),
-        switch_message.track_name.clone(),
-        Location {
-          group: start_group,
-          object: 0,
-        },
-        switch_params,
-      )
-    }
-    None => Subscribe::new_latest_object(
-      switch_message.request_id,
-      switch_message.track_namespace.clone(),
-      switch_message.track_name.clone(),
-      switch_params,
-    ),
-  };
+  let subscribe = Subscribe::new_latest_object(
+    switch_message.request_id,
+    switch_message.track_namespace.clone(),
+    switch_message.track_name.clone(),
+    switch_params,
+  );
 
   let new_full_track_name = subscribe.get_full_track_name();
 
@@ -1738,29 +1706,6 @@ mod tests_compute_delayed_start {
   fn ready_when_oldest_cached_is_none() {
     let result = compute_delayed_start(Some(loc(100, 0)), 80, None);
     assert_eq!(result, DelayedStart::Ready(loc(20, 0)));
-  }
-}
-
-#[cfg(test)]
-mod tests_parse_start_location_group {
-  use super::*;
-
-  #[test]
-  fn parse_returns_some_when_present() {
-    let params = vec![MessageParameter::new_start_location_group(42)];
-    assert_eq!(parse_start_location_group(&params), Some(42));
-  }
-
-  #[test]
-  fn parse_returns_none_when_absent() {
-    let params: Vec<MessageParameter> = vec![];
-    assert_eq!(parse_start_location_group(&params), None);
-  }
-
-  #[test]
-  fn parse_ignores_other_params() {
-    let params = vec![MessageParameter::new_delay_groups(99)];
-    assert_eq!(parse_start_location_group(&params), None);
   }
 }
 

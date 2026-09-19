@@ -102,11 +102,7 @@ export interface DiscontinuityRecord {
   actualStartGroup?: number;
   clampedByRelay?: boolean;
 
-  // miss signal (Task B5)
-  timeMapMiss?: boolean;
-
   // mode context (every record)
-  switchMode: 'live-edge' | 'time-shifted';
   clientMode: 'filtered' | 'unfiltered';
   filterDelaySeconds: number;
 }
@@ -176,8 +172,6 @@ export interface PlayerOptions {
   clientMode?: 'filtered' | 'unfiltered';
   /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
   filterDelaySeconds?: number;
-  /** Quality-switch primitive: 'live-edge' = today (start at latest); 'time-shifted' = start at group containing player's current PTS. */
-  switchMode?: 'live-edge' | 'time-shifted';
 }
 
 const DefaultOptions = {
@@ -188,7 +182,6 @@ const DefaultOptions = {
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
   filterDelaySeconds: 0,
-  switchMode: 'live-edge' as 'live-edge' | 'time-shifted',
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -211,30 +204,6 @@ export function buildSubscribeParameters(opts: {
   const delayGroups = Math.round((opts.filterDelaySeconds * 1000) / opts.gopDurationMs);
   if (delayGroups <= 0) return undefined;
   return new MessageParameters().addDelayGroups(delayGroups).build();
-}
-
-/**
- * Builds the `parameters` field for a SWITCH message based on the active
- * switchMode and the player's current PTS.
- *
- * - 'live-edge' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
- * - 'time-shifted' mode: looks up the group containing `currentTime` via the TimeMap
- *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
- *   switch fired before any object was received), returns `{ params: undefined,
- *   timeMapMiss: true }` so the caller can record the miss.
- *
- * Exported for unit testing.
- */
-export function buildSwitchParameters(opts: {
-  switchMode: 'live-edge' | 'time-shifted';
-  targetGroup: number | undefined;
-}): { params: MessageParameter[] | undefined; timeMapMiss: boolean } {
-  if (opts.switchMode !== 'time-shifted') return { params: undefined, timeMapMiss: false };
-  if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
-  return {
-    params: new MessageParameters().addStartLocationGroup(opts.targetGroup).build(),
-    timeMapMiss: false,
-  };
 }
 
 /**
@@ -281,13 +250,9 @@ export class Player {
   // Captured in subscribe(); consumed once on the first received object.
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
-  // B4: PTS <-> group lookup populated from incoming object decode times.
-  // Consumed by B5 (time-shifted switch) to compute START_LOCATION_GROUP.
+  // PTS <-> group lookup populated from incoming object decode times.
+  // Measurement only: maps the playhead to the group it is showing.
   #timeMap: TimeMap | undefined;
-  // B5: latched at switchTrack() time; consumed by the next switch
-  // DiscontinuityRecord emission and reset to false afterwards so it doesn't
-  // leak across switches.
-  #lastSwitchHadTimeMapMiss: boolean = false;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -325,7 +290,7 @@ export class Player {
       throw error;
     }
 
-    // B4: construct the TimeMap once, anchored on the video track's GOP duration.
+    // Construct the TimeMap once, anchored on the video track's GOP duration.
     // Quality variants share a TimeMap — gopDurationMs is equal across them in practice.
     const videoTracks = this.catalog?.getTracks('video');
     const videoTrack = videoTracks?.[0];
@@ -667,13 +632,9 @@ export class Player {
                   playheadPTS_ms,
                   playheadGapMs,
                   wallClockMs,
-                  switchMode: this.#options.switchMode,
-                  timeMapMiss: this.#lastSwitchHadTimeMapMiss,
                   clientMode: this.#options.clientMode,
                   filterDelaySeconds: this.#options.filterDelaySeconds,
                 };
-                // Reset so the flag doesn't leak across switches.
-                this.#lastSwitchHadTimeMapMiss = false;
                 if (typeof window !== 'undefined') {
                   const w = window as Window & {
                     __moqtailMetrics?: {
@@ -712,7 +673,7 @@ export class Player {
               );
               if (info !== undefined) {
                 struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-                // B4: feed the TimeMap so time-shifted switch (B5) can resolve playhead -> group.
+                // Feed the TimeMap so measurements can resolve playhead -> group.
                 // Only the first object of each group records (idempotent in TimeMap),
                 // and frame 0 of a group has decodeTime == group start PTS.
                 if (this.#timeMap) {
@@ -823,7 +784,6 @@ export class Player {
                     expectedStartGroup: expected,
                     actualStartGroup: actual,
                     clampedByRelay,
-                    switchMode: this.#options.switchMode,
                     clientMode: this.#options.clientMode,
                     filterDelaySeconds: this.#options.filterDelaySeconds,
                   };
@@ -1142,24 +1102,6 @@ export class Player {
     const switchSentAt = performance.now();
     const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
 
-    // Compute aligned-switch target group from playhead via TimeMap.
-    let targetGroup: number | undefined;
-    if (
-      this.#options.switchMode === 'time-shifted' &&
-      this.#timeMap &&
-      playheadPTS_ms !== undefined
-    ) {
-      targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
-    }
-    const { params: switchParams, timeMapMiss } = buildSwitchParameters({
-      switchMode: this.#options.switchMode,
-      targetGroup,
-    });
-    if (timeMapMiss) {
-      logger.warn('media', 'time-shifted switch: TimeMap miss; falling through to live-edge');
-    }
-    this.#lastSwitchHadTimeMapMiss = timeMapMiss;
-
     // Pre-allocate the new request id and update videoStruct.requestId BEFORE
     // awaiting client.switch(). If a second switchTrack call (ABR tick or
     // force_switch) starts before this one completes, it will read the
@@ -1177,7 +1119,6 @@ export class Player {
         requestId: newRequestId,
         fullTrackName,
         subscriptionRequestId,
-        parameters: switchParams,
       });
 
       if (result instanceof RequestError) {

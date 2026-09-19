@@ -71,11 +71,6 @@ pub enum MessageParameter {
   DelayGroups {
     groups: u64,
   },
-  /// Project-local extension (non-MoQT-standard, type 0x72): the absolute
-  /// group id where a SWITCH should start delivering the new track.
-  StartLocationGroup {
-    group: u64,
-  },
 }
 
 impl MessageParameter {
@@ -143,10 +138,6 @@ impl MessageParameter {
     Self::DelayGroups { groups }
   }
 
-  pub fn new_start_location_group(group: u64) -> Self {
-    Self::StartLocationGroup { group }
-  }
-
   /// Returns the raw wire type value for this parameter.
   pub fn type_value(&self) -> u64 {
     match self {
@@ -164,7 +155,6 @@ impl MessageParameter {
       Self::NewGroupRequest { .. } => MessageParameterType::NewGroupRequest as u64,
       Self::TrackNamespacePrefix { .. } => MessageParameterType::TrackNamespacePrefix as u64,
       Self::DelayGroups { .. } => MessageParameterType::DelayGroups as u64,
-      Self::StartLocationGroup { .. } => MessageParameterType::StartLocationGroup as u64,
     }
   }
 
@@ -254,8 +244,8 @@ impl MessageParameter {
       ),
       Self::TrackNamespacePrefix { .. } => matches!(msg_type, ControlMessageType::RequestUpdate),
       // Project-local: a subscriber sends DELAY_GROUPS on SUBSCRIBE (or on the
-      // SUBSCRIBE a SWITCH turns into) and START_LOCATION_GROUP on SWITCH.
-      Self::DelayGroups { .. } | Self::StartLocationGroup { .. } => matches!(
+      // SUBSCRIBE a SWITCH turns into).
+      Self::DelayGroups { .. } => matches!(
         msg_type,
         ControlMessageType::Subscribe | ControlMessageType::Switch
       ),
@@ -292,9 +282,6 @@ impl MessageParameter {
           MessageParameterType::FillTimeout => Ok(Self::FillTimeout { timeout: *value }),
           MessageParameterType::Expires => Ok(Self::Expires { expires: *value }),
           MessageParameterType::DelayGroups => Ok(Self::DelayGroups { groups: *value }),
-          MessageParameterType::StartLocationGroup => {
-            Ok(Self::StartLocationGroup { group: *value })
-          }
           MessageParameterType::Forward => match *value {
             0 => Ok(Self::Forward { forward: false }),
             1 => Ok(Self::Forward { forward: true }),
@@ -467,9 +454,6 @@ impl TryInto<KeyValuePair> for MessageParameter {
       }
       Self::DelayGroups { groups } => {
         KeyValuePair::try_new_varint(MessageParameterType::DelayGroups as u64, groups)
-      }
-      Self::StartLocationGroup { group } => {
-        KeyValuePair::try_new_varint(MessageParameterType::StartLocationGroup as u64, group)
       }
       Self::Forward { forward } => KeyValuePair::try_new_varint(
         MessageParameterType::Forward as u64,
