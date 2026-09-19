@@ -15,13 +15,13 @@
  */
 
 import {
-  FetchType,
   FilterType,
   FullTrackName,
   GroupOrder,
   Location,
   MoqtObject,
   RequestError,
+  SwitchMode,
   Tuple,
 } from 'moqtail';
 import { MOQtailClient } from 'moqtail/client';
@@ -82,15 +82,15 @@ export interface DiscontinuityRecord {
   newStartPTS_ms: number;
   /** Buffer-end gap: newStartPTS_ms - oldEndPTS_ms. Diagnostic only — measures
    *  buffered-region continuity, NOT user-visible discontinuity. With a fast
-   *  link the buffer reaches the live edge, so both naive and aligned modes
+   *  link the buffer reaches the live edge, so both live-edge and time-shifted modes
    *  produce ~0 here. Use `playheadGapMs` for live-edge-vs-time-shifted differentiation. */
   ptsGapMs: number;
   /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
   playheadPTS_ms?: number;
   /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
-   *  jump introduced by the switch — naive on a filtered client lands ~filterDelay×1000
+   *  jump introduced by the switch — live-edge on a filtered client lands ~filterDelay×1000
    *  positive (relay delivers from live edge while playhead is filterDelay s behind);
-   *  aligned lands ~0. Undefined for `connect` records. */
+   *  time-shifted lands ~0. Undefined for `connect` records. */
   playheadGapMs?: number;
 
   // wall-clock context
@@ -214,25 +214,44 @@ export function buildSubscribeParameters(opts: {
 }
 
 /**
- * Builds the `parameters` field for a SWITCH message based on the active
- * switchMode and the player's current PTS.
+ * How a quality switch is expressed with the SWITCH_FROM parameter
+ * (moq-transport PR #1674 / #1675): a fresh SUBSCRIBE for the target track
+ * carrying SWITCH_FROM that names the subscription it replaces.
  *
- * - 'live-edge' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
- * - 'time-shifted' mode: looks up the group containing `currentTime` via the TimeMap
- *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
- *   switch fired before any object was received), returns `{ params: undefined,
- *   timeMapMiss: true }` so the caller can record the miss.
+ * - 'live-edge' mode: a hard switch (PR #1674) that starts the target at the live
+ *   edge (LatestObject). The suspended track is cut on the first object the
+ *   target delivers; whatever old-track media is already buffered stays, so a
+ *   behind-live client sees the jump to live the paper measures.
+ * - 'time-shifted' mode: a soft switch (PR #1675) whose target starts at the group
+ *   containing the playhead (AbsoluteStartFill). The relay delivers
+ *   [start, live edge) on a fill fetch stream and lets the old track drain up
+ *   to the group before the boundary, so the seam is contiguous at the
+ *   playhead. If the TimeMap has no anchor yet (rare: switch fired before any
+ *   object was received), flags `timeMapMiss: true` and falls through to the
+ *   live-edge plan.
  *
  * Exported for unit testing.
  */
-export function buildSwitchParameters(opts: {
+export function computeSwitchFromPlan(opts: {
   switchMode: 'live-edge' | 'time-shifted';
   targetGroup: number | undefined;
-}): { params: MessageParameter[] | undefined; timeMapMiss: boolean } {
-  if (opts.switchMode !== 'time-shifted') return { params: undefined, timeMapMiss: false };
-  if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
+}): {
+  mode: SwitchMode;
+  filterType: FilterType;
+  startLocation: Location | undefined;
+  timeMapMiss: boolean;
+} {
+  const liveEdge = {
+    mode: SwitchMode.Hard,
+    filterType: FilterType.LatestObject,
+    startLocation: undefined,
+  };
+  if (opts.switchMode !== 'time-shifted') return { ...liveEdge, timeMapMiss: false };
+  if (opts.targetGroup === undefined) return { ...liveEdge, timeMapMiss: true };
   return {
-    params: new MessageParameters().addStartLocationGroup(opts.targetGroup).build(),
+    mode: SwitchMode.Soft,
+    filterType: FilterType.AbsoluteStartFill,
+    startLocation: new Location(BigInt(opts.targetGroup), 0n),
     timeMapMiss: false,
   };
 }
@@ -1142,7 +1161,7 @@ export class Player {
     const switchSentAt = performance.now();
     const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
 
-    // Compute aligned-switch target group from playhead via TimeMap.
+    // Compute the time-shifted target group from the playhead via TimeMap.
     let targetGroup: number | undefined;
     if (
       this.#options.switchMode === 'time-shifted' &&
@@ -1151,47 +1170,54 @@ export class Player {
     ) {
       targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
     }
-    const { params: switchParams, timeMapMiss } = buildSwitchParameters({
+    const plan = computeSwitchFromPlan({
       switchMode: this.#options.switchMode,
       targetGroup,
     });
-    if (timeMapMiss) {
+    if (plan.timeMapMiss) {
       logger.warn('media', 'time-shifted switch: TimeMap miss; falling through to live-edge');
     }
-    this.#lastSwitchHadTimeMapMiss = timeMapMiss;
+    this.#lastSwitchHadTimeMapMiss = plan.timeMapMiss;
 
-    // Pre-allocate the new request id and update videoStruct.requestId BEFORE
-    // awaiting client.switch(). If a second switchTrack call (ABR tick or
-    // force_switch) starts before this one completes, it will read the
-    // already-incremented requestId and pass it as subscriptionRequestId in
-    // its own SWITCH — preventing the stale-id chain that the relay rejects
-    // as ProtocolViolation and tears the WebTransport down. Concurrency on
-    // the wire is preserved; only the id-state read is moved to before the
-    // await.
-    const subscriptionRequestId = videoStruct.requestId;
-    const newRequestId = this.client.allocateNextRequestId();
-    videoStruct.requestId = newRequestId;
+    // SWITCH_FROM (PR #1674): the target is a fresh SUBSCRIBE that names the
+    // subscription it replaces. The relay answers with SUBSCRIBE_OK and keeps
+    // delivering on the SAME output stream (the client re-routes the target's
+    // objects onto it), so the write handler and its SourceBuffer survive the
+    // seam untouched. The request id the relay knows the switched
+    // subscription by is the new SUBSCRIBE's, so it is adopted on success and
+    // the next switch names it as switchFromRequestId.
+    const switchFromRequestId = videoStruct.requestId;
 
     try {
       const result = await this.client.switch({
-        requestId: newRequestId,
-        fullTrackName,
-        subscriptionRequestId,
-        parameters: switchParams,
+        switchFromRequestId,
+        switchMode: plan.mode,
+        newSubscribeOptions: {
+          fullTrackName,
+          priority: 0,
+          groupOrder: GroupOrder.Original,
+          filterType: plan.filterType,
+          startLocation: plan.startLocation,
+        },
       });
 
       if (result instanceof RequestError) {
         logger.error(
           'media',
-          `switchTrack: SWITCH rejected for ${trackName}:`,
+          `switchTrack: SWITCH_FROM rejected for ${trackName}:`,
           result.reasonPhrase.phrase,
         );
-        // Roll back the optimistic id update so the next switchTrack attempt
-        // references the still-active subscription rather than the failed one.
-        videoStruct.requestId = subscriptionRequestId;
+        // The relay refused without touching the current subscription, so the
+        // next attempt keeps referencing it.
         this.#options.onTrackSwitched?.(videoStruct.trackName);
         return;
       }
+      videoStruct.requestId = result.requestId;
+      logger.info(
+        'media',
+        `switchTrack: SWITCH_FROM accepted for ${trackName} (mode=${plan.mode === SwitchMode.Soft ? 'soft' : 'hard'}, ` +
+          `start=${plan.startLocation ? plan.startLocation.group : 'live edge'}, requestId=${result.requestId})`,
+      );
 
       // Arm the write handler for init segment re-injection at the next group
       // boundary. The onTrackSwitched callback (which releases the ABR switching
@@ -1213,8 +1239,6 @@ export class Player {
       videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
-      // Roll back the optimistic id update on unexpected failure too.
-      videoStruct.requestId = subscriptionRequestId;
       this.#options.onTrackSwitched?.(videoStruct.trackName);
     }
   }
@@ -1268,14 +1292,9 @@ export class Player {
       const result = await this.client.fetch({
         groupOrder: GroupOrder.Original,
         priority: 0,
-        typeAndProps: {
-          type: FetchType.Standalone,
-          props: {
-            fullTrackName: getFullTrackName(this.#options.namespace, 'catalog'),
-            startLocation: this.#options.catalogLocation[0],
-            endLocation: this.#options.catalogLocation[1],
-          },
-        },
+        fullTrackName: getFullTrackName(this.#options.namespace, 'catalog'),
+        startLocation: this.#options.catalogLocation[0],
+        endLocation: this.#options.catalogLocation[1],
       });
       if (result instanceof RequestError)
         throw new Error(`Error occured during catalog fetch: ${result.reasonPhrase.phrase}`);
