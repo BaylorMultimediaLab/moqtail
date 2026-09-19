@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { buildSubscribeParameters, buildSwitchParameters, computeStartupTarget } from './player';
+import {
+  buildSubscribeParameters,
+  computeSwitchMinimumGroup,
+  computeStartupTarget,
+} from './player';
 
 describe('buildSubscribeParameters', () => {
   it('returns undefined for unfiltered mode', () => {
@@ -52,33 +56,68 @@ describe('buildSubscribeParameters', () => {
   });
 });
 
-describe('buildSwitchParameters', () => {
-  it('returns undefined params for live-edge mode', () => {
-    const r = buildSwitchParameters({ switchMode: 'live-edge', targetGroup: 42 });
-    expect(r.params).toBeUndefined();
+describe('computeSwitchMinimumGroup', () => {
+  it('live-edge mode floors at the next boundary after the latest received group', () => {
+    // latestGroup + 1: the relay identifies G_switch within T_switch, waiting
+    // for a not-yet-started group, so naming the NEXT boundary is safe and
+    // lands the switch with no redelivery and no catch-up.
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'live-edge',
+      targetGroup: 42,
+      latestGroup: 17n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('encodes START_LOCATION_GROUP for time-shifted mode with a target', () => {
-    const r = buildSwitchParameters({ switchMode: 'time-shifted', targetGroup: 42 });
-    expect(r.params).toBeDefined();
-    const kvps = r.params!.map(p => p.toKeyValuePair());
-    expect(kvps).toHaveLength(1);
-    expect(kvps[0]!.typeValue).toBe(0x72n);
-    expect(kvps[0]!.value).toBe(42n);
+  it('live-edge mode before any object arrives sends the spec floor 0', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'live-edge',
+      targetGroup: undefined,
+      latestGroup: -1n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(0);
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('flags timeMapMiss when aligned but no target', () => {
-    const r = buildSwitchParameters({ switchMode: 'time-shifted', targetGroup: undefined });
-    expect(r.params).toBeUndefined();
+  it('uses the target group as the floor for time-shifted mode with a target', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'time-shifted',
+      targetGroup: 42,
+      latestGroup: 17n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(42);
+    expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('flags timeMapMiss when time-shifted but no target, falling through to the live-edge floor', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'time-shifted',
+      targetGroup: undefined,
+      latestGroup: 17n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(true);
   });
 
-  it("does NOT flag miss when naive + no target (naive doesn't need TimeMap)", () => {
-    const r = buildSwitchParameters({ switchMode: 'live-edge', targetGroup: undefined });
-    expect(r.params).toBeUndefined();
+  it("does NOT flag miss when live-edge + no target (live-edge doesn't need TimeMap)", () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'live-edge',
+      targetGroup: undefined,
+      latestGroup: 17n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(18);
     expect(r.timeMapMiss).toBe(false);
+  });
+
+  it('time-shifted miss before any object arrives falls all the way to 0', () => {
+    const r = computeSwitchMinimumGroup({
+      switchMode: 'time-shifted',
+      targetGroup: undefined,
+      latestGroup: -1n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(0);
+    expect(r.timeMapMiss).toBe(true);
   });
 });
 

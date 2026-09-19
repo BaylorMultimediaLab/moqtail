@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
-use crate::server::client::switch_context::SwitchStatus;
 use crate::server::message_handlers::parameters;
 use crate::server::session::Session;
 use crate::server::session_context::{PendingRequest, SessionContext};
@@ -57,17 +56,6 @@ use tracing::{debug, error, info, warn};
 fn parse_delay_groups(params: &[MessageParameter]) -> Option<u64> {
   params.iter().find_map(|p| match p {
     MessageParameter::DelayGroups { groups } => Some(*groups),
-    _ => None,
-  })
-}
-
-/// Search a SWITCH's parameters for the project-local START_LOCATION_GROUP
-/// parameter. Returns the first match's value, or None if not present. Used by
-/// handle_switch_message to start the new track at an absolute group_id rather
-/// than at the live edge.
-fn parse_start_location_group(params: &[MessageParameter]) -> Option<u64> {
-  params.iter().find_map(|p| match p {
-    MessageParameter::StartLocationGroup { group } => Some(*group),
     _ => None,
   })
 }
@@ -619,10 +607,10 @@ async fn handle_subscribe_message(
   }
 
   // Synthetic-probe shortcut. A SUBSCRIBE for `.probe:<size>:<priority>` is
-  // not routed to any publisher; the relay generates `size` bytes locally and
-  // ends. This intentionally skips track_manager registration and publisher
-  // lookup so probe traffic can never share a track alias with real video and
-  // corrupt switch_context.
+  // not routed to any publisher; the relay generates one object of `size`
+  // bytes locally and ends. This intentionally skips track_manager
+  // registration and publisher lookup so probe traffic can never share a
+  // track_alias with real video and corrupt per-track subscription state.
   if let Some((size, priority)) = parse_probe_track_name(sub.track_name.as_bytes()) {
     return handle_probe_subscribe(client, stream_handler, sub, size, priority).await;
   }
@@ -1139,6 +1127,30 @@ pub(crate) async fn cancel_subscription(
   request_id: u64,
   context: &Arc<SessionContext>,
 ) {
+  // SWITCH PR #1378 cancel race: "If the subscriber [cancels] the Current
+  // Subscribe Request ID before the Relay has opened a PUBLISH for the target
+  // Track, the Relay MUST abandon the SWITCH and MUST open a PUBLISH for the
+  // target Track and immediately send PUBLISH_DONE with Status Code
+  // SUBSCRIPTION_ENDED." Under draft-18 the cancel is the subscriber closing or
+  // resetting the subscription's request stream, which lands here. Mark the
+  // in-flight switch abandoned FIRST (before any teardown, to shrink the race
+  // window); the switch task observes the mark -- mid-drain or at its atomic
+  // mark_published() claim -- and emits the mandated failure PUBLISH. abandon()
+  // returns false when there is nothing to abandon (no switch in flight, or its
+  // PUBLISH already opened), in which case this is ordinary teardown, which
+  // proceeds below in every case.
+  if client
+    .switch_in_flight
+    .lock()
+    .await
+    .abandon(request_id, std::time::Instant::now())
+  {
+    info!(
+      "cancel: abandoning in-flight SWITCH for Current Subscribe Request ID {}",
+      request_id
+    );
+  }
+
   // find the track alias by using the request id
   let full_track_name = {
     let requests = client.subscribe_requests.read().await;
@@ -1440,149 +1452,459 @@ async fn handle_subscribe_error_message(
 
 async fn handle_switch_message(
   client: Arc<MOQTClient>,
-  stream_handler: &mut ControlStreamHandler,
+  _stream_handler: &mut ControlStreamHandler,
   switch_message: moqtail::model::control::switch::Switch,
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
   info!("received Switch message: {:?}", switch_message);
 
-  // now different from a normal subscribe, we need to
-  // check whether there is a related track to switch from
-  let switch_from_track = {
-    let requests = client.subscribe_requests.read().await;
+  // SWITCH PR #1378: the relay carries out the switch by opening a PUBLISH for
+  // the target Track toward the subscriber (it does not mutate the existing
+  // subscription). Every post-validation outcome opens the target PUBLISH and
+  // reports via PUBLISH_DONE, leaving the current subscription untouched on
+  // failure -- no ProtocolViolation disconnect.
+  use crate::server::switch_delivery::{
+    DrainOutcome, SeamBoundUndo, SelectOutcome, apply_seam_bound, build_switch_live_sub,
+    drain_source_below, poll_select_switch_group, restore_source_end_group, send_switch_failure,
+    send_switch_publish, spawn_switch_catchup_stream, switch_catchup_priority,
+    switch_subscriber_priority, switch_target_parameters, terminate_source,
+  };
+  use crate::server::switch_guard::{AdmitResult, ClaimResult, SwitchFailure};
+  use moqtail::model::parameter::switch_transition::SwitchTransition;
+  use std::time::Instant;
 
-    let req = requests.get(&switch_message.subscription_request_id);
-    match req {
+  let target_full_track_name = switch_message.get_full_track_name();
+  let current_sub_req_id = switch_message.current_subscribe_request_id;
+
+  // SWITCH PR #1378 pre-PUBLISH gate -- this MUST come before anything else:
+  // "Upon receiving a SWITCH message, the Relay MUST first validate that the
+  // Current Subscribe Request ID identifies an Established subscription. If no
+  // such subscription exists, the Relay MUST NOT open a PUBLISH for the target
+  // Track and MUST NOT modify any existing subscription state."
+  //
+  // This is the ONE SWITCH outcome that produces no PUBLISH at all -- the
+  // subscriber's client.switch() resolves through its local response timeout.
+  // A known request id whose track has already been torn down is treated the
+  // same way: that subscription is no longer Established.
+  let current_track_arc = {
+    let requests = client.subscribe_requests.read().await;
+    match requests.get(&current_sub_req_id) {
       Some(req) => {
-        let track_name = req.original_subscribe_request.get_full_track_name();
-        if let Some(track) = context.track_manager.get_track(&track_name).await {
-          info!(
-            "found old track request, original request id: {:?}",
-            req.original_request_id
-          );
-          Some(track.clone())
-        } else {
-          warn!("old track not found for track name: {:?}", track_name);
-          None
-        }
+        let name = req.original_subscribe_request.get_full_track_name();
+        context.track_manager.get_track(&name).await
       }
       None => None,
     }
   };
-
-  if switch_from_track.is_none() {
-    warn!(
-      "no existing track found for switch subscription request id: {:?}",
-      switch_message.subscription_request_id
-    );
-    return Err(TerminationCode::ProtocolViolation);
-  }
-
-  let switch_from_track_guard = switch_from_track.unwrap();
-
-  let switch_from_track = switch_from_track_guard.read().await;
-
-  if let Some(sub) = client
-    .subscriptions
-    .get_subscription(&switch_from_track.full_track_name)
+  let current_track_arc = match current_track_arc {
+    Some(t) => t,
+    None => {
+      warn!(
+        "switch: Current Subscribe Request ID {} does not identify an Established \
+         subscription; dropping SWITCH (no PUBLISH, no state change)",
+        current_sub_req_id
+      );
+      return Ok(());
+    }
+  };
+  let current_full_track_name = current_track_arc.read().await.full_track_name.clone();
+  // "Established" means a live subscription on the track for THIS connection,
+  // not merely a leftover request-map entry.
+  if current_track_arc
+    .read()
     .await
+    .get_subscription(context.connection_id)
+    .await
+    .is_none()
   {
-    if sub.upgrade().is_none() {
-      warn!(
-        "subscription weak reference is dead for track: {:?} subscriber: {}",
-        switch_from_track.full_track_name, context.connection_id
-      );
-      return Err(TerminationCode::ProtocolViolation);
-    }
-
-    let mut is_active = false;
-    if let Some(sub) = sub.upgrade() {
-      let sub = sub.read().await;
-      is_active = sub.is_active().await;
-    }
-
-    if !is_active {
-      warn!(
-        "subscription is not active for track: {:?} subscriber: {}",
-        switch_from_track.full_track_name, context.connection_id
-      );
-      return Err(TerminationCode::ProtocolViolation);
-    }
-  } else {
     warn!(
-      "no subscription found for track: {:?} subscriber: {}",
-      switch_from_track.full_track_name, context.connection_id
+      "switch: request id {} has no live subscription; dropping SWITCH (no PUBLISH, no state change)",
+      current_sub_req_id
     );
-    return Err(TerminationCode::ProtocolViolation);
+    return Ok(());
   }
 
-  let mut switch_params: Vec<MessageParameter> = switch_message
-    .subscribe_parameters
-    .iter()
-    .filter_map(|kvp| MessageParameter::deserialize(kvp).ok())
-    .collect();
-
-  switch_params.set_param(MessageParameter::new_forward(true)); // forward always true for switch
-
-  // Inspect for START_LOCATION_GROUP: when present, start the new track at
-  // the requested absolute group (time-shifted switch). Otherwise default to the
-  // live-edge semantic.
-  let subscribe = match parse_start_location_group(&switch_params) {
-    Some(start_group) => {
-      info!(
-        "Switch has START_LOCATION_GROUP={}; using new_absolute_start (request_id={})",
-        start_group, switch_message.request_id
-      );
-      Subscribe::new_absolute_start(
-        switch_message.request_id,
-        switch_message.track_namespace.clone(),
-        switch_message.track_name.clone(),
-        Location {
-          group: start_group,
-          object: 0,
-        },
-        switch_params,
-      )
+  // Single in-flight SWITCH per Current Subscribe Request ID -> EXCESSIVE_LOAD.
+  // Checked immediately after the Established gate, before the target Track is
+  // resolved. One T_switch deadline for the whole operation, anchored at SWITCH
+  // receipt: the same `admitted_at` seeds both the guard entry's expiry and the
+  // task's deadline, so the instant the slot becomes reclaimable by a newer
+  // SWITCH is exactly the instant this task's own polls start reporting
+  // TimedOut. `generation` is this admission's ownership token.
+  let t_switch = context.server_config.get_t_switch();
+  let admitted_at = Instant::now();
+  let t_switch_deadline = admitted_at + t_switch;
+  let generation = {
+    let mut guard = client.switch_in_flight.lock().await;
+    match guard.try_admit(current_sub_req_id, admitted_at, t_switch) {
+      AdmitResult::Admitted { generation } => generation,
+      AdmitResult::Rejected => {
+        drop(guard);
+        let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+        send_switch_failure(
+          &client,
+          rid,
+          &target_full_track_name,
+          0,
+          SwitchFailure::AlreadyInFlight,
+        )
+        .await;
+        return Ok(());
+      }
     }
-    None => Subscribe::new_latest_object(
-      switch_message.request_id,
-      switch_message.track_namespace.clone(),
-      switch_message.track_name.clone(),
-      switch_params,
-    ),
   };
 
-  let new_full_track_name = subscribe.get_full_track_name();
-
-  if let Err(e) = handle_subscribe_message(
-    client.clone(),
-    stream_handler,
-    subscribe,
-    context.clone(),
-    true, // is_switch
-  )
-  .await
-  {
-    error!("error handling switch subscribe message: {:?}", e);
-    Err(e)
-  } else {
-    info!("switch subscribe message handled successfully");
-
-    // update the switch context
+  // Resolve the target Track. This relay serves the tracks its publishers
+  // PUBLISHed or that an earlier SUBSCRIBE established; a target it does not
+  // carry is reported as DOES_NOT_EXIST (the lazy upstream establishment and
+  // relay-chaining backfill of the draft-14 implementation are not ported to
+  // the draft-18 request-stream model). This runs after admission, so the
+  // failure path releases the guard slot -- otherwise a retry within T_switch
+  // would be spuriously rejected with EXCESSIVE_LOAD.
+  let Some(target_track_arc) = context
+    .track_manager
+    .get_track(&target_full_track_name)
+    .await
+  else {
+    warn!(
+      "switch: target track {:?} is not known to this relay",
+      target_full_track_name
+    );
+    let rid = Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+    send_switch_failure(
+      &client,
+      rid,
+      &target_full_track_name,
+      0,
+      SwitchFailure::TargetTrackMissing,
+    )
+    .await;
     client
-      .switch_context
-      .add_or_update_switch_item(new_full_track_name, SwitchStatus::Next)
+      .switch_in_flight
+      .lock()
+      .await
+      .complete(current_sub_req_id, generation);
+    return Ok(());
+  };
+  let target_alias = target_track_arc.read().await.relay_track_id;
+
+  // The relay (not the subscriber) allocates the target delivery's Request ID.
+  let target_request_id =
+    Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+
+  // Per SWITCH PR #1378 the SWITCH's parameter set is the complete parameter set
+  // for the target PUBLISH; the relay restates the transport fields it owns.
+  let target_parameters = switch_target_parameters(&switch_message.subscribe_parameters);
+  let subscriber_priority = switch_subscriber_priority(&target_parameters);
+
+  // Strict ordering (soft switch): identify G_switch, drain the source Track's
+  // Objects in Groups below it, THEN terminate the source, attach the target
+  // subscription, open the target PUBLISH and start catch-up + live delivery.
+  // The whole sequence runs in a task so the request stream isn't blocked while
+  // selection waits for a boundary or the drain waits on a lagging source.
+  let target_namespace = switch_message.track_namespace.clone();
+  let target_name = switch_message.track_name.clone();
+  let minimum_switching_group_id = switch_message.minimum_switching_group_id;
+  let connection_id = context.connection_id;
+  tokio::spawn(async move {
+    // (0) Identify G_switch within T_switch: the smallest group at/above the
+    // client's Minimum Switching Group ID that is a common boundary between
+    // the two Tracks and past which the target can supply every group the
+    // current Track would have supplied below the live edge (see
+    // switch_selection.rs). Selection is a T_switch-bounded wait, not a
+    // one-shot check: a floor naming a group the target has not produced yet
+    // waits here for that group to materialize while the current subscription
+    // keeps forwarding untouched.
+    let g_switch = match poll_select_switch_group(
+      &client,
+      &current_track_arc,
+      &target_track_arc,
+      minimum_switching_group_id,
+      current_sub_req_id,
+      generation,
+      t_switch_deadline,
+    )
+    .await
+    {
+      SelectOutcome::Ready(g) => g,
+      SelectOutcome::TimedOut => {
+        warn!(
+          "switch: could not identify G_switch within T_switch for {:?} (min={})",
+          target_full_track_name, minimum_switching_group_id
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::NoCommonBoundary,
+        )
+        .await;
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
+      SelectOutcome::Abandoned => {
+        info!(
+          "switch: abandoned by cancel of request id {current_sub_req_id} during G_switch selection; reporting SUBSCRIPTION_ENDED"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::SubscriptionEnded,
+        )
+        .await;
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
+      SelectOutcome::TargetRejected => {
+        warn!(
+          "switch: upstream rejected target track {:?}; reporting DOES_NOT_EXIST",
+          target_full_track_name
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::TargetTrackMissing,
+        )
+        .await;
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
+    };
+    info!(
+      "switch: target={:?} g_switch={} target_request_id={}",
+      target_full_track_name, g_switch, target_request_id
+    );
+
+    // (1) Drain the source below G_switch before any target Object is sent,
+    // sharing the T_switch deadline with selection above. On timeout (severe
+    // congestion) abort with TIMEOUT and leave the current subscription
+    // unchanged. The drain itself does not mutate the source: the seam bound is
+    // applied AFTER the claim in (1b) succeeds, so every non-Claimed outcome
+    // leaves the current subscription untouched.
+    match drain_source_below(
+      &client,
+      &current_track_arc,
+      connection_id,
+      g_switch,
+      current_sub_req_id,
+      generation,
+      t_switch_deadline,
+    )
+    .await
+    {
+      DrainOutcome::Drained | DrainOutcome::Abandoned => {}
+      DrainOutcome::TimedOut => {
+        warn!(
+          "switch: source drain timed out below g_switch={g_switch}; aborting, current subscription unchanged"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::DrainTimeout,
+        )
+        .await;
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
+    };
+
+    // (1b) Cancel race: atomically claim the right to open the target PUBLISH.
+    // abandon() (cancel_subscription) and mark_published() (here) are
+    // serialized on the same mutex, so exactly one side wins.
+    let claim = {
+      let mut guard = client.switch_in_flight.lock().await;
+      guard.mark_published(current_sub_req_id, generation)
+    };
+    match claim {
+      ClaimResult::Claimed => {}
+      ClaimResult::Abandoned => {
+        info!(
+          "switch: abandoned by cancel of request id {current_sub_req_id} before target PUBLISH; reporting SUBSCRIPTION_ENDED"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::SubscriptionEnded,
+        )
+        .await;
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
+      ClaimResult::Superseded => {
+        warn!(
+          "switch: T_switch elapsed and a newer SWITCH took over request id {current_sub_req_id}; reporting TIMEOUT"
+        );
+        send_switch_failure(
+          &client,
+          target_request_id,
+          &target_full_track_name,
+          target_alias,
+          SwitchFailure::Superseded,
+        )
+        .await;
+        client
+          .switch_in_flight
+          .lock()
+          .await
+          .complete(current_sub_req_id, generation);
+        return;
+      }
+    }
+
+    // (1c) Claim won: bound the source at the seam so it does not forward
+    // Groups >= G_switch concurrently with the target before teardown.
+    let drain_undo = apply_seam_bound(&current_track_arc, connection_id, g_switch).await;
+
+    // (1d) Re-read the target's live edge NOW -- the draft pins
+    // SWITCH_TRANSITION's Live Edge Group ID to the live edge "at the time the
+    // PUBLISH is opened". largest_location is monotonic, so it is >= the
+    // selection-time snapshot and g_switch <= live edge holds.
+    let live_edge = target_track_arc
+      .read()
+      .await
+      .largest_location
+      .read()
+      .await
+      .group;
+
+    // (2) Build the live subscription: AbsoluteStart at (max(g_switch,
+    // live_edge), 0) with the joining cache replay -- see build_switch_live_sub.
+    let live_sub = build_switch_live_sub(
+      target_request_id,
+      target_namespace,
+      target_name,
+      g_switch,
+      live_edge,
+      target_parameters.clone(),
+    );
+
+    // (3) Close-After-Switch: terminate the source with PUBLISH_DONE on the
+    // current Request ID and drop relay state.
+    terminate_source(
+      &client,
+      &current_track_arc,
+      &current_full_track_name,
+      connection_id,
+      current_sub_req_id,
+    )
+    .await;
+
+    // (4) Attach the live subscription on the target Track (objects from the
+    // live edge onward, on SUBGROUP streams) + relay-side request mapping. The
+    // catch-up stream's priority sits above every live group of the target.
+    let catchup_priority = switch_catchup_priority(subscriber_priority);
+    let subscription = {
+      let target_track = target_track_arc.read().await;
+      if !add_subscription(live_sub.clone(), &target_track, client.clone(), false).await {
+        error!(
+          "switch: could not attach the target subscription for {:?}",
+          target_full_track_name
+        );
+      }
+      target_track.get_subscription(connection_id).await
+    };
+    let Some(subscription) = subscription else {
+      // The seam bound on the (already terminated) source is moot; report the
+      // failure so the subscriber does not wait for a PUBLISH that never comes.
+      if let Some(SeamBoundUndo { prior_end_group }) = drain_undo {
+        restore_source_end_group(&current_track_arc, connection_id, prior_end_group).await;
+      }
+      send_switch_failure(
+        &client,
+        target_request_id,
+        &target_full_track_name,
+        target_alias,
+        SwitchFailure::PublishBuildFailed,
+      )
       .await;
+      client
+        .switch_in_flight
+        .lock()
+        .await
+        .complete(current_sub_req_id, generation);
+      return;
+    };
+    {
+      let req = SubscribeRequest::new(target_request_id, connection_id, live_sub, None);
+      client
+        .subscribe_requests
+        .write()
+        .await
+        .insert(target_request_id, req.clone());
+      client
+        .inbound_requests
+        .write()
+        .await
+        .insert(target_request_id, PendingRequest::Subscribe(req));
+    }
+    // The new subscription is what wants Objects from the target, so a
+    // PUBLISH-created track's publisher may need to be told to forward.
+    super::publish_handler::ensure_upstream_forwarding(&target_track_arc, &context).await;
 
-    let switch_from_track_name = switch_from_track.full_track_name.clone();
+    // (5) Open the target PUBLISH on its own request stream, carrying
+    // SWITCH_TRANSITION { G_switch, live edge }. The subscription's alias is
+    // announced by that PUBLISH, so live forwarding starts once it is out.
+    send_switch_publish(
+      client.clone(),
+      context.clone(),
+      target_track_arc.clone(),
+      subscription,
+      target_request_id,
+      &target_full_track_name,
+      Location::new(live_edge, 0),
+      &target_parameters,
+      SwitchTransition::new(g_switch, live_edge),
+    )
+    .await;
 
+    // (6) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
+    spawn_switch_catchup_stream(
+      client.clone(),
+      target_track_arc.clone(),
+      target_request_id,
+      g_switch,
+      live_edge,
+      catchup_priority,
+    );
+
+    // (7) Release the in-flight guard.
     client
-      .switch_context
-      .add_or_update_switch_item(switch_from_track_name, SwitchStatus::Current)
-      .await;
+      .switch_in_flight
+      .lock()
+      .await
+      .complete(current_sub_req_id, generation);
+  });
 
-    Ok(())
-  }
+  Ok(())
 }
 
 pub async fn handle(
@@ -1738,29 +2060,6 @@ mod tests_compute_delayed_start {
   fn ready_when_oldest_cached_is_none() {
     let result = compute_delayed_start(Some(loc(100, 0)), 80, None);
     assert_eq!(result, DelayedStart::Ready(loc(20, 0)));
-  }
-}
-
-#[cfg(test)]
-mod tests_parse_start_location_group {
-  use super::*;
-
-  #[test]
-  fn parse_returns_some_when_present() {
-    let params = vec![MessageParameter::new_start_location_group(42)];
-    assert_eq!(parse_start_location_group(&params), Some(42));
-  }
-
-  #[test]
-  fn parse_returns_none_when_absent() {
-    let params: Vec<MessageParameter> = vec![];
-    assert_eq!(parse_start_location_group(&params), None);
-  }
-
-  #[test]
-  fn parse_ignores_other_params() {
-    let params = vec![MessageParameter::new_delay_groups(99)];
-    assert_eq!(parse_start_location_group(&params), None);
   }
 }
 

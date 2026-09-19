@@ -24,7 +24,7 @@ import {
   RequestError,
   Tuple,
 } from 'moqtail';
-import { MOQtailClient } from 'moqtail/client';
+import { MOQtailClient, SwitchFailure } from 'moqtail/client';
 import { CMSFCatalog, MessageParameters, type MessageParameter } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
@@ -34,6 +34,13 @@ import { TimeMap } from '@/lib/abr/TimeMap';
 
 // NTP epoch (1900) is 2_208_988_800 seconds before the UNIX epoch (1970).
 const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;
+
+/**
+ * Guard band for seam replacement. The seam must sit far enough ahead of the
+ * playhead that removing at it cannot strand the playhead in an unbuffered
+ * region; an overlap is a lesser evil than a stall.
+ */
+const SEAM_REMOVE_GUARD_SECONDS = 0.05;
 
 /**
  * If the chunk starts with a PRFT (Producer Reference Time) box per
@@ -82,15 +89,18 @@ export interface DiscontinuityRecord {
   newStartPTS_ms: number;
   /** Buffer-end gap: newStartPTS_ms - oldEndPTS_ms. Diagnostic only — measures
    *  buffered-region continuity, NOT user-visible discontinuity. With a fast
-   *  link the buffer reaches the live edge, so both naive and aligned modes
+   *  link the buffer reaches the live edge, so both live-edge and time-shifted modes
    *  produce ~0 here. Use `playheadGapMs` for live-edge-vs-time-shifted differentiation. */
   ptsGapMs: number;
   /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
   playheadPTS_ms?: number;
   /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
-   *  jump introduced by the switch — naive on a filtered client lands ~filterDelay×1000
-   *  positive (relay delivers from live edge while playhead is filterDelay s behind);
-   *  aligned lands ~0. Undefined for `connect` records. */
+   *  jump introduced by the switch. Since the 0-sentinel was dropped (SWITCH PR
+   *  #1378 conformance) BOTH modes are seam-gap-free: live-edge floors at the next
+   *  boundary after the buffer's edge, time-shifted at the playhead's group, so both
+   *  land near 0 (live-edge measures buffer-end distance, time-shifted playhead
+   *  distance). The historical ~filterDelay×1000 live-edge jump only reproduces on
+   *  pre-conformance builds. */
   playheadGapMs?: number;
 
   // wall-clock context
@@ -128,11 +138,28 @@ interface PendingSwitch {
 
 interface MOQStreamStruct {
   trackName: string;
+  /**
+   * Current data route. Replaced on every SWITCH: under SWITCH PR #1378 the
+   * relay terminates the old subscription (PUBLISH_DONE) and delivers the
+   * target track on a fresh relay-initiated PUBLISH route, surfaced as
+   * `SwitchSuccess.stream`. The pump in startMedia() re-pipes whenever this
+   * changes, so the write handler (and its SourceBuffer) survives the seam.
+   */
   source: ReadableStream<MoqtObject>;
+  /** Aborts only the in-flight pipe, so a SWITCH can re-bind `source` without tearing down the track. */
+  pipeAc?: AbortController;
   requestId: bigint;
   tracker: GoodputTracker;
   lastGroupId: bigint;
   pendingSwitch: PendingSwitch | null;
+  /**
+   * True from the moment a SWITCH is sent until the relay's PUBLISH (success
+   * or failure) resolves it. Prevents a second SWITCH from referencing a
+   * Current Subscribe Request ID that is mid-teardown (SWITCH PR #1378 allows only
+   * one in-flight SWITCH per subscription; the relay rejects extras with
+   * EXCESSIVE_LOAD).
+   */
+  switchInFlight?: boolean;
   /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
   /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
@@ -176,7 +203,10 @@ export interface PlayerOptions {
   clientMode?: 'filtered' | 'unfiltered';
   /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
   filterDelaySeconds?: number;
-  /** Quality-switch primitive: 'live-edge' = today (start at latest); 'time-shifted' = start at group containing player's current PTS. */
+  /** Quality-switch primitive. Both modes send a spec-conformant SWITCH floor
+   *  (SWITCH PR #1378 has no live-edge sentinel): 'live-edge' = floor at the latest
+   *  received group (switch as close to live as possible, gap-free);
+   *  'time-shifted' = floor at the group containing the player's current PTS. */
   switchMode?: 'live-edge' | 'time-shifted';
 }
 
@@ -214,27 +244,46 @@ export function buildSubscribeParameters(opts: {
 }
 
 /**
- * Builds the `parameters` field for a SWITCH message based on the active
- * switchMode and the player's current PTS.
+ * Computes the SWITCH "Minimum Switching Group ID" from the active
+ * switchMode, the player's current PTS, and the latest group received on the
+ * current track.
  *
- * - 'live-edge' mode: returns `undefined` — relay defaults to LatestObject (today's behavior).
- * - 'time-shifted' mode: looks up the group containing `currentTime` via the TimeMap
- *   and emits START_LOCATION_GROUP. If the TimeMap has no anchor yet (rare:
- *   switch fired before any object was received), returns `{ params: undefined,
- *   timeMapMiss: true }` so the caller can record the miss.
+ * SWITCH PR #1378 defines the field as a plain floor: the relay selects the
+ * smallest common, gap-free boundary at or above it, and `0` means "any group
+ * is acceptable" (oldest boundary, maximal catch-up). There is no live-edge
+ * sentinel, so "switch as close to live as possible" (live-edge mode) must be
+ * expressed AS a floor:
+ *
+ * - 'live-edge' mode: returns `latestGroup + 1` — the next boundary after the
+ *   buffer's edge. That group may not exist at the relay yet (a client at the
+ *   live edge names a group that hasn't started); the relay identifies
+ *   G_switch within its T_switch window, waiting for the boundary to
+ *   materialize while the current subscription keeps delivering (PR #1378
+ *   frames TIMEOUT as "could not identify G_switch within T_switch", not a
+ *   one-shot check at receipt). The switch therefore lands cleanly on the
+ *   first group that starts after the request: no redelivery of the
+ *   in-progress group, no catch-up, no seam gap.
+ * - 'time-shifted' mode: returns the group containing `currentTime` (via the
+ *   TimeMap) as the floor. If the TimeMap has no anchor yet (rare: switch
+ *   fired before any object was received), flags `timeMapMiss: true` and
+ *   falls through to the live-edge computation.
+ * - Before any object has arrived (`latestGroup < 0`), returns 0 — the spec
+ *   floor for "nothing buffered, any group works".
  *
  * Exported for unit testing.
  */
-export function buildSwitchParameters(opts: {
+export function computeSwitchMinimumGroup(opts: {
   switchMode: 'live-edge' | 'time-shifted';
   targetGroup: number | undefined;
-}): { params: MessageParameter[] | undefined; timeMapMiss: boolean } {
-  if (opts.switchMode !== 'time-shifted') return { params: undefined, timeMapMiss: false };
-  if (opts.targetGroup === undefined) return { params: undefined, timeMapMiss: true };
-  return {
-    params: new MessageParameters().addStartLocationGroup(opts.targetGroup).build(),
-    timeMapMiss: false,
-  };
+  /** Latest group id received on the current track; -1n when none yet. */
+  latestGroup: bigint;
+}): { minimumSwitchingGroupId: number; timeMapMiss: boolean } {
+  const naiveFloor = opts.latestGroup >= 0n ? Number(opts.latestGroup) + 1 : 0;
+  if (opts.switchMode !== 'time-shifted')
+    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: false };
+  if (opts.targetGroup === undefined)
+    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: true };
+  return { minimumSwitchingGroupId: opts.targetGroup, timeMapMiss: false };
 }
 
 /**
@@ -263,6 +312,33 @@ export function computeStartupTarget(opts: {
   return Math.max(opts.baseTarget, opts.end - offset);
 }
 
+/**
+ * Reads a `?certHash=` query parameter (base64url SHA-256 of the relay's DER
+ * certificate) and turns it into WebTransport `serverCertificateHashes`.
+ *
+ * Firefox's HTTP/3 stack rejects a certificate issued by a locally-installed
+ * CA even when that CA is trusted, so pinning the leaf hash is the only way to
+ * reach a dev relay from Firefox. Chrome accepts either route. Browsers honour
+ * a pinned hash only for ECDSA P-256 certificates valid 14 days or less — see
+ * scripts/gen-dev-cert.sh.
+ *
+ * Returns undefined when the parameter is absent, leaving the default
+ * CA-trusted path untouched.
+ */
+function serverCertificateHashesFromUrl(): { transportOptions: WebTransportOptions } | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const raw = new URLSearchParams(window.location.search).get('certHash');
+  if (!raw) return undefined;
+  try {
+    const bin = atob(raw.replace(/-/g, '+').replace(/_/g, '/'));
+    const value = Uint8Array.from(bin, c => c.charCodeAt(0));
+    return { transportOptions: { serverCertificateHashes: [{ algorithm: 'sha-256', value }] } };
+  } catch {
+    logger.error('media', 'certHash query parameter is not valid base64url; ignoring it');
+    return undefined;
+  }
+}
+
 export class Player {
   catalog: CMSFCatalog | null = null;
   client: MOQtailClient | null = null;
@@ -282,7 +358,8 @@ export class Player {
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
   // B4: PTS <-> group lookup populated from incoming object decode times.
-  // Consumed by B5 (time-shifted switch) to compute START_LOCATION_GROUP.
+  // Consumed by time-shifted switches to compute the SWITCH's Minimum Switching
+  // Group ID floor (SWITCH PR #1378) from the playhead PTS.
   #timeMap: TimeMap | undefined;
   // B5: latched at switchTrack() time; consumed by the next switch
   // DiscontinuityRecord emission and reset to false afterwards so it doesn't
@@ -301,6 +378,7 @@ export class Player {
       // Initialize the client and fetch the catalog
       this.client = await MOQtailClient.new({
         url: this.#options.relayUrl,
+        ...(serverCertificateHashesFromUrl() ?? {}),
       });
     } catch (error) {
       logger.error('media', 'Failed to connect to relay', (error as Error).message);
@@ -355,11 +433,20 @@ export class Player {
       transport as unknown as { getStats: () => Promise<StatsResult> }
     ).getStats.bind(transport);
 
-    const s1 = await getStats();
-    const t1 = Date.now();
-    await new Promise(r => setTimeout(r, 200));
-    const s2 = await getStats();
-    const t2 = Date.now();
+    // Firefox ships getStats() as a stub that rejects with
+    // NS_ERROR_NOT_IMPLEMENTED, so a typeof check alone is not enough — an
+    // unhandled rejection here aborts the whole connect before attachMedia().
+    // Any failure just means "no estimate", which the caller already handles.
+    let s1: StatsResult, s2: StatsResult, t1: number, t2: number;
+    try {
+      s1 = await getStats();
+      t1 = Date.now();
+      await new Promise(r => setTimeout(r, 200));
+      s2 = await getStats();
+      t2 = Date.now();
+    } catch {
+      return 0;
+    }
 
     const deltaBytes = (s2.bytesReceived ?? 0) - (s1.bytesReceived ?? 0);
     const deltaMs = t2 - t1;
@@ -461,7 +548,17 @@ export class Player {
       for (let i = 0; i < buf.length - 1; i++) {
         const end = buf.end(i);
         const nextStart = buf.start(i + 1);
-        if (el.currentTime >= end - 0.05 && nextStart > end && nextStart - end < 1.5) {
+        // currentTime must be inside *this* gap, not merely past some earlier
+        // range's end: without the upper bound any earlier gap matches and the
+        // seek runs backwards. Visible once the timeline has several ranges —
+        // e.g. playhead at 199.69 with ranges [[170.7,179.7],[180.7,199.7],...]
+        // matched range 0 and seeked back to 180.7.
+        if (
+          el.currentTime >= end - 0.05 &&
+          el.currentTime < nextStart &&
+          nextStart > end &&
+          nextStart - end < 1.5
+        ) {
           logger.info(
             'media',
             `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
@@ -615,6 +712,55 @@ export class Player {
               struct.postSwitchSentAt = switchSentAt;
               struct.postSwitchToTrack = newTrackName;
 
+              // Seam replacement (SWITCH PR #1378): the relay's catch-up range starts
+              // at switchTransition.switchingGroupId, so whatever is already
+              // buffered at or above that point is old-track media about to be
+              // re-delivered. Discard it first — otherwise both tracks' samples
+              // occupy the same span of the SourceBuffer, which is what fragments
+              // the buffered timeline and, on a large enough overlap, trips the
+              // demuxer.
+              //
+              // The first object of the new track begins exactly at the seam, so
+              // its baseMediaDecodeTime is the removal point. Parsed once here and
+              // reused below for the discontinuity record.
+              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const newStartPTS_ms =
+                newTimescale && newTimescale > 0
+                  ? parseMoofBaseMediaDecodeTime(
+                      new Uint8Array(
+                        object.payload.buffer,
+                        object.payload.byteOffset,
+                        object.payload.byteLength,
+                      ),
+                      newTimescale,
+                    )
+                  : undefined;
+
+              if (newStartPTS_ms !== undefined) {
+                const seamSeconds = newStartPTS_ms / 1000;
+                const playheadSeconds = this.#element?.currentTime ?? 0;
+                if (seamSeconds > playheadSeconds + SEAM_REMOVE_GUARD_SECONDS) {
+                  try {
+                    if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+                    sourceBuffer.remove(seamSeconds, Infinity);
+                    await waitForBufferUpdate(sourceBuffer);
+                  } catch (removeError) {
+                    // Non-fatal: the append below still succeeds, it just overlaps.
+                    logger.warn(
+                      'media',
+                      `switchTrack: seam removal at ${seamSeconds.toFixed(2)}s failed`,
+                      removeError,
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    'media',
+                    `switchTrack: seam ${seamSeconds.toFixed(2)}s is at or behind the ` +
+                      `playhead ${playheadSeconds.toFixed(2)}s; keeping the old-track buffer`,
+                  );
+                }
+              }
+
               // changeType() must not be called while the SourceBuffer is updating
               if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
               try {
@@ -634,22 +780,10 @@ export class Player {
                 return;
               }
 
-              // Compute and push the discontinuity record. PTS-gap is the headline
-              // metric: signed difference between the first appended frame's PTS on
-              // the new track and the last appended frame's end PTS on the old track.
-              const newTimescale = this.catalog?.getTimescale(newTrackName);
-              const newStartPTS_ms =
-                newTimescale && newTimescale > 0
-                  ? parseMoofBaseMediaDecodeTime(
-                      new Uint8Array(
-                        object.payload.buffer,
-                        object.payload.byteOffset,
-                        object.payload.byteLength,
-                      ),
-                      newTimescale,
-                    )
-                  : undefined;
-
+              // Push the discontinuity record. PTS-gap is the headline metric:
+              // signed difference between the first appended frame's PTS on the new
+              // track and the last appended frame's end PTS on the old track.
+              // newStartPTS_ms was parsed above for the seam removal.
               if (newStartPTS_ms !== undefined) {
                 const ptsGapMs = oldEndPTS_ms !== undefined ? newStartPTS_ms - oldEndPTS_ms : 0;
                 const playheadGapMs =
@@ -851,19 +985,46 @@ export class Player {
         },
       });
 
-      // Pipe to the writable stream
-      const promise = struct.source.pipeTo(writable, { signal: ac.signal });
-
-      // Cleanup stream — for live streams, do NOT call endOfStream() when the
-      // pipe ends. The readable stream can close transiently (e.g., during a
-      // SWITCH, relay reconnection, or subscription update). Calling endOfStream()
-      // permanently seals the MediaSource, preventing any further data from being
-      // appended. Only call endOfStream() when the player is being disposed.
-      promise.catch(error => {
-        if (!['AbortError', 'InternalError'].includes(error.name)) {
-          logger.error('media', 'Stream pipe error:', error);
+      // Pump the current data route into `writable`, re-piping whenever a
+      // SWITCH replaces `struct.source`.
+      //
+      // A single pipeTo() was correct while a switch kept one subscription
+      // alive and merely changed what flowed through it. Under SWITCH PR #1378
+      // the relay tears the old subscription down (PUBLISH_DONE) and opens a
+      // new PUBLISH route for the target, so the post-switch objects arrive on
+      // a different ReadableStream. Piping only the original one left every
+      // post-switch object unread: no appends, the pending init segment never
+      // applied, and playback froze at the seam with no error anywhere.
+      //
+      // preventClose/preventAbort keep `writable` — and with it the
+      // SourceBuffer, the pendingSwitch bookkeeping and the discontinuity
+      // records — alive across the seam. Only call endOfStream() on dispose.
+      const pump = async () => {
+        while (!ac.signal.aborted) {
+          const current = struct.source;
+          const pipeAc = new AbortController();
+          struct.pipeAc = pipeAc;
+          try {
+            await current.pipeTo(writable, {
+              signal: AbortSignal.any([ac.signal, pipeAc.signal]),
+              preventClose: true,
+              preventAbort: true,
+              preventCancel: true,
+            });
+          } catch (error) {
+            const name = (error as Error)?.name;
+            if (!['AbortError', 'InternalError'].includes(name)) {
+              logger.error('media', 'Stream pipe error:', error);
+            }
+          }
+          if (ac.signal.aborted) break;
+          // The route was replaced by switchTrack() — pick up the new stream.
+          // Otherwise the source ended on its own and there is nothing to pump.
+          if (struct.source === current) break;
+          logger.info('media', `pump: re-binding to post-switch stream for ${struct.trackName}`);
         }
-      });
+      };
+      void pump();
     }
   }
 
@@ -1142,7 +1303,7 @@ export class Player {
     const switchSentAt = performance.now();
     const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
 
-    // Compute aligned-switch target group from playhead via TimeMap.
+    // Compute the time-shifted target group from the playhead via TimeMap.
     let targetGroup: number | undefined;
     if (
       this.#options.switchMode === 'time-shifted' &&
@@ -1151,47 +1312,79 @@ export class Player {
     ) {
       targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
     }
-    const { params: switchParams, timeMapMiss } = buildSwitchParameters({
+    const { minimumSwitchingGroupId, timeMapMiss } = computeSwitchMinimumGroup({
       switchMode: this.#options.switchMode,
       targetGroup,
+      latestGroup: videoStruct.lastGroupId,
     });
     if (timeMapMiss) {
       logger.warn('media', 'time-shifted switch: TimeMap miss; falling through to live-edge');
     }
     this.#lastSwitchHadTimeMapMiss = timeMapMiss;
 
-    // Pre-allocate the new request id and update videoStruct.requestId BEFORE
-    // awaiting client.switch(). If a second switchTrack call (ABR tick or
-    // force_switch) starts before this one completes, it will read the
-    // already-incremented requestId and pass it as subscriptionRequestId in
-    // its own SWITCH — preventing the stale-id chain that the relay rejects
-    // as ProtocolViolation and tears the WebTransport down. Concurrency on
-    // the wire is preserved; only the id-state read is moved to before the
-    // await.
+    // Per SWITCH PR #1378 the subscriber does NOT allocate a Request ID for a
+    // SWITCH: the relay allocates the Request ID of the PUBLISH it opens for
+    // the target track, and that id is what the relay registers the new
+    // subscription under. The player must therefore adopt `result.requestId`
+    // (relay-allocated) on success — a locally pre-allocated id would be
+    // unknown to the relay and every subsequent SWITCH referencing it as the
+    // Current Subscribe Request ID would fail validation.
+    //
+    // videoStruct.requestId is left untouched until the relay's PUBLISH
+    // arrives, so a concurrent switchTrack (force_switch racing the ABR tick)
+    // sends the same still-established Current Subscribe Request ID; the relay
+    // serializes it via its single-in-flight guard (EXCESSIVE_LOAD), which is
+    // the discipline PR #1378 prescribes. The switchInFlight flag below keeps
+    // the player from issuing that duplicate in the first place.
+    if (videoStruct.switchInFlight) {
+      logger.warn(
+        'media',
+        `switchTrack: SWITCH already in flight; ignoring request for ${trackName}`,
+      );
+      return;
+    }
     const subscriptionRequestId = videoStruct.requestId;
-    const newRequestId = this.client.allocateNextRequestId();
-    videoStruct.requestId = newRequestId;
+    videoStruct.switchInFlight = true;
 
     try {
       const result = await this.client.switch({
-        requestId: newRequestId,
         fullTrackName,
         subscriptionRequestId,
-        parameters: switchParams,
+        minimumSwitchingGroupId: BigInt(minimumSwitchingGroupId),
       });
 
-      if (result instanceof RequestError) {
+      if (result instanceof SwitchFailure) {
+        // Relay could not perform the switch (TIMEOUT, EXCESSIVE_LOAD,
+        // DOES_NOT_EXIST, ... — or the client-side response timeout). Per
+        // SWITCH PR #1378 the relay left the CURRENT subscription untouched, and
+        // videoStruct.requestId was never overwritten, so the next attempt
+        // automatically references the still-active subscription.
         logger.error(
           'media',
-          `switchTrack: SWITCH rejected for ${trackName}:`,
-          result.reasonPhrase.phrase,
+          `switchTrack: SWITCH failed for ${trackName}: status=${result.statusCode} ${result.reasonPhrase}`,
         );
-        // Roll back the optimistic id update so the next switchTrack attempt
-        // references the still-active subscription rather than the failed one.
-        videoStruct.requestId = subscriptionRequestId;
+        // videoStruct.requestId was never overwritten, so the next attempt
+        // automatically references the still-active subscription.
         this.#options.onTrackSwitched?.(videoStruct.trackName);
         return;
       }
+
+      // Success: adopt the relay-allocated PUBLISH request id. This is the id
+      // the relay registered the post-switch subscription under, and the id
+      // the NEXT SWITCH must reference as its Current Subscribe Request ID.
+      videoStruct.requestId = result.requestId;
+
+      // Adopt the relay's new data route. SwitchSuccess extends SubscribeResult,
+      // and `stream` is where the catch-up range and the post-switch live
+      // objects arrive; the old subscription's stream is finished. Aborting the
+      // in-flight pipe makes the pump re-bind to it.
+      videoStruct.source = result.stream;
+      videoStruct.pipeAc?.abort();
+      logger.info(
+        'media',
+        `switchTrack: seam at group ${result.switchTransition.switchingGroupId}, ` +
+          `catch-up [${result.switchTransition.switchingGroupId}, ${result.switchTransition.liveEdgeGroupId})`,
+      );
 
       // Arm the write handler for init segment re-injection at the next group
       // boundary. The onTrackSwitched callback (which releases the ABR switching
@@ -1213,9 +1406,12 @@ export class Player {
       videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
-      // Roll back the optimistic id update on unexpected failure too.
-      videoStruct.requestId = subscriptionRequestId;
+      // videoStruct.requestId still holds the pre-switch id; nothing to roll
+      // back. (client.switch() disconnects the session on throw, so recovery
+      // here is best-effort logging + guard release.)
       this.#options.onTrackSwitched?.(videoStruct.trackName);
+    } finally {
+      videoStruct.switchInFlight = false;
     }
   }
 

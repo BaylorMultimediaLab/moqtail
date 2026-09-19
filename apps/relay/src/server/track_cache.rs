@@ -16,7 +16,9 @@ use moka::future::Cache;
 use moka::notification::RemovalCause;
 use moqtail::model::common::location::Location;
 use moqtail::model::data::fetch_object::FetchObjectPayload;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{
@@ -60,6 +62,13 @@ pub struct TrackCache {
   cache: Cache<CacheKey, GroupObjects>,
   #[allow(dead_code)] // Used in eviction listener closure
   log_folder: String,
+  /// Availability generation: bumped on every event that can change which
+  /// groups/objects this cache holds — a successful `add_object` insert
+  /// (duplicates don't count) and an eviction. Consumers that derive state
+  /// from availability (the SWITCH selection/drain polls) compare snapshots
+  /// of this counter to skip recomputing O(n) scans when nothing changed;
+  /// see `switch_delivery::poll_select_switch_group`.
+  generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,10 +82,17 @@ impl TrackCache {
   pub fn new(relay_track_id: u64, cache_size: usize, config: &AppConfig) -> Self {
     let log_folder = config.log_folder.clone();
     let log_folder_for_listener = log_folder.clone();
+    let generation = Arc::new(AtomicU64::new(0));
+    let generation_for_listener = generation.clone();
 
     let cache_builder = Cache::builder()
       .max_capacity(cache_size as u64)
       .eviction_listener(move |key: Arc<CacheKey>, value: GroupObjects, cause| {
+        // Eviction changes availability, so it must bump the generation:
+        // gated consumers (SWITCH selection) can flip on group REMOVAL too --
+        // e.g. a blocking group evicted from the current track unblocks a
+        // lower boundary.
+        generation_for_listener.fetch_add(1, Ordering::Release);
         let relay_track_id = key.relay_track_id;
         let group_id = key.group_id;
         let log_folder = log_folder_for_listener.clone();
@@ -113,7 +129,15 @@ impl TrackCache {
       relay_track_id,
       cache,
       log_folder,
+      generation,
     }
+  }
+
+  /// Current availability generation (see the field doc). Compare two loads
+  /// to decide whether availability-derived state must be recomputed;
+  /// unchanged means no insert or eviction happened in between.
+  pub fn generation(&self) -> u64 {
+    self.generation.load(Ordering::Acquire)
   }
 
   /// Log cache eviction events to cache_eviction.log
@@ -169,32 +193,76 @@ impl TrackCache {
     }
   }
 
-  pub async fn add_object(&self, object: FetchObjectPayload) {
+  /// Inserts `object` into its group, keeping two invariants every consumer
+  /// (the catch-up/FETCH range read and the joining replay, whose subgroup
+  /// delta-encoding requires strictly increasing object ids) depends on:
+  ///
+  /// 1. **Idempotent** -- a group may be fed by several concurrent ingest paths
+  ///    (live-forward racing a backfill FETCH covering the same groups). An
+  ///    object already present (same subgroup_id + object_id) is silently
+  ///    skipped; appending it blindly would later replay non-increasing ids,
+  ///    underflowing the subgroup delta encoder.
+  /// 2. **Sorted by (subgroup_id, object_id)** -- the racing paths interleave
+  ///    arbitrarily, so arrival order is not delivery order. For a single
+  ///    well-formed stream (ids strictly increasing) the sort is a no-op.
+  ///
+  /// The group entry itself is created via moka's atomic entry API: a
+  /// get-else-insert races concurrent ingest into creating two vecs, the
+  /// second silently replacing (and losing) the first.
+  ///
+  /// Returns `true` when the object was inserted, `false` for a duplicate --
+  /// callers use this to suppress double fan-out of a re-ingested object.
+  pub async fn add_object(&self, object: FetchObjectPayload) -> bool {
     let cache_key = CacheKey::new(self.relay_track_id, object.group_id);
 
-    // Check if group already exists in cache
-    if let Some(existing_objects) = self.cache.get(&cache_key).await {
-      // Add object to existing group
-      let mut objects = existing_objects.write().await;
-      objects.push(object.clone());
-      debug!(
-        "track_cache::add_object | added object to existing group | track: {} group: {} object_id: {} total_objects: {}",
-        self.relay_track_id,
-        object.group_id,
-        object.object_id,
-        objects.len()
-      );
-    } else {
-      // Create new group with this object
-      let new_group_objects = Arc::new(RwLock::new(vec![object.clone()]));
-      self.cache.insert(cache_key, new_group_objects).await;
-      debug!(
-        "track_cache::add_object | created new group | track: {} group: {} object_id: {}",
-        self.relay_track_id, object.group_id, object.object_id
-      );
+    let entry = self
+      .cache
+      .entry(cache_key)
+      .or_insert_with(async { Arc::new(RwLock::new(Vec::new())) })
+      .await;
+    let group_objects = entry.into_value();
+
+    let mut objects = group_objects.write().await;
+    let position = objects.binary_search_by(|existing| {
+      (existing.subgroup_id, existing.object_id).cmp(&(object.subgroup_id, object.object_id))
+    });
+    match position {
+      Ok(_) => {
+        debug!(
+          "track_cache::add_object | duplicate skipped | track: {} group: {} subgroup: {} object_id: {}",
+          self.relay_track_id, object.group_id, object.subgroup_id, object.object_id
+        );
+        false
+      }
+      Err(index) => {
+        objects.insert(index, object.clone());
+        // Availability changed: wake gated consumers (bump after the insert
+        // is visible under the group's write lock, so a consumer that sees
+        // the new generation also sees the object).
+        self.generation.fetch_add(1, Ordering::Release);
+        debug!(
+          "track_cache::add_object | inserted | track: {} group: {} object_id: {} total_objects: {}",
+          self.relay_track_id,
+          object.group_id,
+          object.object_id,
+          objects.len()
+        );
+        true
+      }
     }
   }
 
+  /// Stream cached objects in `[start, end]`, where `end.object == 0` means
+  /// "the whole end group".
+  ///
+  /// Snapshot semantics, part of the contract: the set of groups in range is
+  /// collected once at call time; each group's object vector is then read as
+  /// that group is streamed. A group that lands in the cache after the
+  /// snapshot is never delivered, and objects appended to a group the stream
+  /// has already passed are missed. Callers that ride on this (the switch
+  /// catch-up stream, FETCH responses) accept the approximation because
+  /// re-scanning would break their in-order delivery guarantees — see the
+  /// caveat on `switch_delivery::spawn_switch_catchup_stream`.
   pub async fn read_objects(
     &self,
     start: Location,
@@ -346,6 +414,47 @@ impl TrackCache {
       .min()
   }
 
+  /// The greatest `(group, max object_id)` location held for any group
+  /// strictly below `group_bound` — the switch drain's completion target
+  /// (SWITCH PR #1378: "once all Objects from the current Track for Groups
+  /// with GroupID less than G_switch have been delivered"). `None` when
+  /// nothing below the bound is held (nothing to drain). Using the highest
+  /// AVAILABLE group (not `group_bound - 1`) is what makes the drain converge
+  /// when `G_switch - 1` is a hole shared by both Tracks — the relaxed
+  /// selection permits that, and waiting for a group that will never exist
+  /// would spin the drain into a spurious TIMEOUT. The object component is
+  /// the group's max object_id (delivery-completeness proxy; exact for the
+  /// single-subgroup groups this relay produces, approximate under subgroup
+  /// interleaving).
+  pub async fn max_location_below_group(&self, group_bound: u64) -> Option<Location> {
+    let group_id = self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.relay_track_id == self.relay_track_id && k.group_id < group_bound)
+      .map(|(k, _)| k.group_id)
+      .max()?;
+    let key = CacheKey::new(self.relay_track_id, group_id);
+    let objects_arc = self.cache.get(&key).await?;
+    let objects = objects_arc.read().await;
+    let object_id = objects.iter().map(|o| o.object_id).max()?;
+    Some(Location::new(group_id, object_id))
+  }
+
+  /// Returns the set of group_ids currently cached for this track.
+  ///
+  /// Feeds the SWITCH handler's `compute_switch_group` (PR #1378): the relay
+  /// needs the full availability set on both the current and target Tracks to
+  /// test the common-boundary and gap-free-to-live-edge conditions, which the
+  /// scalar `oldest`/`newest` accessors can't express. O(n) over cache entries.
+  pub async fn available_group_ids(&self) -> BTreeSet<u64> {
+    self
+      .cache
+      .iter()
+      .filter(|(k, _)| k.relay_track_id == self.relay_track_id)
+      .map(|(k, _)| k.group_id)
+      .collect()
+  }
+
   /// Returns the largest group_id currently in the cache for this track,
   /// or None if empty. Mirror of `oldest_group_id`.
   ///
@@ -402,6 +511,7 @@ mod tests_group_bounds {
       downstream_alias_timeout: Duration::from_millis(3000),
       publish_done_stream_timeout: Duration::from_millis(2000),
       dedup_retained_groups: 30,
+      t_switch_ms: 3000,
     }
   }
 
@@ -446,5 +556,210 @@ mod tests_group_bounds {
     cache.run_pending_tasks().await;
     assert_eq!(cache.oldest_group_id().await, Some(42));
     assert_eq!(cache.newest_group_id().await, Some(42));
+  }
+}
+
+#[cfg(test)]
+mod tests_switch_cache_support {
+  use super::*;
+  use crate::server::config::CacheExpirationType;
+  use bytes::Bytes;
+  use moqtail::model::data::constant::ObjectForwardingPreference;
+  use std::collections::BTreeSet;
+  use std::time::Duration;
+
+  fn test_config() -> AppConfig {
+    AppConfig {
+      port: 0,
+      host: String::new(),
+      cert_file: String::new(),
+      key_file: String::new(),
+      max_idle_timeout: 60,
+      keep_alive_interval: 30,
+      cache_size: 100,
+      log_folder: String::new(),
+      cache_expiration_type: CacheExpirationType::Ttl,
+      cache_expiration_minutes: 30,
+      enable_object_logging: false,
+      enable_token_logging: false,
+      token_log_path: String::new(),
+      io_sockets: 1,
+      max_request_streams: 10,
+      max_active_requests: 0,
+      max_subscriber_lag: 0,
+      max_publish_streams: 0,
+      write_kbps_limit: 0,
+      redirect_uri: None,
+      max_upstream_fetch_gaps: 10,
+      upstream_fetch_timeout: Duration::from_secs(10),
+      upstream_subscribe_timeout: Duration::from_secs(10),
+      track_alias_resolution_timeout: Duration::from_millis(500),
+      downstream_alias_timeout: Duration::from_millis(3000),
+      publish_done_stream_timeout: Duration::from_millis(2000),
+      dedup_retained_groups: 30,
+      t_switch_ms: 3000,
+    }
+  }
+
+  fn obj(group_id: u64, subgroup_id: u64, object_id: u64) -> FetchObjectPayload {
+    FetchObjectPayload {
+      group_id,
+      subgroup_id,
+      object_id,
+      publisher_priority: 0,
+      forwarding_preference: ObjectForwardingPreference::Subgroup,
+      properties: None,
+      payload: Bytes::from_static(b"x"),
+    }
+  }
+
+  async fn group_ids(cache: &TrackCache, group: u64) -> Vec<(u64, u64)> {
+    let objects = cache.get_group(group).await.expect("group present");
+    let objects = objects.read().await;
+    objects
+      .iter()
+      .map(|o| (o.subgroup_id, o.object_id))
+      .collect()
+  }
+
+  // ---- available_group_ids ----
+
+  #[tokio::test]
+  async fn empty_cache_returns_empty_set() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    assert!(cache.available_group_ids().await.is_empty());
+  }
+
+  #[tokio::test]
+  async fn collects_distinct_groups_with_a_gap() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    // Two objects in group 5 must not double-count; group 4 is absent (a gap).
+    cache.add_object(obj(3, 0, 0)).await;
+    cache.add_object(obj(5, 0, 0)).await;
+    cache.add_object(obj(5, 0, 1)).await;
+    cache.add_object(obj(6, 0, 0)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.available_group_ids().await, BTreeSet::from([3, 5, 6]));
+  }
+
+  // ---- add_object invariants ----
+
+  /// Concurrent ingest paths can feed the same object twice; the second insert
+  /// must be a no-op, or the joining replay later emits non-increasing ids.
+  #[tokio::test]
+  async fn duplicate_insert_is_idempotent() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    assert!(cache.add_object(obj(0, 0, 1)).await);
+    assert!(!cache.add_object(obj(0, 0, 1)).await);
+    cache.run_pending_tasks().await;
+    assert_eq!(group_ids(&cache, 0).await, vec![(0, 1)]);
+  }
+
+  #[tokio::test]
+  async fn out_of_order_inserts_are_sorted() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    cache.add_object(obj(0, 0, 4)).await;
+    cache.add_object(obj(0, 0, 0)).await;
+    cache.add_object(obj(0, 0, 2)).await;
+    cache.add_object(obj(0, 0, 1)).await;
+    cache.add_object(obj(0, 0, 3)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(
+      group_ids(&cache, 0).await,
+      vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]
+    );
+  }
+
+  /// Identity is (subgroup_id, object_id): the same object id in different
+  /// subgroups is two distinct objects, not a duplicate.
+  #[tokio::test]
+  async fn same_object_id_across_subgroups_is_kept() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    cache.add_object(obj(0, 1, 0)).await;
+    cache.add_object(obj(0, 0, 0)).await;
+    cache.run_pending_tasks().await;
+    assert_eq!(group_ids(&cache, 0).await, vec![(0, 0), (1, 0)]);
+  }
+
+  /// A get-else-insert races concurrent group creation into two vecs, the
+  /// second replacing (and losing) the first; the atomic entry API must keep
+  /// every distinct object regardless of interleaving.
+  #[tokio::test]
+  async fn concurrent_ingest_loses_nothing() {
+    let cache = std::sync::Arc::new(TrackCache::new(1, 100, &test_config()));
+    let mut handles = Vec::new();
+    for object_id in 0..16u64 {
+      let cache = cache.clone();
+      handles.push(tokio::spawn(async move {
+        cache.add_object(obj(7, 0, object_id)).await;
+      }));
+    }
+    for h in handles {
+      h.await.expect("ingest task");
+    }
+    cache.run_pending_tasks().await;
+    let ids = group_ids(&cache, 7).await;
+    assert_eq!(ids.len(), 16, "no object may be lost to a creation race");
+    assert_eq!(ids, (0..16u64).map(|o| (0, o)).collect::<Vec<_>>());
+  }
+
+  // ---- max_location_below_group ----
+
+  #[tokio::test]
+  async fn empty_cache_has_no_drain_target() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    assert_eq!(cache.max_location_below_group(5).await, None);
+  }
+
+  #[tokio::test]
+  async fn picks_highest_available_group_and_its_max_object() {
+    // Groups 0 and 2 held (1 and 4 are holes), bound 5: the drain target is
+    // the last object of the highest AVAILABLE group below the seam -- (2, 7)
+    // -- not a location in the nonexistent Group 4.
+    let cache = TrackCache::new(1, 100, &test_config());
+    for (g, sg, o) in [(0, 0, 0), (2, 0, 3), (2, 0, 7), (2, 0, 5)] {
+      cache.add_object(obj(g, sg, o)).await;
+    }
+    assert_eq!(
+      cache.max_location_below_group(5).await,
+      Some(Location::new(2, 7))
+    );
+  }
+
+  #[tokio::test]
+  async fn bound_is_exclusive_and_zero_yields_none() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    cache.add_object(obj(3, 0, 1)).await;
+    cache.add_object(obj(4, 0, 9)).await;
+    // Group 3 is below bound 4; Group 4 itself is not.
+    assert_eq!(
+      cache.max_location_below_group(4).await,
+      Some(Location::new(3, 1))
+    );
+    // Nothing exists below Group 0.
+    assert_eq!(cache.max_location_below_group(0).await, None);
+  }
+
+  // ---- generation ----
+
+  #[tokio::test]
+  async fn insert_bumps_generation() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    let g0 = cache.generation();
+    cache.add_object(obj(0, 0, 0)).await;
+    let g1 = cache.generation();
+    assert!(g1 > g0, "a successful insert must move the generation");
+    cache.add_object(obj(0, 0, 1)).await;
+    assert!(cache.generation() > g1, "each insert moves it again");
+  }
+
+  #[tokio::test]
+  async fn duplicate_insert_does_not_bump_generation() {
+    let cache = TrackCache::new(1, 100, &test_config());
+    cache.add_object(obj(3, 0, 0)).await;
+    let before = cache.generation();
+    let inserted = cache.add_object(obj(3, 0, 0)).await;
+    assert!(!inserted);
+    assert_eq!(cache.generation(), before);
   }
 }

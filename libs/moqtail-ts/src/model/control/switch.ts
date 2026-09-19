@@ -20,11 +20,29 @@ import { KeyValuePair } from '../common/pair'
 import { ControlMessageType } from './constant'
 import { FullTrackName } from '../data'
 
+/**
+ * SWITCH control message (SWITCH PR #1378).
+ *
+ * The subscriber does NOT allocate a Request ID for the SWITCH; the relay
+ * allocates the Request ID of the target PUBLISH it opens in response.
+ * `minimumSwitchingGroupId` is a lower bound, not an exact transition point —
+ * the relay selects the smallest feasible common, gap-free boundary at or
+ * above it.
+ */
 export class Switch {
   constructor(
-    public requestId: bigint,
+    /** The Established subscription being replaced ("Current Subscribe Request ID"). */
+    public currentSubscribeRequestId: bigint,
     public fullTrackName: FullTrackName,
-    public subscriptionRequestId: bigint,
+    /**
+     * Lower bound on the transition group ("Minimum Switching Group ID").
+     * An ordinary floor — the draft has NO live-edge sentinel: `0n` means
+     * "any group is acceptable" and resolves to the OLDEST common gap-free
+     * boundary, i.e. full buffer replacement with a maximal catch-up range.
+     * To switch near live, pass the latest group id received on the current
+     * subscription.
+     */
+    public minimumSwitchingGroupId: bigint,
     public parameters: KeyValuePair[],
   ) {}
 
@@ -37,9 +55,9 @@ export class Switch {
     buf.putVI(ControlMessageType.Switch)
 
     const payload = new ByteBuffer()
-    payload.putVI(this.requestId)
+    payload.putVI(this.currentSubscribeRequestId)
     payload.putBytes(this.fullTrackName.serialize().toUint8Array())
-    payload.putVI(this.subscriptionRequestId)
+    payload.putVI(this.minimumSwitchingGroupId)
 
     payload.putVI(this.parameters.length)
     payload.putBytes(serializeMessageParameterKvps(this.parameters).toUint8Array())
@@ -52,13 +70,13 @@ export class Switch {
   }
 
   static parsePayload(buf: BaseByteBuffer): Switch {
-    const requestId = buf.getVI()
+    const currentSubscribeRequestId = buf.getVI()
     const fullTrackName = buf.getFullTrackName()
-    const subscriptionRequestId = buf.getVI()
+    const minimumSwitchingGroupId = buf.getVI()
 
     const paramCount = Number(buf.getVI())
     const parameters: KeyValuePair[] = deserializeMessageParameterKvps(buf, paramCount)
 
-    return new Switch(requestId, fullTrackName, subscriptionRequestId, parameters)
+    return new Switch(currentSubscribeRequestId, fullTrackName, minimumSwitchingGroupId, parameters)
   }
 }

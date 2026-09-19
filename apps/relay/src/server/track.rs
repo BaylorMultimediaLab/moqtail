@@ -399,10 +399,11 @@ impl Track {
   ) -> Result<Arc<RwLock<Subscription>>, anyhow::Error> {
     let origin_enum = origin_message.into();
     // Check if subscription already exists
-    if let Some(sub_guard) = self
+    if self
       .subscription_manager
       .get_subscription(subscriber.connection_id)
       .await
+      .is_some()
     {
       if !is_switch {
         error!(
@@ -410,13 +411,14 @@ impl Track {
           subscriber.connection_id, self.relay_track_id
         );
       } else {
+        // Under SWITCH PR #1378 a quality switch never re-subscribes the same
+        // subscriber to a track through this path: the relay's SWITCH handler
+        // drains the source and PUBLISHes the target. A duplicate here is
+        // therefore always an error, never a hand-over.
         info!(
           "Subscriber with connection_id: {} already exists in relay_track_id={} (switch subscription)",
           subscriber.connection_id, self.relay_track_id
         );
-        // inform the existing subscription about the switch
-        let sub = sub_guard.read().await;
-        sub.notify_switch().await;
       }
       return Err(anyhow::anyhow!(
         "A subscription already exists for this subscriber"
@@ -432,10 +434,6 @@ impl Track {
         Arc::clone(&self.active_subgroup_headers),
       )
       .await?;
-
-    if is_switch {
-      subscription.read().await.notify_switch().await;
-    }
 
     Ok(subscription)
   }
@@ -510,7 +508,18 @@ impl Track {
       .await?;
 
     if let Ok(fetch_object) = object.clone().try_into_fetch() {
-      self.cache.add_object(fetch_object).await;
+      if !self.cache.add_object(fetch_object).await {
+        // Duplicate ingest: concurrent paths (live-forward from the upstream
+        // subscription racing an upstream backfill FETCH) can deliver the same
+        // object twice. The cache collapsed it; forwarding it again would hand
+        // subscribers a duplicate the replay watermark cannot catch (it only
+        // guards replay-vs-live, not live-vs-live).
+        debug!(
+          "new_subgroup_object: duplicate ingest skipped | track: {:?} location: {:?}",
+          object.track_alias, object.location
+        );
+        return Ok(());
+      }
     } else {
       warn!(
         "new_subgroup_object: object cannot be cached | relay_track_id: {} track_alias: {} location: {:?} stream_id: {} diff_ms: {} object: {:?}",
@@ -595,7 +604,14 @@ impl Track {
         }
 
         if let Ok(fetch_object) = object.clone().try_into_fetch() {
-          self.cache.add_object(fetch_object).await;
+          if !self.cache.add_object(fetch_object).await {
+            // Duplicate ingest — see new_subgroup_object: forward once only.
+            debug!(
+              "new_datagram_object: duplicate ingest skipped | track: {:?} group: {:?} object_id: {}",
+              datagram.track_alias, datagram.group_id, datagram.object_id
+            );
+            return Ok(());
+          }
         } else {
           warn!(
             "new_datagram: object cannot be cached | relay_track_id={} group: {:?} object_id={} diff_ms={} object: {:?}",

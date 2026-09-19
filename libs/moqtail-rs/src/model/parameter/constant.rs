@@ -68,8 +68,18 @@ pub enum MessageParameterType {
   /// Behind-live offset in groups for filtered (delay-mode) clients.
   DelayGroups = 0x70,
   /// Project-local extension; non-MoQT-standard.
-  /// Absolute group_id where a Switch should start delivering the new track.
+  /// Legacy: previously carried a SWITCH's start group as a parameter. The
+  /// SWITCH message now has a first-class `Minimum Switching Group ID` field
+  /// (SWITCH PR #1378), so this parameter is no longer used
+  /// for switching. Retained for wire-compatibility of the type registry.
   StartLocationGroup = 0x72,
+  /// Project-local extension; non-MoQT-standard.
+  /// SWITCH_TRANSITION (draft-ietf-moq-transport PR #1378). Carried on the
+  /// target Track's PUBLISH so the subscriber learns where the seam is. Odd
+  /// type => bytes-valued KeyValuePair whose payload is two varints:
+  /// `{ Switching Group ID (G_switch), Live Edge Group ID }`. See
+  /// `parameter::switch_transition::SwitchTransition`.
+  SwitchTransition = 0x73,
 }
 
 impl TryFrom<u64> for MessageParameterType {
@@ -92,6 +102,7 @@ impl TryFrom<u64> for MessageParameterType {
       0x34 => Ok(MessageParameterType::TrackNamespacePrefix),
       0x70 => Ok(MessageParameterType::DelayGroups),
       0x72 => Ok(MessageParameterType::StartLocationGroup),
+      0x73 => Ok(MessageParameterType::SwitchTransition),
       _ => Err(ParseError::InvalidType {
         context: "MessageParameterType::try_from(u64)",
         details: format!("Unknown parameter type, got {value}"),

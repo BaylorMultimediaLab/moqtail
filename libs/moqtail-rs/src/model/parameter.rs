@@ -16,3 +16,4 @@ pub mod authorization_token;
 pub mod constant;
 pub mod message_parameter;
 pub mod setup_option;
+pub mod switch_transition;

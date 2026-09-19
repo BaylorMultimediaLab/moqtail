@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
-use crate::server::client::switch_context::SwitchStatus;
 use crate::server::config::AppConfig;
 use crate::server::object_logger::ObjectLogger;
 use crate::server::stream_id::StreamId;
@@ -88,14 +87,61 @@ pub struct SubscriptionState {
   pub forward: bool,
   pub filter_type: FilterType,
   pub start_location: Option<Location>,
-  pub end_group: u64,
+  /// Inclusive last group to forward; `None` = unbounded.
+  pub end_group: Option<u64>,
   pub subscribe_parameters: Vec<MessageParameter>,
   pub last_sent_max_location: Option<Location>,
   pub last_received_object_location: Option<Location>,
   pub is_joining: bool,
+  /// Per-`(group_id, subgroup_id)` high-water of object IDs actually
+  /// delivered by the joining cache replay. The live-forward path drops a
+  /// queued SubgroupObject event iff its subgroup has a watermark at or above
+  /// its object ID — i.e. iff the replay already delivered that exact object.
+  /// Object IDs are monotonic within a subgroup, and `read_objects` replays a
+  /// consistent per-group snapshot (the group's read lock is held for the
+  /// whole iteration) while `Track::new_subgroup_object` caches every object
+  /// BEFORE fanning it out, so "<= watermark" is exactly "was replayed":
+  /// late arrivals the snapshot never covered — older-group stragglers or
+  /// interleaved subgroups with smaller IDs — have no watermark at/above them
+  /// and pass through. A single max-location threshold cannot express this
+  /// and would drop such stragglers (a seam gap on the target track).
+  pub replay_watermarks: HashMap<(u64, u64), u64>,
+}
+
+/// True iff writing `object_id` onto a per-(group, subgroup) send stream whose
+/// last successfully sent object id is `previous` would break the stream's
+/// monotonicity — equal means a duplicate, lower means a late arrival. The
+/// subgroup delta encoder (`wire = id - previous - 1`) underflows on either,
+/// and a strict MOQT receiver must treat a non-increasing subgroup stream as
+/// malformed. `previous == None` (nothing sent yet) never blocks.
+pub(crate) fn breaks_stream_monotonicity(previous: Option<u64>, object_id: u64) -> bool {
+  previous.is_some_and(|prev| object_id <= prev)
 }
 
 impl SubscriptionState {
+  /// True iff the joining cache replay already delivered this exact object,
+  /// i.e. the object's subgroup has a replay watermark at or above its
+  /// object ID. Objects with no subgroup ID never appear in a replay
+  /// (`Object::try_from_fetch` always sets `Some`), so they are never
+  /// duplicates of one.
+  pub fn is_replay_duplicate(&self, location: &Location, subgroup_id: Option<u64>) -> bool {
+    match subgroup_id {
+      Some(subgroup_id) => self
+        .replay_watermarks
+        .get(&(location.group, subgroup_id))
+        .is_some_and(|wm| location.object <= *wm),
+      None => false,
+    }
+  }
+
+  /// True iff `group` lies beyond the subscription's end-group bound
+  /// (`None` = unbounded). `Some(0)` is a real bound at Group 0 — the case
+  /// the old `u64` sentinel (0 = "no limit") could not express, which let the
+  /// switch drain's seam bound for `G_switch == 1` leak Groups >= 1.
+  pub fn exceeds_end_group(&self, group: u64) -> bool {
+    self.end_group.is_some_and(|end| group > end)
+  }
+
   pub fn update_last_sent_max_location(&mut self, location: Location) {
     match &self.last_sent_max_location {
       Some(current_max) => {
@@ -173,12 +219,12 @@ impl From<SubscriptionOrigin> for SubscriptionState {
               end_group,
             } = p
             {
-              Some((*filter_type, start_location.clone(), end_group.unwrap_or(0)))
+              Some((*filter_type, start_location.clone(), *end_group))
             } else {
               None
             }
           })
-          .unwrap_or((FilterType::LatestObject, None, 0));
+          .unwrap_or((FilterType::LatestObject, None, None));
 
         let is_joining = start_location.is_some();
         Self {
@@ -191,6 +237,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           subscribe_parameters: subscribe.subscribe_parameters,
           last_sent_max_location: None,
           last_received_object_location: None,
+          replay_watermarks: HashMap::new(),
           // A SUBSCRIBE that names an explicit start location (delay-mode,
           // AbsoluteStart, or a SWITCH carrying START_LOCATION_GROUP) must have
           // the cached objects in [start_location, live edge] replayed before
@@ -246,12 +293,12 @@ impl From<SubscriptionOrigin> for SubscriptionState {
               end_group,
             } = p
             {
-              Some((*filter_type, start_location.clone(), end_group.unwrap_or(0)))
+              Some((*filter_type, start_location.clone(), *end_group))
             } else {
               None
             }
           })
-          .unwrap_or((FilterType::LatestObject, None, 0));
+          .unwrap_or((FilterType::LatestObject, None, None));
 
         Self {
           subscriber_priority,
@@ -263,68 +310,10 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           subscribe_parameters: publish.parameters,
           last_sent_max_location: None,
           last_received_object_location: None,
+          replay_watermarks: HashMap::new(),
           is_joining: false,
         }
       }
-    }
-  }
-}
-
-/// Decide whether the new (Next-status) track should promote to Current right
-/// now, given OLD's progress and the new track's incoming object.
-///
-/// For live-edge switches the new sub was started with `LatestObject` and OLD has
-/// been catching up via cache; we wait until NEW's incoming live object passes
-/// OLD's `last_sent_max.group` before flipping the new track to Current and
-/// snapping its start to the next group boundary. That avoids a mid-GOP
-/// pre-OLD jump on the new track.
-///
-/// For time-shifted switches the new sub was started with `AbsoluteStart(player_target)`;
-/// the player explicitly chose where the new track should begin and *needs*
-/// every cached object from that target onward. The "wait until NEW catches
-/// OLD's last_sent" gate would silently drop those cached objects (NEW sits in
-/// `forward=false` while waiting), so the new track would effectively start at
-/// OLD's buffer position regardless of `START_LOCATION_GROUP`. Honor the
-/// player by promoting immediately.
-fn should_promote_switch(
-  player_start: Option<&Location>,
-  last_sent_max: Option<&Location>,
-  object_location: &Location,
-) -> bool {
-  if player_start.is_some() {
-    return true;
-  }
-  match last_sent_max {
-    Some(last) => object_location.group >= last.group,
-    None => true,
-  }
-}
-
-/// Decide the new track's `start_location` once the relay has accepted that the
-/// switch boundary is crossed.
-///
-/// - `player_start`: what the new subscription was created with. For time-shifted
-///   switches the SWITCH handler set this from the player's `START_LOCATION_GROUP`
-///   (so it's `Some`); for live-edge switches it's `None` (`Subscribe::new_latest_object`).
-/// - `last_sent_next`: `OLD.last_sent_max_location.group + 1` if known, else `None`.
-/// - `object_location`: the object that just triggered the switch-context check.
-///
-/// Time-shifted switches MUST honor `player_start`; otherwise the new track silently
-/// degrades to starting at OLD's last-sent group, which on a filtered client is
-/// `delay_groups` ahead of the playhead.
-fn compute_switch_start_location(
-  player_start: Option<Location>,
-  last_sent_next: Option<Location>,
-  object_location: &Location,
-) -> Location {
-  if let Some(loc) = player_start {
-    loc
-  } else if let Some(loc) = last_sent_next {
-    loc
-  } else {
-    Location {
-      object: 0,
-      group: object_location.group + 1,
     }
   }
 }
@@ -335,7 +324,7 @@ fn compute_switch_start_location(
 /// Within each band, group_id determines relative position according to group_order:
 ///   Ascending / Original – lower group_id = higher priority (counts down from band_max)
 ///   Descending            – higher group_id = higher priority (counts up from band_min)
-fn compute_stream_priority(
+pub(crate) fn compute_stream_priority(
   sub_prio: u8,
   pub_prio: u8,
   group_order: GroupOrder,
@@ -355,6 +344,7 @@ fn compute_stream_priority(
 pub struct Subscription {
   pub request_id: u64,
   relay_track_id: u64,
+  #[allow(dead_code)] // retained for diagnostics; unread since the switch pipeline moved off it
   pub full_track_name: FullTrackName,
   pub subscription_state: Arc<RwLock<SubscriptionState>>,
   subscriber: Arc<MOQTClient>,
@@ -369,7 +359,6 @@ pub struct Subscription {
   client_connection_id: usize,
   object_logger: ObjectLogger,
   config: &'static AppConfig,
-  check_switch_context_on_next_object: Arc<AtomicBool>,
   /// Subgroup header cached while forward=false. Cleared when forward becomes true (stream opened)
   /// or when a new group starts (old group ended without forward ever becoming true).
   pending_header: Arc<Mutex<Option<(StreamId, HeaderInfo)>>>,
@@ -414,7 +403,6 @@ impl Subscription {
       client_connection_id,
       object_logger: ObjectLogger::new(log_folder),
       config,
-      check_switch_context_on_next_object: Arc::new(AtomicBool::new(false)),
       pending_header: Arc::new(Mutex::new(None)),
       active_subgroup_headers,
       alias_announced: Arc::new(AtomicBool::new(false)),
@@ -523,6 +511,12 @@ impl Subscription {
                 "Joining state - subscriber={} relay_track_id={} from location: {:?} to end: {:?}",
                 instance.client_connection_id, relay_track_id, start_location, end
               );
+              // Exactly what this replay pass delivers, keyed by
+              // (group_id, subgroup_id) -> max object_id. Published into
+              // SubscriptionState after the loop, so the replayed objects
+              // themselves (which flow through handle_track_event below)
+              // are never self-filtered.
+              let mut replay_watermarks: HashMap<(u64, u64), u64> = HashMap::new();
               {
                 let mut object_receiver =
                   cache.read_objects(start_location, end.clone(), false).await;
@@ -584,6 +578,18 @@ impl Subscription {
                           (None, last_stream_id.clone())
                         };
 
+                        // Record before `object` is moved below. Duplicates of
+                        // these exact objects can already sit in this
+                        // subscription's event queue (cached after
+                        // add_subscription but before this group's snapshot);
+                        // the live-forward path drops them via this watermark.
+                        let wm = replay_watermarks
+                          .entry((object.group_id, object.subgroup_id))
+                          .or_insert(object.object_id);
+                        if object.object_id > *wm {
+                          *wm = object.object_id;
+                        }
+
                         let the_object = Object::try_from_fetch(object, relay_track_id).unwrap();
 
                         let track_event = TrackEvent::SubgroupObject {
@@ -606,11 +612,22 @@ impl Subscription {
                   }
                 }
               }
-              // Record what was replayed up to so the live-forward path knows where
-              // to resume; live objects in [start_location, end] that arrive after
-              // the snapshot would otherwise be duplicates.
+
+              // Record the nominal replay end (upper bound for a future
+              // reconnect replay) and publish the per-subgroup watermarks of
+              // what was ACTUALLY delivered. Dedup against queued live events
+              // uses the watermarks, not this location: a single max-location
+              // threshold would also swallow late arrivals the snapshot never
+              // covered. Merge rather than replace, in case a future
+              // reconnect path re-enters the joining block.
               let mut state = instance.subscription_state.write().await;
               state.last_received_object_location = Some(end);
+              for (key, wm) in replay_watermarks.drain() {
+                let entry = state.replay_watermarks.entry(key).or_insert(wm);
+                if wm > *entry {
+                  *entry = wm;
+                }
+              }
               drop(state);
             }
             let mut state = instance.subscription_state.write().await;
@@ -643,6 +660,7 @@ impl Subscription {
     self.finished.load(Ordering::Relaxed)
   }
 
+  #[allow(dead_code)] // retained accessor; last non-dead caller was the excised subscription-pipeline switch gate
   pub async fn is_forwarding(&self) -> bool {
     let state = self.subscription_state.read().await;
     state.forward
@@ -655,6 +673,7 @@ impl Subscription {
   }
 
   // Returns true if the subscription is active (not finished and forwarding objects)
+  #[allow(dead_code)] // retained accessor; no longer used after the PUBLISH-based SWITCH rework
   pub async fn is_active(&self) -> bool {
     !self.is_finished().await && self.is_forwarding().await
   }
@@ -714,7 +733,7 @@ impl Subscription {
         state.filter_type = ft;
       }
       if let Some(eg) = new_end_group {
-        state.end_group = eg;
+        state.end_group = Some(eg);
       }
 
       // Update parameters. If a parameter included in SUBSCRIBE is not present in
@@ -829,142 +848,6 @@ impl Subscription {
     }
   }
 
-  // Notify the subscription to check the switch context on the next object
-  pub async fn notify_switch(&self) {
-    info!(
-      "Notifying subscription to check switch context on next object for subscriber={} relay_track_id={}",
-      self.client_connection_id, self.relay_track_id
-    );
-    self
-      .check_switch_context_on_next_object
-      .store(true, std::sync::atomic::Ordering::Relaxed);
-  }
-
-  async fn check_switch_context(&self, object_location: &Location) -> bool {
-    // if the object is after the end group, finish the subscription
-    let status = self
-      .subscriber
-      .switch_context
-      .get_switch_status(&self.full_track_name)
-      .await;
-
-    if status.is_none() {
-      // not in a switch context, always forward
-      return true;
-    }
-
-    let status = status.unwrap();
-
-    match status {
-      SwitchStatus::Next => {
-        // check whether the group id of this track
-        // is equal to or greater than the one of
-        // the switch context's current track
-        // if so, set this track as current
-        // Look up OLD's last_sent_max so we know whether to gate (live-edge) and
-        // where to snap the new start_location. For time-shifted switches the gate
-        // is bypassed in should_promote_switch -- see its doc comment.
-        let mut last_sent_max_location = None;
-        let mut new_start_location = None;
-
-        if let Some(current_track_name) = self.subscriber.switch_context.get_current().await
-          && let Some(current_subscription_opt) = self
-            .subscriber
-            .subscriptions
-            .get_subscription(&current_track_name)
-            .await
-          && let Some(current_subscription) = current_subscription_opt.upgrade()
-        {
-          let current_subscription = current_subscription.read().await;
-          let current_state = current_subscription.subscription_state.read().await;
-          last_sent_max_location = current_state.last_sent_max_location.clone();
-          if let Some(loc) = &last_sent_max_location {
-            new_start_location = Some(Location {
-              group: loc.group + 1, // next group after OLD's last sent
-              object: 0,            // start of that group
-            });
-          }
-        }
-
-        let player_start = self.subscription_state.read().await.start_location.clone();
-        let switch_at_next_group = should_promote_switch(
-          player_start.as_ref(),
-          last_sent_max_location.as_ref(),
-          object_location,
-        );
-
-        if switch_at_next_group {
-          // set this track as current
-          let subscriber = self.subscriber.clone();
-          let full_track_name = self.full_track_name.clone();
-
-          // the following method also sets the current active track's status to None if any
-          info!(
-            "check_switch_context: Setting track to Current for subscriber={} relay_track_id={} object location group: {}",
-            self.client_connection_id, self.relay_track_id, object_location.group
-          );
-          subscriber
-            .switch_context
-            .add_or_update_switch_item(full_track_name.clone(), SwitchStatus::Current)
-            .await;
-
-          // set forward to true and set start group the next group
-          let mut state = self.subscription_state.write().await;
-          state.forward = true;
-
-          state.is_joining = true;
-
-          // Time-shifted switches arrive with state.start_location already set from
-          // the player's START_LOCATION_GROUP; that target must win over the
-          // last_sent+1 fallback (see compute_switch_start_location).
-          let player_start = state.start_location.clone();
-          state.start_location = Some(compute_switch_start_location(
-            player_start,
-            new_start_location,
-            object_location,
-          ));
-
-          state.end_group = 0; // remove end group limit
-
-          info!(
-            "check_switch_context: Will forward objects for subscriber={} relay_track_id={} starting from group: {}",
-            self.client_connection_id,
-            self.relay_track_id,
-            state.start_location.as_ref().unwrap().group
-          );
-        } else {
-          // Do not forward objects for Next status until switch condition is met
-          // set forward to false if it is true
-          if self.is_forwarding().await {
-            info!(
-              "check_switch_context: Setting forward to false for Next track for subscriber={} relay_track_id={} object location group: {}",
-              self.client_connection_id, self.relay_track_id, object_location.group
-            );
-            self.subscription_state.write().await.forward = false;
-          }
-        }
-        // even if the switch_at_next_group is true,
-        // we return false here to wait for the next group to switch
-        false
-      }
-      SwitchStatus::Current => true,
-      SwitchStatus::None => {
-        // set forward to false if it is true
-        if self.is_forwarding().await {
-          info!(
-            "check_switch_context: Setting end group to {} for None track for subscriber={} relay_track_id={}",
-            object_location.group, self.client_connection_id, self.relay_track_id
-          );
-          let mut state = self.subscription_state.write().await;
-          state.forward = false;
-          state.end_group = object_location.group;
-        }
-
-        false
-      }
-    }
-  }
-
   async fn receive(&mut self) {
     debug!(
       "Receiving for subscriber: {} track: {}",
@@ -1070,28 +953,6 @@ impl Subscription {
           state.update_last_received_object_location(object.location.clone());
         }
 
-        // Check switch context state if needed
-        // Whether when a new header is received or when notified about a switch context change
-        let check_switch = self
-          .check_switch_context_on_next_object
-          .load(std::sync::atomic::Ordering::Relaxed);
-        if header_info.is_some() || check_switch {
-          if check_switch {
-            self
-              .check_switch_context_on_next_object
-              .store(false, std::sync::atomic::Ordering::Relaxed);
-          }
-          // Check whether this track is in a switch context and update forward state
-          if !self.check_switch_context(&object.location).await {
-            // if this returns false, do not start the stream
-            info!(
-              "Not forwarding object for subscriber={} relay_track_id={} due to switch context state",
-              self.client_connection_id, self.relay_track_id
-            );
-            return;
-          }
-        }
-
         let object_received_time = utils::passed_time_since_start();
 
         {
@@ -1106,9 +967,26 @@ impl Subscription {
             return;
           }
 
-          if state.end_group > 0 && object.location.group > state.end_group {
+          // Joining-replay dedup: drop this event iff the replay already
+          // delivered this exact object (its subgroup's watermark is at or
+          // above its object ID). Without this, an object cached between
+          // add_subscription and the replay's group snapshot is sent twice —
+          // and both copies resolve to the SAME subgroup StreamId, producing
+          // non-increasing object IDs on one QUIC stream, which a strict
+          // MOQT receiver must treat as malformed. Objects with no
+          // subgroup_id never appear in the replay (try_from_fetch always
+          // sets Some), so they pass through unfiltered.
+          if state.is_replay_duplicate(&object.location, object.subgroup_id) {
             debug!(
-              "Object beyond end group for subscriber={} relay_track_id={} object location: {:?} end group: {}",
+              "Duplicate of joining replay; skipping - subscriber={} relay_track_id={} location: {:?}",
+              self.client_connection_id, self.relay_track_id, object.location
+            );
+            return;
+          }
+
+          if state.exceeds_end_group(object.location.group) {
+            debug!(
+              "Object beyond end group for subscriber={} relay_track_id={} object location: {:?} end group: {:?}",
               self.client_connection_id, self.relay_track_id, object.location, state.end_group
             );
             return;
@@ -1210,6 +1088,25 @@ impl Subscription {
               .flatten()
           };
 
+          // Foreign-upstream fan-out guard: a fetch-backfilled object can be
+          // fanned out after live objects of the same (group, subgroup) were
+          // already forwarded on this stream. Reachable when a non-moqtail
+          // upstream ignores DELAY_GROUPS=0 and degrades the lazy upstream
+          // subscription to LatestObject: the mid-flight group's head then
+          // arrives only via the backfill FETCH, behind its own tail. Writing
+          // a lower (or equal) object id onto an already-advanced subgroup
+          // stream underflows the delta encoder and is malformed for any
+          // strict receiver — skip the write. The object itself is not lost:
+          // it sits in the (idempotent, sorted) cache, so joining replays and
+          // catch-up/FETCH range reads still deliver it in order.
+          if breaks_stream_monotonicity(previous_object_id, object.location.object) {
+            debug!(
+              "Non-monotonic object for already-advanced stream; skipping fan-out - subscriber: {} stream_id: {} previous: {:?} object: {:?}",
+              self.client_connection_id, stream_id, previous_object_id, object.location
+            );
+            return;
+          }
+
           debug!(
             "Received Object event: subscriber={} stream_id={} relay_track_id={} previous_object_id: {:?} object: {:?} now={} received time={}",
             self.client_connection_id,
@@ -1295,9 +1192,9 @@ impl Subscription {
             return;
           }
 
-          if state.end_group > 0 && location.group > state.end_group {
+          if state.exceeds_end_group(location.group) {
             debug!(
-              "Datagram beyond end group for subscriber={} relay_track_id={} object location: {:?} end group: {}",
+              "Datagram beyond end group for subscriber={} relay_track_id={} object location: {:?} end group: {:?}",
               self.client_connection_id, self.relay_track_id, location, state.end_group
             );
             return;
@@ -1752,135 +1649,204 @@ mod tests_from_subscribe_is_joining {
 }
 
 #[cfg(test)]
-mod tests_compute_switch_start_location {
+mod tests_replay_watermark_dedup {
   use super::*;
+  use moqtail::model::common::tuple::{Tuple, TupleField};
 
-  #[test]
-  fn time_shifted_switch_preserves_player_start_location() {
-    let player_start = Some(Location {
-      group: 17,
-      object: 0,
-    });
-    let last_sent_next = Some(Location {
-      group: 24,
-      object: 0,
-    });
-    let object_location = Location {
-      group: 23,
-      object: 0,
-    };
-    let result = compute_switch_start_location(player_start, last_sent_next, &object_location);
-    assert_eq!(
-      result,
-      Location {
-        group: 17,
-        object: 0
-      }
+  fn state_with_watermark(group: u64, subgroup: u64, max_object: u64) -> SubscriptionState {
+    let sub = Subscribe::new_absolute_start(
+      1,
+      Tuple::from_utf8_path("/test"),
+      TupleField::from_utf8("video"),
+      Location { group, object: 0 },
+      vec![],
     );
+    let mut state = SubscriptionState::from(SubscriptionOrigin::from(sub));
+    state
+      .replay_watermarks
+      .insert((group, subgroup), max_object);
+    state
   }
 
   #[test]
-  fn live_edge_switch_with_old_progress_uses_last_sent_next() {
-    let last_sent_next = Some(Location {
-      group: 24,
-      object: 0,
-    });
-    let object_location = Location {
-      group: 23,
-      object: 5,
-    };
-    let result = compute_switch_start_location(None, last_sent_next, &object_location);
-    assert_eq!(
-      result,
-      Location {
-        group: 24,
+  fn object_at_or_below_watermark_is_duplicate() {
+    // The exact race: the object was cached between add_subscription and the
+    // replay's group snapshot, so it was replayed AND queued as a live event.
+    // The queued copy must be dropped — both copies resolve to the same
+    // subgroup StreamId, and a second write means non-increasing object IDs
+    // on one QUIC stream, which a strict MOQT receiver treats as malformed.
+    let state = state_with_watermark(10, 0, 5);
+    assert!(state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 5
+      },
+      Some(0)
+    ));
+    assert!(state.is_replay_duplicate(
+      &Location {
+        group: 10,
         object: 0
-      }
-    );
+      },
+      Some(0)
+    ));
   }
 
   #[test]
-  fn live_edge_switch_without_old_progress_uses_object_next_group() {
-    let object_location = Location {
-      group: 7,
-      object: 3,
-    };
-    let result = compute_switch_start_location(None, None, &object_location);
-    assert_eq!(
-      result,
-      Location {
-        group: 8,
-        object: 0
-      }
+  fn object_above_watermark_passes() {
+    // Cached after the snapshot: only the live event exists; must pass.
+    let state = state_with_watermark(10, 0, 5);
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 6
+      },
+      Some(0)
+    ));
+  }
+
+  #[test]
+  fn interleaved_subgroup_straggler_passes() {
+    // Why the watermark is per-(group, subgroup) and not a max location:
+    // subgroup 1's object 3 can arrive after subgroup 0's object 9 was
+    // replayed. It was never in the snapshot, so it must NOT be dropped —
+    // a single max-location threshold (e.g. (group, u64::MAX)) would
+    // swallow it and re-open a seam gap.
+    let state = state_with_watermark(10, 0, 9);
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 3
+      },
+      Some(1)
+    ));
+  }
+
+  #[test]
+  fn older_group_straggler_passes() {
+    // Same argument across groups: a late object in a group the replay
+    // never saw has no watermark and must pass.
+    let state = state_with_watermark(10, 0, 9);
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 9,
+        object: 2
+      },
+      Some(0)
+    ));
+  }
+
+  #[test]
+  fn object_without_subgroup_passes() {
+    // try_from_fetch always sets Some(subgroup_id), so a replay can never
+    // have delivered a subgroup-less object; never treat one as a duplicate.
+    let state = state_with_watermark(10, 0, 9);
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 10,
+        object: 1
+      },
+      None
+    ));
+  }
+
+  #[test]
+  fn empty_watermarks_never_filter() {
+    // No replay ran (live-only LatestObject subscription): nothing filtered.
+    let sub = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path("/test"),
+      TupleField::from_utf8("video"),
+      vec![],
     );
+    let state = SubscriptionState::from(SubscriptionOrigin::from(sub));
+    assert!(!state.is_replay_duplicate(
+      &Location {
+        group: 0,
+        object: 0
+      },
+      Some(0)
+    ));
   }
 }
 
 #[cfg(test)]
-mod tests_should_promote_switch {
+mod tests_end_group_bound {
+  use super::*;
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+
+  fn unbounded_state() -> SubscriptionState {
+    let sub = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path("/test"),
+      TupleField::from_utf8("video"),
+      vec![],
+    );
+    SubscriptionState::from(SubscriptionOrigin::from(sub))
+  }
+
+  #[test]
+  fn bound_at_group_zero_is_a_real_bound() {
+    // THE sentinel regression (8934fff fix 3): the switch drain writes
+    // Some(0) when G_switch == 1. Under the old u64 encoding this was 0 =
+    // "no limit" and Group 1+ objects leaked across the seam.
+    let mut state = unbounded_state();
+    state.end_group = Some(0);
+    assert!(state.exceeds_end_group(1), "Group 1 must be filtered");
+    assert!(!state.exceeds_end_group(0), "Group 0 itself must pass");
+  }
+
+  #[test]
+  fn none_means_unbounded() {
+    let state = unbounded_state();
+    assert_eq!(state.end_group, None);
+    assert!(!state.exceeds_end_group(0));
+    assert!(!state.exceeds_end_group(u64::MAX));
+  }
+
+  #[test]
+  fn bound_is_inclusive() {
+    let mut state = unbounded_state();
+    state.end_group = Some(5);
+    assert!(!state.exceeds_end_group(5));
+    assert!(state.exceeds_end_group(6));
+  }
+}
+
+#[cfg(test)]
+mod tests_stream_monotonicity_guard {
   use super::*;
 
   #[test]
-  fn time_shifted_switch_promotes_immediately_even_when_object_is_behind_old() {
-    let player_start = Some(Location {
-      group: 17,
-      object: 0,
-    });
-    let last_sent_max = Some(Location {
-      group: 22,
-      object: 23,
-    });
-    let object_location = Location {
-      group: 17,
-      object: 0,
-    };
-    assert!(should_promote_switch(
-      player_start.as_ref(),
-      last_sent_max.as_ref(),
-      &object_location
-    ));
+  fn fresh_stream_never_blocks() {
+    // Nothing sent yet: any first object id is valid, including 0 and
+    // arbitrary mid-group ids (a joining replay's fake-header streams start
+    // wherever the replay starts).
+    assert!(!breaks_stream_monotonicity(None, 0));
+    assert!(!breaks_stream_monotonicity(None, u64::MAX));
   }
 
   #[test]
-  fn live_edge_switch_defers_promotion_when_object_is_behind_old() {
-    let last_sent_max = Some(Location {
-      group: 22,
-      object: 23,
-    });
-    let object_location = Location {
-      group: 17,
-      object: 0,
-    };
-    assert!(!should_promote_switch(
-      None,
-      last_sent_max.as_ref(),
-      &object_location
-    ));
+  fn increasing_ids_pass() {
+    assert!(!breaks_stream_monotonicity(Some(2), 3));
+    // Gaps are legal on a subgroup stream (the delta encoder expresses them).
+    assert!(!breaks_stream_monotonicity(Some(2), 10));
   }
 
   #[test]
-  fn live_edge_switch_promotes_when_object_meets_or_exceeds_old() {
-    let last_sent_max = Some(Location {
-      group: 22,
-      object: 23,
-    });
-    let object_location = Location {
-      group: 22,
-      object: 0,
-    };
-    assert!(should_promote_switch(
-      None,
-      last_sent_max.as_ref(),
-      &object_location
-    ));
+  fn duplicate_id_is_blocked() {
+    // Equal = live-vs-fetch duplicate that slipped past cache-level
+    // suppression ordering; re-sending it is a protocol violation.
+    assert!(breaks_stream_monotonicity(Some(3), 3));
   }
 
   #[test]
-  fn live_edge_switch_promotes_when_no_old_progress() {
-    let object_location = Location {
-      group: 5,
-      object: 0,
-    };
-    assert!(should_promote_switch(None, None, &object_location));
+  fn late_lower_id_is_blocked() {
+    // THE foreign-upstream case: the mid-flight group's head arrives via the
+    // backfill FETCH after its tail was live-forwarded on the same stream.
+    // wire = id - previous - 1 would underflow; the head must be dropped from
+    // THIS stream (the sorted cache still serves it to replays and fetches).
+    assert!(breaks_stream_monotonicity(Some(3), 0));
+    assert!(breaks_stream_monotonicity(Some(3), 2));
   }
 }

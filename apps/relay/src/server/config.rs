@@ -151,6 +151,15 @@ pub struct Cli {
   /// Capped, because the memory this costs also scales with the size of a group
   #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(0..=MAX_DEDUP_RETAINED_GROUPS))]
   pub dedup_retained_groups: u64,
+
+  /// T_switch (ms): budget for completing a SWITCH (SWITCH PR #1378): G_switch
+  /// identification plus the source drain share one deadline, and the
+  /// single-in-flight guard slot self-expires at the same instant. Operators
+  /// raising this past 3000 must raise the TS client's SWITCH_RESPONSE_TIMEOUT_MS
+  /// (2x this value by default) in step, or the client will time out switches the
+  /// relay would still complete.
+  #[arg(long, default_value_t = 3000)]
+  pub t_switch_ms: u64,
 }
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -194,6 +203,8 @@ pub struct AppConfig {
   /// Groups of Object ids retained per track for duplicate detection. Bounds what that
   /// costs; a publisher more than this many groups behind can slip a duplicate through.
   pub dedup_retained_groups: usize,
+  /// The SWITCH operation budget (SWITCH PR #1378 T_switch), in milliseconds.
+  pub t_switch_ms: u64,
 }
 
 impl AppConfig {
@@ -232,7 +243,13 @@ impl AppConfig {
       downstream_alias_timeout: Duration::from_millis(cli.downstream_alias_timeout_ms),
       publish_done_stream_timeout: Duration::from_millis(cli.publish_done_stream_timeout_ms),
       dedup_retained_groups: cli.dedup_retained_groups as usize,
+      t_switch_ms: cli.t_switch_ms,
     }
+  }
+
+  /// The SWITCH operation budget (SWITCH PR #1378 T_switch) as a Duration.
+  pub fn get_t_switch(&self) -> Duration {
+    Duration::from_millis(self.t_switch_ms)
   }
 
   /// Builds the relay's QUIC listeners. WebTransport and raw-QUIC clients share the
@@ -390,6 +407,7 @@ mod tests {
       downstream_alias_timeout: Duration::from_millis(3000),
       publish_done_stream_timeout: Duration::from_millis(2000),
       dedup_retained_groups: 30,
+      t_switch_ms: 3000,
     }
   }
 

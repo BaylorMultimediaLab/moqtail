@@ -250,3 +250,4 @@ data/video/tears_of_steel_*
 data/video/.cache/
 .claude/
 CLAUDE.md
+apps/relay/cert/ecdsa/

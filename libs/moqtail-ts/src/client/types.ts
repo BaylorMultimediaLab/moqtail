@@ -25,6 +25,8 @@ import {
   ControlMessage,
   Datagram,
   MoqtObject,
+  SwitchTransition,
+  PublishDoneStatusCode,
 } from '@/model'
 import { PublishNamespaceRequest } from './request/publish_namespace'
 import { FetchRequest } from './request/fetch'
@@ -48,6 +50,37 @@ export type SubscribeResult = {
   stream: ReadableStream<MoqtObject>
   /** Relay's `largest_location` at SubscribeOk time, or `undefined` if no live edge known. */
   largestLocation?: Location | undefined
+}
+
+/**
+ * Successful SWITCH outcome (SWITCH PR #1378): resolved from the relay's PUBLISH for
+ * the target track. `requestId` is the relay-allocated PUBLISH Request ID —
+ * the id the relay registered the post-switch subscription under, and the id
+ * a subsequent SWITCH must reference as its Current Subscribe Request ID.
+ */
+export type SwitchSuccess = SubscribeResult & {
+  /**
+   * Decoded SWITCH_TRANSITION: the catch-up range
+   * `[switchingGroupId, liveEdgeGroupId)` arrives on a dedicated FETCH_HEADER
+   * stream (routed into `stream` alongside live objects); live objects follow
+   * from the live edge on SUBGROUP streams. `switchingGroupId` is also the
+   * seam for buffer replacement — buffered old-track groups at or above it
+   * should be discarded.
+   */
+  switchTransition: SwitchTransition
+}
+
+/**
+ * Failed SWITCH outcome (SWITCH PR #1378 failure discipline): the relay opened the
+ * target PUBLISH and immediately closed it with PUBLISH_DONE carrying
+ * `statusCode`. The CURRENT subscription was left untouched by the relay, so
+ * the caller should keep using its existing request id.
+ */
+export class SwitchFailure {
+  constructor(
+    public readonly statusCode: PublishDoneStatusCode,
+    public readonly reasonPhrase: string,
+  ) {}
 }
 /**
  * Discriminated union of every in‑flight MOQ‑tail control request tracked by the {@link MOQtailClient}.
@@ -223,11 +256,14 @@ export type SubscribeUpdateOptions = {
 /**
  * Parameters for {@link MOQtailClient.switch | switching} an existing SUBSCRIBE to a new track.
  *
- * @example Switching subscription to a new track
+ * @example Switching subscription to a new track near the live edge
  * ```ts
  * await client.switch({
  *   fullTrackName: newFullTrackName,
- *   subscriptionRequestId
+ *   subscriptionRequestId,
+ *   // floor at the latest group received on the current subscription;
+ *   // pass an older group id instead to replace buffered content
+ *   minimumSwitchingGroupId: latestReceivedGroupId
  * })
  * ```
  */
@@ -236,17 +272,28 @@ export type SwitchOptions = {
   fullTrackName: FullTrackName
   /** The original SUBSCRIBE request id (bigint) being updated. */
   subscriptionRequestId: bigint
-  /** Optional additional parameters; existing parameters persist if omitted. */
+  /**
+   * The complete parameter set for the target track's PUBLISH (SWITCH PR
+   * #1378): the relay uses exactly these parameters and MUST NOT inherit any
+   * from the current subscription. If omitted, an EMPTY set is sent — the
+   * target PUBLISH then carries no AUTHORIZATION TOKEN, DELAY_GROUPS, etc.,
+   * regardless of what the current subscription negotiated. Callers that need
+   * the current subscription's parameters on the target track must restate
+   * them here.
+   */
   parameters?: MessageParameter[]
   /**
-   * Optional pre-allocated request id for the SWITCH itself. When provided, the
-   * client uses it instead of allocating internally — letting the caller update
-   * its own subscription-id state synchronously *before* awaiting, so concurrent
-   * `switch()` calls each pass a fresh `subscriptionRequestId` rather than racing
-   * on a stale one (which the relay rejects as ProtocolViolation).
-   * Allocate via {@link MOQtailClient.allocateNextRequestId}.
+   * Lower bound on the transition group (SWITCH PR #1378 "Minimum Switching Group ID").
+   * The relay must not switch before this group and selects the smallest
+   * feasible boundary at or above it. REQUIRED — there is no safe library
+   * default: `0n` is an ordinary floor meaning "any group is acceptable",
+   * which the relay resolves to the OLDEST common gap-free boundary, i.e.
+   * full buffer replacement with a maximal catch-up range (the most
+   * expensive transition the protocol can express). To switch as close to
+   * live as possible, pass the latest group id received on the current
+   * subscription — there is no live-edge sentinel in the draft.
    */
-  requestId?: bigint
+  minimumSwitchingGroupId: bigint
 }
 
 /**

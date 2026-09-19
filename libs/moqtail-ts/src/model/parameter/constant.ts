@@ -67,8 +67,15 @@ export enum MessageParameterType {
    */
   DelayGroups = 0x70,
   /** Project-local extension; non-MoQT-standard.
-   *  Absolute group_id where a Switch should start delivering the new track. */
+   *  Legacy: a SWITCH's transition group is now a first-class field (Minimum
+   *  Switching Group ID, PR #1378), so this parameter is no longer used for
+   *  switching. Retained for wire-compatibility of the type registry. */
   StartLocationGroup = 0x72,
+  /** Project-local extension; non-MoQT-standard.
+   *  SWITCH_TRANSITION (PR #1378): carried on the target Track's PUBLISH so the
+   *  subscriber learns the seam. Bytes value = two varints:
+   *  Switching Group ID (G_switch), then Live Edge Group ID. */
+  SwitchTransition = 0x73,
 }
 
 export function messageParameterTypeFromNumber(value: bigint | number): MessageParameterType {
@@ -104,6 +111,8 @@ export function messageParameterTypeFromNumber(value: bigint | number): MessageP
       return MessageParameterType.DelayGroups
     case 0x72:
       return MessageParameterType.StartLocationGroup
+    case 0x73:
+      return MessageParameterType.SwitchTransition
     default:
       throw new InvalidTypeError('messageParameterTypeFromNumber', `Unknown message parameter type: ${value}`)
   }

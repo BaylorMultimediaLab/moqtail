@@ -32,6 +32,7 @@ import { LargestObject } from './message/largest_object'
 import { NewGroupRequest } from './message/new_group_request'
 import { DelayGroups } from './message/delay_groups'
 import { StartLocationGroup } from './message/start_location_group'
+import { SwitchTransition } from './message/switch_transition'
 import { SubscriberPriority } from './message/subscriber_priority'
 import { SubscriptionFilter } from './message/subscription_filter'
 
@@ -50,6 +51,7 @@ export type MessageParameter =
   | NewGroupRequest
   | DelayGroups
   | StartLocationGroup
+  | SwitchTransition
 
 export namespace MessageParameter {
   /**
@@ -72,7 +74,8 @@ export namespace MessageParameter {
       SubscriptionFilter.fromKeyValuePair(pair) ??
       NewGroupRequest.fromKeyValuePair(pair) ??
       DelayGroups.fromKeyValuePair(pair) ??
-      StartLocationGroup.fromKeyValuePair(pair)
+      StartLocationGroup.fromKeyValuePair(pair) ??
+      SwitchTransition.fromKeyValuePair(pair)
     )
   }
 
@@ -139,6 +142,20 @@ export namespace MessageParameter {
 
   export function isStartLocationGroup(param: MessageParameter): param is StartLocationGroup {
     return param instanceof StartLocationGroup
+  }
+
+  export function isSwitchTransition(param: MessageParameter): param is SwitchTransition {
+    return param instanceof SwitchTransition
+  }
+
+  /** The SWITCH_TRANSITION seam a relay attached to a PUBLISH, if any (SWITCH PR #1378). */
+  export function switchTransitionOf(params: readonly MessageParameter[]): SwitchTransition | undefined {
+    return params.find(isSwitchTransition)
+  }
+
+  /** The Forward State a parameter list carries; draft-18's default is forwarding. */
+  export function forwardOf(params: readonly MessageParameter[]): boolean {
+    return params.find(isForward)?.forward ?? true
   }
 
   /** The relay's LARGEST_OBJECT location, if the parameter list carries one. */
