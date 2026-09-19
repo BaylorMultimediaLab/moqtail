@@ -1,6 +1,6 @@
 /**
  * Bidirectional PTS <-> group lookup. Used by the player to compute
- * `START_LOCATION_GROUP` for aligned switches: given the current
+ * `START_LOCATION_GROUP` for time-shifted switches: given the current
  * playhead PTS, find the group_id that contains it.
  *
  * Recorded boundaries are explicit `(groupId, startPTS_ms)` points

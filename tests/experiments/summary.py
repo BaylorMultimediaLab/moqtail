@@ -18,7 +18,7 @@ def build_run_summary(
     and produces a flat dict combining cell parameters with derived metrics.
 
     The discontinuity threshold (50ms) is the same as Task 4.3's E3 assertion:
-    aligned switching should never produce a >50ms PTS gap, so any switch
+    time-shifted switching should never produce a >50ms PTS gap, so any switch
     above that line is counted as a discontinuity. Below threshold, switches
     are still counted (n_switches) but not flagged.
     """
@@ -30,7 +30,7 @@ def build_run_summary(
     # ptsGapMs is buffer-end (newStart − bufferEnd) — diagnostic only.
     pts_gaps = [abs(s.get("ptsGapMs", 0)) for s in switch_events]
     # playheadGapMs is playhead-relative (newStart − currentTime at switchSentAt) —
-    # this is the headline naive-vs-aligned metric. Records emitted before the
+    # this is the headline live-edge-vs-time-shifted metric. Records emitted before the
     # client carried `playheadGapMs` will be missing the field; skip those rather
     # than treat them as zero, so an old run isn't silently mis-summarized.
     playhead_gaps = [

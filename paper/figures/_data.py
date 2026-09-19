@@ -337,12 +337,12 @@ def avg_metric_matrix(experiment: str, compute_fn) -> pd.DataFrame:
 
 
 def e6_avg_bitrate_matrix() -> pd.DataFrame:
-    """E6 (filtered+aligned) mean selected-quality bitrate (kbps), per cell."""
+    """E6 (filtered+time-shifted) mean selected-quality bitrate (kbps), per cell."""
     return avg_metric_matrix("e6", compute_avg_delivered_bitrate_kbps)
 
 
 def e5_avg_bitrate_matrix() -> pd.DataFrame:
-    """E5 (unfiltered+naive) mean selected-quality bitrate (kbps), per cell."""
+    """E5 (unfiltered+live-edge) mean selected-quality bitrate (kbps), per cell."""
     return avg_metric_matrix("e5", compute_avg_delivered_bitrate_kbps)
 
 
@@ -357,7 +357,7 @@ def e5_delivered_goodput_matrix() -> pd.DataFrame:
 
 
 def e7_avg_bitrate_matrix() -> pd.DataFrame:
-    """E7 (filtered+aligned, zero filter delay) mean selected-quality bitrate (kbps), per cell."""
+    """E7 (filtered+time-shifted, zero filter delay) mean selected-quality bitrate (kbps), per cell."""
     return avg_metric_matrix("e7", compute_avg_delivered_bitrate_kbps)
 
 

@@ -25,7 +25,7 @@
 
 Reference implementation and experiment artifacts accompanying the MMSys 2026
 Special Session paper on Media-over-QUIC Transport (MOQT) ABR streaming with
-time-aligned switching, filtered/unfiltered client modes, and pluggable ABR
+time-time-shifted switching, filtered/unfiltered client modes, and pluggable ABR
 composability.
 
 This repository contains everything needed to reproduce the paper's figures
@@ -139,10 +139,10 @@ the git filter once with `.venv/bin/nbstripout --install`.
 | ------ | ----------------------------------------------------------------------------------------------------------- | ------------ | --------- | --------------- |
 | **E1** | Baseline single-run smoke (5-rung 720p ladder, stable 10 Mbps, unfiltered live edge)                        | 1 × 1        | ~1.5 min  | — (sanity only) |
 | **E2** | Naive (immediate) switch — PTS discontinuity under bandwidth step-down at filter delays 5/10/20/30 s        | 4 × 5        | ~27 min   | Fig 2, Fig 3a   |
-| **E3** | Group-aligned switch — same conditions as E2, switching deferred to GOP boundary                            | 4 × 5        | ~27 min   | Fig 2, Fig 3b   |
+| **E3** | Group-time-shifted switch — same conditions as E2, switching deferred to GOP boundary                       | 4 × 5        | ~27 min   | Fig 2, Fig 3b   |
 | **E4** | Cache-availability boundary — forced upswitch at filter delays 5/10/20/30/40 s with relay `--cache-size 20` | 5 × 5        | ~33 min   | Fig 4           |
-| **E5** | Unfiltered + naive ABR composability sweep (E5 was reserved at design time; added later)                    | —            | —         | Fig 6           |
-| **E6** | Filtered + aligned ABR composability — 8 ABR configs × 3 bandwidth profiles                                 | 24 × 5       | ~2.7 h    | Fig 5           |
+| **E5** | Unfiltered + live-edge ABR composability sweep (E5 was reserved at design time; added later)                | —            | —         | Fig 6           |
+| **E6** | Filtered + time-shifted ABR composability — 8 ABR configs × 3 bandwidth profiles                            | 24 × 5       | ~2.7 h    | Fig 5           |
 
 Full per-experiment specs (parameters, run flow, assertions, summary fields)
 live in [docs/superpowers/specs/2026-04-30-paper-experiments-design.md](docs/superpowers/specs/2026-04-30-paper-experiments-design.md).

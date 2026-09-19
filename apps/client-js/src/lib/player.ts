@@ -82,15 +82,15 @@ export interface DiscontinuityRecord {
   newStartPTS_ms: number;
   /** Buffer-end gap: newStartPTS_ms - oldEndPTS_ms. Diagnostic only — measures
    *  buffered-region continuity, NOT user-visible discontinuity. With a fast
-   *  link the buffer reaches the live edge, so both naive and aligned modes
-   *  produce ~0 here. Use `playheadGapMs` for naive-vs-aligned differentiation. */
+   *  link the buffer reaches the live edge, so both live-edge and time-shifted modes
+   *  produce ~0 here. Use `playheadGapMs` for live-edge-vs-time-shifted differentiation. */
   ptsGapMs: number;
   /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
   playheadPTS_ms?: number;
   /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
-   *  jump introduced by the switch — naive on a filtered client lands ~filterDelay×1000
+   *  jump introduced by the switch — live-edge on a filtered client lands ~filterDelay×1000
    *  positive (relay delivers from live edge while playhead is filterDelay s behind);
-   *  aligned lands ~0. Undefined for `connect` records. */
+   *  time-shifted lands ~0. Undefined for `connect` records. */
   playheadGapMs?: number;
 
   // wall-clock context
@@ -106,7 +106,7 @@ export interface DiscontinuityRecord {
   timeMapMiss?: boolean;
 
   // mode context (every record)
-  switchMode: 'naive' | 'aligned';
+  switchMode: 'live-edge' | 'time-shifted';
   clientMode: 'filtered' | 'unfiltered';
   filterDelaySeconds: number;
 }
@@ -118,7 +118,7 @@ interface PendingSwitch {
   /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
   oldEndPTS_ms: number | undefined;
   /** Snapshot of video.currentTime * 1000 at switchTrack() call — used by the discontinuity
-   *  record's `playheadGapMs` (newStart − playhead) which is the headline naive-vs-aligned metric. */
+   *  record's `playheadGapMs` (newStart − playhead) which is the headline live-edge-vs-time-shifted metric. */
   playheadPTS_ms: number | undefined;
   /** performance.now() at switchTrack() call — for wallClockMs and perceivedPauseMs. */
   switchSentAt: number;
@@ -176,8 +176,8 @@ export interface PlayerOptions {
   clientMode?: 'filtered' | 'unfiltered';
   /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
   filterDelaySeconds?: number;
-  /** Quality-switch primitive: 'naive' = today (start at latest); 'aligned' = start at group containing player's current PTS. */
-  switchMode?: 'naive' | 'aligned';
+  /** Quality-switch primitive: 'live-edge' = today (start at latest); 'time-shifted' = start at group containing player's current PTS. */
+  switchMode?: 'live-edge' | 'time-shifted';
 }
 
 const DefaultOptions = {
@@ -188,7 +188,7 @@ const DefaultOptions = {
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
   filterDelaySeconds: 0,
-  switchMode: 'naive' as 'naive' | 'aligned',
+  switchMode: 'live-edge' as 'live-edge' | 'time-shifted',
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
   Pick<PlayerOptions, 'onTrackSwitched'>;
 
@@ -218,22 +218,22 @@ export function buildSubscribeParameters(opts: {
  * (moq-transport PR #1674 / #1675): a fresh SUBSCRIBE for the target track
  * carrying SWITCH_FROM that names the subscription it replaces.
  *
- * - 'naive' mode: a hard switch (PR #1674) that starts the target at the live
+ * - 'live-edge' mode: a hard switch (PR #1674) that starts the target at the live
  *   edge (LatestObject). The suspended track is cut on the first object the
  *   target delivers; whatever old-track media is already buffered stays, so a
  *   behind-live client sees the jump to live the paper measures.
- * - 'aligned' mode: a soft switch (PR #1675) whose target starts at the group
+ * - 'time-shifted' mode: a soft switch (PR #1675) whose target starts at the group
  *   containing the playhead (AbsoluteStartFill). The relay delivers
  *   [start, live edge) on a fill fetch stream and lets the old track drain up
  *   to the group before the boundary, so the seam is contiguous at the
  *   playhead. If the TimeMap has no anchor yet (rare: switch fired before any
  *   object was received), flags `timeMapMiss: true` and falls through to the
- *   naive plan.
+ *   live-edge plan.
  *
  * Exported for unit testing.
  */
 export function computeSwitchFromPlan(opts: {
-  switchMode: 'naive' | 'aligned';
+  switchMode: 'live-edge' | 'time-shifted';
   targetGroup: number | undefined;
 }): {
   mode: SwitchMode;
@@ -241,13 +241,13 @@ export function computeSwitchFromPlan(opts: {
   startLocation: Location | undefined;
   timeMapMiss: boolean;
 } {
-  const naive = {
+  const liveEdge = {
     mode: SwitchMode.Hard,
     filterType: FilterType.LatestObject,
     startLocation: undefined,
   };
-  if (opts.switchMode !== 'aligned') return { ...naive, timeMapMiss: false };
-  if (opts.targetGroup === undefined) return { ...naive, timeMapMiss: true };
+  if (opts.switchMode !== 'time-shifted') return { ...liveEdge, timeMapMiss: false };
+  if (opts.targetGroup === undefined) return { ...liveEdge, timeMapMiss: true };
   return {
     mode: SwitchMode.Soft,
     filterType: FilterType.AbsoluteStartFill,
@@ -301,7 +301,7 @@ export class Player {
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
   // B4: PTS <-> group lookup populated from incoming object decode times.
-  // Consumed by B5 (aligned switch) to compute START_LOCATION_GROUP.
+  // Consumed by B5 (time-shifted switch) to compute START_LOCATION_GROUP.
   #timeMap: TimeMap | undefined;
   // B5: latched at switchTrack() time; consumed by the next switch
   // DiscontinuityRecord emission and reset to false afterwards so it doesn't
@@ -731,7 +731,7 @@ export class Player {
               );
               if (info !== undefined) {
                 struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-                // B4: feed the TimeMap so aligned switch (B5) can resolve playhead -> group.
+                // B4: feed the TimeMap so time-shifted switch (B5) can resolve playhead -> group.
                 // Only the first object of each group records (idempotent in TimeMap),
                 // and frame 0 of a group has decodeTime == group start PTS.
                 if (this.#timeMap) {
@@ -1161,9 +1161,13 @@ export class Player {
     const switchSentAt = performance.now();
     const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
 
-    // Compute aligned-switch target group from playhead via TimeMap.
+    // Compute the time-shifted target group from the playhead via TimeMap.
     let targetGroup: number | undefined;
-    if (this.#options.switchMode === 'aligned' && this.#timeMap && playheadPTS_ms !== undefined) {
+    if (
+      this.#options.switchMode === 'time-shifted' &&
+      this.#timeMap &&
+      playheadPTS_ms !== undefined
+    ) {
       targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
     }
     const plan = computeSwitchFromPlan({
@@ -1171,7 +1175,7 @@ export class Player {
       targetGroup,
     });
     if (plan.timeMapMiss) {
-      logger.warn('media', 'aligned switch: TimeMap miss; falling through to naive');
+      logger.warn('media', 'time-shifted switch: TimeMap miss; falling through to live-edge');
     }
     this.#lastSwitchHadTimeMapMiss = plan.timeMapMiss;
 
