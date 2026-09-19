@@ -119,3 +119,20 @@ implementation this document originally described:
   upstream establishment of an unknown switch target and its backfill FETCH,
   and the draft-14 `tests/switch_e2e.rs` harness. A target track this relay does
   not carry is answered with DOES_NOT_EXIST.
+
+## Experiment knobs and events on this branch
+
+- The player's `switchFloor` option (URL `?switchFloor=next-group|playhead`,
+  Settings panel "Switch Floor") chooses the SWITCH's Minimum Switching Group
+  ID: `next-group` names the boundary after the latest received group (the
+  switch lands as close to live as possible), `playhead` names the group the
+  player is currently showing (a time-shifted client switches at the point it
+  is watching and re-fetches the buffered groups on the new track). The
+  default is `next-group`. The chosen floor is recorded in the client's
+  `SWITCH_SENT` event as `minimum_switching_group`, and `RUN_META` carries
+  `switch_floor`.
+- Relay events specific to this mechanism: `SWITCH_RECV` carries
+  `minimum_switching_group`; `SWITCH_PROMOTED` is emitted when the target
+  PUBLISH opens, with `start_group` = G_switch and the target's live edge;
+  `SWITCH_FAILED` carries the failure kind and status code. The shared record
+  schema is in `docs/measurement-schema.md`.

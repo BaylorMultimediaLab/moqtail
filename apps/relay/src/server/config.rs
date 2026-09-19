@@ -66,6 +66,9 @@ pub struct Cli {
   pub keep_alive_interval: u64,
   #[arg(long, default_value = "/tmp")]
   pub log_folder: String,
+  /// Project-local experiment event log (JSON lines). Empty disables it.
+  #[arg(long, default_value = "")]
+  pub event_log: String,
   /// Cache expiration type (ttl or tti)
   #[arg(long, value_enum, default_value = "ttl")]
   pub cache_expiration_type: CacheExpirationType,
@@ -171,6 +174,8 @@ pub struct AppConfig {
   pub keep_alive_interval: u64,
   pub cache_size: u16,
   pub log_folder: String,
+  /// Path of the experiment event log; empty = disabled.
+  pub event_log: String,
   pub cache_expiration_type: CacheExpirationType,
   pub cache_expiration_minutes: u64,
   pub enable_object_logging: bool,
@@ -224,6 +229,7 @@ impl AppConfig {
       keep_alive_interval: cli.keep_alive_interval,
       cache_size: cli.cache_size,
       log_folder: cli.log_folder,
+      event_log: cli.event_log,
       cache_expiration_type: cli.cache_expiration_type,
       cache_expiration_minutes: cli.cache_expiration_minutes,
       enable_object_logging: cli.enable_object_logging,
@@ -408,6 +414,7 @@ mod tests {
       publish_done_stream_timeout: Duration::from_millis(2000),
       dedup_retained_groups: 30,
       t_switch_ms: 3000,
+      event_log: String::new(),
     }
   }
 

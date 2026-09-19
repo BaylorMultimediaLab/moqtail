@@ -57,12 +57,12 @@ describe('buildSubscribeParameters', () => {
 });
 
 describe('computeSwitchMinimumGroup', () => {
-  it('live-edge mode floors at the next boundary after the latest received group', () => {
+  it('next-group floor lands at the next boundary after the latest received group', () => {
     // latestGroup + 1: the relay identifies G_switch within T_switch, waiting
     // for a not-yet-started group, so naming the NEXT boundary is safe and
     // lands the switch with no redelivery and no catch-up.
     const r = computeSwitchMinimumGroup({
-      switchMode: 'live-edge',
+      switchFloor: 'next-group',
       targetGroup: 42,
       latestGroup: 17n,
     });
@@ -70,9 +70,9 @@ describe('computeSwitchMinimumGroup', () => {
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('live-edge mode before any object arrives sends the spec floor 0', () => {
+  it('next-group floor before any object arrives sends the spec floor 0', () => {
     const r = computeSwitchMinimumGroup({
-      switchMode: 'live-edge',
+      switchFloor: 'next-group',
       targetGroup: undefined,
       latestGroup: -1n,
     });
@@ -80,9 +80,9 @@ describe('computeSwitchMinimumGroup', () => {
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('uses the target group as the floor for time-shifted mode with a target', () => {
+  it('uses the target group as the floor for the playhead floor with a target', () => {
     const r = computeSwitchMinimumGroup({
-      switchMode: 'time-shifted',
+      switchFloor: 'playhead',
       targetGroup: 42,
       latestGroup: 17n,
     });
@@ -90,9 +90,9 @@ describe('computeSwitchMinimumGroup', () => {
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('flags timeMapMiss when time-shifted but no target, falling through to the live-edge floor', () => {
+  it('flags timeMapMiss when playhead floor has no target, falling through to next-group', () => {
     const r = computeSwitchMinimumGroup({
-      switchMode: 'time-shifted',
+      switchFloor: 'playhead',
       targetGroup: undefined,
       latestGroup: 17n,
     });
@@ -100,9 +100,9 @@ describe('computeSwitchMinimumGroup', () => {
     expect(r.timeMapMiss).toBe(true);
   });
 
-  it("does NOT flag miss when live-edge + no target (live-edge doesn't need TimeMap)", () => {
+  it("does NOT flag miss when next-group + no target (next-group doesn't need TimeMap)", () => {
     const r = computeSwitchMinimumGroup({
-      switchMode: 'live-edge',
+      switchFloor: 'next-group',
       targetGroup: undefined,
       latestGroup: 17n,
     });
@@ -110,9 +110,9 @@ describe('computeSwitchMinimumGroup', () => {
     expect(r.timeMapMiss).toBe(false);
   });
 
-  it('time-shifted miss before any object arrives falls all the way to 0', () => {
+  it('playhead miss before any object arrives falls all the way to 0', () => {
     const r = computeSwitchMinimumGroup({
-      switchMode: 'time-shifted',
+      switchFloor: 'playhead',
       targetGroup: undefined,
       latestGroup: -1n,
     });

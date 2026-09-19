@@ -6,6 +6,7 @@ mod cmaf;
 mod connection;
 mod decoder;
 mod encoder;
+mod events;
 mod pacing;
 mod replay;
 mod scaler;
@@ -43,6 +44,7 @@ async fn main() -> Result<()> {
   init_logging();
 
   let cli = Cli::parse();
+  events::init(&cli.event_log);
   ffmpeg_next::init().expect("failed to initialize ffmpeg");
 
   match cli.encoded_dir.clone() {
@@ -76,6 +78,27 @@ async fn run_live(cli: Cli) -> Result<()> {
   );
   let catalog_json = catalog::build_catalog_json(&catalog_tracks)?;
   info!("Catalog JSON built ({} bytes)", catalog_json.len());
+  events::emit(
+    "RUN_META",
+    serde_json::json!({
+      "mode": "live",
+      "video_path": cli.video_path,
+      "namespace": cli.namespace,
+      "source_width": video_info.width,
+      "source_height": video_info.height,
+      "framerate": video_info.framerate,
+      "target_latency_ms": cli.target_latency_ms,
+      "ladder": catalog_tracks.iter().map(|t| serde_json::json!({
+        "track": t.name,
+        "width": t.width,
+        "height": t.height,
+        "bitrate_bps": t.bitrate_bps,
+        "framerate": t.framerate,
+        "gop_duration_ms": t.gop_duration_ms,
+        "codec": t.codec,
+      })).collect::<Vec<_>>(),
+    }),
+  );
 
   let mut moq = MoqConnection::establish(&cli.endpoint, cli.validate_cert).await?;
   let track_aliases =
@@ -151,6 +174,7 @@ async fn run_live(cli: Cli) -> Result<()> {
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_live_variant(
   variant: adaptive::QualityVariant,
   source_w: u32,
@@ -335,6 +359,7 @@ async fn run_prepare(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_prepare_variant(
   variant: adaptive::QualityVariant,
   source_w: u32,
@@ -484,6 +509,29 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
     "Catalog JSON built from cache ({} bytes)",
     catalog_json.len()
   );
+  events::emit(
+    "RUN_META",
+    serde_json::json!({
+      "mode": "replay",
+      "encoded_dir": encoded_dir.display().to_string(),
+      "namespace": cli.namespace,
+      "source_width": top_meta.source_width,
+      "source_height": top_meta.source_height,
+      "framerate": top_meta.framerate,
+      "gops_per_variant": top_meta.gops_per_variant,
+      "loop": !cli.no_loop,
+      "target_latency_ms": cli.target_latency_ms,
+      "ladder": catalog_tracks.iter().map(|t| serde_json::json!({
+        "track": t.name,
+        "width": t.width,
+        "height": t.height,
+        "bitrate_bps": t.bitrate_bps,
+        "framerate": t.framerate,
+        "gop_duration_ms": t.gop_duration_ms,
+        "codec": t.codec,
+      })).collect::<Vec<_>>(),
+    }),
+  );
 
   let mut moq = MoqConnection::establish(&cli.endpoint, cli.validate_cert).await?;
   // Build a borrowed-variant view of the cache so publish_all_tracks works
@@ -550,6 +598,7 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_replay_variant(
   quality: String,
   variant_dir: PathBuf,

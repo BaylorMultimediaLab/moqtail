@@ -79,6 +79,16 @@ pub async fn send_track(
     {
       Ok(()) => {
         groups_sent += 1;
+        crate::events::emit(
+          "GROUP_EMIT",
+          serde_json::json!({
+            "track": format!("video-{label}"),
+            "track_alias": track_alias,
+            "group": gop.group_id,
+            "objects": gop.packets.len(),
+            "bytes": gop.packets.iter().map(|p| p.len() as u64).sum::<u64>(),
+          }),
+        );
         if !first_group_logged {
           info!(
             "Sender ({} alias={}): first group sent (group_id={})",

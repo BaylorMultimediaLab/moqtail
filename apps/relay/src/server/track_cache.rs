@@ -28,6 +28,7 @@ use tokio::sync::{
 use tracing::{debug, error, info, warn};
 
 use super::config::{AppConfig, CacheExpirationType};
+use super::events;
 
 /// Composite cache key combining relay_track_id and group_id for global uniqueness
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +70,19 @@ pub struct TrackCache {
   /// of this counter to skip recomputing O(n) scans when nothing changed;
   /// see `switch_delivery::poll_select_switch_group`.
   generation: Arc<AtomicU64>,
+  /// Payload bytes currently held for this track (sum over cached groups).
+  /// Maintained at insert and eviction so the experiment log can report the
+  /// memory cost of caching several representations.
+  bytes: Arc<AtomicU64>,
+}
+
+/// Snapshot of one track cache for the experiment event log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+  pub groups: u64,
+  pub bytes: u64,
+  pub oldest_group: Option<u64>,
+  pub newest_group: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +98,8 @@ impl TrackCache {
     let log_folder_for_listener = log_folder.clone();
     let generation = Arc::new(AtomicU64::new(0));
     let generation_for_listener = generation.clone();
+    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes_for_listener = bytes.clone();
 
     let cache_builder = Cache::builder()
       .max_capacity(cache_size as u64)
@@ -96,9 +112,28 @@ impl TrackCache {
         let relay_track_id = key.relay_track_id;
         let group_id = key.group_id;
         let log_folder = log_folder_for_listener.clone();
+        let bytes = bytes_for_listener.clone();
 
         tokio::spawn(async move {
-          let object_count = value.read().await.len();
+          let (object_count, group_bytes) = {
+            let objects = value.read().await;
+            let b: u64 = objects.iter().map(|o| o.payload.len() as u64).sum();
+            (objects.len(), b)
+          };
+          bytes.fetch_sub(
+            group_bytes.min(bytes.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+          );
+          events::emit(
+            "CACHE_EVICT",
+            serde_json::json!({
+              "relay_track_id": relay_track_id,
+              "group": group_id,
+              "objects": object_count,
+              "bytes": group_bytes,
+              "cause": format!("{cause:?}"),
+            }),
+          );
           Self::log_cache_eviction(log_folder, relay_track_id, group_id, object_count, cause).await;
         });
       });
@@ -130,6 +165,26 @@ impl TrackCache {
       cache,
       log_folder,
       generation,
+      bytes,
+    }
+  }
+
+  /// Groups, payload bytes and group-id bounds currently cached for this track.
+  pub async fn stats(&self) -> CacheStats {
+    let mut oldest = None;
+    let mut newest = None;
+    for (k, _) in self.cache.iter() {
+      if k.relay_track_id != self.relay_track_id {
+        continue;
+      }
+      oldest = Some(oldest.map_or(k.group_id, |o: u64| o.min(k.group_id)));
+      newest = Some(newest.map_or(k.group_id, |n: u64| n.max(k.group_id)));
+    }
+    CacheStats {
+      groups: self.cache.entry_count(),
+      bytes: self.bytes.load(Ordering::Relaxed),
+      oldest_group: oldest,
+      newest_group: newest,
     }
   }
 
@@ -214,6 +269,9 @@ impl TrackCache {
   /// callers use this to suppress double fan-out of a re-ingested object.
   pub async fn add_object(&self, object: FetchObjectPayload) -> bool {
     let cache_key = CacheKey::new(self.relay_track_id, object.group_id);
+    self
+      .bytes
+      .fetch_add(object.payload.len() as u64, Ordering::Relaxed);
 
     let entry = self
       .cache
@@ -512,6 +570,7 @@ mod tests_group_bounds {
       publish_done_stream_timeout: Duration::from_millis(2000),
       dedup_retained_groups: 30,
       t_switch_ms: 3000,
+      event_log: String::new(),
     }
   }
 
@@ -546,6 +605,21 @@ mod tests_group_bounds {
     cache.run_pending_tasks().await;
     assert_eq!(cache.oldest_group_id().await, Some(5));
     assert_eq!(cache.newest_group_id().await, Some(9));
+  }
+
+  #[tokio::test]
+  async fn stats_count_groups_and_payload_bytes() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    cache.add_object(fetch_object(3, 0)).await;
+    cache.add_object(fetch_object(3, 1)).await;
+    cache.add_object(fetch_object(4, 0)).await;
+    cache.run_pending_tasks().await;
+    let s = cache.stats().await;
+    assert_eq!(s.groups, 2);
+    assert_eq!(s.bytes, 3, "one byte per test payload");
+    assert_eq!(s.oldest_group, Some(3));
+    assert_eq!(s.newest_group, Some(4));
   }
 
   #[tokio::test]
@@ -598,6 +672,7 @@ mod tests_switch_cache_support {
       publish_done_stream_timeout: Duration::from_millis(2000),
       dedup_retained_groups: 30,
       t_switch_ms: 3000,
+      event_log: String::new(),
     }
   }
 

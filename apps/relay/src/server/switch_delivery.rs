@@ -127,6 +127,18 @@ pub(crate) async fn send_switch_publish(
       track.track_properties.read().await.clone(),
     )
   };
+  crate::server::events::emit(
+    "SWITCH_PROMOTED",
+    serde_json::json!({
+      "conn": subscriber.connection_id,
+      "relay_track_id": relay_track_id,
+      "track": crate::server::events::track_name_string(target),
+      "request_id": publish_request_id,
+      "start_group": switch_transition.switching_group_id,
+      "live_edge_group": switch_transition.live_edge_group_id,
+      "live_edge_object": live_edge.object,
+    }),
+  );
   let mut parameters = target_parameters.to_vec();
   parameters.set_param(MessageParameter::new_forward(true));
   parameters.set_param(MessageParameter::new_largest_object(live_edge));
@@ -175,6 +187,16 @@ pub(crate) async fn send_switch_failure(
     track_alias,
     parameters,
     vec![],
+  );
+  crate::server::events::emit(
+    "SWITCH_FAILED",
+    serde_json::json!({
+      "conn": subscriber.connection_id,
+      "track": crate::server::events::track_name_string(target),
+      "request_id": publish_request_id,
+      "failure": format!("{failure:?}"),
+      "status_code": failure.status_code() as u64,
+    }),
   );
   let reason = ReasonPhrase::try_new(format!("switch: {failure:?}"))
     .unwrap_or_else(|_| ReasonPhrase::try_new(String::new()).unwrap());

@@ -57,4 +57,9 @@ pub struct Cli {
   /// harness sets this so a fixed-length collection never straddles that seam.
   #[arg(long, default_value_t = false)]
   pub no_loop: bool,
+
+  /// Project-local experiment event log (JSON lines): RUN_META once, then
+  /// one GROUP_EMIT per group per variant. Empty disables it.
+  #[arg(long, default_value = "")]
+  pub event_log: String,
 }

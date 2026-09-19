@@ -67,9 +67,20 @@ export class AbrRulesCollection {
   }
 
   getBestPossibleSwitchRequest(context: RulesContext): SwitchRequest | null {
+    return this.evaluate(context).chosen;
+  }
+
+  /**
+   * Run every active rule and return each rule's request alongside the
+   * collection's choice. Used by the experiment log so a switch decision can
+   * be attributed to the rule (and signal) that produced it.
+   */
+  evaluate(context: RulesContext): RulesEvaluation {
     const isLowLatencyMode = this.isRuleActive('L2ARule') || this.isRuleActive('LoLPRule');
 
     const requests: SwitchRequest[] = [];
+    const byRule: Record<string, SwitchRequest | null> = {};
+    const skipped: string[] = [];
 
     for (const [name, entry] of this.#rules) {
       if (!entry.active) continue;
@@ -77,20 +88,35 @@ export class AbrRulesCollection {
       // Apply dynamic mutual exclusivity for BolaRule and ThroughputRule
       if (name === 'BolaRule') {
         // Skip BOLA in low-latency mode, or when !shouldUseBolaRule in normal mode
-        if (isLowLatencyMode || !this.#shouldUseBolaRule) continue;
+        if (isLowLatencyMode || !this.#shouldUseBolaRule) {
+          skipped.push(name);
+          continue;
+        }
       } else if (name === 'ThroughputRule') {
         // Skip Throughput in low-latency mode, or when shouldUseBolaRule in normal mode
-        if (isLowLatencyMode || this.#shouldUseBolaRule) continue;
+        if (isLowLatencyMode || this.#shouldUseBolaRule) {
+          skipped.push(name);
+          continue;
+        }
       }
 
       const req = entry.rule.getMaxIndex(context);
+      byRule[name] = req;
       if (req !== null) {
         requests.push(req);
       }
     }
 
-    return getMinSwitchRequest(requests);
+    return { byRule, skipped, chosen: getMinSwitchRequest(requests) };
   }
+}
+
+export interface RulesEvaluation {
+  /** Every rule that ran, with its request (null = no opinion). */
+  byRule: Record<string, SwitchRequest | null>;
+  /** Active rules skipped by the BOLA/throughput exclusivity. */
+  skipped: string[];
+  chosen: SwitchRequest | null;
 }
 
 function getMinSwitchRequest(requests: SwitchRequest[]): SwitchRequest | null {

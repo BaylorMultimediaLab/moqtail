@@ -238,8 +238,8 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           last_sent_max_location: None,
           last_received_object_location: None,
           replay_watermarks: HashMap::new(),
-          // A SUBSCRIBE that names an explicit start location (delay-mode,
-          // AbsoluteStart, or a SWITCH carrying START_LOCATION_GROUP) must have
+          // A SUBSCRIBE that names an explicit start location (delay-mode or
+          // AbsoluteStart) must have
           // the cached objects in [start_location, live edge] replayed before
           // live objects flow. The replay path below is gated on `is_joining`;
           // without it those cached objects are silently dropped.

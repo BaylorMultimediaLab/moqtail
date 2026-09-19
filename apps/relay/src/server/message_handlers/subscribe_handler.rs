@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
+use crate::server::events;
 use crate::server::message_handlers::parameters;
 use crate::server::session::Session;
 use crate::server::session_context::{PendingRequest, SessionContext};
@@ -158,6 +159,15 @@ async fn handle_probe_subscribe(
   info!(
     "synthetic probe: request_id={} size={} priority={}",
     sub.request_id, size, probe_priority
+  );
+  events::emit(
+    "PROBE",
+    serde_json::json!({
+      "conn": client.connection_id,
+      "request_id": sub.request_id,
+      "size": size,
+      "priority": probe_priority,
+    }),
   );
 
   // Allocate a unique synthetic alias. PROBE_ALIAS_BASE puts these in a
@@ -709,12 +719,28 @@ async fn handle_subscribe_message(
       let oldest_cached = cache.oldest_group_id().await;
       let decision = compute_delayed_start(largest.clone(), delay_groups, oldest_cached);
 
+      let clamped = matches!(decision, DelayedStart::ClampedToOldest(_));
       match decision {
         DelayedStart::Ready(loc) | DelayedStart::ClampedToOldest(loc) => {
           info!(
             "Subscribe delay-mode resolved: request_id={} largest={:?} \
              oldest_cached={:?} -> start_location={:?}",
             sub.request_id, largest, oldest_cached, loc
+          );
+          events::emit(
+            "SUBSCRIBE_RECV",
+            serde_json::json!({
+              "conn": context.connection_id,
+              "request_id": sub.request_id,
+              "track": events::track_name_string(&full_track_name),
+              "is_switch": is_switch,
+              "delay_groups": delay_groups,
+              "decision": if clamped { "clamped" } else { "ready" },
+              "largest_group": largest.as_ref().map(|l| l.group),
+              "oldest_cached_group": oldest_cached,
+              "start_group": loc.group,
+              "held": registered,
+            }),
           );
           sub
             .subscribe_parameters
@@ -736,6 +762,16 @@ async fn handle_subscribe_message(
                largest={:?}; awaiting live edge advance",
               sub.request_id, dg, largest
             );
+            events::emit(
+              "SUBSCRIBE_HOLD",
+              serde_json::json!({
+                "conn": context.connection_id,
+                "request_id": sub.request_id,
+                "track": events::track_name_string(&full_track_name),
+                "delay_groups": dg,
+                "largest_group": largest.as_ref().map(|l| l.group),
+              }),
+            );
             holding_subscribes
               .write()
               .await
@@ -749,6 +785,22 @@ async fn handle_subscribe_message(
         }
       }
     }
+  }
+
+  if events::enabled() && parse_delay_groups(&sub.subscribe_parameters).is_none() {
+    let largest = { track_arc.read().await.largest_object().await };
+    events::emit(
+      "SUBSCRIBE_RECV",
+      serde_json::json!({
+        "conn": context.connection_id,
+        "request_id": sub.request_id,
+        "track": events::track_name_string(&full_track_name),
+        "is_switch": is_switch,
+        "delay_groups": serde_json::Value::Null,
+        "decision": "live",
+        "largest_group": largest.as_ref().map(|l| l.group),
+      }),
+    );
   }
 
   // Scoped so the guard is gone before anything below reaches for this lock again.
@@ -1457,6 +1509,19 @@ async fn handle_switch_message(
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
   info!("received Switch message: {:?}", switch_message);
+  events::emit(
+    "SWITCH_RECV",
+    serde_json::json!({
+      "conn": context.connection_id,
+      "request_id": serde_json::Value::Null,
+      "old_request_id": switch_message.current_subscribe_request_id,
+      "minimum_switching_group": switch_message.minimum_switching_group_id,
+      "track": format!(
+        "{:?}/{}",
+        switch_message.track_namespace, switch_message.track_name
+      ),
+    }),
+  );
 
   // SWITCH PR #1378: the relay carries out the switch by opening a PUBLISH for
   // the target Track toward the subscriber (it does not mutate the existing

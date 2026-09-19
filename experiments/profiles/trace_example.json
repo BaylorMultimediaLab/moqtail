@@ -1,0 +1,9 @@
+{
+  "name": "trace_example",
+  "description": "Replays a capacity trace: CSV with header t_s,rate_mbps (see traces/README).",
+  "queue": "tail-drop",
+  "queue_pkts": 100,
+  "delay_ms": 40,
+  "loss_pct": 0,
+  "trace": "traces/example_4g.csv"
+}

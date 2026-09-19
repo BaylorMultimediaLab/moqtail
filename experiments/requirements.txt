@@ -1,0 +1,2 @@
+# Optional: browser automation. Without it the runner launches Chromium directly.
+playwright>=1.45
