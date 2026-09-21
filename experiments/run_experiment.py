@@ -15,10 +15,12 @@ Typical Experiment-1 invocations (native SWITCH, live-edge vs 10 s time-shifted)
 
     sudo python3 experiments/run_experiment.py --mechanism native \\
         --client-mode live-edge --profile experiments/profiles/step_down_up.json \\
-        --duration 200 --net netns
+        --duration 200 --net netns --repeat 5
     sudo python3 experiments/run_experiment.py --mechanism native \\
         --client-mode time-shifted --time-shift 10 --profile experiments/profiles/step_down_up.json \\
-        --duration 200 --net netns
+        --duration 200 --net netns --repeat 5
+    git checkout switch/pr1378 && python3 experiments/run_experiment.py --mechanism pr1378 \\
+        --mechanism-mode playhead --client-mode time-shifted ...
 
 ``--net none`` runs unshaped (macOS, smoke tests). The binaries must already be
 built (``cargo build --release --workspace``) and the GOP cache prepared
@@ -44,6 +46,38 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
 from net import BackgroundFlows, Shape, make_backend  # noqa: E402
+
+# Mechanism label -> the modes it accepts (empty = takes none), the branch it
+# runs on, and the player URL parameter that selects the mode.
+MECHANISM_MODES = {"native": set(), "pr1378": {"next-group", "playhead"}, "switch-from": {"hard", "soft"}}
+MECHANISM_BRANCH = {"native": "switch/native", "pr1378": "switch/pr1378", "switch-from": "switch/pr1674"}
+MECHANISM_URL_PARAM = {"native": None, "pr1378": "switchFloor", "switch-from": "switchFromMode"}
+
+
+def _client_run_meta(out: Path) -> dict:
+    p = ROOT / "logs" / out.name / "client-events.jsonl"
+    if not p.exists():
+        p = out / "client-events.jsonl"
+    if not p.exists():
+        return {}
+    with p.open() as f:
+        for line in f:
+            if '"RUN_META"' in line:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") == "RUN_META":
+                    return rec
+    return {}
+
+
+def client_delay_groups(out: Path):
+    return _client_run_meta(out).get("delay_groups")
+
+
+def client_gop_duration_ms(out: Path):
+    return _client_run_meta(out).get("gop_duration_ms")
 
 
 def now_ms() -> float:
@@ -136,6 +170,30 @@ def wait_port(host: str, port: int, timeout: float) -> bool:
     return False
 
 
+def warm_vite(base: str) -> None:
+    """Load the page and its entry module twice. Vite optimises dependencies on
+    the first request and then forces a full page reload; if that happened
+    inside a run the client would restart mid-experiment (new request ids,
+    a second CLOCK_MAP), so trigger it here and wait until the served entry is
+    stable."""
+    import urllib.request
+    last = None
+    for attempt in range(6):
+        try:
+            html = urllib.request.urlopen(base + "/", timeout=10).read()
+            entry = urllib.request.urlopen(base + "/src/main.tsx", timeout=10).read()
+        except Exception as e:  # noqa: BLE001
+            print(f"[run] vite warm-up attempt {attempt}: {e}")
+            time.sleep(2)
+            continue
+        if last == (len(html), len(entry)) and attempt > 0:
+            print("[run] vite warm")
+            return
+        last = (len(html), len(entry))
+        time.sleep(3)
+    print("[run] WARNING: vite entry did not stabilise; a mid-run reload is possible")
+
+
 def find_browser(explicit: str | None) -> str | None:
     candidates = [explicit] if explicit else []
     candidates += [
@@ -152,7 +210,12 @@ def find_browser(explicit: str | None) -> str | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mechanism", required=True, help="label for the switching mechanism under test (native, pr1378, pr1674-hard, ...)")
+    ap.add_argument("--mechanism", required=True, choices=list(MECHANISM_MODES),
+                    help="switching mechanism under test; must match the checked-out branch")
+    ap.add_argument("--mechanism-mode", default=None,
+                    help="mechanism-specific mode: pr1378 next-group|playhead, switch-from hard|soft; none for native")
+    ap.add_argument("--repeat", type=int, default=1, help="independent repetitions of this condition")
+    ap.add_argument("--repeat-start", type=int, default=0, help="first repeat_index (to extend a series)")
     ap.add_argument("--client-mode", choices=["live-edge", "time-shifted"], default="live-edge")
     ap.add_argument("--time-shift", type=float, default=10.0, help="seconds behind live for time-shifted clients")
     ap.add_argument("--profile", type=Path, required=True)
@@ -179,10 +242,29 @@ def main() -> int:
                     help="skip rebuilding libs/moqtail-ts (the player imports its dist, which goes stale across branches)")
     args = ap.parse_args()
 
+    modes = MECHANISM_MODES[args.mechanism]
+    if modes and args.mechanism_mode not in modes:
+        ap.error(f"--mechanism {args.mechanism} needs --mechanism-mode one of {sorted(modes)}")
+    if not modes and args.mechanism_mode is not None:
+        ap.error(f"--mechanism {args.mechanism} takes no --mechanism-mode")
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    expected_branch = MECHANISM_BRANCH[args.mechanism]
+    if branch != expected_branch:
+        ap.error(f"--mechanism {args.mechanism} runs on branch {expected_branch}, but HEAD is {branch}")
+
+    for repeat_index in range(args.repeat_start, args.repeat_start + args.repeat):
+        code = run_once(args, repeat_index)
+        if code != 0:
+            return code
+    return 0
+
+
+def run_once(args, repeat_index: int) -> int:
     profile = load_profile(args.profile)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     mode = "live-edge" if args.client_mode == "live-edge" else f"shift{args.time_shift:g}s"
-    run_id = f"{stamp}_{args.mechanism}_{mode}_{profile['name']}_bg{args.bg_flows}"
+    mech = args.mechanism + (f"-{args.mechanism_mode}" if args.mechanism_mode else "")
+    run_id = f"{stamp}_{mech}_{mode}_{profile['name']}_bg{args.bg_flows}_r{repeat_index}"
     if args.label:
         run_id += f"_{args.label}"
     out = args.results / run_id
@@ -240,6 +322,7 @@ def main() -> int:
         ], out / "vite.log", env=vite_env)
         if not wait_port(backend.vite_host if backend.vite_host != "localhost" else "127.0.0.1", args.vite_port, 60):
             raise SystemExit("vite did not come up")
+        warm_vite(f"http://{backend.vite_host}:{args.vite_port}")
 
         # Let the publisher fill the relay cache past the requested shift so
         # a time-shifted SUBSCRIBE is never held (and never clamped) at startup.
@@ -266,6 +349,8 @@ def main() -> int:
                f"&relay=https://{backend.relay_host}:{args.relay_port}")
         if args.log_objects:
             url += "&logObjects=1"
+        if args.mechanism_mode:
+            url += f"&{MECHANISM_URL_PARAM[args.mechanism]}={args.mechanism_mode}"
         if args.abr:
             url += "&" + args.abr
         browser = find_browser(args.browser)
@@ -330,11 +415,38 @@ def main() -> int:
             shutil.copy(src, out / "client-events.jsonl")
         else:
             print(f"[run] WARNING: no client events at {src}")
+        # Immutable identity of this experiment instance. Every raw record lives
+        # under results/<run_id>/, so a row of any aggregate can be rebuilt from
+        # the raw logs plus this block alone.
+        identity = {
+            "run_id": run_id,
+            "git_sha": git("rev-parse", "HEAD"),
+            "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "mechanism": args.mechanism,
+            "mechanism_mode": args.mechanism_mode,
+            "client_type": args.client_mode,
+            "time_shift_s": args.time_shift if args.client_mode == "time-shifted" else 0,
+            "delay_groups": client_delay_groups(out),
+            "gop_duration_ms": client_gop_duration_ms(out),
+            "ladder_id": f"{args.ladder_spec}@{args.encoded_dir.name}",
+            "network_profile": profile["name"],
+            "trace_id": Path(profile["trace_file"]).stem if profile.get("trace_file") else None,
+            "qdisc": profile["queue"] if backend.name != "none" else "none",
+            "background_flows": args.bg_flows,
+            "background_pattern": args.bg_pattern if args.bg_flows else None,
+            "repeat_index": repeat_index,
+            "timestamp_start": stamp,
+            "duration_s": args.duration,
+            "abr_overrides": args.abr or None,
+            "seed": args.seed,
+        }
         meta = {
-            "run_id": run_id, "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-            "profile": profile, "git_branch": git("rev-parse", "--abbrev-ref", "HEAD"),
-            "git_sha": git("rev-parse", "HEAD"), "started": stamp, "host": os.uname().nodename,
-            "platform": sys.platform, "net_backend": backend.name,
+            "identity": identity,
+            "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+            "profile": profile, "host": os.uname().nodename, "platform": sys.platform,
+            "net_backend": backend.name,
+            # kept for older readers
+            "run_id": run_id, "git_branch": identity["branch"], "git_sha": identity["git_sha"], "started": stamp,
         }
         (out / "run_meta.json").write_text(json.dumps(meta, indent=2))
         print(f"[run] wrote {out / 'run_meta.json'}")

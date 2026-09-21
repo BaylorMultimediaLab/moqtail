@@ -67,20 +67,22 @@ export function estimateLiveEdge(opts: {
  * The time shift a client is asked to hold, in ms of media. A time-shifted client
  * requests `delayGroups` whole groups (the wire quantises the seconds value),
  * so the target is stated in groups times GOP duration rather than in the
- * seconds the user typed. An live-edge client targets the player's own
- * live-edge delay.
+ * seconds the user typed. A live-edge client has no shift target: its target
+ * is 0, so its time-shift error *is* its live-edge distance (the player's own
+ * live-edge delay is a tuning constant, not a target the experiment sets).
  */
 export function targetShiftMs(opts: {
   clientMode: 'time-shifted' | 'live-edge';
   timeShiftSeconds: number;
   gopDurationMs: number;
-  liveEdgeDelaySeconds: number;
+  /** Kept for callers; a live-edge client's target is 0 regardless. */
+  liveEdgeDelaySeconds?: number;
 }): { targetShiftMs: number; delayGroups: number } {
   if (opts.clientMode === 'time-shifted' && opts.timeShiftSeconds > 0 && opts.gopDurationMs > 0) {
     const delayGroups = Math.round((opts.timeShiftSeconds * 1000) / opts.gopDurationMs);
     return { targetShiftMs: delayGroups * opts.gopDurationMs, delayGroups };
   }
-  return { targetShiftMs: opts.liveEdgeDelaySeconds * 1000, delayGroups: 0 };
+  return { targetShiftMs: 0, delayGroups: 0 };
 }
 
 const NTP_UNIX_DELTA_SECONDS = 2_208_988_800;

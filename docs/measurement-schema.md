@@ -31,6 +31,13 @@ Enable the logs by hand with `relay --event-log <file>`,
 
 ## Run metadata
 
+`run_meta.json` carries an `identity` block (run id, git SHA, branch, mechanism,
+`mechanism_mode`, `client_type`, `delay_groups`, `gop_duration_ms`, `ladder_id`,
+`network_profile`, `trace_id`, `qdisc`, `background_flows`, `repeat_index`,
+`timestamp_start`); every aggregate row is rebuilt from it plus the raw logs.
+`experiments/validate.py` checks one run; `analyze.py --stats` reports per
+condition median, IQR and a bootstrap 95 % CI of the median across repetitions.
+
 - client `RUN_META`: `run_id`, `relay_url`, `namespace`, `client_mode`
   (`live-edge` = live-edge client, `time-shifted` = time-shifted client),
   `time_shift_s`, `delay_groups`, `target_shift_ms`, `gop_duration_ms`,
@@ -82,6 +89,7 @@ groups, so the target is stated in groups, not in the seconds typed.
 | `SWITCH_PROMOTED` | the new track became Current: `trigger_group`, `start_group`                                                                                                     |
 | `PROBE`           | synthetic probe served                                                                                                                                           |
 | `CACHE_STATS`     | once per second per track: `groups`, `bytes`, `oldest_group`, `newest_group`                                                                                     |
+| `CACHE_GROUP`     | a group's first object entered a track's cache: `relay_track_id`, `group`, `first_object` (joins publisher `GROUP_EMIT` to client `OBJECT_RECV`)                 |
 | `CACHE_EVICT`     | `group`, `objects`, `bytes`, `cause`                                                                                                                             |
 
 Mechanism branches add their own relay events (for example a fill or
@@ -113,8 +121,8 @@ catch-up stream) using the same helper; they must keep these names.
   where `live_edge_distance_ms = (prft.media_ms + (now - prft.capture_ms)) - playhead_ms`
   from the most recent Producer Reference Time box on the video track.
   Positive means further behind live than requested. `abs` statistics are
-  reported alongside. For a live-edge client the target is the player's
-  live-edge delay (0.6 s) and the distance itself is the metric.
+  reported alongside. A live-edge client's target is 0, so its error equals
+  its live-edge distance, which is the metric for that client type.
 - **Switch timeline** per switch: `t2` decision (`ABR_DECISION`), `t3`
   `SWITCH_SENT` (and `SWITCH_OK` round trip), relay `SWITCH_RECV` and
   `SWITCH_PROMOTED` (with the group the relay started the new track at),

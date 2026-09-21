@@ -37,14 +37,14 @@ describe('targetShiftMs', () => {
     expect(t).toEqual({ targetShiftMs: 10_000, delayGroups: 10 });
   });
 
-  it('uses the player live-edge delay for an live-edge client', () => {
+  it('has a zero target for a live-edge client', () => {
     const t = targetShiftMs({
       clientMode: 'live-edge',
       timeShiftSeconds: 10,
       gopDurationMs: 1000,
       liveEdgeDelaySeconds: 0.6,
     });
-    expect(t).toEqual({ targetShiftMs: 600, delayGroups: 0 });
+    expect(t).toEqual({ targetShiftMs: 0, delayGroups: 0 });
   });
 });
 
