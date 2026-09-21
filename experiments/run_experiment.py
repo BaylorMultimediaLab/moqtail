@@ -14,10 +14,10 @@ Everything the run produces lands in ``results/<run_id>/``:
 Typical Experiment-1 invocations (native SWITCH, live-edge vs 10 s time-shifted):
 
     sudo python3 experiments/run_experiment.py --mechanism native \\
-        --client-mode unfiltered --profile experiments/profiles/step_down_up.json \\
+        --client-mode live-edge --profile experiments/profiles/step_down_up.json \\
         --duration 200 --net netns
     sudo python3 experiments/run_experiment.py --mechanism native \\
-        --client-mode filtered --filter-delay 10 --profile experiments/profiles/step_down_up.json \\
+        --client-mode time-shifted --time-shift 10 --profile experiments/profiles/step_down_up.json \\
         --duration 200 --net netns
 
 ``--net none`` runs unshaped (macOS, smoke tests). The binaries must already be
@@ -153,8 +153,8 @@ def find_browser(explicit: str | None) -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mechanism", required=True, help="label for the switching mechanism under test (native, pr1378, pr1674-hard, ...)")
-    ap.add_argument("--client-mode", choices=["unfiltered", "filtered"], default="unfiltered")
-    ap.add_argument("--filter-delay", type=float, default=10.0, help="seconds behind live for filtered clients")
+    ap.add_argument("--client-mode", choices=["live-edge", "time-shifted"], default="live-edge")
+    ap.add_argument("--time-shift", type=float, default=10.0, help="seconds behind live for time-shifted clients")
     ap.add_argument("--profile", type=Path, required=True)
     ap.add_argument("--duration", type=float, default=180.0, help="seconds of playback to record")
     ap.add_argument("--net", choices=["none", "netns"], default="none")
@@ -181,7 +181,7 @@ def main() -> int:
 
     profile = load_profile(args.profile)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    mode = "live-edge" if args.client_mode == "unfiltered" else f"shift{args.filter_delay:g}s"
+    mode = "live-edge" if args.client_mode == "live-edge" else f"shift{args.time_shift:g}s"
     run_id = f"{stamp}_{args.mechanism}_{mode}_{profile['name']}_bg{args.bg_flows}"
     if args.label:
         run_id += f"_{args.label}"
@@ -242,8 +242,8 @@ def main() -> int:
             raise SystemExit("vite did not come up")
 
         # Let the publisher fill the relay cache past the requested shift so
-        # a filtered SUBSCRIBE is never held (and never clamped) at startup.
-        warmup = max(5.0, args.filter_delay + 3.0) if args.client_mode == "filtered" else 5.0
+        # a time-shifted SUBSCRIBE is never held (and never clamped) at startup.
+        warmup = max(5.0, args.time_shift + 3.0) if args.client_mode == "time-shifted" else 5.0
         print(f"[run] warming up publisher for {warmup:.0f}s")
         time.sleep(warmup)
 
@@ -262,7 +262,7 @@ def main() -> int:
 
         # Browser ------------------------------------------------------------
         url = (f"http://{backend.vite_host}:{args.vite_port}/?run={run_id}&autoConnect=1"
-               f"&clientMode={args.client_mode}&filterDelay={args.filter_delay:g}"
+               f"&clientMode={args.client_mode}&timeShift={args.time_shift:g}"
                f"&relay=https://{backend.relay_host}:{args.relay_port}")
         if args.log_objects:
             url += "&logObjects=1"

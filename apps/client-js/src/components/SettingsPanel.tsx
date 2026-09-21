@@ -25,10 +25,10 @@ export interface SettingsPanelProps {
   blurSettings: BlurSettings;
   onBlurSettingsChange: (settings: BlurSettings) => void;
   // Pre-connect client mode (immutable while connected).
-  clientMode: 'filtered' | 'unfiltered';
-  onClientModeChange: (mode: 'filtered' | 'unfiltered') => void;
-  filterDelaySeconds: number;
-  onFilterDelaySecondsChange: (seconds: number) => void;
+  clientMode: 'time-shifted' | 'live-edge';
+  onClientModeChange: (mode: 'time-shifted' | 'live-edge') => void;
+  timeShiftSeconds: number;
+  onTimeShiftSecondsChange: (seconds: number) => void;
   /** When non-'idle', the Connection card is disabled. */
   connectStatus: 'idle' | 'connecting' | 'ready' | 'restarting' | 'playing' | 'error';
   /** SWITCH_FROM mode: PR #1674 hard or PR #1675 soft. */
@@ -131,8 +131,8 @@ export function SettingsPanel({
   onBlurSettingsChange,
   clientMode,
   onClientModeChange,
-  filterDelaySeconds,
-  onFilterDelaySecondsChange,
+  timeShiftSeconds,
+  onTimeShiftSecondsChange,
   connectStatus,
   switchFromMode,
   onSwitchFromModeChange,
@@ -170,7 +170,7 @@ export function SettingsPanel({
           <OptionCard title="Connection">
             <SectionLabel>Client Mode</SectionLabel>
             <div className="mb-2 flex gap-1">
-              {(['unfiltered', 'filtered'] as const).map(m => (
+              {(['live-edge', 'time-shifted'] as const).map(m => (
                 <button
                   key={m}
                   disabled={connectStatus !== 'idle'}
@@ -187,15 +187,15 @@ export function SettingsPanel({
                 </button>
               ))}
             </div>
-            {clientMode === 'filtered' && (
+            {clientMode === 'time-shifted' && (
               <>
-                <SectionLabel>Filter Delay (s)</SectionLabel>
+                <SectionLabel>Time Shift (s)</SectionLabel>
                 <div className={cn(connectStatus !== 'idle' && 'pointer-events-none opacity-50')}>
                   <NumberInput
                     label="Seconds behind live"
-                    value={filterDelaySeconds}
+                    value={timeShiftSeconds}
                     placeholder="2"
-                    onChange={v => onFilterDelaySecondsChange(v < 0 ? 0 : v)}
+                    onChange={v => onTimeShiftSecondsChange(v < 0 ? 0 : v)}
                   />
                 </div>
               </>
