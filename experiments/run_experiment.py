@@ -97,6 +97,15 @@ class RunnerLog:
         self.f.close()
 
 
+def worktree_dirty() -> bool:
+    """Tracked modifications or untracked (non-ignored) files in the repo."""
+    try:
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+        return bool(out.strip())
+    except Exception:
+        return True
+
+
 def git(*args: str) -> str:
     try:
         return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
@@ -238,6 +247,8 @@ def main() -> int:
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
     ap.add_argument("--no-analyze", action="store_true")
+    ap.add_argument("--final", action="store_true",
+                    help="paper-quality run: refuse a dirty worktree up front and validate with --final")
     ap.add_argument("--no-lib-build", action="store_true",
                     help="skip rebuilding libs/moqtail-ts (the player imports its dist, which goes stale across branches)")
     args = ap.parse_args()
@@ -248,6 +259,8 @@ def main() -> int:
     if not modes and args.mechanism_mode is not None:
         ap.error(f"--mechanism {args.mechanism} takes no --mechanism-mode")
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    if args.final and worktree_dirty():
+        ap.error("--final requires a clean git worktree (commit or stash first)")
     expected_branch = MECHANISM_BRANCH[args.mechanism]
     if branch != expected_branch:
         ap.error(f"--mechanism {args.mechanism} runs on branch {expected_branch}, but HEAD is {branch}")
@@ -436,6 +449,8 @@ def run_once(args, repeat_index: int) -> int:
             "background_pattern": args.bg_pattern if args.bg_flows else None,
             "repeat_index": repeat_index,
             "timestamp_start": stamp,
+            "dirty_worktree": worktree_dirty(),
+            "final": args.final,
             "duration_s": args.duration,
             "abr_overrides": args.abr or None,
             "seed": args.seed,
@@ -451,7 +466,14 @@ def run_once(args, repeat_index: int) -> int:
         (out / "run_meta.json").write_text(json.dumps(meta, indent=2))
         print(f"[run] wrote {out / 'run_meta.json'}")
         if not args.no_analyze and exit_code == 0:
-            subprocess.run([sys.executable, str(HERE / "analyze.py"), str(out)], check=False)
+            subprocess.run([sys.executable, str(HERE / "analyze.py"), str(out), "--quiet"], check=False)
+            vcmd = [sys.executable, str(HERE / "validate.py"), str(out)] + (["--final"] if args.final else [])
+            print("[run] validation:")
+            v = subprocess.run(vcmd, check=False)
+            meta["validity"] = {"passed": v.returncode == 0, "final": args.final}
+            (out / "run_meta.json").write_text(json.dumps(meta, indent=2))
+            if v.returncode != 0:
+                print(f"[run] WARNING: validation FAILED; the run is marked invalid (see {out / 'validation.json'})")
     return exit_code
 
 

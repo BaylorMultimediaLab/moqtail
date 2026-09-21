@@ -49,22 +49,20 @@ export interface DiscontinuityRecord {
   // PTS-domain (headline)
   oldEndPTS_ms?: number;
   newStartPTS_ms: number;
-  /** Buffer-end gap: newStartPTS_ms - oldEndPTS_ms. Diagnostic only — measures
-   *  buffered-region continuity, NOT user-visible discontinuity. With a fast
-   *  link the buffer reaches the live edge, so both naive and aligned modes
-   *  produce ~0 here. Use `playheadGapMs` for live-edge-vs-time-shifted differentiation. */
-  ptsGapMs: number;
+  /** Media seam gap: newStartPTS_ms - oldEndPTS_ms. Buffered-region continuity at
+   *  the seam (0 = contiguous), not a viewer-visible discontinuity. */
+  mediaSeamGapMs: number;
   /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
   playheadPTS_ms?: number;
-  /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
-   *  jump introduced by the switch — naive on a time-shifted client lands ~timeShift×1000
-   *  positive (relay delivers from live edge while playhead is timeShift s behind);
-   *  aligned lands ~0. Undefined for `connect` records. */
-  playheadGapMs?: number;
+  /** Seam distance ahead of the playhead: newStartPTS_ms - playheadPTS_ms, i.e. how
+   *  much media the viewer still plays before seeing the new representation.
+   *  Undefined for `connect` records. */
+  seamAheadOfPlayheadMs?: number;
 
   // wall-clock context
   wallClockMs: number;
-  perceivedPauseMs?: number;
+  /** Wall-clock pause at the seam crossing beyond one frame period (ms). */
+  viewerPauseMs?: number;
 
   // connect-time clamp signal (Task C4)
   expectedStartGroup?: number;
@@ -82,12 +80,11 @@ interface PendingSwitch {
   mimeType: string;
   /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
   oldEndPTS_ms: number | undefined;
-  /** Snapshot of video.currentTime * 1000 at switchTrack() call — used by the discontinuity
-   *  record's `playheadGapMs` (newStart − playhead) which is the headline live-edge-vs-time-shifted metric. */
+  /** Snapshot of video.currentTime * 1000 at switchTrack() call, for `seamAheadOfPlayheadMs`. */
   playheadPTS_ms: number | undefined;
-  /** performance.now() at switchTrack() call — for wallClockMs and perceivedPauseMs. */
+  /** performance.now() at switchTrack() call — for wallClockMs and the visibility delay. */
   switchSentAt: number;
-  /** videoElement.getVideoPlaybackQuality().totalVideoFrames at switch time — for perceivedPauseMs (Task C5). */
+  /** videoElement.getVideoPlaybackQuality().totalVideoFrames at switch time (diagnostic). */
   framesAtSwitch: number;
 }
 
@@ -100,24 +97,25 @@ interface MOQStreamStruct {
   pendingSwitch: PendingSwitch | null;
   /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
-  /** Set true after the first frame is rendered post-switch. Reset when pendingSwitch is set. Used by C5 (perceivedPauseMs). */
+  /** Set true after the first new-track frame is presented post-switch. Reset when pendingSwitch is set. */
   firstFrameAfterSwitchSeen?: boolean;
   /**
-   * When a switch is in progress, this holds the totalVideoFrames count at
-   * switchTrack time. Once totalVideoFrames > this value, the first new-track
-   * frame has rendered and perceivedPauseMs is computed.
-   *
-   * Set in the write handler when the new init segment is applied; consumed
-   * (and cleared) by the rVFC poll.
+   * Media time (ms) where the new representation begins in the buffer: the
+   * first appended target frame's PTS. The rVFC poll watches presented
+   * `mediaTime` cross it; that presented frame is the first the viewer sees
+   * of the new representation. Set when the new init segment is applied;
+   * cleared by the poll.
    */
-  postSwitchFrameTarget?: number;
+  postSwitchSeamPTS_ms?: number;
+  /** Frame duration (ms) of the most recently parsed object, for seam arithmetic. */
+  lastFrameDurationMs?: number;
   /** Snapshot of pendingSwitch.switchSentAt at the moment of init-segment application. */
   postSwitchSentAt?: number;
   /** Source track of the switch whose first frame is awaited (for SWITCH_FIRST_FRAME). */
   postSwitchFromTrack?: string;
   /** tracker.getSampleCount() after the previous object; a change means a THROUGHPUT_SAMPLE was finalised. */
   lastSampleCount?: number;
-  /** Track name to attach perceivedPauseMs to in switchDiscontinuities. */
+  /** Track name to attach viewerPauseMs to in switchDiscontinuities. */
   postSwitchToTrack?: string;
   buffer?: {
     sourceBuffer: SourceBuffer;
@@ -512,7 +510,7 @@ export class Player {
         this.#element!.currentTime = target;
         this.#element!.play();
         // Install the rVFC poll that detects first-frame-rendered post-switch
-        // and computes perceivedPauseMs (Task C5). Safe to install once playback
+        // and the seam-crossing metrics. Safe to install once playback
         // has started — the element is non-null and ready to render frames.
         this.#installPerceivedPausePoll();
       }
@@ -637,13 +635,17 @@ export class Player {
                 framesAtSwitch,
               } = struct.pendingSwitch;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
+              // The source's last appended frame at the moment the switch lands
+              // (the send-time snapshot in pendingSwitch predates ~1 GOP of
+              // source frames that arrived while the SWITCH was in flight).
+              const sourceEndAtApplyPTS_ms = struct.lastAppendedEndPTS_ms;
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
-              struct.firstFrameAfterSwitchSeen = false; // reset for C5
-              // Stash C5 state on sibling struct fields that survive the
-              // pendingSwitch clear. The rVFC poll consumes these to compute
-              // perceivedPauseMs and attach it to the discontinuity record.
-              struct.postSwitchFrameTarget = framesAtSwitch;
+              struct.firstFrameAfterSwitchSeen = false;
+              // Stash post-switch state on sibling struct fields that survive the
+              // pendingSwitch clear; the rVFC poll consumes them once the presented
+              // media time crosses the seam.
+              void framesAtSwitch;
               struct.postSwitchSentAt = switchSentAt;
               struct.postSwitchToTrack = newTrackName;
               struct.postSwitchFromTrack = fromTrack;
@@ -696,22 +698,36 @@ export class Player {
                 group: object.location.group,
                 object: object.location.object,
                 new_start_pts_ms: newStartPTS_ms ?? null,
-                old_end_pts_ms: oldEndPTS_ms ?? null,
-                pts_gap_ms:
-                  newStartPTS_ms !== undefined && oldEndPTS_ms !== undefined
-                    ? newStartPTS_ms - oldEndPTS_ms
+                old_end_pts_ms: sourceEndAtApplyPTS_ms ?? null,
+                old_end_pts_at_send_ms: oldEndPTS_ms ?? null,
+                // Seam continuity of the appended media: first target frame PTS
+                // minus the last appended source frame's end PTS at landing time
+                // (0 = contiguous, >0 = hole, <0 = overlap: the target restarts
+                // inside media the source already covered).
+                media_seam_gap_ms:
+                  newStartPTS_ms !== undefined && sourceEndAtApplyPTS_ms !== undefined
+                    ? newStartPTS_ms - sourceEndAtApplyPTS_ms
                     : null,
+                // A switch that lands on object 0 starts on the group's keyframe.
+                landed_on_group_start: object.location.object === 0n,
                 playhead_ms: playheadPTS_ms ?? null,
-                playhead_gap_ms:
+                // How far ahead of the viewer the new representation lands: the
+                // media the viewer still has to play before seeing it. NOT a
+                // playback-position jump; that is measured at the seam crossing.
+                seam_ahead_of_playhead_ms:
                   newStartPTS_ms !== undefined && playheadPTS_ms !== undefined
                     ? newStartPTS_ms - playheadPTS_ms
                     : null,
                 since_sent_ms: performance.now() - switchSentAt,
               });
+              struct.postSwitchSeamPTS_ms = newStartPTS_ms;
 
               if (newStartPTS_ms !== undefined) {
-                const ptsGapMs = oldEndPTS_ms !== undefined ? newStartPTS_ms - oldEndPTS_ms : 0;
-                const playheadGapMs =
+                const mediaSeamGapMs =
+                  sourceEndAtApplyPTS_ms !== undefined
+                    ? newStartPTS_ms - sourceEndAtApplyPTS_ms
+                    : 0;
+                const seamAheadOfPlayheadMs =
                   playheadPTS_ms !== undefined ? newStartPTS_ms - playheadPTS_ms : undefined;
                 const wallClockMs = performance.now() - switchSentAt;
                 const record: DiscontinuityRecord = {
@@ -722,9 +738,9 @@ export class Player {
                   toTrack: newTrackName,
                   oldEndPTS_ms,
                   newStartPTS_ms,
-                  ptsGapMs,
+                  mediaSeamGapMs,
                   playheadPTS_ms,
-                  playheadGapMs,
+                  seamAheadOfPlayheadMs,
                   wallClockMs,
                   clientMode: this.#options.clientMode,
                   timeShiftSeconds: this.#options.timeShiftSeconds,
@@ -769,6 +785,7 @@ export class Player {
               if (info !== undefined) {
                 decodeTimeMs = info.decodeTimeMs;
                 struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
+                struct.lastFrameDurationMs = info.frameDurationMs;
                 // Feed the TimeMap so measurements can resolve playhead -> group.
                 // Only the first object of each group records (idempotent in TimeMap),
                 // and frame 0 of a group has decodeTime == group start PTS.
@@ -900,7 +917,7 @@ export class Player {
 
                   const connectGopDurationMs =
                     this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
-                  const ptsGapMs = (actual - expected) * connectGopDurationMs;
+                  const mediaSeamGapMs = (actual - expected) * connectGopDurationMs;
                   const wallClockMs = performance.now() - this.#connectSentAt;
 
                   const record: DiscontinuityRecord = {
@@ -909,7 +926,7 @@ export class Player {
                     switchAppliedAt: performance.now(),
                     toTrack: struct.trackName,
                     newStartPTS_ms: newStartPTS_ms ?? 0,
-                    ptsGapMs,
+                    mediaSeamGapMs,
                     wallClockMs,
                     expectedStartGroup: expected,
                     actualStartGroup: actual,
@@ -1113,31 +1130,30 @@ export class Player {
   }
 
   /**
-   * Recurring requestVideoFrameCallback poll that detects the first new-track
-   * frame actually rendering after a track switch (Task C5).
+   * Recurring requestVideoFrameCallback poll.
    *
-   * Each fired callback fires on every rendered frame. For each stream struct
-   * in the post-switch awaiting state (sibling fields stashed by the write
-   * handler when the new init segment was applied), check whether
-   * totalVideoFrames has advanced past the snapshot taken at switchTrack()
-   * time. If so, the first new-track frame has rendered: compute
-   * perceivedPauseMs = performance.now() - switchSentAt and attach it to the
-   * most recent matching switch record in window.__moqtailMetrics.switchDiscontinuities.
-   *
-   * Re-arms each frame for the lifetime of the player — per-tick work is a
-   * cheap for-loop over streams.
+   * Every presented frame reports its `mediaTime`. The first presented frame
+   * whose media time is at or past a pending switch's seam PTS is the first
+   * frame of the new representation the viewer sees. At that frame:
+   *   switch_visibility_delay_ms = now - switchSentAt
+   *   playback_position_jump_ms  = mediaTime - previous mediaTime - one frame
+   *                                (0 when the seam is played through contiguously)
+   *   viewer_pause_ms            = wall-clock gap to the previous presented frame
+   *                                beyond one frame period (0 when smooth)
+   * The poll also reports STARTUP on the first presented frame.
    */
   #installPerceivedPausePoll(): void {
     if (!this.#element) return;
-    const poll = () => {
+    let prevMediaMs: number | undefined;
+    let prevNowMs: number | undefined;
+    const poll = (now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata) => {
       if (!this.#element) return;
-      const total = this.#element.getVideoPlaybackQuality().totalVideoFrames;
-      if (!this.#firstFrameSeen && total > 0) {
+      const mediaMs = metadata.mediaTime * 1000;
+      if (!this.#firstFrameSeen) {
         this.#firstFrameSeen = true;
-        const now = performance.now();
         events.emit('STARTUP', {
           track: this.getMetrics().activeTrack,
-          playhead_ms: this.#element.currentTime * 1000,
+          playhead_ms: mediaMs,
           connect_to_first_object_ms:
             this.#tConnectStart !== undefined && this.#tFirstObject !== undefined
               ? this.#tFirstObject - this.#tConnectStart
@@ -1148,45 +1164,68 @@ export class Player {
         });
       }
       for (const struct of this.#streams) {
+        const seam = struct.postSwitchSeamPTS_ms;
         if (
           struct.firstFrameAfterSwitchSeen !== true &&
-          struct.postSwitchFrameTarget !== undefined &&
+          seam !== undefined &&
           struct.postSwitchSentAt !== undefined &&
-          struct.postSwitchToTrack !== undefined &&
-          total > struct.postSwitchFrameTarget
+          struct.postSwitchToTrack !== undefined
         ) {
+          const frameMs = struct.lastFrameDurationMs ?? 1000 / 30;
+          if (mediaMs < seam - frameMs / 2) continue;
           struct.firstFrameAfterSwitchSeen = true;
-          const perceivedPauseMs = performance.now() - struct.postSwitchSentAt;
+          const visibilityDelayMs = now - struct.postSwitchSentAt;
+          const jumpMs = prevMediaMs !== undefined ? mediaMs - prevMediaMs - frameMs : null;
+          const pauseMs = prevNowMs !== undefined ? Math.max(0, now - prevNowMs - frameMs) : null;
           const targetTrack = struct.postSwitchToTrack;
+          // Ground truth for the seam: the hole in the element's buffered ranges
+          // just before the range that holds the presented frame (0 = the seam
+          // lies inside one contiguous range). This is what a range-jump seek
+          // crosses; the parsed-PTS gap above cannot see frames the decoder
+          // never presented.
+          let bufferHoleMs: number | null = null;
+          const ranges = this.#element.buffered;
+          for (let i = 0; i < ranges.length; i++) {
+            if (
+              ranges.start(i) * 1000 - frameMs <= mediaMs &&
+              mediaMs <= ranges.end(i) * 1000 + frameMs
+            ) {
+              bufferHoleMs = i > 0 ? (ranges.start(i) - ranges.end(i - 1)) * 1000 : 0;
+              break;
+            }
+          }
           events.emit('SWITCH_FIRST_FRAME', {
             from: struct.postSwitchFromTrack ?? null,
             to: targetTrack,
-            perceived_pause_ms: perceivedPauseMs,
-            playhead_ms: this.#element.currentTime * 1000,
+            seam_pts_ms: seam,
+            presented_pts_ms: mediaMs,
+            switch_visibility_delay_ms: visibilityDelayMs,
+            playback_position_jump_ms: jumpMs,
+            viewer_pause_ms: pauseMs,
+            seam_buffer_hole_ms: bufferHoleMs,
           });
 
-          // Find the most recent matching switch record and attach.
           if (typeof window !== 'undefined' && window.__moqtailMetrics) {
             const records = window.__moqtailMetrics.switchDiscontinuities;
             if (records) {
               for (let i = records.length - 1; i >= 0; i--) {
                 const r = records[i];
                 if (r && r.eventType === 'switch' && r.toTrack === targetTrack) {
-                  r.perceivedPauseMs = perceivedPauseMs;
+                  r.viewerPauseMs = pauseMs ?? undefined;
                   break;
                 }
               }
             }
           }
 
-          // Clean up — switch transition complete.
-          struct.postSwitchFrameTarget = undefined;
+          struct.postSwitchSeamPTS_ms = undefined;
           struct.postSwitchSentAt = undefined;
           struct.postSwitchToTrack = undefined;
           struct.postSwitchFromTrack = undefined;
         }
       }
-      // Re-arm for next frame.
+      prevMediaMs = mediaMs;
+      prevNowMs = now;
       this.#element.requestVideoFrameCallback(poll);
     };
     this.#element.requestVideoFrameCallback(poll);
