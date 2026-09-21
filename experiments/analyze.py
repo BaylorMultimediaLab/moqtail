@@ -60,6 +60,21 @@ def load(run: Path) -> list[dict]:
     return recs
 
 
+def last_session(recs: list[dict]) -> tuple[list[dict], int]:
+    """Keep only the client records of the last page session (reloads restart
+    request ids, so sessions must not be mixed). Returns (records, sessions)."""
+    sessions = sorted({r.get("session") for r in recs if r.get("src") == "client" and r.get("session") is not None})
+    if len(sessions) <= 1:
+        return recs, len(sessions)
+    last = sessions[-1]
+    return [r for r in recs if r.get("src") != "client" or r.get("session") == last], len(sessions)
+
+
+def wall_clock_gaps(recs: list[dict], event: str = "SAMPLE", threshold_ms: float = 5000.0) -> list[float]:
+    ts = [r["ts"] for r in recs if r.get("event") == event]
+    return [b - a for a, b in zip(ts, ts[1:]) if b - a > threshold_ms]
+
+
 def pct(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -99,7 +114,7 @@ def first(recs: list[dict], event: str, after: float = -1, pred=None) -> dict | 
 
 
 def analyze(run: Path, t1_tol: float, offset_tol_ms: float, offset_hold_s: float) -> dict:
-    recs = load(run)
+    recs, sessions = last_session(load(run))
     by = lambda ev: [r for r in recs if r.get("event") == ev]  # noqa: E731
     meta = json.loads((run / "run_meta.json").read_text()) if (run / "run_meta.json").exists() else {}
     client_meta = first(recs, "RUN_META", pred=lambda r: r.get("src") == "client") or {}
@@ -108,9 +123,13 @@ def analyze(run: Path, t1_tol: float, offset_tol_ms: float, offset_hold_s: float
     index_of = {t["track"]: i for i, t in enumerate(ladder)}
     bitrate_of = {t["track"]: (t.get("bitrate") or 0) for t in ladder}
 
+    identity = meta.get("identity") or {}
     out: dict = {
         "run_id": meta.get("run_id", run.name),
-        "mechanism": meta.get("args", {}).get("mechanism"),
+        "identity": identity,
+        "mechanism": identity.get("mechanism") or meta.get("args", {}).get("mechanism"),
+        "mechanism_mode": identity.get("mechanism_mode"),
+        "repeat_index": identity.get("repeat_index"),
         "client_mode": client_meta.get("client_mode"),
         "time_shift_s": client_meta.get("time_shift_s"),
         "delay_groups": client_meta.get("delay_groups"),
@@ -119,6 +138,8 @@ def analyze(run: Path, t1_tol: float, offset_tol_ms: float, offset_hold_s: float
         "bg_flows": meta.get("args", {}).get("bg_flows"),
         "gops_per_variant": pub_meta.get("gops_per_variant"),
         "events": len(recs),
+        "client_sessions": sessions,
+        "wall_clock_gaps_ms": wall_clock_gaps(recs),
     }
 
     # Startup ---------------------------------------------------------------
@@ -367,16 +388,28 @@ def to_markdown(s: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-AGG_COLUMNS = ["run_id", "mechanism", "client_mode", "time_shift_s", "profile", "bg_flows", "startup_delay_ms",
-               "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down", "t4_mean_ms", "t5_mean_ms",
-               "playhead_gap_mean_ms", "abs_playhead_gap_p95_ms", "shift_err_mean_ms", "shift_abs_err_p95_ms",
-               "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps", "cache_max_bytes", "relay_max_rss_mb"]
+IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "client_type", "delay_groups",
+                    "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "background_flows",
+                    "repeat_index", "timestamp_start"]
+METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down",
+                  "t4_mean_ms", "t5_mean_ms", "playhead_gap_mean_ms", "abs_playhead_gap_p95_ms", "shift_err_mean_ms",
+                  "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps", "cache_max_bytes",
+                  "relay_max_rss_mb"]
+AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
 
 
 def agg_row(s: dict) -> dict:
-    return {
-        "run_id": s["run_id"], "mechanism": s["mechanism"], "client_mode": s["client_mode"],
-        "time_shift_s": s["time_shift_s"], "profile": s["profile"], "bg_flows": s["bg_flows"],
+    """One aggregate row per run: the identity block plus the headline metrics."""
+    ident = dict(s.get("identity") or {})
+    # Runs recorded before the identity block existed: rebuild what we can.
+    ident.setdefault("run_id", s["run_id"])
+    ident.setdefault("mechanism", s["mechanism"])
+    ident.setdefault("client_type", s["client_mode"])
+    ident.setdefault("delay_groups", s["delay_groups"])
+    ident.setdefault("network_profile", s["profile"])
+    ident.setdefault("background_flows", s["bg_flows"])
+    row = {k: ident.get(k) for k in IDENTITY_COLUMNS}
+    row.update({
         "startup_delay_ms": s["startup"]["startup_delay_ms"], "stall_count": s["stalls"]["count"],
         "stall_total_ms": s["stalls"]["total_ms"], "switch_count": s["switches"]["count"],
         "switch_up": s["switches"]["up"], "switch_down": s["switches"]["down"],
@@ -391,13 +424,54 @@ def agg_row(s: dict) -> dict:
         "bitrate_kbps": s["bitrate"].get("time_weighted_mean_kbps"),
         "cache_max_bytes": s["cache"]["total_max_bytes"],
         "relay_max_rss_mb": (s["process"].get("relay", {}).get("max_rss_bytes") or 0) / 1e6 or None,
-    }
+    })
+    return row
+
+
+CONDITION_KEYS = ["mechanism", "mechanism_mode", "client_type", "delay_groups", "network_profile", "qdisc",
+                  "background_flows", "ladder_id"]
+
+
+def bootstrap_ci(values: list[float], iterations: int = 2000, seed: int = 1) -> tuple[float, float] | None:
+    """95 % percentile-bootstrap confidence interval of the median."""
+    import random
+    vals = [v for v in values if v is not None]
+    if len(vals) < 2:
+        return None
+    rng = random.Random(seed)
+    meds = sorted(statistics.median([rng.choice(vals) for _ in vals]) for _ in range(iterations))
+    return meds[int(0.025 * (iterations - 1))], meds[int(0.975 * (iterations - 1))]
+
+
+def condition_stats(rows: list[dict]) -> list[dict]:
+    """Per condition (every identity key except repeat_index and the timestamps): n,
+    median, IQR and a bootstrap 95 % CI of the median for each metric column."""
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(tuple(r.get(k) for k in CONDITION_KEYS), []).append(r)
+    out = []
+    for key, members in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        rec: dict = dict(zip(CONDITION_KEYS, key))
+        rec["n"] = len(members)
+        for m in METRIC_COLUMNS:
+            vals = [r[m] for r in members if r.get(m) is not None]
+            if not vals:
+                continue
+            rec[f"{m}_median"] = statistics.median(vals)
+            rec[f"{m}_q1"] = pct(vals, 0.25)
+            rec[f"{m}_q3"] = pct(vals, 0.75)
+            ci = bootstrap_ci(vals)
+            rec[f"{m}_ci95_lo"], rec[f"{m}_ci95_hi"] = ci if ci else (None, None)
+        out.append(rec)
+    return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("runs", nargs="+", type=Path)
-    ap.add_argument("--csv", type=Path, default=None, help="aggregate CSV across runs")
+    ap.add_argument("--csv", type=Path, default=None, help="aggregate CSV across runs (one row per run)")
+    ap.add_argument("--stats", type=Path, default=None,
+                    help="per-condition CSV: n, median, IQR, bootstrap 95%% CI of the median for each metric")
     ap.add_argument("--t1-tolerance", type=float, default=0.25, help="fraction of the new rate for t1")
     ap.add_argument("--offset-tolerance", type=float, default=500.0, help="ms for offset recovery")
     ap.add_argument("--offset-hold", type=float, default=5.0, help="seconds within tolerance for offset recovery")
@@ -420,6 +494,23 @@ def main() -> int:
             w.writeheader()
             w.writerows(rows)
         print(f"wrote {args.csv}")
+    if args.stats and rows:
+        conds = condition_stats(rows)
+        cols: list[str] = []
+        for c in conds:
+            for k in c:
+                if k not in cols:
+                    cols.append(k)
+        with args.stats.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(conds)
+        print(f"wrote {args.stats} ({len(conds)} conditions)")
+        for c in conds:
+            print("  " + ", ".join(f"{k}={c.get(k)}" for k in CONDITION_KEYS if c.get(k) is not None) + f": n={c['n']}"
+                  + "".join(f"  {m}={fmt(c.get(m + '_median'))} [{fmt(c.get(m + '_q1'))}..{fmt(c.get(m + '_q3'))}]"
+                            for m in ("startup_delay_ms", "stall_count", "switch_count", "t5_mean_ms",
+                                      "playhead_gap_mean_ms", "shift_abs_err_p95_ms")))
     return 0
 
 

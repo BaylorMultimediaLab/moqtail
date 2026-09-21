@@ -14,26 +14,55 @@ branch checked out decides the mechanism, `--mechanism` only labels the run.
 - for shaping: Linux, root, `iproute2` (`ip`, `tc`); for background traffic
   `iperf3`
 
-## Experiment 1: native SWITCH, live-edge vs 10 s time-shifted client
+## Before any series: validate one run of each client type
 
 ```sh
 git checkout switch/native
-cargo build --release --workspace
-for rep in 1 2 3; do
-  sudo python3 experiments/run_experiment.py --mechanism native --client-mode live-edge \
-      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --label r$rep
-  sudo python3 experiments/run_experiment.py --mechanism native --client-mode time-shifted --time-shift 10 \
-      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --label r$rep
-done
-python3 experiments/analyze.py results/* --csv results/experiment1.csv
+python3 experiments/run_experiment.py --mechanism native --client-mode live-edge \
+    --profile experiments/profiles/stable_10mbps.json --duration 60 --net none --log-objects
+python3 experiments/run_experiment.py --mechanism native --client-mode time-shifted --time-shift 10 \
+    --profile experiments/profiles/stable_10mbps.json --duration 60 --net none --log-objects
+python3 experiments/validate.py results/<live-edge run>
+python3 experiments/validate.py results/<time-shifted run>
 ```
 
-Repeat with `stable_3mbps.json` and `stable_10mbps.json` for the constrained
-and broadband regimes, and with `--bg-flows 1|4 [--bg-pattern bursty]` for
-competing TCP traffic. On macOS use `--net none` (unshaped smoke test).
+`validate.py` checks, with numbers: the identity block; live-edge client
+target 0 and small mean distance; time-shifted client pre-switch distance
+within 1.5 GOPs of `delay_groups x GOP` and no relay clamp; per-switch
+ordering t2 <= t3 <= relay recv <= promoted <= t4 <= applied <= t5; client
+to relay one-way delay within the shared-host clock assumption; and the
+publisher -> relay -> client join of several groups. Fix anything that fails
+before generating data.
 
-The same commands on `switch/pr1378` and `switch/pr1674` (with `--mechanism
-pr1378` / `pr1674`) produce comparable summaries.
+## Pilot, then Experiment 1
+
+The runner records an immutable identity block per run (`run_meta.json`
+`identity`: run id, git SHA, branch, mechanism, mechanism_mode, client type,
+delay groups, GOP, ladder, profile, trace, qdisc, background flows,
+repeat index, start time), refuses a `--mechanism` that does not match the
+checked-out branch, and repeats a condition with `--repeat N`. Pilot first,
+3 to 5 repetitions per condition, analysed end to end:
+
+```sh
+git checkout switch/native
+sudo python3 experiments/run_experiment.py --mechanism native --client-mode live-edge \
+    --profile experiments/profiles/step_down_up.json --duration 200 --net netns --repeat 5
+sudo python3 experiments/run_experiment.py --mechanism native --client-mode time-shifted --time-shift 10 \
+    --profile experiments/profiles/step_down_up.json --duration 200 --net netns --repeat 5
+python3 experiments/analyze.py results/* --csv results/pilot.csv --stats results/pilot_stats.csv
+```
+
+`--stats` reports, per condition, n, median, IQR and a bootstrap 95 %
+confidence interval of the median for every metric; use the pilot spread
+to pick the repetition count for the full grid (2 client types x 4 profiles
+x N repetitions). Then run the grid with `stable_3mbps`, `stable_10mbps`,
+`step_down_up` and `step_down_up_fqcodel`, and with `--bg-flows 1|4
+[--bg-pattern bursty]` for competing traffic. On macOS use `--net none`
+(unshaped smoke tests only).
+
+The other mechanisms use the same commands on their branches:
+`--mechanism pr1378 --mechanism-mode next-group|playhead` on `switch/pr1378`,
+`--mechanism switch-from --mechanism-mode hard|soft` on `switch/pr1674`.
 
 ## What a run does
 

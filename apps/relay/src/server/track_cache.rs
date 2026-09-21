@@ -294,6 +294,16 @@ impl TrackCache {
       }
       Err(index) => {
         objects.insert(index, object.clone());
+        if objects.len() == 1 {
+          events::emit(
+            "CACHE_GROUP",
+            serde_json::json!({
+              "relay_track_id": self.relay_track_id,
+              "group": object.group_id,
+              "first_object": object.object_id,
+            }),
+          );
+        }
         // Availability changed: wake gated consumers (bump after the insert
         // is visible under the group's write lock, so a consumer that sees
         // the new generation also sees the object).
