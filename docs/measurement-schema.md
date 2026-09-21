@@ -32,15 +32,15 @@ Enable the logs by hand with `relay --event-log <file>`,
 ## Run metadata
 
 - client `RUN_META`: `run_id`, `relay_url`, `namespace`, `client_mode`
-  (`unfiltered` = live-edge client, `filtered` = time-shifted client),
-  `filter_delay_s`, `delay_groups`, `target_shift_ms`, `gop_duration_ms`,
+  (`live-edge` = live-edge client, `time-shifted` = time-shifted client),
+  `time_shift_s`, `delay_groups`, `target_shift_ms`, `gop_duration_ms`,
   `initial_bandwidth_bps`, `startup_track`, `abr_settings`, `ladder`.
 - publisher `RUN_META`: `mode` (`replay`/`live`), `gops_per_variant`, `loop`,
   `framerate`, `ladder` (track, resolution, bitrate, `gop_duration_ms`, codec).
 - runner `run_meta.json`: CLI arguments, profile (with resolved steps), git
   branch and SHA, host, network backend.
 
-`delay_groups = round(filter_delay_s * 1000 / gop_duration_ms)` and
+`delay_groups = round(time_shift_s * 1000 / gop_duration_ms)` and
 `target_shift_ms = delay_groups * gop_duration_ms`. The wire carries whole
 groups, so the target is stated in groups, not in the seconds typed.
 

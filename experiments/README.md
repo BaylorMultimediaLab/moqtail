@@ -20,9 +20,9 @@ branch checked out decides the mechanism, `--mechanism` only labels the run.
 git checkout switch/native
 cargo build --release --workspace
 for rep in 1 2 3; do
-  sudo python3 experiments/run_experiment.py --mechanism native --client-mode unfiltered \
+  sudo python3 experiments/run_experiment.py --mechanism native --client-mode live-edge \
       --profile experiments/profiles/step_down_up.json --duration 200 --net netns --label r$rep
-  sudo python3 experiments/run_experiment.py --mechanism native --client-mode filtered --filter-delay 10 \
+  sudo python3 experiments/run_experiment.py --mechanism native --client-mode time-shifted --time-shift 10 \
       --profile experiments/profiles/step_down_up.json --duration 200 --net netns --label r$rep
 done
 python3 experiments/analyze.py results/* --csv results/experiment1.csv
@@ -64,7 +64,7 @@ Record and metric definitions: `docs/measurement-schema.md`.
 - The relay's QUIC congestion control is BBR; iperf3 uses the host default
   (usually CUBIC) unless `--bg-cc` is given. Record both in the write-up.
 - With 1 s GOPs a 10 s shift is exactly 10 groups; the relay cache default
-  (1000 groups) is far larger, so a filtered SUBSCRIBE is never clamped.
+  (1000 groups) is far larger, so a time-shifted SUBSCRIBE is never clamped.
 - A time-shifted client can only buffer up to its shift, so the ABR's 18 s
   `stableBufferTime` is out of reach for it. Pass `--abr
 'stableBufferTime=8&bufferTimeDefault=8'` to test the controller in a

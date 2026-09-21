@@ -29,8 +29,8 @@ from), `upstream-switch-from/2026-09-12` (the switch-from snapshot merged into
   is far enough ahead), which is what makes a time-shifted client. Also the
   `.probe:<size>:<priority>` synthetic track for bandwidth probing.
 - `apps/client-js`: the ABR player (rules, metrics, TimeMap, goodput and latency
-  trackers) with `clientMode` (`filtered` = time-shifted, `unfiltered` =
-  live-edge). The player never tells the relay _how_ to switch; each
+  trackers) with `clientMode` (`live-edge` | `time-shifted`; the shift is realised
+  with `DELAY_GROUPS`). The player never tells the relay _how_ to switch; each
   `switch/*` branch supplies that.
 - Library support for the project-local `DELAY_GROUPS` parameter, `SubscribeResult.largestLocation`,
   and `gopDurationMs` in the catalog.

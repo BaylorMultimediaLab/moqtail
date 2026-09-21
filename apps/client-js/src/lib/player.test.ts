@@ -2,28 +2,28 @@ import { describe, it, expect } from 'vitest';
 import { buildSubscribeParameters, computeStartupTarget } from './player';
 
 describe('buildSubscribeParameters', () => {
-  it('returns undefined for unfiltered mode', () => {
+  it('returns undefined for live-edge mode', () => {
     const params = buildSubscribeParameters({
-      clientMode: 'unfiltered',
-      filterDelaySeconds: 2,
+      clientMode: 'live-edge',
+      timeShiftSeconds: 2,
       gopDurationMs: 1000,
     });
     expect(params).toBeUndefined();
   });
 
-  it('returns undefined for filtered with zero delay', () => {
+  it('returns undefined for time-shifted with zero delay', () => {
     const params = buildSubscribeParameters({
-      clientMode: 'filtered',
-      filterDelaySeconds: 0,
+      clientMode: 'time-shifted',
+      timeShiftSeconds: 0,
       gopDurationMs: 1000,
     });
     expect(params).toBeUndefined();
   });
 
-  it('builds a parameter list with DELAY_GROUPS for filtered + 2s delay + 1000ms GOP', () => {
+  it('builds a parameter list with DELAY_GROUPS for time-shifted + 2s delay + 1000ms GOP', () => {
     const params = buildSubscribeParameters({
-      clientMode: 'filtered',
-      filterDelaySeconds: 2,
+      clientMode: 'time-shifted',
+      timeShiftSeconds: 2,
       gopDurationMs: 1000,
     });
     expect(params).toBeDefined();
@@ -35,8 +35,8 @@ describe('buildSubscribeParameters', () => {
 
   it('rounds 1.7s delay with 1000ms GOP to 2 groups', () => {
     const params = buildSubscribeParameters({
-      clientMode: 'filtered',
-      filterDelaySeconds: 1.7,
+      clientMode: 'time-shifted',
+      timeShiftSeconds: 1.7,
       gopDurationMs: 1000,
     });
     expect(params![0]!.toKeyValuePair().value).toBe(2n);
@@ -44,8 +44,8 @@ describe('buildSubscribeParameters', () => {
 
   it('handles 500ms GOP correctly: 2s delay → 4 groups', () => {
     const params = buildSubscribeParameters({
-      clientMode: 'filtered',
-      filterDelaySeconds: 2,
+      clientMode: 'time-shifted',
+      timeShiftSeconds: 2,
       gopDurationMs: 500,
     });
     expect(params![0]!.toKeyValuePair().value).toBe(4n);
@@ -53,83 +53,83 @@ describe('buildSubscribeParameters', () => {
 });
 
 describe('computeStartupTarget', () => {
-  it('subtracts 1.0s from end for unfiltered mode', () => {
-    const t = computeStartupTarget({ end: 10, baseTarget: 0, clientMode: 'unfiltered' });
+  it('subtracts 1.0s from end for live-edge mode', () => {
+    const t = computeStartupTarget({ end: 10, baseTarget: 0, clientMode: 'live-edge' });
     expect(t).toBeCloseTo(9.0);
   });
 
-  it('does not subtract anything for filtered mode (already behind live)', () => {
-    const t = computeStartupTarget({ end: 10, baseTarget: 0, clientMode: 'filtered' });
+  it('does not subtract anything for time-shifted mode (already behind live)', () => {
+    const t = computeStartupTarget({ end: 10, baseTarget: 0, clientMode: 'time-shifted' });
     expect(t).toBeCloseTo(10.0);
   });
 
-  it('preserves baseTarget when it exceeds the offset-adjusted end (unfiltered)', () => {
+  it('preserves baseTarget when it exceeds the offset-adjusted end (live-edge)', () => {
     // baseTarget 9.5 > end-1 (9.0) -> max wins
-    const t = computeStartupTarget({ end: 10, baseTarget: 9.5, clientMode: 'unfiltered' });
+    const t = computeStartupTarget({ end: 10, baseTarget: 9.5, clientMode: 'live-edge' });
     expect(t).toBeCloseTo(9.5);
   });
 
-  it('preserves baseTarget when it exceeds end in filtered mode', () => {
+  it('preserves baseTarget when it exceeds end in time-shifted mode', () => {
     // shouldn't happen in practice, but max() semantic is preserved
-    const t = computeStartupTarget({ end: 10, baseTarget: 11, clientMode: 'filtered' });
+    const t = computeStartupTarget({ end: 10, baseTarget: 11, clientMode: 'time-shifted' });
     expect(t).toBeCloseTo(11);
   });
 
-  it('subtracts filterDelaySeconds for filtered mode when provided', () => {
+  it('subtracts timeShiftSeconds for time-shifted mode when provided', () => {
     // bufferEdge=30, delay=30 → target=0 (player starts already 30s behind buffer end)
     expect(
       computeStartupTarget({
         end: 30,
         baseTarget: 0,
-        clientMode: 'filtered',
-        filterDelaySeconds: 30,
+        clientMode: 'time-shifted',
+        timeShiftSeconds: 30,
       }),
     ).toBeCloseTo(0);
   });
 
-  it('subtracts smaller filterDelaySeconds correctly', () => {
+  it('subtracts smaller timeShiftSeconds correctly', () => {
     // bufferEdge=10, delay=2 → target=8 (player 2s behind buffer end)
     expect(
       computeStartupTarget({
         end: 10,
         baseTarget: 0,
-        clientMode: 'filtered',
-        filterDelaySeconds: 2,
+        clientMode: 'time-shifted',
+        timeShiftSeconds: 2,
       }),
     ).toBeCloseTo(8);
   });
 
-  it('preserves baseTarget when it exceeds end - filterDelaySeconds', () => {
+  it('preserves baseTarget when it exceeds end - timeShiftSeconds', () => {
     // baseTarget 5 > end-delay (30-30=0) → max wins
     expect(
       computeStartupTarget({
         end: 30,
         baseTarget: 5,
-        clientMode: 'filtered',
-        filterDelaySeconds: 30,
+        clientMode: 'time-shifted',
+        timeShiftSeconds: 30,
       }),
     ).toBeCloseTo(5);
   });
 
-  it('falls back to 0 offset when filtered + filterDelaySeconds undefined', () => {
+  it('falls back to 0 offset when time-shifted + timeShiftSeconds undefined', () => {
     // Backward-compat: existing behavior when caller forgets to pass it.
     expect(
       computeStartupTarget({
         end: 10,
         baseTarget: 0,
-        clientMode: 'filtered',
+        clientMode: 'time-shifted',
       }),
     ).toBeCloseTo(10);
   });
 
-  it('ignores filterDelaySeconds in unfiltered mode', () => {
-    // Even if caller passes filterDelaySeconds, unfiltered uses LIVE_EDGE_STARTUP_OFFSET_SECONDS.
+  it('ignores timeShiftSeconds in live-edge mode', () => {
+    // Even if caller passes timeShiftSeconds, live-edge uses LIVE_EDGE_STARTUP_OFFSET_SECONDS.
     expect(
       computeStartupTarget({
         end: 10,
         baseTarget: 0,
-        clientMode: 'unfiltered',
-        filterDelaySeconds: 5,
+        clientMode: 'live-edge',
+        timeShiftSeconds: 5,
       }),
     ).toBeCloseTo(9);
   });

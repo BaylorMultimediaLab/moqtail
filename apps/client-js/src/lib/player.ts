@@ -36,7 +36,7 @@ import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/li
 import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
 
 /**
- * One record per track-switch (or, in C4, per filtered connect).
+ * One record per track-switch (or, in C4, per time-shifted connect).
  * Pushed to window.__moqtailMetrics.switchDiscontinuities for offline analysis.
  */
 export interface DiscontinuityRecord {
@@ -57,8 +57,8 @@ export interface DiscontinuityRecord {
   /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
   playheadPTS_ms?: number;
   /** Playhead-relative gap: newStartPTS_ms - playheadPTS_ms. Captures the user-visible
-   *  jump introduced by the switch — naive on a filtered client lands ~filterDelay×1000
-   *  positive (relay delivers from live edge while playhead is filterDelay s behind);
+   *  jump introduced by the switch — naive on a time-shifted client lands ~timeShift×1000
+   *  positive (relay delivers from live edge while playhead is timeShift s behind);
    *  aligned lands ~0. Undefined for `connect` records. */
   playheadGapMs?: number;
 
@@ -72,8 +72,8 @@ export interface DiscontinuityRecord {
   clampedByRelay?: boolean;
 
   // mode context (every record)
-  clientMode: 'filtered' | 'unfiltered';
-  filterDelaySeconds: number;
+  clientMode: 'time-shifted' | 'live-edge';
+  timeShiftSeconds: number;
 }
 
 interface PendingSwitch {
@@ -141,10 +141,10 @@ export interface PlayerOptions {
   catalogLocation?: [Location, Location];
   /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
   onTrackSwitched?: (trackName: string) => void;
-  /** Pre-connect: 'filtered' clients subscribe behind live by `filterDelaySeconds`; 'unfiltered' is today's behavior. */
-  clientMode?: 'filtered' | 'unfiltered';
-  /** When clientMode === 'filtered', subscribe at `filterDelaySeconds` behind the live edge. */
-  filterDelaySeconds?: number;
+  /** Pre-connect: 'time-shifted' clients subscribe behind live by `timeShiftSeconds`; 'live-edge' is today's behavior. */
+  clientMode?: 'time-shifted' | 'live-edge';
+  /** When clientMode === 'time-shifted', subscribe at `timeShiftSeconds` behind the live edge. */
+  timeShiftSeconds?: number;
   /** Experiment log: emit one OBJECT_RECV record per received media object (frame). */
   logObjects?: boolean;
   /**
@@ -163,8 +163,8 @@ const DefaultOptions = {
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
-  clientMode: 'unfiltered' as 'filtered' | 'unfiltered',
-  filterDelaySeconds: 0,
+  clientMode: 'live-edge' as 'time-shifted' | 'live-edge',
+  timeShiftSeconds: 0,
   logObjects: false,
   landingRequiresAliasMapping: true,
 } satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
@@ -173,28 +173,28 @@ const DefaultOptions = {
 /**
  * Builds the `parameters` field for a media-track SUBSCRIBE.
  *
- * - For unfiltered mode: returns `undefined` (no parameters added — today's behavior).
- * - For filtered mode: returns a parameter list carrying
- *   `DELAY_GROUPS = round(filterDelaySeconds * 1000 / gopDurationMs)`.
+ * - For live-edge mode: returns `undefined` (no parameters added — today's behavior).
+ * - For time-shifted mode: returns a parameter list carrying
+ *   `DELAY_GROUPS = round(timeShiftSeconds * 1000 / gopDurationMs)`.
  *
  * The relay reads `DELAY_GROUPS` and starts delivery `delay_groups` behind the live edge.
  */
 export function buildSubscribeParameters(opts: {
-  clientMode: 'filtered' | 'unfiltered';
-  filterDelaySeconds: number;
+  clientMode: 'time-shifted' | 'live-edge';
+  timeShiftSeconds: number;
   gopDurationMs: number;
 }): MessageParameter[] | undefined {
-  if (opts.clientMode !== 'filtered') return undefined;
-  if (opts.filterDelaySeconds <= 0) return undefined;
-  const delayGroups = Math.round((opts.filterDelaySeconds * 1000) / opts.gopDurationMs);
+  if (opts.clientMode !== 'time-shifted') return undefined;
+  if (opts.timeShiftSeconds <= 0) return undefined;
+  const delayGroups = Math.round((opts.timeShiftSeconds * 1000) / opts.gopDurationMs);
   if (delayGroups <= 0) return undefined;
   return new MessageParameters().addDelayGroups(delayGroups).build();
 }
 
 /**
- * Compute the seek target for playback startup. Unfiltered clients seek
- * 1.0s behind the live edge so MSE has buffer runway; filtered clients
- * are already `filterDelaySeconds` behind live and don't need the extra
+ * Compute the seek target for playback startup. Live-edge clients seek
+ * 1.0s behind the live edge so MSE has buffer runway; time-shifted clients
+ * are already `timeShiftSeconds` behind live and don't need the extra
  * offset.
  *
  * Exported for unit testing.
@@ -204,15 +204,15 @@ export const LIVE_EDGE_STARTUP_OFFSET_SECONDS = 1.0;
 export function computeStartupTarget(opts: {
   end: number;
   baseTarget: number;
-  clientMode: 'filtered' | 'unfiltered';
-  /** Seconds-behind-live-edge target for filtered mode. Ignored when unfiltered.
+  clientMode: 'time-shifted' | 'live-edge';
+  /** Seconds-behind-live-edge target for time-shifted mode. Ignored when live-edge.
    *  Defaults to 0 (today's broken behavior) only when not provided — callers
-   *  in filtered mode SHOULD pass this. */
-  filterDelaySeconds?: number;
+   *  in time-shifted mode SHOULD pass this. */
+  timeShiftSeconds?: number;
 }): number {
   const offset =
-    opts.clientMode === 'filtered'
-      ? (opts.filterDelaySeconds ?? 0)
+    opts.clientMode === 'time-shifted'
+      ? (opts.timeShiftSeconds ?? 0)
       : LIVE_EDGE_STARTUP_OFFSET_SECONDS;
   return Math.max(opts.baseTarget, opts.end - offset);
 }
@@ -231,7 +231,7 @@ export class Player {
   // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
   // `LatencyTrendRule` reads `getTrendRatio()` for downswitch decisions.
   #latencyTracker = new LatencyTracker();
-  // Connect-time state (Task C4) for filtered-mode clamp detection.
+  // Connect-time state (Task C4) for time-shifted-mode clamp detection.
   // Captured in subscribe(); consumed once on the first received object.
   #connectSentAt: number | undefined;
   #expectedStartGroupId: number | undefined;
@@ -494,7 +494,7 @@ export class Player {
         end,
         baseTarget: target,
         clientMode: this.#options.clientMode,
-        filterDelaySeconds: this.#options.filterDelaySeconds,
+        timeShiftSeconds: this.#options.timeShiftSeconds,
       });
 
       gotNotification++;
@@ -727,7 +727,7 @@ export class Player {
                   playheadGapMs,
                   wallClockMs,
                   clientMode: this.#options.clientMode,
-                  filterDelaySeconds: this.#options.filterDelaySeconds,
+                  timeShiftSeconds: this.#options.timeShiftSeconds,
                 };
                 if (typeof window !== 'undefined') {
                   const w = window as Window & {
@@ -871,11 +871,11 @@ export class Player {
                 });
 
                 // Connect-time discontinuity record (Task C4): emit only if we
-                // were in filtered mode AND we have a known expected start
+                // were in time-shifted mode AND we have a known expected start
                 // group (i.e. the relay sent a SubscribeOk with largestLocation
                 // and delay_groups was non-zero).
                 if (
-                  this.#options.clientMode === 'filtered' &&
+                  this.#options.clientMode === 'time-shifted' &&
                   this.#expectedStartGroupId !== undefined &&
                   this.#connectSentAt !== undefined
                 ) {
@@ -915,7 +915,7 @@ export class Player {
                     actualStartGroup: actual,
                     clampedByRelay,
                     clientMode: this.#options.clientMode,
-                    filterDelaySeconds: this.#options.filterDelaySeconds,
+                    timeShiftSeconds: this.#options.timeShiftSeconds,
                   };
                   window.__moqtailMetrics.switchDiscontinuities ??= [];
                   window.__moqtailMetrics.switchDiscontinuities.push(record);
@@ -1020,7 +1020,7 @@ export class Player {
       const gopDurationMs = this.#timeMap?.gopDurationMs ?? 0;
       const target = targetShiftMs({
         clientMode: this.#options.clientMode,
-        filterDelaySeconds: this.#options.filterDelaySeconds,
+        timeShiftSeconds: this.#options.timeShiftSeconds,
         gopDurationMs,
         liveEdgeDelaySeconds: DEFAULT_LIVE_EDGE_DELAY,
       });
@@ -1577,7 +1577,7 @@ export class Player {
       const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
       parameters = buildSubscribeParameters({
         clientMode: this.#options.clientMode,
-        filterDelaySeconds: this.#options.filterDelaySeconds,
+        timeShiftSeconds: this.#options.timeShiftSeconds,
         gopDurationMs,
       });
     }
@@ -1589,7 +1589,7 @@ export class Player {
       events.emit('SUBSCRIBE_SENT', {
         track: params.trackName,
         client_mode: this.#options.clientMode,
-        filter_delay_s: this.#options.filterDelaySeconds,
+        time_shift_s: this.#options.timeShiftSeconds,
         delay_groups: parameters ? Number(parameters[0]!.toKeyValuePair().value) : 0,
       });
     }
@@ -1612,15 +1612,15 @@ export class Player {
 
     // Capture connect-time state for media tracks (not catalog) so C4 can emit
     // a connect-time discontinuity record on the first arriving object. We only
-    // populate #expectedStartGroupId for filtered mode with a non-zero
+    // populate #expectedStartGroupId for time-shifted mode with a non-zero
     // delay_groups; otherwise the relay does not clamp and we have nothing to
     // detect against.
     if (params.trackName !== 'catalog' && this.catalog) {
       const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
       const largest = result.largestLocation;
       this.#connectSentAt = performance.now();
-      if (this.#options.clientMode === 'filtered' && largest !== undefined) {
-        const delayGroups = Math.round((this.#options.filterDelaySeconds * 1000) / gopDurationMs);
+      if (this.#options.clientMode === 'time-shifted' && largest !== undefined) {
+        const delayGroups = Math.round((this.#options.timeShiftSeconds * 1000) / gopDurationMs);
         if (delayGroups > 0) {
           // expected = largest - delay_groups (saturating at 0)
           this.#expectedStartGroupId = Math.max(0, Number(largest.group) - delayGroups);

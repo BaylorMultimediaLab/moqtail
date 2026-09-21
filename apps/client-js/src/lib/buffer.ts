@@ -27,19 +27,19 @@ export const DEFAULT_CATCHUP_PLAYBACK_RATE = 1.05; // 5% faster
 
 /**
  * Computes the target latency (seconds behind live edge) for the MSEBuffer's
- * catch-up loop. Filtered clients should hold the playhead at
- * `filterDelaySeconds` behind live (matching the wire-level DELAY_GROUPS);
- * unfiltered clients use the default 1.25s for buffer runway.
+ * catch-up loop. Time-shifted clients should hold the playhead at
+ * `timeShiftSeconds` behind live (matching the wire-level DELAY_GROUPS);
+ * live-edge clients use the default 1.25s for buffer runway.
  *
- * Defensive: filtered + non-positive delay falls back to DEFAULT to avoid
+ * Defensive: time-shifted + non-positive delay falls back to DEFAULT to avoid
  * parking the playhead at zero buffer (which immediately stalls MSE).
  */
 export function computeLiveEdgeDelay(
-  clientMode: 'filtered' | 'unfiltered',
-  filterDelaySeconds: number,
+  clientMode: 'time-shifted' | 'live-edge',
+  timeShiftSeconds: number,
 ): number {
-  if (clientMode === 'filtered' && filterDelaySeconds > 0) {
-    return filterDelaySeconds;
+  if (clientMode === 'time-shifted' && timeShiftSeconds > 0) {
+    return timeShiftSeconds;
   }
   return DEFAULT_LIVE_EDGE_DELAY;
 }

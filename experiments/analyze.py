@@ -112,7 +112,7 @@ def analyze(run: Path, t1_tol: float, offset_tol_ms: float, offset_hold_s: float
         "run_id": meta.get("run_id", run.name),
         "mechanism": meta.get("args", {}).get("mechanism"),
         "client_mode": client_meta.get("client_mode"),
-        "filter_delay_s": client_meta.get("filter_delay_s"),
+        "time_shift_s": client_meta.get("time_shift_s"),
         "delay_groups": client_meta.get("delay_groups"),
         "target_shift_ms": client_meta.get("target_shift_ms"),
         "profile": meta.get("profile", {}).get("name"),
@@ -329,7 +329,7 @@ def fmt(v) -> str:
 
 def to_markdown(s: dict) -> str:
     L = [f"# {s['run_id']}", "",
-         f"mechanism={s['mechanism']} client={s['client_mode']} shift={s['filter_delay_s']}s "
+         f"mechanism={s['mechanism']} client={s['client_mode']} shift={s['time_shift_s']}s "
          f"(delay_groups={s['delay_groups']}, target={s['target_shift_ms']} ms) profile={s['profile']} bg={s['bg_flows']}", "",
          "| metric | value |", "|---|---|",
          f"| startup delay (ms) | {fmt(s['startup']['startup_delay_ms'])} |",
@@ -367,7 +367,7 @@ def to_markdown(s: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-AGG_COLUMNS = ["run_id", "mechanism", "client_mode", "filter_delay_s", "profile", "bg_flows", "startup_delay_ms",
+AGG_COLUMNS = ["run_id", "mechanism", "client_mode", "time_shift_s", "profile", "bg_flows", "startup_delay_ms",
                "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down", "t4_mean_ms", "t5_mean_ms",
                "playhead_gap_mean_ms", "abs_playhead_gap_p95_ms", "shift_err_mean_ms", "shift_abs_err_p95_ms",
                "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps", "cache_max_bytes", "relay_max_rss_mb"]
@@ -376,7 +376,7 @@ AGG_COLUMNS = ["run_id", "mechanism", "client_mode", "filter_delay_s", "profile"
 def agg_row(s: dict) -> dict:
     return {
         "run_id": s["run_id"], "mechanism": s["mechanism"], "client_mode": s["client_mode"],
-        "filter_delay_s": s["filter_delay_s"], "profile": s["profile"], "bg_flows": s["bg_flows"],
+        "time_shift_s": s["time_shift_s"], "profile": s["profile"], "bg_flows": s["bg_flows"],
         "startup_delay_ms": s["startup"]["startup_delay_ms"], "stall_count": s["stalls"]["count"],
         "stall_total_ms": s["stalls"]["total_ms"], "switch_count": s["switches"]["count"],
         "switch_up": s["switches"]["up"], "switch_down": s["switches"]["down"],
