@@ -60,4 +60,34 @@ describe('EventLog', () => {
     expect(recent.length).toBe(11);
     log.stop();
   });
+
+  it('splits a burst into bounded batches and never uses keepalive on a timer flush', () => {
+    const log = new EventLog();
+    log.start('run-4');
+    const big = 'x'.repeat(1000);
+    for (let i = 0; i < 100; i++) log.emit('OBJECT_RECV', { i, big }); // ~100 KB pending
+    log.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(init.body).length).toBeLessThanOrEqual(48 * 1024);
+    expect(init.keepalive).toBe(false);
+    log.stop();
+  });
+
+  it('re-queues rows when the server rejects a batch', async () => {
+    fetchMock.mockImplementationOnce(() => Promise.reject(new TypeError('network')));
+    const log = new EventLog();
+    log.start('run-5');
+    log.emit('A');
+    log.flush();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(log.failures).toBeGreaterThan(0);
+    log.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(String(init.body)).toContain('"event":"A"');
+    log.stop();
+  });
 });

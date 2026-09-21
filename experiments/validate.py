@@ -20,6 +20,10 @@ Checks (each PASS / FAIL / SKIP with the numbers behind it):
   join          for several groups G: publisher GROUP_EMIT(G) <= relay CACHE_GROUP(G)
                 <= client receipt of G (OBJECT_RECV with --log-objects, else the
                 THROUGHPUT_SAMPLE that finalises G), on the track the client was on
+  clean-worktree (--final only) the run was made from a committed tree
+
+Writes validation.json into the run directory; analyze.py excludes runs whose
+validation failed from aggregate CSVs and statistics unless --include-invalid.
 
 Exit status 1 if any check fails.
 """
@@ -33,7 +37,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from analyze import last_session, load, track_matches, wall_clock_gaps  # noqa: E402
+from analyze import analyze, last_session, load, track_matches, wall_clock_gaps  # noqa: E402
 
 
 class Report:
@@ -59,6 +63,9 @@ def main() -> int:
     ap.add_argument("--clock-tolerance-ms", type=float, default=250.0)
     ap.add_argument("--join-samples", type=int, default=5)
     ap.add_argument("--window-s", type=float, default=5.0, help="seconds after the first frame used for the initial-shift check")
+    ap.add_argument("--final", action="store_true",
+                    help="paper-quality gate: also require a clean git worktree at run time")
+    ap.add_argument("--no-write", action="store_true", help="do not write validation.json into the run directory")
     args = ap.parse_args()
 
     recs, sessions = last_session(load(args.run))
@@ -88,10 +95,12 @@ def main() -> int:
     startup = next(iter(by("STARTUP")), None)
     first_switch = next(iter(by("SWITCH_SENT")), None)
     samples = [s for s in by("SAMPLE") if startup and s["ts"] >= startup["ts"] and s.get("live_edge_distance_ms") is not None]
-    # Initial-shift window: the first --window-s seconds after the first frame. A
-    # switch inside that window does not move the playhead, so the shift the
-    # relay delivered is still what these samples measure.
-    pre_switch = [s for s in samples if s["ts"] < startup["ts"] + args.window_s * 1000] if startup else []
+    # The analyzer owns the initial-shift window definition (stored in the
+    # summary), so the check and the reported number cannot drift apart.
+    summary = analyze(args.run, initial_window_s=args.window_s)
+    (args.run / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    initial = summary["time_shift"]["initial_window"]
+    pre_switch = [s for s in samples if initial["end_ms"] is not None and s["ts"] < initial["end_ms"]]
 
     # live-edge / time-shifted ----------------------------------------------
     if client_type == "live-edge":
@@ -108,7 +117,7 @@ def main() -> int:
         fo = next(iter(by("FIRST_OBJECT")), {})
         ok = (bool(dist) and abs(mean - target) <= args.gop_tolerance * gop and fo.get("clamped") is False
               and fo.get("group") == fo.get("expected_start_group"))
-        rep.add("time-shifted", ok, f"initial-window mean_distance_ms={mean and round(mean, 1)} target={target} "
+        rep.add("time-shifted", ok, f"initial-window [{initial['definition']}] mean_distance_ms={mean and round(mean, 1)} target={target} "
                                     f"(n={len(dist)}, tol {args.gop_tolerance * gop:.0f}); first_group={fo.get('group')} "
                                     f"expected={fo.get('expected_start_group')} clamped={fo.get('clamped')}")
         rep.add("live-edge", None, "not a live-edge client")
@@ -116,17 +125,13 @@ def main() -> int:
         rep.add("live-edge", False, f"unknown client type {client_type!r}")
 
     # ordering ---------------------------------------------------------------
-    summary_path = args.run / "summary.json"
-    if not summary_path.exists():
-        import subprocess
-        subprocess.run([sys.executable, str(Path(__file__).with_name("analyze.py")), str(args.run), "--quiet"], check=False)
-    summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     switches = summary.get("switches", {}).get("list", [])
     bad = []
     for sw in switches:
         seq = [("t2", -(sw["t2_decision_ms"] or 0) if sw["t2_decision_ms"] is not None else None), ("t3", 0.0),
                ("relay_recv", sw["relay_recv_ms"]), ("promoted", sw["relay_promoted_ms"]),
-               ("t4", sw["t4_first_object_ms"]), ("applied", sw["applied_ms"]), ("t5", sw["t5_first_frame_ms"])]
+               ("t4", sw["switch_delivery_latency_ms"]), ("applied", sw["applied_ms"]),
+               ("t5", sw["switch_visibility_delay_ms"])]
         present = [(k, v) for k, v in seq if v is not None]
         for (ka, va), (kb, vb) in zip(present, present[1:]):
             if vb < va - 1e-6:
@@ -174,7 +179,24 @@ def main() -> int:
             f"{checked} groups joined publisher->relay->client; violations: {violations or 'none'}"
             + ("" if by("OBJECT_RECV") else " (client side from THROUGHPUT_SAMPLE; use --log-objects for exact receipt)"))
 
+    # worktree ---------------------------------------------------------------
+    dirty = identity.get("dirty_worktree")
+    if args.final:
+        rep.add("clean-worktree", dirty is False, f"dirty_worktree={dirty} (required false for --final)")
+    else:
+        rep.add("clean-worktree", None, f"dirty_worktree={dirty} (only enforced with --final)")
+
     print(rep.render())
+    if not args.no_write:
+        summary["validity"] = {"valid": not rep.failed, "reasons": [r[0] for r in rep.rows if r[1] == "FAIL"], "final": args.final}
+        (args.run / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        (args.run / "validation.json").write_text(json.dumps({
+            "passed": not rep.failed, "final": args.final,
+            "failed": [r[0] for r in rep.rows if r[1] == "FAIL"],
+            "checks": [{"name": r[0], "status": r[1], "detail": r[2]} for r in rep.rows],
+            "gop_tolerance": args.gop_tolerance, "clock_tolerance_ms": args.clock_tolerance_ms,
+            "window_s": args.window_s,
+        }, indent=2))
     return 1 if rep.failed else 0
 
 
