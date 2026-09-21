@@ -64,20 +64,20 @@ export function estimateLiveEdge(opts: {
 }
 
 /**
- * The time shift a client is asked to hold, in ms of media. A filtered client
+ * The time shift a client is asked to hold, in ms of media. A time-shifted client
  * requests `delayGroups` whole groups (the wire quantises the seconds value),
  * so the target is stated in groups times GOP duration rather than in the
- * seconds the user typed. An unfiltered client targets the player's own
+ * seconds the user typed. An live-edge client targets the player's own
  * live-edge delay.
  */
 export function targetShiftMs(opts: {
-  clientMode: 'filtered' | 'unfiltered';
-  filterDelaySeconds: number;
+  clientMode: 'time-shifted' | 'live-edge';
+  timeShiftSeconds: number;
   gopDurationMs: number;
   liveEdgeDelaySeconds: number;
 }): { targetShiftMs: number; delayGroups: number } {
-  if (opts.clientMode === 'filtered' && opts.filterDelaySeconds > 0 && opts.gopDurationMs > 0) {
-    const delayGroups = Math.round((opts.filterDelaySeconds * 1000) / opts.gopDurationMs);
+  if (opts.clientMode === 'time-shifted' && opts.timeShiftSeconds > 0 && opts.gopDurationMs > 0) {
+    const delayGroups = Math.round((opts.timeShiftSeconds * 1000) / opts.gopDurationMs);
     return { targetShiftMs: delayGroups * opts.gopDurationMs, delayGroups };
   }
   return { targetShiftMs: opts.liveEdgeDelaySeconds * 1000, delayGroups: 0 };

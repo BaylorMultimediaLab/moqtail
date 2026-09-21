@@ -27,20 +27,20 @@ describe('estimateLiveEdge', () => {
 });
 
 describe('targetShiftMs', () => {
-  it('quantises a filtered client to whole groups', () => {
+  it('quantises a time-shifted client to whole groups', () => {
     const t = targetShiftMs({
-      clientMode: 'filtered',
-      filterDelaySeconds: 10.4,
+      clientMode: 'time-shifted',
+      timeShiftSeconds: 10.4,
       gopDurationMs: 1000,
       liveEdgeDelaySeconds: 0.6,
     });
     expect(t).toEqual({ targetShiftMs: 10_000, delayGroups: 10 });
   });
 
-  it('uses the player live-edge delay for an unfiltered client', () => {
+  it('uses the player live-edge delay for an live-edge client', () => {
     const t = targetShiftMs({
-      clientMode: 'unfiltered',
-      filterDelaySeconds: 10,
+      clientMode: 'live-edge',
+      timeShiftSeconds: 10,
       gopDurationMs: 1000,
       liveEdgeDelaySeconds: 0.6,
     });

@@ -236,7 +236,7 @@ function TrackGroup({
  *   ?autoConnect=1   connect and start playback without a click (headless runs)
  *   ?logObjects=1    one OBJECT_RECV record per received frame
  *   ?relay=<url> ?namespace=<ns>  connection defaults
- * Together with ?clientMode, ?filterDelay and the ABR overrides below.
+ * Together with ?clientMode, ?timeShift and the ABR overrides below.
  */
 function readRunParams() {
   const params = new URLSearchParams(window.location.search);
@@ -257,14 +257,14 @@ export function App() {
   const [relayUrl, setRelayUrl] = useState(runParams.relay ?? 'https://127.0.0.1:4433');
   const [namespace, setNamespace] = useState(runParams.namespace ?? 'moqtail');
   const [status, setStatus] = useState<Status>('idle');
-  const [clientMode, setClientMode] = useState<'filtered' | 'unfiltered'>(() => {
+  const [clientMode, setClientMode] = useState<'time-shifted' | 'live-edge'>(() => {
     const params = new URLSearchParams(window.location.search);
     const cm = params.get('clientMode');
-    return cm === 'filtered' || cm === 'unfiltered' ? cm : 'unfiltered';
+    return cm === 'time-shifted' || cm === 'live-edge' ? cm : 'live-edge';
   });
-  const [filterDelaySeconds, setFilterDelaySeconds] = useState<number>(() => {
+  const [timeShiftSeconds, setTimeShiftSeconds] = useState<number>(() => {
     const params = new URLSearchParams(window.location.search);
-    const fd = params.get('filterDelay');
+    const fd = params.get('timeShift');
     if (!fd) return 2;
     const n = parseFloat(fd);
     return Number.isFinite(n) && n >= 0 ? n : 2;
@@ -426,7 +426,7 @@ export function App() {
         namespace: Tuple.fromUtf8Path(namespace),
         receiveCatalogViaSubscribe: true,
         clientMode,
-        filterDelaySeconds,
+        timeShiftSeconds,
         switchFloor,
         logObjects: runParams.logObjects,
       });
@@ -459,16 +459,18 @@ export function App() {
         const gopDurationMs = catalog.getGopDurationMs(firstVideo.name);
         const shift = targetShiftMs({
           clientMode,
-          filterDelaySeconds,
+          timeShiftSeconds,
           gopDurationMs,
-          liveEdgeDelaySeconds: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+          liveEdgeDelaySeconds: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
         });
         events.emit('RUN_META', {
           run_id: runParams.runId,
           relay_url: relayUrl,
           namespace,
           client_mode: clientMode,
-          filter_delay_s: filterDelaySeconds,
+          // How the time shift is realised on the wire; the only mechanism today.
+          shift_mechanism: clientMode === 'time-shifted' ? 'delay-groups' : 'none',
+          time_shift_s: timeShiftSeconds,
           switch_floor: switchFloor,
           delay_groups: shift.delayGroups,
           target_shift_ms: shift.targetShiftMs,
@@ -487,7 +489,7 @@ export function App() {
         setStatus('restarting');
         await player.attachMedia(videoRef.current);
         bufferRef.current = new MSEBuffer(videoRef.current, {
-          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
         });
         await player.addMediaTrack(firstVideo.name);
         // Anchor the throughput EMA to the startup track's own bitrate so the
@@ -573,7 +575,7 @@ export function App() {
     disposePlayer,
     abrSettings,
     clientMode,
-    filterDelaySeconds,
+    timeShiftSeconds,
     switchFloor,
     runParams,
   ]);
@@ -611,7 +613,7 @@ export function App() {
           namespace: Tuple.fromUtf8Path(namespace),
           receiveCatalogViaSubscribe: true,
           clientMode,
-          filterDelaySeconds,
+          timeShiftSeconds,
           switchFloor,
         });
         playerRef.current = player;
@@ -623,7 +625,7 @@ export function App() {
 
         await player.attachMedia(videoRef.current);
         bufferRef.current = new MSEBuffer(videoRef.current, {
-          liveEdgeDelay: computeLiveEdgeDelay(clientMode, filterDelaySeconds),
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
         });
 
         if (videoTrack) await player.addMediaTrack(videoTrack);
@@ -698,7 +700,7 @@ export function App() {
         await disposePlayer();
       }
     },
-    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, filterDelaySeconds, switchFloor],
+    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, timeShiftSeconds, switchFloor],
   );
 
   const handleTrackChange = useCallback(
@@ -803,8 +805,8 @@ export function App() {
         onBlurSettingsChange={setBlurSettings}
         clientMode={clientMode}
         onClientModeChange={setClientMode}
-        filterDelaySeconds={filterDelaySeconds}
-        onFilterDelaySecondsChange={setFilterDelaySeconds}
+        timeShiftSeconds={timeShiftSeconds}
+        onTimeShiftSecondsChange={setTimeShiftSeconds}
         connectStatus={status}
         switchFloor={switchFloor}
         onSwitchFloorChange={setSwitchFloor}
