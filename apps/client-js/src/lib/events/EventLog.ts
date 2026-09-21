@@ -41,6 +41,10 @@ export interface EventRecord extends EventFields {
 const FLUSH_INTERVAL_MS = 500;
 const RING_SIZE = 5000;
 const MAX_PENDING = 20000;
+/** Bytes per POST. Chrome rejects `keepalive` bodies above 64 KB and a burst of
+ *  per-frame records (a 10-group joining replay) can exceed that in one flush
+ *  window, so every flush is split into bounded batches. */
+const MAX_BATCH_BYTES = 48 * 1024;
 
 export class EventLog {
   #runId: string | null = null;
@@ -50,6 +54,8 @@ export class EventLog {
   #endpoint = '/__events';
   #seq = 0;
   #dropped = 0;
+  #inFlight = 0;
+  #failures = 0;
 
   /** Whether `start()` has been called and events are being recorded. */
   get active(): boolean {
@@ -77,13 +83,14 @@ export class EventLog {
     this.#timer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
   }
 
-  /** Stop recording; flushes what is pending. */
+  /** Stop recording; flushes what is pending (best effort, keepalive so it
+   *  survives page unload). */
   stop(): void {
     if (this.#timer !== null) {
       clearInterval(this.#timer);
       this.#timer = null;
     }
-    this.flush();
+    this.flush(true);
     this.#runId = null;
   }
 
@@ -121,21 +128,57 @@ export class EventLog {
     return this.#dropped;
   }
 
-  /** Send pending records. Fire-and-forget; failures are retried on the next flush. */
-  flush(): void {
+  /** Records whose POST failed and were re-queued or dropped. */
+  get failures(): number {
+    return this.#failures;
+  }
+
+  /**
+   * Send pending records in bounded batches. Fire-and-forget; a failed batch
+   * is re-queued (bounded) for the next flush and reported on the console so
+   * the dev server's console forwarding makes it visible.
+   */
+  flush(unloading = false): void {
     if (this.#runId === null || this.#pending.length === 0) return;
     if (typeof fetch !== 'function') return;
-    const rows = this.#pending.splice(0);
-    const body = rows.join('\n') + '\n';
+    // One in-flight batch at a time keeps ordering and avoids piling requests
+    // up when the server is slow; the timer retries 500 ms later.
+    if (this.#inFlight > 0 && !unloading) return;
     const url = `${this.#endpoint}?run=${encodeURIComponent(this.#runId)}`;
-    fetch(url, { method: 'POST', body, keepalive: true }).catch(() => {
-      // Dev server unavailable: keep the rows for the next attempt (bounded).
-      if (this.#pending.length + rows.length <= MAX_PENDING) {
-        this.#pending.unshift(...rows);
-      } else {
-        this.#dropped += rows.length;
+    while (this.#pending.length > 0) {
+      const rows: string[] = [];
+      let bytes = 0;
+      while (this.#pending.length > 0 && bytes + this.#pending[0]!.length + 1 <= MAX_BATCH_BYTES) {
+        const row = this.#pending.shift()!;
+        rows.push(row);
+        bytes += row.length + 1;
       }
-    });
+      if (rows.length === 0) {
+        // A single record larger than the batch limit: send it alone.
+        rows.push(this.#pending.shift()!);
+      }
+      const body = rows.join('\n') + '\n';
+      this.#inFlight++;
+      fetch(url, { method: 'POST', body, keepalive: unloading })
+        .then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        })
+        .catch((err: unknown) => {
+          this.#failures += rows.length;
+          if (this.#failures === rows.length) {
+            console.error('[events] flush failed; rows re-queued', err);
+          }
+          if (this.#pending.length + rows.length <= MAX_PENDING) {
+            this.#pending.unshift(...rows);
+          } else {
+            this.#dropped += rows.length;
+          }
+        })
+        .finally(() => {
+          this.#inFlight--;
+        });
+      if (!unloading) break; // one batch per tick; the rest goes on the next tick
+    }
   }
 }
 
