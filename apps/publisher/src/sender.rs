@@ -68,6 +68,19 @@ pub async fn send_track(
     // clears when switching to a higher bitrate whose pipeline fills slower.
     emit_barrier.wait().await;
 
+    // Stamped at the start of the send, so it precedes the relay's CACHE_GROUP
+    // and the client's receipt of the same group in a cross-process join.
+    crate::events::emit(
+      "GROUP_EMIT",
+      serde_json::json!({
+        "track": format!("video-{label}"),
+        "track_alias": track_alias,
+        "group": gop.group_id,
+        "objects": gop.packets.len(),
+        "bytes": gop.packets.iter().map(|p| p.len() as u64).sum::<u64>(),
+      }),
+    );
+
     match send_group(
       &connection,
       track_alias,
@@ -79,16 +92,6 @@ pub async fn send_track(
     {
       Ok(()) => {
         groups_sent += 1;
-        crate::events::emit(
-          "GROUP_EMIT",
-          serde_json::json!({
-            "track": format!("video-{label}"),
-            "track_alias": track_alias,
-            "group": gop.group_id,
-            "objects": gop.packets.len(),
-            "bytes": gop.packets.iter().map(|p| p.len() as u64).sum::<u64>(),
-          }),
-        );
         if !first_group_logged {
           info!(
             "Sender ({} alias={}): first group sent (group_id={})",

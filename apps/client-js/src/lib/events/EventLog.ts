@@ -96,6 +96,10 @@ export class EventLog {
       src: 'client',
       event,
       seq: this.#seq++,
+      // Page-load identity: a reload (for example Vite re-optimising on first
+      // load) starts a new session whose request ids restart, so records must
+      // never be joined across sessions.
+      session: typeof performance !== 'undefined' ? Math.round(performance.timeOrigin) : 0,
       ...fields,
     };
     this.#ring.push(record);

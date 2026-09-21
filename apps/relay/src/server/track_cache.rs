@@ -247,6 +247,14 @@ impl TrackCache {
       // Create new group with this object
       let new_group_objects = Arc::new(RwLock::new(vec![object.clone()]));
       self.cache.insert(cache_key, new_group_objects).await;
+      events::emit(
+        "CACHE_GROUP",
+        serde_json::json!({
+          "relay_track_id": self.relay_track_id,
+          "group": object.group_id,
+          "first_object": object.object_id,
+        }),
+      );
       debug!(
         "track_cache::add_object | created new group | track: {} group: {} object_id: {}",
         self.relay_track_id, object.group_id, object.object_id
