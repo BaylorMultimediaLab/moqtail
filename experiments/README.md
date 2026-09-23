@@ -6,6 +6,11 @@ branch checked out decides the mechanism, `--mechanism` only labels the run.
 
 ## Prerequisites
 
+For a Linux machine, follow `docs/pilot-linux.md` end to end; it covers
+the browser choice (Firefox, since Chrome cannot decode our HEVC on Linux),
+the pinned relay certificate, shaping without running the runner as root,
+and what to send back.
+
 - `cargo build --release --workspace` (relay and publisher binaries)
 - a prepared GOP cache: run `scripts/run-stack.sh` once (it encodes
   `data/video/smoking_test_1080p_ts.mp4` into `data/encoded/...`)

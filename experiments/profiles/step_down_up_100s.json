@@ -1,0 +1,11 @@
+{
+  "name": "step_down_up_100s",
+  "description": "step_down_up compressed to fit a ~112-GOP cache: 6 Mbps for 30 s, 1.5 Mbps for 30 s, 6 Mbps again; run with --duration 100.",
+  "queue": "tail-drop",
+  "queue_pkts": 100,
+  "steps": [
+    { "at_s": 0, "rate_mbps": 6, "delay_ms": 40, "loss_pct": 0 },
+    { "at_s": 30, "rate_mbps": 1.5, "delay_ms": 40, "loss_pct": 0 },
+    { "at_s": 60, "rate_mbps": 6, "delay_ms": 40, "loss_pct": 0 }
+  ]
+}

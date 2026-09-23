@@ -141,17 +141,28 @@ def spawn(cmd: list[str], log: Path, cwd: Path = ROOT, env: dict | None = None) 
                             preexec_fn=os.setsid)
 
 
+def _killpg(pgid: int, sig: int) -> None:
+    """Signal a process group; a group that contains root-owned wrappers
+    (sudo ip netns exec ...) is signalled through sudo instead."""
+    try:
+        os.killpg(pgid, sig)
+    except PermissionError:
+        subprocess.run(["sudo", "-n", "kill", f"-{sig}", "--", f"-{pgid}"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def stop(p: subprocess.Popen | None, name: str) -> None:
     if p is None or p.poll() is not None:
         return
     try:
-        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        pgid = os.getpgid(p.pid)
+    except ProcessLookupError:
+        return
+    _killpg(pgid, signal.SIGTERM)
+    try:
         p.wait(timeout=10)
     except Exception:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except Exception:
-            pass
+        _killpg(pgid, signal.SIGKILL)
     print(f"[run] stopped {name}")
 
 
@@ -204,8 +215,13 @@ def warm_vite(base: str) -> None:
 
 
 def find_browser(explicit: str | None) -> str | None:
+    """Explicit path, else Firefox, else a Chromium. Firefox first because it
+    decodes HEVC in software everywhere; Chrome on Linux needs a working VA-API
+    HEVC decoder and renders black frames on NVIDIA (docs/pilot-linux.md)."""
     candidates = [explicit] if explicit else []
     candidates += [
+        shutil.which("firefox"), shutil.which("firefox-esr"),
+        "/Applications/Firefox.app/Contents/MacOS/firefox",
         shutil.which("chromium"), shutil.which("chromium-browser"), shutil.which("google-chrome"),
         shutil.which("google-chrome-stable"), shutil.which("chrome"),
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -215,6 +231,50 @@ def find_browser(explicit: str | None) -> str | None:
         if c and Path(c).exists():
             return c
     return None
+
+
+def browser_kind(path: str) -> str:
+    return "firefox" if "firefox" in Path(path).name.lower() else "chromium"
+
+
+FIREFOX_PREFS = """
+user_pref("media.autoplay.default", 0);
+user_pref("media.autoplay.blocking_policy", 0);
+user_pref("media.block-autoplay-until-in-foreground", false);
+user_pref("media.hevc.enabled", true);
+user_pref("dom.webtransport.enabled", true);
+user_pref("network.http.http3.disable_when_third_party_roots_found", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("app.update.enabled", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("dom.disable_beforeunload", true);
+"""
+
+
+def browser_command(browser: str, url: str, out: Path, headed: bool) -> list[str]:
+    if browser_kind(browser) == "firefox":
+        profile = out / "firefox-profile"
+        profile.mkdir(exist_ok=True)
+        (profile / "user.js").write_text(FIREFOX_PREFS)
+        cmd = [browser, "--no-remote", "--new-instance", "--profile", str(profile),
+               "--width", "1280", "--height", "800"]
+        if not headed:
+            cmd.append("--headless")
+        return cmd + [url]
+    cmd = [
+        browser, "--no-first-run", "--no-default-browser-check", "--disable-gpu-vsync",
+        "--autoplay-policy=no-user-gesture-required", "--ignore-certificate-errors",
+        "--webtransport-developer-mode", "--enable-features=WebTransportDeveloperMode",
+        "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+        f"--user-data-dir={out / 'chrome-profile'}", "--window-size=1280,800",
+    ]
+    if os.geteuid() == 0:
+        cmd.append("--no-sandbox")  # Chromium refuses to start as root otherwise
+    if not headed:
+        cmd.append("--headless=new")
+    return cmd + [url]
 
 
 def main() -> int:
@@ -239,7 +299,9 @@ def main() -> int:
     ap.add_argument("--cache-size", type=int, default=1000, help="relay --cache-size (groups per track)")
     ap.add_argument("--relay-port", type=int, default=4433)
     ap.add_argument("--vite-port", type=int, default=5173)
-    ap.add_argument("--browser", default=None, help="path to a Chromium binary")
+    ap.add_argument("--browser", default=None, help="path to a Firefox or Chromium binary (default: Firefox if found, else Chromium)")
+    ap.add_argument("--cert-dir", type=Path, default=ROOT / "apps/relay/cert",
+                    help="directory with the relay's cert.pem/key.pem; if hash.txt is there (scripts/gen-dev-cert.sh) the player pins it")
     ap.add_argument("--headed", action="store_true", help="show the browser window")
     ap.add_argument("--log-objects", action="store_true", help="one OBJECT_RECV per frame (needed for VMAF joins)")
     ap.add_argument("--abr", default="", help="extra ABR URL params, e.g. 'stableBufferTime=8&bufferTimeDefault=8'")
@@ -296,6 +358,7 @@ def run_once(args, repeat_index: int) -> int:
     backend.setup()
 
     procs: dict[str, subprocess.Popen] = {}
+    browser: str | None = None
     bg = BackgroundFlows(backend, args.bg_flows, args.bg_pattern, cc=args.bg_cc, log=rlog.emit)
     exit_code = 0
     try:
@@ -308,8 +371,8 @@ def run_once(args, repeat_index: int) -> int:
         (out / "relay-logs").mkdir()
         procs["relay"] = spawn([
             str(relay_bin), "--port", str(args.relay_port), "--host", backend.relay_host,
-            "--cert-file", str(ROOT / "apps/relay/cert/cert.pem"),
-            "--key-file", str(ROOT / "apps/relay/cert/key.pem"),
+            "--cert-file", str(args.cert_dir / "cert.pem"),
+            "--key-file", str(args.cert_dir / "key.pem"),
             "--log-folder", str(out / "relay-logs"),
             "--event-log", str(out / "relay-events.jsonl"),
             "--cache-size", str(args.cache_size),
@@ -366,21 +429,15 @@ def run_once(args, repeat_index: int) -> int:
             url += f"&{MECHANISM_URL_PARAM[args.mechanism]}={args.mechanism_mode}"
         if args.abr:
             url += "&" + args.abr
+        hash_file = args.cert_dir / "hash.txt"
+        if hash_file.exists():
+            url += "&certHash=" + hash_file.read_text().strip()
         browser = find_browser(args.browser)
         if browser is None:
-            raise SystemExit("no Chromium found; pass --browser")
-        chrome_args = [
-            browser, "--no-first-run", "--no-default-browser-check", "--disable-gpu-vsync",
-            "--autoplay-policy=no-user-gesture-required", "--ignore-certificate-errors",
-            "--webtransport-developer-mode", "--enable-features=WebTransportDeveloperMode",
-            "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
-            f"--user-data-dir={out / 'chrome-profile'}", "--window-size=1280,800",
-        ]
-        if not args.headed:
-            chrome_args.append("--headless=new")
-        chrome_args.append(url)
-        procs["browser"] = spawn(backend.wrap(chrome_args), out / "browser.log")
-        rlog.emit("BROWSER_START", {"url": url, "binary": browser, "headless": not args.headed})
+            raise SystemExit("no Firefox or Chromium found; pass --browser")
+        procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed)), out / "browser.log")
+        rlog.emit("BROWSER_START", {"url": url, "binary": browser, "kind": browser_kind(browser),
+                                    "headless": not args.headed, "cert_pinned": hash_file.exists()})
 
         # Main loop: apply steps on schedule, sample process stats -----------
         t0 = time.time()
@@ -394,6 +451,8 @@ def run_once(args, repeat_index: int) -> int:
             bg.tick()
             if time.time() - last_stats >= 1.0:
                 last_stats = time.time()
+                if backend.name != "none" and os.geteuid() != 0 and int(last_stats) % 240 == 0:
+                    subprocess.run(["sudo", "-n", "-v"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 for name, p in procs.items():
                     if name == "vite":
                         continue
@@ -453,6 +512,7 @@ def run_once(args, repeat_index: int) -> int:
             "final": args.final,
             "duration_s": args.duration,
             "abr_overrides": args.abr or None,
+            "browser": browser_kind(browser) if browser else None,
             "seed": args.seed,
         }
         meta = {

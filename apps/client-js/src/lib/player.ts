@@ -263,6 +263,30 @@ export function computeStartupTarget(opts: {
   return Math.max(opts.baseTarget, opts.end - offset);
 }
 
+/**
+ * Reads a `?certHash=` query parameter (base64url SHA-256 of the relay's DER
+ * certificate) and turns it into WebTransport `serverCertificateHashes`.
+ *
+ * Firefox's HTTP/3 stack rejects a certificate issued by a locally-installed
+ * CA even when that CA is trusted, so pinning the leaf hash is the only way to
+ * reach a dev relay from Firefox; Chrome accepts either route. Browsers honour
+ * a pinned hash only for ECDSA P-256 certificates valid 14 days or less, see
+ * scripts/gen-dev-cert.sh. Absent the parameter, nothing changes.
+ */
+function serverCertificateHashesFromUrl(): { transportOptions: WebTransportOptions } | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const raw = new URLSearchParams(window.location.search).get('certHash');
+  if (!raw) return undefined;
+  try {
+    const bin = atob(raw.replace(/-/g, '+').replace(/_/g, '/'));
+    const value = Uint8Array.from(bin, c => c.charCodeAt(0));
+    return { transportOptions: { serverCertificateHashes: [{ algorithm: 'sha-256', value }] } };
+  } catch {
+    logger.error('media', 'certHash query parameter is not valid base64url; ignoring it');
+    return undefined;
+  }
+}
+
 export class Player {
   catalog: CMSFCatalog | null = null;
   client: MOQtailClient | null = null;
@@ -309,6 +333,7 @@ export class Player {
       // Initialize the client and fetch the catalog
       this.client = await MOQtailClient.new({
         url: this.#options.relayUrl,
+        ...(serverCertificateHashesFromUrl() ?? {}),
       });
     } catch (error) {
       logger.error('media', 'Failed to connect to relay', (error as Error).message);
@@ -377,11 +402,20 @@ export class Player {
       transport as unknown as { getStats: () => Promise<StatsResult> }
     ).getStats.bind(transport);
 
-    const s1 = await getStats();
+    // Firefox ships getStats() as a stub that rejects; treat that as "no
+    // estimate" rather than aborting the connect.
+    let s1: StatsResult;
+    let s2: StatsResult;
     const t1 = Date.now();
-    await new Promise(r => setTimeout(r, 200));
-    const s2 = await getStats();
-    const t2 = Date.now();
+    let t2 = t1;
+    try {
+      s1 = await getStats();
+      await new Promise(r => setTimeout(r, 200));
+      s2 = await getStats();
+      t2 = Date.now();
+    } catch {
+      return 0;
+    }
 
     const deltaBytes = (s2.bytesReceived ?? 0) - (s1.bytesReceived ?? 0);
     const deltaMs = t2 - t1;
@@ -1274,9 +1308,27 @@ export class Player {
       }
       prevMediaMs = mediaMs;
       prevNowMs = now;
-      this.#element.requestVideoFrameCallback(poll);
+      schedule(poll);
     };
-    this.#element.requestVideoFrameCallback(poll);
+    // requestVideoFrameCallback reports each presented frame with its media
+    // time; where it is missing, fall back to an animation-frame poll that
+    // reads currentTime (coarser, but the seam crossing is still detected).
+    const el = this.#element;
+    const rvfc = (
+      el as HTMLVideoElement & {
+        requestVideoFrameCallback?: (
+          cb: (now: number, m: VideoFrameCallbackMetadata) => void,
+        ) => number;
+      }
+    ).requestVideoFrameCallback;
+    const schedule =
+      typeof rvfc === 'function'
+        ? (cb: (now: number, m: VideoFrameCallbackMetadata) => void) => rvfc.call(el, cb)
+        : (cb: (now: number, m: VideoFrameCallbackMetadata) => void) =>
+            requestAnimationFrame(now =>
+              cb(now, { mediaTime: el.currentTime } as VideoFrameCallbackMetadata),
+            );
+    schedule(poll);
   }
 
   /**
