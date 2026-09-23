@@ -40,10 +40,19 @@ class Shape:
     jitter_ms: float = 0.0
 
 
+def sudo_prefix() -> list[str]:
+    """`ip`/`tc` need root. Run them through non-interactive sudo when the runner
+    itself is unprivileged (the browser, relay and publisher then stay the
+    user's own processes). `sudo -v` once before a series, or a NOPASSWD rule
+    for ip/tc/kill, keeps the prompt out of the run."""
+    return [] if os.geteuid() == 0 else ["sudo", "-n"]
+
+
 def _run(cmd: str, check: bool = True, quiet: bool = False) -> subprocess.CompletedProcess:
+    argv = sudo_prefix() + shlex.split(cmd)
     if not quiet:
-        print(f"[net] $ {cmd}")
-    return subprocess.run(shlex.split(cmd), check=check, capture_output=True, text=True)
+        print(f"[net] $ {' '.join(argv)}")
+    return subprocess.run(argv, check=check, capture_output=True, text=True)
 
 
 class NoneBackend:
@@ -92,7 +101,10 @@ class NetnsBackend:
     # -- lifecycle -----------------------------------------------------------
     def setup(self) -> None:
         if os.geteuid() != 0:
-            raise SystemExit("[net] backend=netns needs root (sudo)")
+            probe = subprocess.run(["sudo", "-n", "true"], capture_output=True)
+            if probe.returncode != 0:
+                raise SystemExit("[net] backend=netns needs passwordless sudo for ip/tc: run `sudo -v` first "
+                                 "(or add a NOPASSWD rule), then retry")
         self.teardown()
         _run(f"ip netns add {self.ns}")
         _run(f"ip link add {self.host_if} type veth peer name {self.ns_if}")
@@ -144,7 +156,16 @@ class NetnsBackend:
 
     # -- helpers -------------------------------------------------------------
     def wrap(self, cmd: list[str]) -> list[str]:
-        return ["ip", "netns", "exec", self.ns] + cmd
+        """Run `cmd` inside the namespace. Entering a namespace needs root; the
+        command itself is dropped back to the invoking user so the browser
+        never runs as root (Chromium refuses, Firefox misbehaves, and the
+        profile would be root-owned)."""
+        if os.geteuid() == 0:
+            return ["ip", "netns", "exec", self.ns] + cmd
+        user = os.environ.get("SUDO_USER") or os.environ.get("USER") or str(os.getuid())
+        keep = [f"{k}={v}" for k, v in os.environ.items()
+                if k in ("HOME", "PATH", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LANG", "MOZ_LOG", "MOZ_LOG_FILE")]
+        return ["sudo", "-n", "ip", "netns", "exec", self.ns, "sudo", "-n", "-u", user, "env", *keep] + cmd
 
     @property
     def relay_host(self) -> str:
@@ -197,7 +218,8 @@ class BackgroundFlows:
                "-P", str(self.flows)]
         if self.cc:
             cmd += ["-C", self.cc]
-        self.client = subprocess.Popen(self.backend.wrap(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.client = subprocess.Popen(self.backend.wrap(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       preexec_fn=os.setsid)
         self._on = True
         self.log("BG_FLOW_ON", {"flows": self.flows, "seconds": seconds})
 

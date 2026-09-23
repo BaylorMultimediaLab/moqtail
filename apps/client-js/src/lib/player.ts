@@ -296,12 +296,9 @@ export function computeStartupTarget(opts: {
  *
  * Firefox's HTTP/3 stack rejects a certificate issued by a locally-installed
  * CA even when that CA is trusted, so pinning the leaf hash is the only way to
- * reach a dev relay from Firefox. Chrome accepts either route. Browsers honour
- * a pinned hash only for ECDSA P-256 certificates valid 14 days or less — see
- * scripts/gen-dev-cert.sh.
- *
- * Returns undefined when the parameter is absent, leaving the default
- * CA-trusted path untouched.
+ * reach a dev relay from Firefox; Chrome accepts either route. Browsers honour
+ * a pinned hash only for ECDSA P-256 certificates valid 14 days or less, see
+ * scripts/gen-dev-cert.sh. Absent the parameter, nothing changes.
  */
 function serverCertificateHashesFromUrl(): { transportOptions: WebTransportOptions } | undefined {
   if (typeof window === 'undefined') return undefined;
@@ -432,14 +429,14 @@ export class Player {
       transport as unknown as { getStats: () => Promise<StatsResult> }
     ).getStats.bind(transport);
 
-    // Firefox ships getStats() as a stub that rejects with
-    // NS_ERROR_NOT_IMPLEMENTED, so a typeof check alone is not enough — an
-    // unhandled rejection here aborts the whole connect before attachMedia().
-    // Any failure just means "no estimate", which the caller already handles.
-    let s1: StatsResult, s2: StatsResult, t1: number, t2: number;
+    // Firefox ships getStats() as a stub that rejects; treat that as "no
+    // estimate" rather than aborting the connect.
+    let s1: StatsResult;
+    let s2: StatsResult;
+    const t1 = Date.now();
+    let t2 = t1;
     try {
       s1 = await getStats();
-      t1 = Date.now();
       await new Promise(r => setTimeout(r, 200));
       s2 = await getStats();
       t2 = Date.now();
@@ -1412,9 +1409,27 @@ export class Player {
       }
       prevMediaMs = mediaMs;
       prevNowMs = now;
-      this.#element.requestVideoFrameCallback(poll);
+      schedule(poll);
     };
-    this.#element.requestVideoFrameCallback(poll);
+    // requestVideoFrameCallback reports each presented frame with its media
+    // time; where it is missing, fall back to an animation-frame poll that
+    // reads currentTime (coarser, but the seam crossing is still detected).
+    const el = this.#element;
+    const rvfc = (
+      el as HTMLVideoElement & {
+        requestVideoFrameCallback?: (
+          cb: (now: number, m: VideoFrameCallbackMetadata) => void,
+        ) => number;
+      }
+    ).requestVideoFrameCallback;
+    const schedule =
+      typeof rvfc === 'function'
+        ? (cb: (now: number, m: VideoFrameCallbackMetadata) => void) => rvfc.call(el, cb)
+        : (cb: (now: number, m: VideoFrameCallbackMetadata) => void) =>
+            requestAnimationFrame(now =>
+              cb(now, { mediaTime: el.currentTime } as VideoFrameCallbackMetadata),
+            );
+    schedule(poll);
   }
 
   /**

@@ -17,25 +17,23 @@
 # Usage:
 #   ./scripts/gen-dev-cert.sh
 #
-# run-stack.sh always reads apps/relay/cert/{cert,key}.pem and takes no cert
-# flag (its only argument is VIDEO_PATH), so swap the generated pair in:
-#
-#   cp apps/relay/cert/cert.pem apps/relay/cert/cert.pem.bak
-#   cp apps/relay/cert/key.pem  apps/relay/cert/key.pem.bak
-#   cp apps/relay/cert/ecdsa/cert.pem apps/relay/cert/cert.pem
-#   cp apps/relay/cert/ecdsa/key.pem  apps/relay/cert/key.pem
-#   ./scripts/run-stack.sh
-#   firefox "http://localhost:5173/?certHash=$(cat apps/relay/cert/ecdsa/hash.txt)"
+# Writes cert.pem, key.pem and hash.txt into apps/relay/cert (backing up an
+# existing pair once as *.bak), which is where run-stack.sh and the experiment
+# runner read the relay certificate from. The runner appends ?certHash= to the
+# player URL automatically when hash.txt is present.
 
 set -euo pipefail
 
-OUT_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)/apps/relay/cert/ecdsa}"
+OUT_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)/apps/relay/cert}"
 mkdir -p "$OUT_DIR"
+for f in cert.pem key.pem; do
+  if [[ -f "$OUT_DIR/$f" && ! -f "$OUT_DIR/$f.bak" ]]; then cp "$OUT_DIR/$f" "$OUT_DIR/$f.bak"; fi
+done
 
 openssl ecparam -name prime256v1 -genkey -noout -out "$OUT_DIR/key.pem"
 openssl req -new -x509 -key "$OUT_DIR/key.pem" -out "$OUT_DIR/cert.pem" \
   -days 13 -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1,IP:10.200.0.1" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth"
@@ -53,3 +51,4 @@ echo "certHash:    $HASH"
 echo
 echo "Open the player with:"
 echo "  firefox \"http://localhost:5173/?certHash=\$(cat $OUT_DIR/hash.txt)\""
+echo "The experiment runner picks hash.txt up on its own."

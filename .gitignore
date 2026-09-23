@@ -255,3 +255,5 @@ apps/relay/cert/ecdsa/
 # experiment output
 results/
 __pycache__/
+apps/relay/cert/*.pem
+apps/relay/cert/hash.txt
