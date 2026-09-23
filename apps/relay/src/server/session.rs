@@ -100,6 +100,20 @@ impl Session {
         info!("Selected protocol version: {}", v);
         v.to_string()
       }
+      // A client with no WebTransport subprotocol support (Firefox, as of 154)
+      // sends no `wt-available-protocols` at all. Offer the relay's newest
+      // version; the MOQT SETUP that follows still has to agree with it.
+      None if client_protocols.is_empty() => {
+        let v = SUPPORTED_VERSIONS
+          .split(',')
+          .next()
+          .unwrap_or(SUPPORTED_VERSIONS);
+        warn!(
+          "Client sent no wt-available-protocols (no WebTransport subprotocol support); assuming {}",
+          v
+        );
+        v.to_string()
+      }
       None => {
         session_request.forbidden().await;
         return Err(anyhow::anyhow!(
