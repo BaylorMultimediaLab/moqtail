@@ -546,16 +546,17 @@ export class Player {
       this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
       const buf = el.buffered;
       for (let i = 0; i < buf.length - 1; i++) {
+        const start = buf.start(i);
         const end = buf.end(i);
         const nextStart = buf.start(i + 1);
-        // currentTime must be inside *this* gap, not merely past some earlier
-        // range's end: without the upper bound any earlier gap matches and the
-        // seek runs backwards. Visible once the timeline has several ranges —
-        // e.g. playhead at 199.69 with ranges [[170.7,179.7],[180.7,199.7],...]
-        // matched range 0 and seeked back to 180.7.
+        // Only the range the playhead is actually sitting at the end of. Firefox
+        // keeps every old range (Chrome coalesces or evicts them), so without the
+        // lower bound an old hole far behind the playhead matches and the seek
+        // throws playback back by many seconds.
         if (
+          el.currentTime >= start - 0.05 &&
           el.currentTime >= end - 0.05 &&
-          el.currentTime < nextStart &&
+          el.currentTime <= end + 0.25 &&
           nextStart > end &&
           nextStart - end < 1.5
         ) {
