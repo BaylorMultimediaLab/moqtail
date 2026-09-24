@@ -46,7 +46,9 @@ pub struct Cli {
   /// bitrates (e.g. `720p:400,800,1200,2500,5000`); or
   /// `<height>p@<kbps>,<height>p@<kbps>,...` for an explicit per-rung
   /// resolution+bitrate ladder (e.g. `240p@150,360p@200,480p@500,720p@1200,1080p@4000`).
-  /// Used by the paper experiment harness; production publisher leaves this at default.
+  /// In replay mode, `cache` uses whatever ladder the cache was prepared
+  /// with instead of checking it against a request (the experiment runner's
+  /// default). Production publisher leaves this at default.
   #[arg(long, default_value = "default")]
   pub ladder_spec: String,
 

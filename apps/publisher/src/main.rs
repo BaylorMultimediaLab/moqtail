@@ -441,31 +441,35 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
     top_meta.gops_per_variant
   );
 
-  // Validate the cached variant set against the current invocation's request.
-  let synth_video_info = video::VideoInfo {
-    width: top_meta.source_width,
-    height: top_meta.source_height,
-    framerate: top_meta.framerate,
+  // Validate the cached variant set against the current invocation's request,
+  // unless the caller asked for whatever the cache holds (`--ladder-spec cache`).
+  let expected_variants: Option<Vec<adaptive::QualityVariant>> = if cli.ladder_spec == "cache" {
+    info!("Ladder taken from the cache: {:?}", top_meta.variants);
+    None
+  } else {
+    let synth_video_info = video::VideoInfo {
+      width: top_meta.source_width,
+      height: top_meta.source_height,
+      framerate: top_meta.framerate,
+    };
+    let expected = adaptive::resolve_ladder(
+      &cli.ladder_spec,
+      cli.max_variants as usize,
+      &synth_video_info,
+    )
+    .map_err(|e| anyhow::anyhow!("--ladder-spec: {}", e))?;
+    let expected_qualities: Vec<String> = expected.iter().map(|v| v.quality.to_string()).collect();
+    if top_meta.variants != expected_qualities {
+      anyhow::bail!(
+        "Cache variant set {:?} does not match current request (max_variants={}) which would produce {:?}; pass --ladder-spec cache to use the cache as prepared, or delete {} and re-prepare",
+        top_meta.variants,
+        cli.max_variants,
+        expected_qualities,
+        encoded_dir.display()
+      );
+    }
+    Some(expected)
   };
-  let expected_variants = adaptive::resolve_ladder(
-    &cli.ladder_spec,
-    cli.max_variants as usize,
-    &synth_video_info,
-  )
-  .map_err(|e| anyhow::anyhow!("--ladder-spec: {}", e))?;
-  let expected_qualities: Vec<String> = expected_variants
-    .iter()
-    .map(|v| v.quality.to_string())
-    .collect();
-  if top_meta.variants != expected_qualities {
-    anyhow::bail!(
-      "Cache variant set {:?} does not match current request (max_variants={}) which would produce {:?}; delete {} and re-prepare",
-      top_meta.variants,
-      cli.max_variants,
-      expected_qualities,
-      encoded_dir.display()
-    );
-  }
 
   // Read every variant's metadata from disk; sanity-check GOP file count.
   let mut variant_metas: Vec<cache::VariantMeta> = Vec::with_capacity(top_meta.variants.len());
@@ -536,11 +540,22 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   let mut moq = MoqConnection::establish(&cli.endpoint, cli.validate_cert).await?;
   // Build a borrowed-variant view of the cache so publish_all_tracks works
   // without re-running quality_variants against the source video.
-  let variants_for_publish: Vec<adaptive::QualityVariant> = variant_metas
-    .iter()
-    .zip(expected_variants.iter())
-    .map(|(_vm, ev)| ev.clone())
-    .collect();
+  let variants_for_publish: Vec<adaptive::QualityVariant> = match &expected_variants {
+    Some(expected) => variant_metas
+      .iter()
+      .zip(expected.iter())
+      .map(|(_vm, ev)| ev.clone())
+      .collect(),
+    None => variant_metas
+      .iter()
+      .map(|vm| adaptive::QualityVariant {
+        quality: adaptive::Quality::Named(Box::leak(vm.quality.clone().into_boxed_str())),
+        width: vm.width,
+        height: vm.height,
+        bitrate_kbps: vm.bitrate_kbps,
+      })
+      .collect(),
+  };
   let track_aliases = publish_all_tracks(
     &mut moq,
     &cli.namespace,
