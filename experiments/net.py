@@ -75,6 +75,10 @@ class NoneBackend:
         return cmd
 
     @property
+    def detaches_itself(self) -> bool:
+        return False
+
+    @property
     def relay_host(self) -> str:
         return "127.0.0.1"
 
@@ -166,9 +170,17 @@ class NetnsBackend:
         keep = [f"{k}={v}" for k, v in os.environ.items()
                 if k in ("HOME", "PATH", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LANG", "MOZ_LOG", "MOZ_LOG_FILE")]
         # `runuser` (util-linux) lets root become the user without consulting the
-        # sudo policy; a nested `sudo -u` can demand a password on hosts whose
-        # policy requires one even for root, and then the browser never starts.
-        return ["sudo", "-n", "ip", "netns", "exec", self.ns, "runuser", "-u", user, "--", "env", *keep] + cmd
+        # sudo policy. `setsid -w` detaches the command into its own session only
+        # *after* sudo has run: Ubuntu's sudo caches credentials per terminal, so
+        # the sudo itself must keep the runner's terminal (a session-less sudo
+        # sees no timestamp and fails with "a password is required").
+        return ["sudo", "-n", "ip", "netns", "exec", self.ns, "runuser", "-u", user, "--",
+                "setsid", "-w", "env", *keep] + cmd
+
+    @property
+    def detaches_itself(self) -> bool:
+        """The wrapped command creates its own session; the caller must not."""
+        return os.geteuid() != 0
 
     @property
     def relay_host(self) -> str:
@@ -222,7 +234,7 @@ class BackgroundFlows:
         if self.cc:
             cmd += ["-C", self.cc]
         self.client = subprocess.Popen(self.backend.wrap(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       preexec_fn=os.setsid)
+                                       preexec_fn=None if self.backend.detaches_itself else os.setsid)
         self._on = True
         self.log("BG_FLOW_ON", {"flows": self.flows, "seconds": seconds})
 
@@ -244,6 +256,9 @@ class BackgroundFlows:
             self._next_toggle = now + self.on_s
 
     def stop(self) -> None:
+        # The client may sit behind sudo/runuser wrappers: signal it by command line.
+        subprocess.run(["pkill", "-TERM", "-f", f"iperf3 -c {self.backend.relay_host}"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for p in (self.client, self.server):
             if p and p.poll() is None:
                 p.terminate()
