@@ -135,9 +135,15 @@ python3 experiments/run_experiment.py --mechanism native --client-mode live-edge
 
 `results/<run>/runner-events.jsonl` must contain `NET_CHANGE` with
 `"applied": true`, and the summary's played bitrate must be well under the
-unshaped run's. If `sudo -n` prompts fail mid-run, add a NOPASSWD rule for
-`ip`, `tc` and `kill` in `/etc/sudoers.d/moqtail` instead of relying on the
-timestamp.
+unshaped run's. Ubuntu's sudo caches the credential per terminal, so run the
+runner from the terminal where you ran `sudo -v`, not under `nohup` or a
+service. If `sudo -n` fails mid-run anyway, add a NOPASSWD rule instead of
+relying on the timestamp:
+
+```sh
+echo "$USER ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/tc, /usr/bin/kill" | sudo tee /etc/sudoers.d/moqtail
+sudo chmod 440 /etc/sudoers.d/moqtail
+```
 
 ## 7. The pilot
 

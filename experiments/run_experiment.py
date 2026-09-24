@@ -146,11 +146,12 @@ def load_profile(path: Path) -> dict:
     return prof
 
 
-def spawn(cmd: list[str], log: Path, cwd: Path = ROOT, env: dict | None = None) -> subprocess.Popen:
+def spawn(cmd: list[str], log: Path, cwd: Path = ROOT, env: dict | None = None,
+          new_session: bool = True) -> subprocess.Popen:
     f = log.open("ab")
     print("[run] $", " ".join(cmd))
     return subprocess.Popen(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, env=env,
-                            preexec_fn=os.setsid)
+                            preexec_fn=os.setsid if new_session else None)
 
 
 def _killpg(pgid: int, sig: int) -> None:
@@ -163,8 +164,19 @@ def _killpg(pgid: int, sig: int) -> None:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def stop(p: subprocess.Popen | None, name: str) -> None:
+def stop(p: subprocess.Popen | None, name: str, pattern: str | None = None) -> None:
+    """Stop a spawned process. With `pattern`, the real process sits behind
+    privilege wrappers in its own session, so it is signalled by command line
+    (its processes belong to the invoking user) and the wrapper chain follows."""
     if p is None or p.poll() is not None:
+        return
+    if pattern:
+        subprocess.run(["pkill", "-TERM", "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            p.wait(timeout=10)
+        except Exception:
+            subprocess.run(["pkill", "-KILL", "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[run] stopped {name}")
         return
     try:
         pgid = os.getpgid(p.pid)
@@ -372,6 +384,7 @@ def run_once(args, repeat_index: int) -> int:
 
     procs: dict[str, subprocess.Popen] = {}
     browser: str | None = None
+    browser_pattern: str | None = None
     bg = BackgroundFlows(backend, args.bg_flows, args.bg_pattern, cc=args.bg_cc, log=rlog.emit)
     exit_code = 0
     try:
@@ -452,7 +465,12 @@ def run_once(args, repeat_index: int) -> int:
         browser = find_browser(args.browser)
         if browser is None:
             raise SystemExit("no Firefox or Chromium found; pass --browser")
-        procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed)), out / "browser.log")
+        # The profile directory is unique to this run and appears on the browser's
+        # command line, which is how the browser is found again to stop it when it
+        # runs behind privilege wrappers.
+        browser_pattern = str(out / ("firefox-profile" if browser_kind(browser) == "firefox" else "chrome-profile"))
+        procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed)), out / "browser.log",
+                                 new_session=not backend.detaches_itself)
         rlog.emit("BROWSER_START", {"url": url, "binary": browser, "kind": browser_kind(browser),
                                     "headless": not args.headed, "cert_pinned": hash_file.exists()})
 
@@ -488,7 +506,7 @@ def run_once(args, repeat_index: int) -> int:
     finally:
         # Give the browser a moment to flush its event buffer, then stop it first.
         time.sleep(1.5)
-        stop(procs.get("browser"), "browser")
+        stop(procs.get("browser"), "browser", browser_pattern if backend.detaches_itself else None)
         time.sleep(1.0)
         bg.stop()
         for name in ("publisher", "relay", "vite"):
