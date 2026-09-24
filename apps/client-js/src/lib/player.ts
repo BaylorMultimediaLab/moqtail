@@ -519,9 +519,20 @@ export class Player {
       this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
       const buf = el.buffered;
       for (let i = 0; i < buf.length - 1; i++) {
+        const start = buf.start(i);
         const end = buf.end(i);
         const nextStart = buf.start(i + 1);
-        if (el.currentTime >= end - 0.05 && nextStart > end && nextStart - end < 1.5) {
+        // Only the range the playhead is actually sitting at the end of. Firefox
+        // keeps every old range (Chrome coalesces or evicts them), so without the
+        // lower bound an old hole far behind the playhead matches and the seek
+        // throws playback back by many seconds.
+        if (
+          el.currentTime >= start - 0.05 &&
+          el.currentTime >= end - 0.05 &&
+          el.currentTime <= end + 0.25 &&
+          nextStart > end &&
+          nextStart - end < 1.5
+        ) {
           logger.info(
             'media',
             `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
