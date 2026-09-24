@@ -394,8 +394,12 @@ def run_once(args, repeat_index: int) -> int:
 
         # Publisher (replay from the prepared cache, no loop so the media
         # timeline never wraps inside a run) ---------------------------------
+        if str(args.encoded_dir) in ("", "."):
+            raise SystemExit("--encoded-dir is empty: if you pass \"$ENC\", export it in this shell first "
+                             "(see docs/pilot-linux.md step 3)")
         if not (args.encoded_dir / "meta.json").exists():
-            raise SystemExit(f"no prepared GOP cache at {args.encoded_dir}; run scripts/run-stack.sh once")
+            raise SystemExit(f"no prepared GOP cache at {args.encoded_dir} (no meta.json); prepare it with the "
+                             "publisher as in docs/pilot-linux.md step 3")
         procs["publisher"] = spawn([
             str(publisher_bin), f"https://{backend.relay_host}:{args.relay_port}",
             "--encoded-dir", str(args.encoded_dir), "--max-variants", str(args.max_variants),
