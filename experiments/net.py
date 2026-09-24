@@ -165,7 +165,10 @@ class NetnsBackend:
         user = os.environ.get("SUDO_USER") or os.environ.get("USER") or str(os.getuid())
         keep = [f"{k}={v}" for k, v in os.environ.items()
                 if k in ("HOME", "PATH", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LANG", "MOZ_LOG", "MOZ_LOG_FILE")]
-        return ["sudo", "-n", "ip", "netns", "exec", self.ns, "sudo", "-n", "-u", user, "env", *keep] + cmd
+        # `runuser` (util-linux) lets root become the user without consulting the
+        # sudo policy; a nested `sudo -u` can demand a password on hosts whose
+        # policy requires one even for root, and then the browser never starts.
+        return ["sudo", "-n", "ip", "netns", "exec", self.ns, "runuser", "-u", user, "--", "env", *keep] + cmd
 
     @property
     def relay_host(self) -> str:
