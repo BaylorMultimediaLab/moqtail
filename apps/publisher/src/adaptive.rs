@@ -88,6 +88,11 @@ pub enum Quality {
     height: u16,
     bitrate_kbps: u32,
   },
+  /// A rung taken verbatim from a prepared GOP cache (`--ladder-spec cache`):
+  /// the name is whatever the cache was prepared with, so the track names
+  /// match its catalog. `&'static str` keeps the enum `Copy`; the handful of
+  /// names is leaked once at startup.
+  Named(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +252,7 @@ impl std::fmt::Display for Quality {
         height,
         bitrate_kbps,
       } => write!(f, "{}p-{}k", height, bitrate_kbps),
+      Quality::Named(name) => write!(f, "{name}"),
     }
   }
 }
