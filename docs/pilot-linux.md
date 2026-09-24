@@ -81,7 +81,10 @@ cat "$ENC/meta.json"                     # gops_per_variant = seconds of media a
 ```
 
 The runner replays with `--no-loop`, so a run can last at most
-`gops_per_variant` seconds. The shipped clips give about 112 s, which fits
+`gops_per_variant` seconds. It also tells the publisher to use whatever
+ladder the cache was prepared with (`--ladder-spec cache`), so a cache made
+by `prepare_tears_of_steel.sh` (five explicit rungs) and one made by the
+command above (the four-rung default) both just work. The shipped clips give about 112 s, which fits
 the `step_down_up_100s` profile with `--duration 100` (steps at 30 s and
 60 s). For the full 200 s `step_down_up` profile prepare a longer source:
 `CLIP_SECONDS=240 ./scripts/prepare_tears_of_steel.sh` (downloads Tears of

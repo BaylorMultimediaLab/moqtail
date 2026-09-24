@@ -72,6 +72,18 @@ def _client_run_meta(out: Path) -> dict:
     return {}
 
 
+def ladder_id(encoded_dir: Path, ladder_spec: str) -> str:
+    """The prepared cache names the ladder: its directory plus its rung names."""
+    meta = encoded_dir / "meta.json"
+    if meta.exists():
+        try:
+            variants = json.loads(meta.read_text()).get("variants") or []
+            return f"{encoded_dir.name}:{'+'.join(variants)}"
+        except json.JSONDecodeError:
+            pass
+    return f"{ladder_spec}@{encoded_dir.name}"
+
+
 def client_delay_groups(out: Path):
     return _client_run_meta(out).get("delay_groups")
 
@@ -295,7 +307,8 @@ def main() -> int:
     ap.add_argument("--bg-cc", default=None, help="TCP congestion control for iperf3 (cubic, bbr)")
     ap.add_argument("--encoded-dir", type=Path, default=ROOT / "data/encoded/smoking_test_1080p_ts")
     ap.add_argument("--max-variants", type=int, default=4)
-    ap.add_argument("--ladder-spec", default="default")
+    ap.add_argument("--ladder-spec", default="cache",
+                    help="publisher ladder; `cache` (default) uses the ladder the GOP cache was prepared with")
     ap.add_argument("--cache-size", type=int, default=1000, help="relay --cache-size (groups per track)")
     ap.add_argument("--relay-port", type=int, default=4433)
     ap.add_argument("--vite-port", type=int, default=5173)
@@ -500,7 +513,7 @@ def run_once(args, repeat_index: int) -> int:
             "time_shift_s": args.time_shift if args.client_mode == "time-shifted" else 0,
             "delay_groups": client_delay_groups(out),
             "gop_duration_ms": client_gop_duration_ms(out),
-            "ladder_id": f"{args.ladder_spec}@{args.encoded_dir.name}",
+            "ladder_id": ladder_id(args.encoded_dir, args.ladder_spec),
             "network_profile": profile["name"],
             "trace_id": Path(profile["trace_file"]).stem if profile.get("trace_file") else None,
             "qdisc": profile["queue"] if backend.name != "none" else "none",
