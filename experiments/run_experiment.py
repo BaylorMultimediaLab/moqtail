@@ -275,13 +275,20 @@ user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("dom.disable_beforeunload", true);
 """
+# The page is served over plain http. `localhost` is a secure context by
+# definition, but the namespace's host address (10.200.0.1) is not, and
+# WebTransport only exists in secure contexts; each browser has a way to
+# declare one origin trustworthy.
+FIREFOX_SECURE_CONTEXT_PREF = 'user_pref("dom.securecontext.allowlist", "%s");\n'
 
 
-def browser_command(browser: str, url: str, out: Path, headed: bool) -> list[str]:
+def browser_command(browser: str, url: str, out: Path, headed: bool, page_host: str, page_port: int) -> list[str]:
+    insecure_origin = page_host not in ("localhost", "127.0.0.1", "::1")
     if browser_kind(browser) == "firefox":
         profile = out / "firefox-profile"
         profile.mkdir(exist_ok=True)
-        (profile / "user.js").write_text(FIREFOX_PREFS)
+        prefs = FIREFOX_PREFS + (FIREFOX_SECURE_CONTEXT_PREF % page_host if insecure_origin else "")
+        (profile / "user.js").write_text(prefs)
         cmd = [browser, "--no-remote", "--new-instance", "--profile", str(profile),
                "--width", "1280", "--height", "800"]
         if not headed:
@@ -294,6 +301,8 @@ def browser_command(browser: str, url: str, out: Path, headed: bool) -> list[str
         "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
         f"--user-data-dir={out / 'chrome-profile'}", "--window-size=1280,800",
     ]
+    if insecure_origin:
+        cmd.append(f"--unsafely-treat-insecure-origin-as-secure=http://{page_host}:{page_port}")
     if os.geteuid() == 0:
         cmd.append("--no-sandbox")  # Chromium refuses to start as root otherwise
     if not headed:
@@ -469,7 +478,8 @@ def run_once(args, repeat_index: int) -> int:
         # command line, which is how the browser is found again to stop it when it
         # runs behind privilege wrappers.
         browser_pattern = str(out / ("firefox-profile" if browser_kind(browser) == "firefox" else "chrome-profile"))
-        procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed)), out / "browser.log",
+        procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed, backend.vite_host, args.vite_port)),
+                                 out / "browser.log",
                                  new_session=not backend.detaches_itself)
         rlog.emit("BROWSER_START", {"url": url, "binary": browser, "kind": browser_kind(browser),
                                     "headless": not args.headed, "cert_pinned": hash_file.exists()})
