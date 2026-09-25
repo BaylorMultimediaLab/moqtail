@@ -174,6 +174,27 @@ experiments/pack_results.sh results pilot-$(hostname)-$(date +%Y%m%d).tar.gz
 `pack_results.sh` re-runs the analysis, then bundles every run directory
 without browser profiles and process logs (a few MB for ten runs).
 
+## 8b. Cross-mechanism diagnostic (pr1378 versus native)
+
+Same profile and repetitions as the pilot, on the pr1378 branch, both floors
+and both client types. The runner rebuilds the relay for the branch and
+refuses a mechanism that does not match the checkout.
+
+```sh
+git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+sudo -v
+for mode in next-group playhead; do
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode $mode --client-mode live-edge \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode $mode --client-mode time-shifted --time-shift 10 \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+python3 experiments/analyze.py results/*/ --quiet --csv results/all.csv --stats results/all_stats.csv
+python3 experiments/compare.py results/*/     # one column per condition, native included
+```
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
