@@ -661,6 +661,22 @@ pub(crate) async fn forward_publish_downstream(
             subscriber.connection_id, m.error_code
           );
         }
+        // SWITCH PR #1378: the subscription this PUBLISH created is addressed by
+        // the PUBLISH's request id, so the subscriber's *next* SWITCH arrives on
+        // this stream. Handle it exactly like a SWITCH on a SUBSCRIBE stream.
+        Ok(ControlMessage::Switch(m)) => {
+          let handled = super::subscribe_handler::handle_switch_boxed(
+            subscriber.clone(),
+            *m,
+            context.clone(),
+          );
+          if let Err(e) = handled.await {
+            warn!(
+              "SWITCH on downstream publish stream {} failed: {:?}",
+              publish_request_id, e
+            );
+          }
+        }
         Ok(other) => warn!(
           "Unexpected {:?} on downstream publish stream",
           other.get_type()

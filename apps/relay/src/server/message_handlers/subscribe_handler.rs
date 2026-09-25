@@ -1515,9 +1515,20 @@ async fn handle_subscribe_error_message(
   Ok(())
 }
 
+/// Type-erased entry point for a SWITCH that arrives on a relay-opened PUBLISH
+/// stream (`publish_handler::forward_publish_downstream`). A plain function
+/// boundary is required: the handler opens such a stream itself, so the two
+/// async fns would otherwise contain each other's future types.
+pub(crate) fn handle_switch_boxed(
+  client: Arc<MOQTClient>,
+  switch_message: moqtail::model::control::switch::Switch,
+  context: Arc<SessionContext>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TerminationCode>> + Send>> {
+  Box::pin(handle_switch_message(client, switch_message, context))
+}
+
 async fn handle_switch_message(
   client: Arc<MOQTClient>,
-  _stream_handler: &mut ControlStreamHandler,
   switch_message: moqtail::model::control::switch::Switch,
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
@@ -2002,7 +2013,7 @@ pub async fn handle(
       };
       handle_request_update(client, stream_handler, *m, context, target_request_id).await
     }
-    ControlMessage::Switch(m) => handle_switch_message(client, stream_handler, *m, context).await,
+    ControlMessage::Switch(m) => handle_switch_message(client, *m, context).await,
     _ => {
       // no-op
       Ok(())

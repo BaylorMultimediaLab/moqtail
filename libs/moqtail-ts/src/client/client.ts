@@ -1509,16 +1509,27 @@ export class MOQtailClient {
         this.pendingSwitches.set(key, queue)
       })
 
+      // The subscription being replaced is either one this client opened with
+      // SUBSCRIBE, or the one the relay opened with the PUBLISH that answered
+      // the previous SWITCH (its request id was adopted by the caller). Both
+      // are current subscriptions; the second lives on a relay-opened stream.
       const request = this.requests.get(subscriptionRequestId)
-      if (!(request instanceof SubscribeRequest))
+      const pushedStream = this.pushedRequestStreams.get(subscriptionRequestId)
+      const isSubscribe = request instanceof SubscribeRequest
+      const isPushed = pushedStream !== undefined && this.subscriptionAliasMap.has(subscriptionRequestId)
+      if (!isSubscribe && !isPushed)
         throw new ProtocolViolationError('MOQtailClient.switch', 'Current Subscribe Request ID is not a subscription')
 
       const kvpParams = parameters.map((p) => p.toKeyValuePair())
       const msg = new Switch(subscriptionRequestId, fullTrackName, minimumSwitchingGroupId, kvpParams)
       // SWITCH replaces an existing subscription, so it travels on that subscription's
-      // request stream (draft-18 §3.3.2); the relay's answer is a PUBLISH on a new
-      // relay-opened request stream, never a message on this one.
-      const requestStream = this.#requestStreamFor(subscriptionRequestId, 'MOQtailClient.switch')
+      // request stream (draft-18 §3.3.2): the stream this client opened for its
+      // SUBSCRIBE, or the stream the relay opened for its PUBLISH. The relay's
+      // answer is a PUBLISH on a new relay-opened request stream, never a
+      // message on this one.
+      const requestStream = isSubscribe
+        ? this.#requestStreamFor(subscriptionRequestId, 'MOQtailClient.switch')
+        : pushedStream!
       await requestStream.send(msg)
 
       return await result
