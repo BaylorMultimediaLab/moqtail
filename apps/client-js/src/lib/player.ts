@@ -470,6 +470,35 @@ export class Player {
       // fired `waiting`; the interval is credited from the first frozen tick.
       this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
       const buf = el.buffered;
+      // Decoder wedge: frozen for 3 s with data buffered ahead of the playhead
+      // but the element unable to decode at this position (readyState below
+      // HAVE_FUTURE_DATA). Seen on Firefox after three switches inside two
+      // seconds. Skip forward to the next group boundary; the alternative is a
+      // frozen picture for the rest of the run.
+      if (frozenSince >= 6 && el.readyState < 3) {
+        for (let i = 0; i < buf.length; i++) {
+          if (el.currentTime >= buf.start(i) - 0.05 && buf.end(i) - el.currentTime > 1.5) {
+            const gopS = (this.#timeMap?.gopDurationMs ?? 1000) / 1000;
+            const target = Math.min(
+              buf.end(i) - 0.5,
+              (Math.floor(el.currentTime / gopS) + 1) * gopS + 0.001,
+            );
+            logger.warn(
+              'media',
+              `Decoder wedge at ${el.currentTime.toFixed(2)}s (readyState ${el.readyState}), seeking to ${target.toFixed(2)}s`,
+            );
+            events.emit('SEEK', {
+              reason: 'unwedge',
+              from_ms: el.currentTime * 1000,
+              to_ms: target * 1000,
+              ready_state: el.readyState,
+            });
+            el.currentTime = target;
+            frozenSince = 0;
+            return;
+          }
+        }
+      }
       for (let i = 0; i < buf.length - 1; i++) {
         const start = buf.start(i);
         const end = buf.end(i);
@@ -1486,6 +1515,24 @@ export class Player {
     // the wire is preserved; only the id-state read is moved to before the
     // await.
     const subscriptionRequestId = videoStruct.requestId;
+    // A previous switch that has not landed yet (its request id has no track
+    // alias in the library) cannot be switched away from: the library treats
+    // that as an internal error and destroys the whole session. This happens
+    // when the ABR guard times out and re-fires. Skip instead.
+    if (!this.client.subscriptionAliasMap.has(subscriptionRequestId)) {
+      logger.warn(
+        'media',
+        `switchTrack: previous switch has not landed; skipping switch to ${trackName}`,
+      );
+      events.emit('SWITCH_SKIPPED', {
+        from: videoStruct.trackName,
+        to: trackName,
+        reason: 'previous switch not landed',
+        pending_request_id: subscriptionRequestId,
+      });
+      this.#options.onTrackSwitched?.(videoStruct.trackName);
+      return;
+    }
     const newRequestId = this.client.allocateNextRequestId();
     videoStruct.requestId = newRequestId;
 

@@ -258,13 +258,19 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             episodes.append({"ts": open_start["ts"], "cause": r.get("cause"), "duration_ms": r.get("duration_ms"),
                              "playhead_ms": r.get("playhead_ms")})
             open_start = None
+    # A stall still open when the run ended is a stall to the end of the run.
+    if open_start is not None:
+        last_ts = max((r["ts"] for r in recs if r.get("src") == "client"), default=open_start["ts"])
+        episodes.append({"ts": open_start["ts"], "cause": open_start.get("cause"), "duration_ms": last_ts - open_start["ts"],
+                         "playhead_ms": open_start.get("playhead_ms"), "open_at_end": True})
     durations = [e["duration_ms"] for e in episodes if e["duration_ms"] is not None]
     seeks = by("SEEK")
     out["stalls"] = {
         "count": len(episodes), "total_ms": sum(durations), "max_ms": max(durations) if durations else 0,
         "episodes": episodes,
         "seeks": {reason: sum(1 for s in seeks if s.get("reason") == reason)
-                  for reason in ("startup", "wedge", "range-jump", "visibility")},
+                  for reason in ("startup", "wedge", "range-jump", "visibility", "unwedge")},
+        "open_at_end": any(e.get("open_at_end") for e in episodes),
         "wedge_gap_ms_total": sum(s.get("gap_ms") or 0 for s in seeks if s.get("reason") == "wedge"),
     }
 
@@ -353,6 +359,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     }
     out["switching"] = switching_diagnostics(switches, by, reversal_window_s)
     out["feedback"] = feedback_windows(switches, by, feedback_window_s)
+    out["switches"]["skipped_not_landed"] = len(by("SWITCH_SKIPPED"))
+    out["switches"]["session_destroyed"] = any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR"))
 
     # Samples: time shift, live edge, bitrate --------------------------------
     samples = [s for s in by("SAMPLE") if st is None or s["ts"] >= st["ts"]]
@@ -368,6 +376,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         # The shift the relay actually delivered, measured before any playback
         # drift: the first `initial_window_s` seconds after the first presented
         # frame (a switch inside the window does not move the playhead).
+        # Shift erosion: first sample after the initial window at which the client
+        # sits closer than half its target to the live edge (None = never).
+        "time_to_half_shift_ms": next(
+            (s["ts"] - st["ts"] for s in samples
+             if st and win_end is not None and s["ts"] >= win_end
+             and s.get("live_edge_distance_ms") is not None
+             and (client_meta.get("target_shift_ms") or 0) > 0
+             and s["live_edge_distance_ms"] < (client_meta.get("target_shift_ms") or 0) / 2), None),
         "initial_window": {
             "definition": f"first {initial_window_s:g} s after the first presented frame",
             "start_ms": win_start, "end_ms": win_end,
@@ -446,6 +462,11 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                     hold_start = None
             rec["offset_recovery_ms"] = (off - t0) if off else None
         detections.append(rec)
+    # Detection timelines only mean something when the controller is otherwise
+    # quiet: with a switch every second the "first decision after the change"
+    # is just the next oscillation.
+    med_gap = out["switching"]["median_inter_switch_interval_ms"]
+    out["detection_reliable"] = med_gap is None or med_gap >= feedback_window_s * 1000
     out["detection"] = detections
 
     # Relay cache and process stats -----------------------------------------
@@ -474,6 +495,22 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "switch_recv": len(switch_recv), "switch_promoted": len(promoted),
     }
     out["publisher"] = {"groups_emitted": len(by("GROUP_EMIT"))}
+    # Playback progress: fraction of sample intervals in which the playhead
+    # advanced, and the longest stretch without progress.
+    prog_ok, prog_n, longest, run_start = 0, 0, 0.0, None
+    for a, b in zip(samples, samples[1:]):
+        prog_n += 1
+        if b.get("playhead_ms", 0) > a.get("playhead_ms", 0) + 1:
+            prog_ok += 1
+            run_start = None
+        else:
+            run_start = run_start if run_start is not None else a["ts"]
+            longest = max(longest, b["ts"] - run_start)
+    out["playback"] = {
+        "advancing_fraction": (prog_ok / prog_n) if prog_n else None,
+        "longest_no_progress_ms": longest,
+        "presented_frames": samples[-1].get("total_frames") if samples else None,
+    }
     out["client_errors"] = [r.get("message") for r in by("ERROR")]
     return out
 
@@ -531,7 +568,10 @@ def to_markdown(s: dict) -> str:
          f"| playback position jump ms (median / abs p95) | {fmt(s['switches']['playback_position_jump_ms'].get('p50'))} / {fmt(s['switches']['abs_playback_position_jump_ms'].get('p95'))} |",
          f"| viewer pause at seam ms (median / p95) | {fmt(s['switches']['viewer_pause_ms'].get('p50'))} / {fmt(s['switches']['viewer_pause_ms'].get('p95'))} |",
          f"| seam buffer hole ms (median / max) | {fmt(s['switches']['seam_buffer_hole_ms'].get('p50'))} / {fmt(s['switches']['seam_buffer_hole_ms'].get('max'))} |",
-         f"| switches superseded before visible | {s['switches']['superseded']} of {s['switches']['count']} |",
+         f"| switches superseded before visible; skipped (previous not landed) | {s['switches']['superseded']} of {s['switches']['count']}; {s['switches']['skipped_not_landed']} |",
+         f"| playback advancing fraction / longest no-progress s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} |",
+         f"| time to half shift (s) | {fmt((s['time_shift']['time_to_half_shift_ms'] or 0) / 1000) if s['time_shift']['time_to_half_shift_ms'] else '-'} |",
+         f"| detection timelines reliable | {s['detection_reliable']} (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
          f"| seam dropped source frames (median / max); landed on keyframe | {fmt(s['switches']['seam_dropped_source_frames'].get('p50'))} / {fmt(s['switches']['seam_dropped_source_frames'].get('max'))}; {s['switches']['landed_on_group_start']} of {s['switches']['count']} |",
          f"| switches/min; reversals (A->B->A) | {fmt(s['switching']['switches_per_minute'])}; {s['switching']['direction_reversals']} ({s['switching']['aba_reversals']}) |",
          f"| inter-switch interval ms (median / min) | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])} |",
@@ -575,6 +615,8 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "media_seam_gap_p50_ms", "seam_ahead_p50_ms", "seam_buffer_hole_p50_ms", "seam_dropped_frames_p50",
                   "landed_on_group_start", "superseded", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
+                  "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "session_destroyed",
+                  "detection_reliable",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
@@ -613,6 +655,11 @@ def agg_row(s: dict) -> dict:
         "followed_within_window": s["feedback"]["summary"]["followed_within_window"],
         "followed_by_latency_trend": s["feedback"]["summary"]["followed_within_window_by_latency_trend"],
         "initial_live_edge_mean_ms": s["time_shift"]["initial_window"]["live_edge_distance_ms"].get("mean"),
+        "time_to_half_shift_ms": s["time_shift"]["time_to_half_shift_ms"],
+        "advancing_fraction": s["playback"]["advancing_fraction"],
+        "longest_no_progress_ms": s["playback"]["longest_no_progress_ms"],
+        "session_destroyed": s["switches"]["session_destroyed"],
+        "detection_reliable": s["detection_reliable"],
         "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
         "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
         "live_edge_mean_ms": s["time_shift"]["live_edge_distance_ms"].get("mean"),

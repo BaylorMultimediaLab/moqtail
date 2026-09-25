@@ -20,6 +20,9 @@ Checks (each PASS / FAIL / SKIP with the numbers behind it):
   join          for several groups G: publisher GROUP_EMIT(G) <= relay CACHE_GROUP(G)
                 <= client receipt of G (OBJECT_RECV with --log-objects, else the
                 THROUGHPUT_SAMPLE that finalises G), on the track the client was on
+  playback      the playhead advanced in at least half of the sample intervals,
+                never stood still longer than --max-freeze-s, and the MoQ session
+                was not destroyed by a failed switch
   clean-worktree (--final only) the run was made from a committed tree
 
 Writes validation.json into the run directory; analyze.py excludes runs whose
@@ -38,6 +41,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze import analyze, last_session, load, track_matches, wall_clock_gaps  # noqa: E402
+
+
+def fmt_pct(v) -> str:
+    return "-" if v is None else f"{v * 100:.0f} %"
 
 
 class Report:
@@ -63,6 +70,7 @@ def main() -> int:
     ap.add_argument("--clock-tolerance-ms", type=float, default=250.0)
     ap.add_argument("--join-samples", type=int, default=5)
     ap.add_argument("--window-s", type=float, default=5.0, help="seconds after the first frame used for the initial-shift check")
+    ap.add_argument("--max-freeze-s", type=float, default=10.0, help="longest tolerated stretch without playhead progress")
     ap.add_argument("--final", action="store_true",
                     help="paper-quality gate: also require a clean git worktree at run time")
     ap.add_argument("--no-write", action="store_true", help="do not write validation.json into the run directory")
@@ -178,6 +186,14 @@ def main() -> int:
     rep.add("join", (not violations) if checked else None,
             f"{checked} groups joined publisher->relay->client; violations: {violations or 'none'}"
             + ("" if by("OBJECT_RECV") else " (client side from THROUGHPUT_SAMPLE; use --log-objects for exact receipt)"))
+
+    # playback ---------------------------------------------------------------
+    pb = summary.get("playback", {})
+    frac = pb.get("advancing_fraction"); longest = pb.get("longest_no_progress_ms") or 0
+    destroyed = summary.get("switches", {}).get("session_destroyed")
+    ok = frac is not None and frac >= 0.5 and longest <= args.max_freeze_s * 1000 and not destroyed
+    rep.add("playback", ok, f"playhead advancing in {fmt_pct(frac)} of sample intervals (need >= 50 %); longest no-progress "
+                            f"{longest / 1000:.1f} s (max {args.max_freeze_s:g}); session destroyed={destroyed}")
 
     # worktree ---------------------------------------------------------------
     dirty = identity.get("dirty_worktree")
