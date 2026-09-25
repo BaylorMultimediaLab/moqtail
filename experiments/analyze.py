@@ -285,9 +285,17 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             if r.get("to") == sent.get("to"):
                 decision = r
                 break
-        ok = first(recs, "SWITCH_OK", sent["ts"], lambda r: r.get("request_id") == rid)
-        err = first(recs, "SWITCH_ERROR", sent["ts"], lambda r: r.get("request_id") == rid)
-        rrecv = next((r for r in switch_recv if r.get("request_id") == rid), None)
+        # The client's SWITCH_OK/ERROR for this switch is the first one for the same
+        # target after it was sent (request ids differ between mechanisms: native
+        # allocates one up front, PR #1378 adopts the relay's afterwards).
+        ok = first(recs, "SWITCH_OK", sent["ts"], lambda r: r.get("to") == sent.get("to"))
+        err = first(recs, "SWITCH_ERROR", sent["ts"], lambda r: r.get("to") == sent.get("to"))
+        # The relay's SWITCH_RECV names the subscription being replaced (old_request_id)
+        # on every mechanism; the new id may be absent (null) on PR #1378.
+        old_rid = sent.get("old_request_id")
+        rrecv = next((r for r in switch_recv if r["ts"] >= sent["ts"] - 100
+                      and ((rid is not None and r.get("request_id") == rid)
+                           or (old_rid is not None and r.get("old_request_id") == old_rid))), None)
         rprom = first(promoted, "SWITCH_PROMOTED", rrecv["ts"] if rrecv else sent["ts"],
                       lambda r: track_matches(r.get("track"), sent.get("to"))) if rrecv else None
         fobj = first(recs, "SWITCH_FIRST_OBJECT", sent["ts"], lambda r: r.get("to") == sent.get("to"))
