@@ -345,6 +345,8 @@ def main() -> int:
     ap.add_argument("--no-analyze", action="store_true")
     ap.add_argument("--final", action="store_true",
                     help="paper-quality run: refuse a dirty worktree up front and validate with --final")
+    ap.add_argument("--no-rust-build", action="store_true",
+                    help="skip `cargo build --release -p relay -p publisher` (the relay differs per mechanism branch)")
     ap.add_argument("--no-lib-build", action="store_true",
                     help="skip rebuilding libs/moqtail-ts (the player imports its dist, which goes stale across branches)")
     args = ap.parse_args()
@@ -385,6 +387,12 @@ def run_once(args, repeat_index: int) -> int:
         # of another mechanism branch leaves a dist that no longer matches.
         print("[run] building libs/moqtail-ts")
         subprocess.run(["npm", "run", "--prefix", str(ROOT / "libs/moqtail-ts"), "build"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    if not args.no_rust_build:
+        # The relay differs per mechanism branch and a stale target/release binary
+        # silently runs the wrong mechanism; an up-to-date build is a no-op.
+        print("[run] cargo build --release (relay, publisher)")
+        subprocess.run(["cargo", "build", "--release", "-p", "relay", "-p", "publisher"], check=True, cwd=ROOT,
                        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
     rlog = RunnerLog(out / "runner-events.jsonl")
