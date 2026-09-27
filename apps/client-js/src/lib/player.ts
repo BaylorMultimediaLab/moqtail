@@ -31,6 +31,7 @@ import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
 import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
+import type { ProbeResult } from '@/lib/abr/ProbeManager';
 import { events } from '@/lib/events/EventLog';
 import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
 import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
@@ -117,6 +118,14 @@ interface MOQStreamStruct {
   lastSampleCount?: number;
   /** Track name to attach viewerPauseMs to in switchDiscontinuities. */
   postSwitchToTrack?: string;
+  /** performance.now() of the last successful media append (data-starvation watchdog). */
+  lastAppendPerf?: number;
+  /**
+   * A switched-to track whose init segment could not be applied at landing.
+   * Retried before the next object append instead of erroring the write
+   * stream, which used to end delivery for the rest of the run silently.
+   */
+  pendingInit?: { mimeType: string; initData: ArrayBuffer; attempts: number };
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -139,6 +148,8 @@ export interface PlayerOptions {
   catalogLocation?: [Location, Location];
   /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
   onTrackSwitched?: (trackName: string) => void;
+  /** Called when the first frame of a switched-to track is presented (the seam became visible). */
+  onSwitchVisible?: (trackName: string) => void;
   /** Pre-connect: 'time-shifted' clients subscribe behind live by `timeShiftSeconds`; 'live-edge' is today's behavior. */
   clientMode?: 'time-shifted' | 'live-edge';
   /** When clientMode === 'time-shifted', subscribe at `timeShiftSeconds` behind the live edge. */
@@ -161,12 +172,13 @@ const DefaultOptions = {
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
   onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
+  onSwitchVisible: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'live-edge' as 'time-shifted' | 'live-edge',
   timeShiftSeconds: 0,
   logObjects: false,
   landingRequiresAliasMapping: true,
-} satisfies Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
-  Pick<PlayerOptions, 'onTrackSwitched'>;
+} satisfies Required<Omit<PlayerOptions, 'onTrackSwitched' | 'onSwitchVisible'>> &
+  Pick<PlayerOptions, 'onTrackSwitched' | 'onSwitchVisible'>;
 
 /**
  * Builds the `parameters` field for a media-track SUBSCRIBE.
@@ -246,8 +258,11 @@ export class Player {
   #element: HTMLVideoElement | null = null;
   #mse?: MediaSource;
   #streams: MOQStreamStruct[] = [];
-  #options: Required<Omit<PlayerOptions, 'onTrackSwitched'>> &
-    Pick<PlayerOptions, 'onTrackSwitched'>;
+  #options: Required<Omit<PlayerOptions, 'onTrackSwitched' | 'onSwitchVisible'>> &
+    Pick<PlayerOptions, 'onTrackSwitched' | 'onSwitchVisible'>;
+  // Data-starvation watchdog: performance.now() of the last successful append
+  // when a DATA_STARVED episode was opened; undefined while data flows.
+  #starvedSince: number | undefined;
   #disposers: Array<() => void> = [];
   // Per-frame end-to-end latency window (last 100 samples ≈ 4 s at 25 fps).
   // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
@@ -457,6 +472,7 @@ export class Player {
     const wedgeIntervalId = setInterval(() => {
       const q = el.getVideoPlaybackQuality?.();
       const frames = q?.totalVideoFrames ?? 0;
+      this.#checkStarvation(el);
       if (frames > lastFrames) {
         lastFrames = frames;
         frozenSince = 0;
@@ -543,11 +559,58 @@ export class Player {
       el.removeEventListener('playing', onPlaying);
     });
 
-    // Convenience function to wait for buffer updates
-    const waitForBufferUpdate = (sourceBuffer: SourceBuffer) =>
-      new Promise<void>(resolve =>
-        sourceBuffer.addEventListener('updateend', () => resolve(), { once: true }),
-      );
+    // Wait for the SourceBuffer's next `updateend`. Bounded: an `updateend`
+    // that never comes (seen once per few hundred switches on Firefox) used to
+    // park the write handler forever, and with it every later append.
+    const waitForBufferUpdate = (sourceBuffer: SourceBuffer, timeoutMs = 3000) =>
+      new Promise<void>(resolve => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const onEnd = () => {
+          if (timer !== undefined) clearTimeout(timer);
+          resolve();
+        };
+        sourceBuffer.addEventListener('updateend', onEnd, { once: true });
+        timer = setTimeout(() => {
+          sourceBuffer.removeEventListener('updateend', onEnd);
+          events.emit('ERROR', {
+            where: 'updateend-timeout',
+            timeout_ms: timeoutMs,
+            sb_updating: sourceBuffer.updating,
+            mse_ready_state: this.#mse?.readyState ?? 'closed',
+          });
+          resolve();
+        }, timeoutMs);
+      });
+
+    // Apply a track's init segment (changeType + append). Failures are logged
+    // as ERROR events and reported to the caller; they never error the stream.
+    const applyInit = async (
+      sourceBuffer: SourceBuffer,
+      mimeType: string,
+      initData: ArrayBuffer,
+      track: string,
+    ): Promise<boolean> => {
+      try {
+        if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+        sourceBuffer.changeType(mimeType);
+        sourceBuffer.appendBuffer(initData);
+        await waitForBufferUpdate(sourceBuffer);
+        return true;
+      } catch (error) {
+        const err = error as Error & { name?: string };
+        logger.error('media', `switchTrack: failed to apply init segment for ${track}:`, error);
+        events.emit('ERROR', {
+          where: 'switch-init-append',
+          track,
+          name: err?.name ?? null,
+          message: err?.message ?? String(error),
+          sb_updating: sourceBuffer.updating,
+          mse_ready_state: this.#mse?.readyState ?? 'closed',
+          video_error_code: this.#element?.error?.code ?? 0,
+        });
+        return false;
+      }
+    };
 
     // Seek behind the live edge so the player starts with buffer runway.
     // Without this offset the player lands on the live edge (0 s buffer),
@@ -731,22 +794,19 @@ export class Player {
                 since_sent_ms: performance.now() - switchSentAt,
               });
 
-              // changeType() must not be called while the SourceBuffer is updating
-              if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
-              try {
-                sourceBuffer.changeType(mimeType);
-                sourceBuffer.appendBuffer(initData);
-                await waitForBufferUpdate(sourceBuffer);
-              } catch (switchError) {
-                logger.error(
-                  'media',
-                  `switchTrack: failed to apply init segment for ${newTrackName}:`,
-                  switchError,
-                );
-                // Release the guard and abort the write stream — the source buffer
-                // may be in an inconsistent state after a partial changeType/append.
+              if (!(await applyInit(sourceBuffer, mimeType, initData, newTrackName))) {
+                // Keep the pipeline alive: retry the init before the next object
+                // append and drop this object (it cannot be decoded without it).
+                struct.pendingInit = { mimeType, initData, attempts: 1 };
                 this.#options.onTrackSwitched?.(newTrackName);
-                controller.error(switchError);
+                events.emit('DROP_STALE', {
+                  track: objectTrackName,
+                  current: struct.trackName,
+                  pending: null,
+                  group: Number(object.location.group),
+                  object: Number(object.location.object),
+                  reason: 'init-pending',
+                });
                 return;
               }
 
@@ -872,6 +932,28 @@ export class Player {
               }
             }
 
+            if (struct.pendingInit) {
+              const pi = struct.pendingInit;
+              pi.attempts += 1;
+              if (await applyInit(sourceBuffer, pi.mimeType, pi.initData, struct.trackName)) {
+                events.emit('SWITCH_INIT_RECOVERED', {
+                  track: struct.trackName,
+                  attempts: pi.attempts,
+                });
+                struct.pendingInit = undefined;
+              } else {
+                events.emit('DROP_STALE', {
+                  track: objectTrackName,
+                  current: struct.trackName,
+                  pending: struct.pendingSwitch?.trackName ?? null,
+                  group: Number(object.location.group),
+                  object: Number(object.location.object),
+                  reason: 'init-pending',
+                });
+                return;
+              }
+            }
+
             // Append the data
             let maxRetries = 5;
             while (maxRetries--) {
@@ -901,6 +983,29 @@ export class Player {
                   );
                 }
               }
+            }
+
+            if (maxRetries < 0) {
+              events.emit('ERROR', {
+                where: 'append-exhausted',
+                track: objectTrackName,
+                group: Number(object.location.group),
+                object: Number(object.location.object),
+                bytes: object.payload.byteLength,
+                mse_ready_state: this.#mse?.readyState ?? 'closed',
+                video_error_code: this.#element?.error?.code ?? 0,
+              });
+            } else {
+              const nowPerf = performance.now();
+              if (this.#starvedSince !== undefined) {
+                events.emit('DATA_RESUMED', {
+                  track: objectTrackName,
+                  group: Number(object.location.group),
+                  starved_ms: nowPerf - this.#starvedSince,
+                });
+                this.#starvedSince = undefined;
+              }
+              struct.lastAppendPerf = nowPerf;
             }
 
             // Check the buffered amount
@@ -1165,6 +1270,52 @@ export class Player {
     };
   }
 
+  /**
+   * Data starvation: nothing has been appended for STARVATION_MS while the
+   * buffer ahead of the playhead is (nearly) empty. Separates "no data is
+   * arriving" (relay or library stopped delivering, typically right after a
+   * switch) from a decoder wedge, which has data buffered ahead. Recorded, not
+   * repaired: in an experiment a starving subscription is a mechanism failure
+   * that must show up as such.
+   */
+  static readonly STARVATION_MS = 4000;
+  #checkStarvation(el: HTMLVideoElement): void {
+    if (this.#starvedSince !== undefined || !this.#firstFrameSeen) return;
+    const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    if (!vs || vs.lastAppendPerf === undefined) return;
+    const now = performance.now();
+    if (now - vs.lastAppendPerf < Player.STARVATION_MS) return;
+    const buf = el.buffered;
+    const ahead = buf.length > 0 ? buf.end(buf.length - 1) - el.currentTime : 0;
+    if (ahead > 0.5) return;
+    this.#starvedSince = vs.lastAppendPerf;
+    events.emit('DATA_STARVED', {
+      track: vs.trackName,
+      request_id: Number(vs.requestId),
+      pending: vs.pendingSwitch?.trackName ?? null,
+      last_group: Number(vs.lastGroupId),
+      since_last_append_ms: now - vs.lastAppendPerf,
+      playhead_ms: el.currentTime * 1000,
+      buffered_end_ms: buf.length > 0 ? buf.end(buf.length - 1) * 1000 : null,
+      ready_state: el.readyState,
+      mse_ready_state: this.#mse?.readyState ?? 'closed',
+      init_pending: vs.pendingInit !== undefined,
+    });
+  }
+
+  /** End PTS (ms) of the most recently appended video frame: where new data is landing in the buffer. */
+  getAppendFrontMs(): number | undefined {
+    return this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')
+      ?.lastAppendedEndPTS_ms;
+  }
+
+  /** True between SWITCH_OK and the target's first object (the switch has not landed). */
+  hasSwitchInFlight(): boolean {
+    return (
+      this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')?.pendingSwitch != null
+    );
+  }
+
   #openStall(cause: 'waiting' | 'frozen', startPerf: number): void {
     if (this.#stall !== null || !this.#element) return;
     if (!this.#firstFrameSeen) return; // pre-startup waiting is startup delay, not a stall
@@ -1296,6 +1447,7 @@ export class Player {
           struct.postSwitchSentAt = undefined;
           struct.postSwitchToTrack = undefined;
           struct.postSwitchFromTrack = undefined;
+          this.#options.onSwitchVisible?.(targetTrack);
         }
       }
       prevMediaMs = mediaMs;
@@ -1335,10 +1487,10 @@ export class Player {
    * estimates total link throughput rather than just the probe's
    * residual capacity.
    *
-   * Returns 0 on subscribe failure or no data.
+   * Returns bps 0 on subscribe failure or no data.
    */
-  async probeTrackBandwidth(trackName: string, durationMs: number): Promise<number> {
-    if (!this.client) return 0;
+  async probeTrackBandwidth(trackName: string, durationMs: number): Promise<ProbeResult> {
+    if (!this.client) return { bps: 0, dtMs: 0 };
     const fullTrackName = getFullTrackName(this.#options.namespace, trackName);
 
     // Snapshot the active video tracker's cumulative bytes before the probe
@@ -1355,7 +1507,7 @@ export class Player {
       forward: true,
       priority: 255,
     });
-    if (result instanceof RequestError) return 0;
+    if (result instanceof RequestError) return { bps: 0, dtMs: 0 };
 
     const reader = result.stream.getReader();
     let pBytes = 0;
@@ -1422,7 +1574,7 @@ export class Player {
         dt_ms: tEnd - tStart,
         bps: 0,
       });
-      return 0;
+      return { bps: 0, dtMs: tEnd - tStart };
     }
 
     const vBytesEnd = videoStruct?.tracker.getCumulativeBytes() ?? vBytesStart;
@@ -1439,7 +1591,9 @@ export class Player {
       stream_done: streamDone,
       bps,
     });
-    return bps;
+    // dtMs includes the idle wait after the last object; the burst itself is
+    // shorter, so a minimum-duration filter on it is conservative.
+    return { bps, dtMs: lastObjectAt - tStart };
   }
 
   /**
@@ -1449,6 +1603,11 @@ export class Player {
    */
   setOnTrackSwitched(cb: (trackName: string) => void): void {
     this.#options.onTrackSwitched = cb;
+  }
+
+  /** Wires the seam-visible notification (post-switch up-guard release in 'visible' mode). */
+  setOnSwitchVisible(cb: (trackName: string) => void): void {
+    this.#options.onSwitchVisible = cb;
   }
 
   /**

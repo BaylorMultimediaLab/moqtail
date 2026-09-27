@@ -53,6 +53,27 @@ MECHANISM_MODES = {"native": set(), "pr1378": {"next-group", "playhead"}, "switc
 MECHANISM_BRANCH = {"native": "switch/native", "pr1378": "switch/pr1378", "switch-from": "switch/pr1674"}
 MECHANISM_URL_PARAM = {"native": None, "pr1378": "switchFloor", "switch-from": "switchFromMode"}
 
+# Controller arm -> player URL parameters (apps/client-js/src/app.tsx reads them into
+# abrSettings.controller, logged in RUN_META). 'baseline' is the controller as shipped.
+# The probe fix and the post-switch up-guard are separate knobs so the 2x2 ablation
+# can attribute effects (docs/abr-controller.md, section 9).
+CONTROLLER_PARAMS = {
+    "baseline": {},
+    "probe": {"probeMinBytes": 250000, "probeMinDurationMs": 300},
+    "guard": {"upGuardSamples": 3, "upGuardRelease": "landed"},
+    "both": {"probeMinBytes": 250000, "probeMinDurationMs": 300, "upGuardSamples": 3, "upGuardRelease": "landed"},
+}
+
+
+def controller_params(args) -> dict:
+    params = dict(CONTROLLER_PARAMS[args.controller])
+    for kv in args.controller_param or []:
+        k, _, v = kv.partition("=")
+        if not v:
+            sys.exit(f"--controller-param expects KEY=VALUE, got {kv!r}")
+        params[k] = v if k == "upGuardRelease" else int(float(v))
+    return params
+
 
 def _client_run_meta(out: Path) -> dict:
     p = ROOT / "logs" / out.name / "client-events.jsonl"
@@ -339,6 +360,11 @@ def main() -> int:
     ap.add_argument("--headed", action="store_true", help="show the browser window")
     ap.add_argument("--log-objects", action="store_true", help="one OBJECT_RECV per frame (needed for VMAF joins)")
     ap.add_argument("--abr", default="", help="extra ABR URL params, e.g. 'stableBufferTime=8&bufferTimeDefault=8'")
+    ap.add_argument("--controller", choices=list(CONTROLLER_PARAMS), default="baseline",
+                    help="controller stabilisation arm: baseline | probe (payload floor + min duration) | "
+                         "guard (post-switch up-guard) | both; recorded in the identity block")
+    ap.add_argument("--controller-param", action="append", metavar="KEY=VALUE",
+                    help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease)")
     ap.add_argument("--seed", type=int, default=None, help="recorded in run_meta; profiles are deterministic")
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
@@ -376,6 +402,8 @@ def run_once(args, repeat_index: int) -> int:
     mode = "live-edge" if args.client_mode == "live-edge" else f"shift{args.time_shift:g}s"
     mech = args.mechanism + (f"-{args.mechanism_mode}" if args.mechanism_mode else "")
     run_id = f"{stamp}_{mech}_{mode}_{profile['name']}_bg{args.bg_flows}_r{repeat_index}"
+    if args.controller != "baseline":
+        run_id += f"_ctl-{args.controller}"
     if args.label:
         run_id += f"_{args.label}"
     out = args.results / run_id
@@ -474,6 +502,8 @@ def run_once(args, repeat_index: int) -> int:
             url += "&logObjects=1"
         if args.mechanism_mode:
             url += f"&{MECHANISM_URL_PARAM[args.mechanism]}={args.mechanism_mode}"
+        for k, v in controller_params(args).items():
+            url += f"&{k}={v}"
         if args.abr:
             url += "&" + args.abr
         hash_file = args.cert_dir / "hash.txt"
@@ -549,6 +579,8 @@ def run_once(args, repeat_index: int) -> int:
             "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
             "mechanism": args.mechanism,
             "mechanism_mode": args.mechanism_mode,
+            "controller": args.controller,
+            "controller_params": controller_params(args),
             "client_type": args.client_mode,
             "time_shift_s": args.time_shift if args.client_mode == "time-shifted" else 0,
             "delay_groups": client_delay_groups(out),

@@ -99,6 +99,11 @@ Record and metric definitions: `docs/measurement-schema.md`.
   (usually CUBIC) unless `--bg-cc` is given. Record both in the write-up.
 - With 1 s GOPs a 10 s shift is exactly 10 groups; the relay cache default
   (1000 groups) is far larger, so a time-shifted SUBSCRIBE is never clamped.
+- `--controller baseline|probe|guard|both` selects the ABR stabilisation arm
+  (probe payload floor + minimum burst duration; post-switch up-guard; both).
+  The arm is part of the run identity and a condition key, so arms are never
+  pooled. `--controller-param KEY=VALUE` overrides one parameter. See
+  `docs/abr-controller.md` section 9 and `docs/pilot-linux.md` section 8c.
 - A time-shifted client can only buffer up to its shift, so the ABR's 18 s
   `stableBufferTime` is out of reach for it. Pass `--abr
 'stableBufferTime=8&bufferTimeDefault=8'` to test the controller in a

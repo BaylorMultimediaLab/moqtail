@@ -293,6 +293,187 @@ describe('AbrController', () => {
     });
   });
 
+  describe('post-switch up-guard (settings.controller.upGuardSamples)', () => {
+    const guarded = (playerOverrides: Partial<ReturnType<typeof makePlayerMetrics>> = {}) =>
+      makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000, ...playerOverrides },
+        {
+          videoAutoSwitch: true,
+          controller: { ...DEFAULT_ABR_SETTINGS.controller, upGuardSamples: 3 },
+        },
+      );
+
+    const land = (
+      controller: AbrController,
+      player: MockPlayer,
+      metrics: Partial<ReturnType<typeof makePlayerMetrics>>,
+    ) => {
+      controller.releaseSwitchingGuard();
+      player.getMetrics.mockReturnValue(makePlayerMetrics({ totalFrames: 2000, ...metrics }));
+    };
+
+    it('holds the next up-switch until the previous switch landed and 3 fresh samples arrived', async () => {
+      const { controller, player } = guarded();
+      await controller._tick(); // 360p -> 720p
+      expect(player.switchTrack).toHaveBeenCalledTimes(1);
+      player.switchTrack.mockClear();
+
+      // Landed on 720p with sampleCount 10; the throughput rule now wants 1080p.
+      land(controller, player, { bufferSeconds: 5, activeTrack: '720p', sampleCount: 10 });
+      await controller._tick();
+      expect(player.switchTrack).not.toHaveBeenCalled(); // 0 fresh samples
+
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          totalFrames: 2000,
+          sampleCount: 12,
+        }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).not.toHaveBeenCalled(); // 2 fresh samples
+
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          totalFrames: 2000,
+          sampleCount: 13,
+        }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p'); // 3 fresh samples
+    });
+
+    it('does not count samples that arrived before the switch landed', async () => {
+      const { controller, player } = guarded();
+      await controller._tick();
+      player.switchTrack.mockClear();
+      // Samples keep arriving while the switch is in flight (still on 360p, guard held).
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '360p', sampleCount: 20 }),
+      );
+      await controller._tick();
+      // Lands at sampleCount 20: the count starts here.
+      land(controller, player, { bufferSeconds: 5, activeTrack: '720p', sampleCount: 20 });
+      await controller._tick();
+      expect(player.switchTrack).not.toHaveBeenCalled();
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          totalFrames: 2000,
+          sampleCount: 23,
+        }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+    });
+
+    it('never holds a down-switch', async () => {
+      const { controller, player } = guarded();
+      await controller._tick(); // up to 720p
+      player.switchTrack.mockClear();
+      // Landed, no fresh samples, and the link collapsed: the throughput rule wants 360p.
+      land(controller, player, {
+        bufferSeconds: 5,
+        activeTrack: '720p',
+        sampleCount: 10,
+        bandwidthBps: 700_000,
+        fastEmaBps: 700_000,
+        slowEmaBps: 700_000,
+      });
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('360p');
+    });
+
+    it('is off when upGuardSamples is 0 (baseline controller)', async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        { videoAutoSwitch: true },
+      );
+      await controller._tick();
+      player.switchTrack.mockClear();
+      controller.releaseSwitchingGuard();
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          totalFrames: 2000,
+          sampleCount: 10,
+        }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+    });
+
+    it("in 'visible' mode counts from notifySwitchVisible, not from landing", async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        {
+          videoAutoSwitch: true,
+          controller: {
+            ...DEFAULT_ABR_SETTINGS.controller,
+            upGuardSamples: 1,
+            upGuardRelease: 'visible',
+          },
+        },
+      );
+      await controller._tick();
+      player.switchTrack.mockClear();
+      land(controller, player, { bufferSeconds: 5, activeTrack: '720p', sampleCount: 10 });
+      await controller._tick();
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          totalFrames: 2000,
+          sampleCount: 15,
+        }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).not.toHaveBeenCalled(); // landed, plenty of samples, but not visible
+      controller.notifySwitchVisible();
+      await controller._tick();
+      expect(player.switchTrack).not.toHaveBeenCalled(); // visible at 15, needs 1 fresh sample
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          totalFrames: 2000,
+          sampleCount: 16,
+        }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+    });
+  });
+
+  describe('probe payload floor (settings.controller.probeMinBytes)', () => {
+    it('sizes the probe from the rung gap by default', async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 100 },
+        { videoAutoSwitch: true },
+      );
+      await controller._tick();
+      // 2 s * (1.5 Mbps - 0.5 Mbps) / 8 = 250 000 bytes
+      expect(player.probeTrackBandwidth).toHaveBeenCalledWith('.probe:250000:0', 500);
+    });
+
+    it('never sends a probe smaller than probeMinBytes', async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 100 },
+        {
+          videoAutoSwitch: true,
+          controller: { ...DEFAULT_ABR_SETTINGS.controller, probeMinBytes: 400_000 },
+        },
+      );
+      await controller._tick();
+      expect(player.probeTrackBandwidth).toHaveBeenCalledWith('.probe:400000:0', 500);
+    });
+  });
+
   describe('no switch when already on best track', () => {
     it('does not switch when already on the best track', async () => {
       // Active track is 1080p (index=2) with high bandwidth — ThroughputRule also wants index=2

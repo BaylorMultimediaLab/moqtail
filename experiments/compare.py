@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Side-by-side comparison of conditions (mechanism, mode, client type) from
+"""Side-by-side comparison of conditions (mechanism, mode, client type, controller arm) from
 analyzed runs. Reads each run's summary.json (analyze.py must have run) and
 prints one column per condition with the median over its valid repetitions.
 
@@ -30,6 +30,13 @@ ROWS = [
     ("stalls", lambda s: s["stalls"]["count"]),
     ("stalled s", lambda s: s["stalls"]["total_ms"] / 1000),
     ("stall max ms", lambda s: s["stalls"]["max_ms"]),
+    ("data starved s", lambda s: s["starvation"]["total_ms"] / 1000),
+    ("range-jumps", lambda s: s["stalls"]["seeks"]["range-jump"]),
+    ("range-jumps deferred", lambda s: s["stalls"]["range_jumps_deferred"]),
+    ("down-reaction s (held 5 s)", lambda s: (s["reaction"]["down_reaction_ms"] / 1000) if s["reaction"]["down_reaction_ms"] is not None else None),
+    ("up-recovery s (held 5 s)", lambda s: (s["reaction"]["up_recovery_ms"] / 1000) if s["reaction"]["up_recovery_ms"] is not None else None),
+    ("up-guard vetoes", lambda s: s["switching"]["up_guard_vetoes"]),
+    ("probes discarded", lambda s: s["switching"]["probes_discarded"]),
     ("played kbps", lambda s: s["bitrate"].get("time_weighted_mean_kbps")),
     ("startup ms", lambda s: s["startup"]["startup_delay_ms"]),
     ("live-edge dist mean ms", lambda s: s["time_shift"]["live_edge_distance_ms"].get("mean")),
@@ -47,7 +54,7 @@ def cond_key(s: dict) -> str:
     ct = i.get("client_type") or s.get("client_mode")
     if ct == "time-shifted":
         ct += f" {i.get('time_shift_s') or s.get('time_shift_s') or ''}s"
-    return f"{mech}\n{ct}\n{i.get('network_profile') or s.get('profile')}"
+    return f"{mech}\n{ct}\n{i.get('network_profile') or s.get('profile')}\nctl {i.get('controller') or 'baseline'}"
 
 
 def main() -> int:
@@ -78,7 +85,7 @@ def main() -> int:
     w = 26
     header = " " * w + "".join(f"{c.splitlines()[0]:>22}" for c in conds)
     print(header)
-    for line in (1, 2):
+    for line in (1, 2, 3):
         print(" " * w + "".join(f"{c.splitlines()[line]:>22}" for c in conds))
     print("-" * (w + 22 * len(conds)))
     for name, fn in ROWS:

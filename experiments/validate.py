@@ -192,8 +192,10 @@ def main() -> int:
     frac = pb.get("advancing_fraction"); longest = pb.get("longest_no_progress_ms") or 0
     destroyed = summary.get("switches", {}).get("session_destroyed")
     ok = frac is not None and frac >= 0.5 and longest <= args.max_freeze_s * 1000 and not destroyed
+    starved = (summary.get("starvation") or {}).get("total_ms") or 0
     rep.add("playback", ok, f"playhead advancing in {fmt_pct(frac)} of sample intervals (need >= 50 %); longest no-progress "
-                            f"{longest / 1000:.1f} s (max {args.max_freeze_s:g}); session destroyed={destroyed}")
+                            f"{longest / 1000:.1f} s (max {args.max_freeze_s:g}); session destroyed={destroyed}; "
+                            f"data starved {starved / 1000:.1f} s")
 
     # worktree ---------------------------------------------------------------
     dirty = identity.get("dirty_worktree")

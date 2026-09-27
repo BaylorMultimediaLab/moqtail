@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+import { events } from '@/lib/events/EventLog';
+
 /**
  * ProbeManager — schedules and stores results of active bandwidth probes.
  *
@@ -29,8 +31,14 @@
  * dependency is a `probeTrackBandwidth(name, durationMs)` callable.
  */
 
+/** A probe measurement: link estimate plus how long the burst was on the wire. */
+export interface ProbeResult {
+  bps: number;
+  dtMs: number;
+}
+
 export interface ProbeFn {
-  probeTrackBandwidth(trackName: string, durationMs: number): Promise<number>;
+  probeTrackBandwidth(trackName: string, durationMs: number): Promise<number | ProbeResult>;
 }
 
 export interface ProbeManagerOptions {
@@ -40,6 +48,13 @@ export interface ProbeManagerOptions {
   durationMs?: number;
   /** Result freshness window, ms. Older than this is treated as stale. */
   freshnessMs?: number;
+  /**
+   * Discard readings whose on-wire duration was shorter than this (ms). A
+   * few-KB probe that completes inside one burst measures burst scheduling,
+   * not link capacity (readings of hundreds of Mbps on a 6 Mbps link). 0 keeps
+   * every reading.
+   */
+  minDurationMs?: number;
 }
 
 export class ProbeManager {
@@ -47,6 +62,7 @@ export class ProbeManager {
   #intervalMs: number;
   #durationMs: number;
   #freshnessMs: number;
+  #minDurationMs: number;
 
   #lastProbeStartMs = 0;
   #probeInFlight = false;
@@ -58,6 +74,11 @@ export class ProbeManager {
     this.#intervalMs = opts.intervalMs ?? 2000;
     this.#durationMs = opts.durationMs ?? 500;
     this.#freshnessMs = opts.freshnessMs ?? 5000;
+    this.#minDurationMs = opts.minDurationMs ?? 0;
+  }
+
+  setMinDurationMs(ms: number): void {
+    this.#minDurationMs = ms;
   }
 
   /**
@@ -75,11 +96,21 @@ export class ProbeManager {
     this.#probeInFlight = true;
     this.#player
       .probeTrackBandwidth(trackName, this.#durationMs)
-      .then(bps => {
-        if (bps > 0) {
-          this.#probeBandwidthBps = bps;
-          this.#probeTimestampMs = Date.now();
+      .then(result => {
+        const bps = typeof result === 'number' ? result : result.bps;
+        const dtMs = typeof result === 'number' ? undefined : result.dtMs;
+        if (bps <= 0) return;
+        if (this.#minDurationMs > 0 && dtMs !== undefined && dtMs < this.#minDurationMs) {
+          events.emit('PROBE_DISCARDED', {
+            track: trackName,
+            bps,
+            dt_ms: dtMs,
+            min_duration_ms: this.#minDurationMs,
+          });
+          return;
         }
+        this.#probeBandwidthBps = bps;
+        this.#probeTimestampMs = Date.now();
       })
       .catch(() => {
         /* swallow: a failed probe is information too — it just doesn't update the cache */

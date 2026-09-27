@@ -9,7 +9,9 @@ export {
   type SwitchEvent,
   type SwitchReason,
   type RuleConfig,
+  type ControllerSettings,
   type Track,
   SwitchRequestPriority,
   DEFAULT_ABR_SETTINGS,
+  DEFAULT_CONTROLLER_SETTINGS,
 } from './types';
