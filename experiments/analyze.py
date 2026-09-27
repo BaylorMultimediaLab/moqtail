@@ -152,7 +152,11 @@ def switching_diagnostics(switches: list[dict], by, window_s: float) -> dict:
         "direction_reversals": reversals,
         "aba_reversals": aba,
         "cooldown_activations": len(by("ABR_GUARD_TIMEOUT")),
-        "slow_start_vetoes": len(by("ABR_GATED")),
+        "slow_start_vetoes": sum(1 for r in by("ABR_GATED") if r.get("why", "slow-start") == "slow-start"),
+        # Up-switches held by the post-switch up-guard (controller arm 'guard'/'both').
+        "up_guard_vetoes": sum(1 for r in by("ABR_GATED") if r.get("why") == "post-switch-up-guard"),
+        # Probe readings dropped for a too-short burst (controller arm 'probe'/'both').
+        "probes_discarded": len(by("PROBE_DISCARDED")),
         "switches_by_rule": by_rule,
     }
 
@@ -206,7 +210,8 @@ def feedback_windows(switches: list[dict], by, window_s: float) -> dict:
 
 
 def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offset_hold_s: float = 5.0,
-            initial_window_s: float = 5.0, reversal_window_s: float = 5.0, feedback_window_s: float = 5.0) -> dict:
+            initial_window_s: float = 5.0, reversal_window_s: float = 5.0, feedback_window_s: float = 5.0,
+            sustain_s: float = 5.0) -> dict:
     recs, sessions = last_session(load(run))
     by = lambda ev: [r for r in recs if r.get("event") == ev]  # noqa: E731
     meta = json.loads((run / "run_meta.json").read_text()) if (run / "run_meta.json").exists() else {}
@@ -272,7 +277,32 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                   for reason in ("startup", "wedge", "range-jump", "visibility", "unwedge")},
         "open_at_end": any(e.get("open_at_end") for e in episodes),
         "wedge_gap_ms_total": sum(s.get("gap_ms") or 0 for s in seeks if s.get("reason") == "wedge"),
+        # Range-jumps the buffer held back because new media was landing inside the gap
+        # (RANGE_JUMP_DEFERRED is emitted once per gap), and the total wait before the jumps
+        # that did happen after a deferral.
+        "range_jumps_deferred": len(by("RANGE_JUMP_DEFERRED")),
+        "range_jump_deferred_ms_total": sum(s.get("deferred_ms") or 0 for s in seeks if s.get("reason") == "range-jump"),
     }
+    # Data starvation: nothing appended for 4 s with an empty buffer (DATA_STARVED, from
+    # the last append) until data flows again (DATA_RESUMED) or the run ends. A
+    # starving subscription is a delivery failure, not a decoder wedge.
+    starved = []
+    open_st = None
+    client_end = max((r["ts"] for r in recs if r.get("src") == "client"), default=None)
+    for r in recs:
+        if r.get("event") == "DATA_STARVED" and open_st is None:
+            open_st = r
+        elif r.get("event") == "DATA_RESUMED" and open_st is not None:
+            starved.append({"ts": open_st["ts"] - (open_st.get("since_last_append_ms") or 0), "duration_ms": r.get("starved_ms"),
+                            "track": open_st.get("track"), "pending": open_st.get("pending"), "last_group": open_st.get("last_group")})
+            open_st = None
+    if open_st is not None and client_end is not None:
+        start = open_st["ts"] - (open_st.get("since_last_append_ms") or 0)
+        starved.append({"ts": start, "duration_ms": client_end - start, "track": open_st.get("track"),
+                        "pending": open_st.get("pending"), "last_group": open_st.get("last_group"), "open_at_end": True})
+    out["starvation"] = {"episodes": starved, "count": len(starved),
+                         "total_ms": sum(e["duration_ms"] or 0 for e in starved),
+                         "open_at_end": any(e.get("open_at_end") for e in starved)}
 
     # Switch timelines -------------------------------------------------------
     switch_recv = by("SWITCH_RECV")
@@ -440,7 +470,23 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                    ((direction == "down" and r.get("reason") in ("auto-downgrade", "auto-emergency")) or
                     (direction == "up" and r.get("reason") == "auto-upgrade")))
         sw = next((s for s in switches if t2 and s["to"] == t2.get("to") and abs(s["ts"] - t2["ts"]) < 5000), None)
-        # Recovery after an up-step: track index back to the pre-drop level.
+        # Reaction to a down-step: the played rung is one that fits the new capacity
+        # (highest rung with bitrate <= new rate) and stays there for `sustain_s`.
+        # Recovery after an up-step: the played rung is back at (or above) the
+        # pre-drop rung and stays there for `sustain_s`. Both are measured on SAMPLE
+        # (what is being played), so a one-tick excursion during a thrash does not count.
+        def sustained(pred, start_ts):
+            run_from = None
+            for smp in samples:
+                if smp["ts"] < start_ts or smp["ts"] >= window_end:
+                    continue
+                if pred(smp):
+                    run_from = run_from if run_from is not None else smp["ts"]
+                    if smp["ts"] - run_from >= sustain_s * 1000:
+                        return run_from
+                else:
+                    run_from = None
+            return None
         rec = {"direction": direction, "from_mbps": prev_rate, "to_mbps": new_rate, "t0": t0,
                "t1_ms": (t1["ts"] - t0) if t1 else None, "t1_bps": t1.get("bps") if t1 else None,
                "t2_ms": (t2["ts"] - t0) if t2 else None, "t2_rule": t2.get("rule_reason") if t2 else None,
@@ -448,12 +494,24 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                "t3_ms": (sw["ts"] - t0) if sw else None,
                "t4_ms": (sw["ts"] + sw["switch_delivery_latency_ms"] - t0) if sw and sw["switch_delivery_latency_ms"] else None,
                "t5_ms": (sw["ts"] + sw["switch_visibility_delay_ms"] - t0) if sw and sw["switch_visibility_delay_ms"] else None}
+        if direction == "down":
+            fitting = [i_ for i_, t in enumerate(ladder) if (t.get("bitrate") or 0) <= target_bps]
+            fit_index = max(fitting) if fitting else 0
+            r_at = sustained(lambda smp: index_of.get(smp.get("track"), 99) <= fit_index, t0)
+            rec["fit_index"] = fit_index
+            rec["down_reaction_ms"] = (r_at - t0) if r_at is not None else None
         if direction == "up":
-            pre = [s for s in samples if s["ts"] < changes[i - 1]["ts"]]
-            pre_index = index_of.get(pre[-1].get("track"), None) if pre else None
+            # The pre-drop rung is the median played rung over the 20 s before the
+            # drop: the last sample alone is one tick of whatever the controller was
+            # doing at that instant.
+            drop_ts = changes[i - 1]["ts"]
+            pre = [index_of[s["track"]] for s in samples if drop_ts - 20000 <= s["ts"] < drop_ts and s.get("track") in index_of]
+            pre_index = int(statistics.median(pre)) if pre else None
             q = first(samples, "SAMPLE", t0, lambda s: pre_index is not None and index_of.get(s.get("track"), -1) >= pre_index)
             rec["pre_drop_index"] = pre_index
             rec["quality_recovery_ms"] = (q["ts"] - t0) if q else None
+            r_at = sustained(lambda smp: pre_index is not None and index_of.get(smp.get("track"), -1) >= pre_index, t0)
+            rec["up_recovery_ms"] = (r_at - t0) if r_at is not None else None
             # Offset recovery: |error| within tolerance for offset_hold_s.
             hold_start = None
             off = None
@@ -476,6 +534,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     med_gap = out["switching"]["median_inter_switch_interval_ms"]
     out["detection_reliable"] = med_gap is None or med_gap >= feedback_window_s * 1000
     out["detection"] = detections
+    # Headline reaction/recovery: the first down-step and the first up-step of the profile.
+    first_down = next((d for d in detections if d["direction"] == "down"), None)
+    first_up = next((d for d in detections if d["direction"] == "up"), None)
+    out["reaction"] = {
+        "sustain_s": sustain_s,
+        "down_reaction_ms": first_down.get("down_reaction_ms") if first_down else None,
+        "up_recovery_ms": first_up.get("up_recovery_ms") if first_up else None,
+    }
 
     # Relay cache and process stats -----------------------------------------
     cache = {}
@@ -567,7 +633,10 @@ def to_markdown(s: dict) -> str:
          f"| startup delay (ms) | {fmt(s['startup']['startup_delay_ms'])} |",
          f"| first group / expected / clamped | {s['startup']['first_group']} / {s['startup']['expected_start_group']} / {s['startup']['clamped_by_relay']} |",
          f"| stalls (count / total ms / max ms) | {s['stalls']['count']} / {fmt(s['stalls']['total_ms'])} / {fmt(s['stalls']['max_ms'])} |",
-         f"| seeks wedge / range-jump | {s['stalls']['seeks']['wedge']} / {s['stalls']['seeks']['range-jump']} |",
+         f"| seeks wedge / range-jump (deferred gaps) / unwedge | {s['stalls']['seeks']['wedge']} / {s['stalls']['seeks']['range-jump']} ({s['stalls']['range_jumps_deferred']}) / {s['stalls']['seeks']['unwedge']} |",
+         f"| data starvation episodes / total s | {s['starvation']['count']} / {fmt(s['starvation']['total_ms'] / 1000)}{' (open at end)' if s['starvation']['open_at_end'] else ''} |",
+         f"| down-reaction / up-recovery s (played rung held {s['reaction']['sustain_s']:g} s) | {fmt((s['reaction']['down_reaction_ms'] or 0) / 1000) if s['reaction']['down_reaction_ms'] is not None else '-'} / {fmt((s['reaction']['up_recovery_ms'] or 0) / 1000) if s['reaction']['up_recovery_ms'] is not None else '-'} |",
+         f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
          f"| switches (up / down / failed) | {s['switches']['count']} ({s['switches']['up']} / {s['switches']['down']} / {s['switches']['failed']}) |",
          f"| switch delivery latency ms, t4 (median / p95) | {fmt(s['switches']['switch_delivery_latency_ms'].get('p50'))} / {fmt(s['switches']['switch_delivery_latency_ms'].get('p95'))} |",
          f"| switch visibility delay ms, t5 (median / p95) | {fmt(s['switches']['switch_visibility_delay_ms'].get('p50'))} / {fmt(s['switches']['switch_visibility_delay_ms'].get('p95'))} |",
@@ -596,12 +665,13 @@ def to_markdown(s: dict) -> str:
         L.append(f"| {name} max RSS MB / mean CPU % | {p['max_rss_bytes'] / 1e6:.1f} / {p['mean_cpu_pct']:.1f} |")
     if s["detection"]:
         L += ["", "## Detection timelines (ms after the capacity change)", "",
-              "| change | t1 sample | t2 decision (rule) | t3 sent | t4 first obj | t5 first frame | quality rec. | offset rec. |",
-              "|---|---|---|---|---|---|---|---|"]
+              "| change | t1 sample | t2 decision (rule) | t3 sent | t4 first obj | t5 first frame | quality rec. | offset rec. | sustained reaction/recovery |",
+              "|---|---|---|---|---|---|---|---|---|"]
         for d in s["detection"]:
             L.append(f"| {d['from_mbps']}->{d['to_mbps']} Mbps | {fmt(d['t1_ms'])} | {fmt(d['t2_ms'])} ({d['t2_rule']}) | "
                      f"{fmt(d['t3_ms'])} | {fmt(d['t4_ms'])} | {fmt(d['t5_ms'])} | "
-                     f"{fmt(d.get('quality_recovery_ms'))} | {fmt(d.get('offset_recovery_ms'))} |")
+                     f"{fmt(d.get('quality_recovery_ms'))} | {fmt(d.get('offset_recovery_ms'))} | "
+                     f"{fmt(d.get('down_reaction_ms', d.get('up_recovery_ms')))} |")
     if s["switches"]["list"]:
         L += ["", "## Switches", "", "| t (s) | from -> to | rule | relay recv | promoted (start grp) | t4 delivery | landed obj0 | seam ahead | t5 visible | hole | jump | dropped src frames |",
               "|---|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -614,7 +684,7 @@ def to_markdown(s: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "client_type", "delay_groups",
+IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "client_type", "delay_groups",
                     "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "background_flows",
                     "repeat_index", "timestamp_start"]
 METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down",
@@ -624,7 +694,8 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "landed_on_group_start", "superseded", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "session_destroyed",
-                  "detection_reliable",
+                  "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
+                  "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
@@ -668,6 +739,13 @@ def agg_row(s: dict) -> dict:
         "longest_no_progress_ms": s["playback"]["longest_no_progress_ms"],
         "session_destroyed": s["switches"]["session_destroyed"],
         "detection_reliable": s["detection_reliable"],
+        "down_reaction_ms": s["reaction"]["down_reaction_ms"],
+        "up_recovery_ms": s["reaction"]["up_recovery_ms"],
+        "data_starved_ms": s["starvation"]["total_ms"],
+        "range_jumps": s["stalls"]["seeks"]["range-jump"],
+        "range_jumps_deferred": s["stalls"]["range_jumps_deferred"],
+        "up_guard_vetoes": s["switching"]["up_guard_vetoes"],
+        "probes_discarded": s["switching"]["probes_discarded"],
         "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
         "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
         "live_edge_mean_ms": s["time_shift"]["live_edge_distance_ms"].get("mean"),
@@ -679,7 +757,7 @@ def agg_row(s: dict) -> dict:
     return row
 
 
-CONDITION_KEYS = ["mechanism", "mechanism_mode", "client_type", "delay_groups", "network_profile", "qdisc",
+CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "client_type", "delay_groups", "network_profile", "qdisc",
                   "background_flows", "ladder_id"]
 
 
@@ -729,6 +807,8 @@ def main() -> int:
     ap.add_argument("--initial-window", type=float, default=5.0, help="seconds after the first frame for the initial-shift window")
     ap.add_argument("--reversal-window", type=float, default=5.0, help="seconds within which opposite switches count as a reversal")
     ap.add_argument("--feedback-window", type=float, default=5.0, help="seconds around each switch for the feedback analysis")
+    ap.add_argument("--sustain", type=float, default=5.0,
+                    help="seconds the played rung must hold for down-reaction / up-recovery")
     ap.add_argument("--include-invalid", action="store_true",
                     help="keep runs whose validation.json says invalid in the aggregate CSV/stats (default: exclude)")
     ap.add_argument("--quiet", action="store_true")
@@ -739,7 +819,7 @@ def main() -> int:
         if not run.is_dir():
             continue
         s = analyze(run, args.t1_tolerance, args.offset_tolerance, args.offset_hold,
-                    args.initial_window, args.reversal_window, args.feedback_window)
+                    args.initial_window, args.reversal_window, args.feedback_window, args.sustain)
         s["validity"] = read_validity(run)
         (run / "summary.json").write_text(json.dumps(s, indent=2, default=str))
         md = to_markdown(s)

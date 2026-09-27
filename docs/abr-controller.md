@@ -24,7 +24,8 @@ every 250 ms (AbrController._tick)
   chosen   = arbiter(votes)                              (section 4)
   if chosen.index == active: stop
   if up-switch and fewer than 3 throughput samples: stop (ABR_GATED slow-start)
-  record history, hold the guard, player.switchTrack()   (ABR_DECISION)
+  if up-switch and the post-switch up-guard is armed: stop (ABR_GATED post-switch-up-guard, section 9)
+  record history, hold the guard, arm the up-guard, player.switchTrack()   (ABR_DECISION)
 ```
 
 Responsibilities are split three ways:
@@ -308,20 +309,21 @@ A→B→A reversals in 60 s, most superseded before they were ever visible.
 
 ## 7. Hard-coded numbers
 
-| where          | value                | meaning                                             |
-| -------------- | -------------------- | --------------------------------------------------- |
-| AbrController  | 250 ms               | tick                                                |
-| AbrController  | 3000 ms / 5000 ms    | switching-guard timeout / cool-down after it        |
-| AbrController  | 3                    | throughput samples before an up-switch (slow start) |
-| AbrController  | 60                   | switch-history length                               |
-| AbrController  | 2 s                  | probe horizon in the size formula                   |
-| ProbeManager   | 2000 / 500 / 5000 ms | min interval / nominal duration / freshness         |
-| GoodputTracker | 5                    | SWMA window (groups)                                |
-| LatencyTracker | 100                  | samples in the trend window                         |
-| BolaRule       | 10 s, 0.99           | MINIMUM_BUFFER_S, placeholder decay                 |
-| L2ARule        | 4, 2, 1.5 s          | horizon, REACT, buffer target                       |
-| LoLpRule       | 0.5 s, 0.1           | emergency buffer, SOM learning rate                 |
-| context        | 1 s, false           | segmentDurationS, isLowLatency                      |
+| where          | value                   | meaning                                                                                           |
+| -------------- | ----------------------- | ------------------------------------------------------------------------------------------------- |
+| AbrController  | 250 ms                  | tick                                                                                              |
+| AbrController  | 3000 ms / 5000 ms       | switching-guard timeout / cool-down after it                                                      |
+| AbrController  | 3                       | throughput samples before an up-switch (slow start)                                               |
+| AbrController  | 60                      | switch-history length                                                                             |
+| AbrController  | 2 s                     | probe horizon in the size formula                                                                 |
+| controller     | 0 B / 0 ms / 0 / landed | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease (section 9; all off = baseline) |
+| ProbeManager   | 2000 / 500 / 5000 ms    | min interval / nominal duration / freshness                                                       |
+| GoodputTracker | 5                       | SWMA window (groups)                                                                              |
+| LatencyTracker | 100                     | samples in the trend window                                                                       |
+| BolaRule       | 10 s, 0.99              | MINIMUM_BUFFER_S, placeholder decay                                                               |
+| L2ARule        | 4, 2, 1.5 s             | horizon, REACT, buffer target                                                                     |
+| LoLpRule       | 0.5 s, 0.1              | emergency buffer, SOM learning rate                                                               |
+| context        | 1 s, false              | segmentDurationS, isLowLatency                                                                    |
 
 ## 8. Things to keep in mind before tuning
 
@@ -339,3 +341,60 @@ A→B→A reversals in 60 s, most superseded before they were ever visible.
 - The 100-sample latency window is 3.4 s at 29 fps.
 - Every rule's vote is in `ABR_TICK` (`rules`, `skipped`, `chosen`), so any
   of the above can be checked on a run before changing it.
+
+## 9. Stabilisation parameters (the ablation knobs)
+
+`settings.controller` (`abr/types.ts`, `ControllerSettings`). Every knob is off
+in the defaults, so the shipped controller is the **baseline** arm. The runner's
+`--controller probe|guard|both` sets them through URL parameters
+(`?probeMinBytes= &probeMinDurationMs= &upGuardSamples= &upGuardRelease=`), and
+both `RUN_META.controller` and `identity.controller` record what ran. The two
+fixes are separate on purpose: they address different problems, and the 2×2
+ablation (baseline / probe / guard / both) attributes the effect of each.
+
+### 9.1 Probe fix: `probeMinBytes`, `probeMinDurationMs`
+
+The Algorithm 1 payload is `2 s × (b[i+1] − b[i] + tracksize)`. On a fine
+ladder the gap is 50 kbps and the payload a few tens of KB, which the relay
+delivers inside one burst; `(v + p) × 8 / Δt` over a few milliseconds reads
+200–300 Mbps on a 6 Mbps link, and `ProbeRule` fires an up-switch on it.
+
+- `probeMinBytes` floors the payload (`max(1024, formula, probeMinBytes)`), so
+  every probe has to occupy the link long enough to see its capacity. The
+  `probe` arm uses 250 000 bytes (1.3 s at 1.5 Mbps, at lowest priority).
+- `probeMinDurationMs` discards a reading whose burst (first to last probe
+  object) was shorter than this; `ProbeManager` emits `PROBE_DISCARDED` and
+  keeps the previous reading. The `probe` arm uses 300 ms.
+
+### 9.2 Post-switch up-guard: `upGuardSamples`, `upGuardRelease`
+
+Every switch (up or down, automatic or manual) arms the guard. While armed, an
+up-switch is refused (`ABR_GATED` with `why = post-switch-up-guard`) until
+
+1. the switch has been **released**: `upGuardRelease = landed` (default) means
+   the target's first object was applied (t4, `onTrackSwitched`), `visible`
+   means the target's first frame was presented (t5, `onSwitchVisible`); a
+   switch that times out (`ABR_GUARD_TIMEOUT`) is released at the timeout so it
+   cannot hold up-switches forever (`ABR_UP_GUARD_RELEASED.how`);
+2. `upGuardSamples` fresh completed-group throughput samples have arrived
+   **since the release** (samples that arrived while the switch was in flight
+   describe the old rung and do not count).
+
+Down-switches are never held. The guard counts groups, not seconds of buffer,
+so it is the same on every mechanism and both client types. `landed` is the
+default because landing takes about one group everywhere (t4 ≈ 0.87 s on
+native and PR #1378 next-group, both client types), whereas visibility takes
+one group at the live edge and the whole shift on a time-shifted client, which
+would make the guard's duration client-type dependent. The guard breaks the
+observed loop at its second step: probe up → insufficient-buffer down →
+(held) → three fresh samples on the low rung → the probe must prove headroom
+again before the next climb. The `guard` arm uses 3 samples, `landed`.
+
+### 9.3 What to compare between arms
+
+`experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
+superseded switches and up-guard vetoes should fall; `down-reaction s` and
+`up-recovery s` (played rung held 5 s, see `docs/measurement-schema.md`)
+should not rise materially; stalls and seam metrics tell whether the remaining
+switches are cheaper. Pick the smallest change that removes the pathological
+switching, then freeze the controller for the grid.

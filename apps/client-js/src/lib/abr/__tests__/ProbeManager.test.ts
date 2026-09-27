@@ -113,4 +113,34 @@ describe('ProbeManager', () => {
     pm.maybeProbe('720p');
     expect(player.probeTrackBandwidth).toHaveBeenCalledTimes(2);
   });
+
+  it('discards a reading whose burst was shorter than minDurationMs', async () => {
+    const player = {
+      probeTrackBandwidth: vi.fn().mockResolvedValue({ bps: 250_000_000, dtMs: 12 }),
+    };
+    const pm = new ProbeManager(player, { minDurationMs: 300 });
+    pm.maybeProbe('720p');
+    await vi.runAllTimersAsync();
+    expect(pm.getFreshBandwidthBps()).toBe(0);
+  });
+
+  it('keeps a reading whose burst lasted at least minDurationMs', async () => {
+    const player = {
+      probeTrackBandwidth: vi.fn().mockResolvedValue({ bps: 5_000_000, dtMs: 420 }),
+    };
+    const pm = new ProbeManager(player, { minDurationMs: 300 });
+    pm.maybeProbe('720p');
+    await vi.runAllTimersAsync();
+    expect(pm.getFreshBandwidthBps()).toBe(5_000_000);
+  });
+
+  it('keeps every structured reading when minDurationMs is 0', async () => {
+    const player = {
+      probeTrackBandwidth: vi.fn().mockResolvedValue({ bps: 250_000_000, dtMs: 12 }),
+    };
+    const pm = new ProbeManager(player);
+    pm.maybeProbe('720p');
+    await vi.runAllTimersAsync();
+    expect(pm.getFreshBandwidthBps()).toBe(250_000_000);
+  });
 });
