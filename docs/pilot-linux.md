@@ -195,6 +195,52 @@ python3 experiments/analyze.py results/*/ --quiet --csv results/all.csv --stats 
 python3 experiments/compare.py results/*/     # one column per condition, native included
 ```
 
+## 8c. Controller ablation (2×2), then the re-pilot
+
+The cross-mechanism diagnostic showed the switching loop is controller-wide,
+so the controller is stabilised before the grid. Two independent fixes, four
+arms, on the two conditions where oscillation is easiest to see: native
+live-edge and pr1378 next-group live-edge. Three repetitions each; 24 runs,
+about 1 h 40 min. `--controller` records the arm in the identity block and in
+the run id (`_ctl-<arm>`), and `compare.py` shows one column per arm.
+
+```sh
+# native arms (branch switch/native)
+git checkout switch/native && git reset --hard origin/switch/native
+sudo -v
+for arm in baseline probe guard both; do
+  python3 experiments/run_experiment.py --mechanism native --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+# pr1378 next-group arms (branch switch/pr1378)
+git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+sudo -v
+for arm in baseline probe guard both; do
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+python3 experiments/analyze.py results/*/ --quiet --csv results/ablation.csv --stats results/ablation_stats.csv
+python3 experiments/compare.py results/*/
+experiments/pack_results.sh results ablation-$(hostname)-$(date +%Y%m%d).tar.gz
+```
+
+Read the table by arm: `switches / min`, `A->B->A reversals`, `superseded` and
+`up-guard vetoes` should fall; `down-reaction s` and `up-recovery s` should
+stay close to the baseline; `stalls`, `stalled s` and the seam rows say what the
+remaining switches cost. Pick the smallest arm that removes the pathological
+switching without slowing the step-down reaction, then run the re-pilot with
+that arm on both mechanisms and both client types (`--repeat 3`), and only then
+freeze the controller and start the grid. Keep `switch/pr1674` out until its
+SWITCH_FROM hard/soft conformance is done.
+
+One diagnostic run is also worth adding to the re-pilot: pr1378 next-group,
+time-shifted, with `--log-objects`, so the per-frame `OBJECT_RECV` records show
+whether the relay delivers whole groups to a delayed subscription across a
+switch (the diagnostic runs showed 2-frame slivers and 917 ms holes at the
+seams that became visible, and 3–6 s holes after the capacity drop).
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

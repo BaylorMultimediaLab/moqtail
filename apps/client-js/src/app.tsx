@@ -304,7 +304,19 @@ export function App() {
         if (Number.isFinite(n)) (overrides as Record<string, number>)[key] = n;
       }
     }
-    return { ...DEFAULT_ABR_SETTINGS, ...overrides };
+    // Controller stabilisation knobs (experiments/run_experiment.py --controller):
+    // ?probeMinBytes= ?probeMinDurationMs= ?upGuardSamples= ?upGuardRelease=landed|visible
+    const controller = { ...DEFAULT_ABR_SETTINGS.controller };
+    for (const key of ['probeMinBytes', 'probeMinDurationMs', 'upGuardSamples'] as const) {
+      const v = params.get(key);
+      if (v !== null && v !== '') {
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 0) controller[key] = n;
+      }
+    }
+    const release = params.get('upGuardRelease');
+    if (release === 'landed' || release === 'visible') controller.upGuardRelease = release;
+    return { ...DEFAULT_ABR_SETTINGS, ...overrides, controller };
   });
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
@@ -478,6 +490,7 @@ export function App() {
           initial_bandwidth_bps: initialBw,
           startup_track: firstVideo.name,
           abr_settings: abrSettings,
+          controller: abrSettings.controller,
           ladder: videoTracksAll.map(t => ({
             track: t.name,
             bitrate: t.bitrate,
@@ -490,6 +503,10 @@ export function App() {
         await player.attachMedia(videoRef.current);
         bufferRef.current = new MSEBuffer(videoRef.current, {
           liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
+          gapFillProbe: () => {
+            const front = player.getAppendFrontMs();
+            return { appendFrontS: front !== undefined ? front / 1000 : undefined };
+          },
         });
         await player.addMediaTrack(firstVideo.name);
         // Anchor the throughput EMA to the startup track's own bitrate so the
@@ -551,6 +568,7 @@ export function App() {
           abrRef.current?.releaseSwitchingGuard();
           setSelectedVideo(trackName);
         });
+        player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());
         abr.start();
 
         const bitrateMap: Record<string, number> = {};
@@ -626,6 +644,10 @@ export function App() {
         await player.attachMedia(videoRef.current);
         bufferRef.current = new MSEBuffer(videoRef.current, {
           liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
+          gapFillProbe: () => {
+            const front = player.getAppendFrontMs();
+            return { appendFrontS: front !== undefined ? front / 1000 : undefined };
+          },
         });
 
         if (videoTrack) await player.addMediaTrack(videoTrack);
@@ -685,6 +707,7 @@ export function App() {
           abrRef.current?.releaseSwitchingGuard();
           setSelectedVideo(trackName);
         });
+        player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());
         abr.start();
 
         const bitrateMap: Record<string, number> = {};

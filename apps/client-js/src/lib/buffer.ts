@@ -44,6 +44,39 @@ export function computeLiveEdgeDelay(
   return DEFAULT_LIVE_EDGE_DELAY;
 }
 
+/** Where new media is landing in the buffer right now (from the player's append path). */
+export interface GapFillState {
+  /** End PTS (s) of the most recently appended frame; undefined before the first append. */
+  appendFrontS?: number;
+}
+
+/**
+ * Whether a range-jump across a real gap should wait instead of seeking.
+ *
+ * The gap is being filled when the append front (where the newest frame
+ * landed) lies inside it: a catch-up or a switch that re-fetches from the
+ * playhead group appends there, and MSE's coded-frame removal has opened a
+ * hole between that front and the older data ahead. Jumping then lands the
+ * playhead past everything the fill will deliver: a time-shifted client
+ * loses its shift in one seek (16.2 s -> 24.0 s in the PR #1378 playhead-floor
+ * runs). The wait is bounded by `noProgressMs` since the front last moved, so
+ * a fill that has died is jumped over like any other hole.
+ */
+export function shouldDeferRangeJump(args: {
+  gapS: number;
+  currentRangeEndS: number;
+  nextRangeStartS: number;
+  fill: GapFillState | undefined;
+  frontStalledMs: number;
+  noProgressMs: number;
+}): boolean {
+  if (args.gapS < MSE_IMMEDIATE_SEEK_THRESHOLD) return false;
+  if (args.frontStalledMs >= args.noProgressMs) return false;
+  const front = args.fill?.appendFrontS;
+  if (front === undefined) return false;
+  return front >= args.currentRangeEndS - 0.25 && front < args.nextRangeStartS;
+}
+
 interface MSEBufferConfig {
   /** Delay from live edge in seconds (default: 0.6) */
   liveEdgeDelay: number;
@@ -55,6 +88,10 @@ interface MSEBufferConfig {
   stallThreshold: number;
   /** Playback rate for catching up to live edge (default: 1.05 = 5% faster) */
   catchupPlaybackRate: number;
+  /** Reports where new media is being appended, so a range-jump does not cross a gap being filled. */
+  gapFillProbe?: () => GapFillState;
+  /** Give up deferring a range-jump once the append front has not moved for this long (ms). */
+  rangeJumpNoProgressMs: number;
 }
 
 class MSEBuffer {
@@ -64,6 +101,12 @@ class MSEBuffer {
   private isCatchingUp: boolean = false;
   private isCatchingDown: boolean = false;
   private originalPlaybackRate: number = 1.0;
+  // Range-jump deferral state: the gap being waited on (its next-range start),
+  // when the wait began, and the append front's last position/movement time.
+  private deferGapKey: number | null = null;
+  private deferSince = 0;
+  private deferFrontS: number | undefined;
+  private deferFrontMovedAt = 0;
 
   constructor(
     public video: HTMLVideoElement,
@@ -75,6 +118,7 @@ class MSEBuffer {
       bufferCheckInterval: DEFAULT_BUFFER_CHECK_INTERVAL,
       stallThreshold: DEFAULT_STALL_THRESHOLD,
       catchupPlaybackRate: DEFAULT_CATCHUP_PLAYBACK_RATE,
+      rangeJumpNoProgressMs: 3000,
       ...config,
     };
 
@@ -187,14 +231,15 @@ class MSEBuffer {
     const shouldSeek = this.shouldSeekToNextRange(currentTime, buffered);
 
     if (shouldSeek.seek) {
-      logger.info(
-        'buffer',
-        `[mseBuffer] At end of range, seeking to next buffered range: ${shouldSeek.targetTime!.toFixed(2)}s`,
-      );
-
       // Perform the seek, only if targetTime is ahead of currentTime
       if (shouldSeek.targetTime <= currentTime) return;
-      this.seek(shouldSeek.targetTime, 'range-jump');
+      const deferredMs = this.maybeDeferRangeJump(shouldSeek, currentTime);
+      if (deferredMs === null) return;
+      logger.info(
+        'buffer',
+        `[mseBuffer] At end of range, seeking to next buffered range: ${shouldSeek.targetTime.toFixed(2)}s`,
+      );
+      this.seek(shouldSeek.targetTime, 'range-jump', deferredMs > 0 ? deferredMs : undefined);
 
       // Resume the video if it was paused
       if (this.video.paused) {
@@ -213,10 +258,56 @@ class MSEBuffer {
     }
   }
 
+  /**
+   * Returns null while the jump should wait (the gap is being filled), else
+   * how long it was deferred (0 = not at all).
+   */
+  private maybeDeferRangeJump(
+    seek: { targetTime: number; gap?: number; currentRangeEnd?: number },
+    currentTime: number,
+  ): number | null {
+    if (seek.gap === undefined || seek.currentRangeEnd === undefined) return 0;
+    const now = performance.now();
+    if (this.deferGapKey !== seek.targetTime) {
+      this.deferGapKey = seek.targetTime;
+      this.deferSince = now;
+      this.deferFrontS = undefined;
+      this.deferFrontMovedAt = now;
+    }
+    const fill = this.config.gapFillProbe?.();
+    const front = fill?.appendFrontS;
+    if (front !== undefined && front !== this.deferFrontS) {
+      this.deferFrontS = front;
+      this.deferFrontMovedAt = now;
+    }
+    const defer = shouldDeferRangeJump({
+      gapS: seek.gap,
+      currentRangeEndS: seek.currentRangeEnd,
+      nextRangeStartS: seek.targetTime,
+      fill,
+      frontStalledMs: now - this.deferFrontMovedAt,
+      noProgressMs: this.config.rangeJumpNoProgressMs,
+    });
+    if (defer) {
+      if (now === this.deferSince || now - this.deferSince < this.config.bufferCheckInterval) {
+        events.emit('RANGE_JUMP_DEFERRED', {
+          playhead_ms: currentTime * 1000,
+          range_end_ms: seek.currentRangeEnd * 1000,
+          next_start_ms: seek.targetTime * 1000,
+          append_front_ms: front !== undefined ? front * 1000 : null,
+        });
+      }
+      return null;
+    }
+    const deferredMs = now - this.deferSince;
+    this.deferGapKey = null;
+    return deferredMs;
+  }
+
   private shouldSeekToNextRange(
     currentTime: number,
     buffered: TimeRanges,
-  ): { seek: true; targetTime: number } | { seek: false } {
+  ): { seek: true; targetTime: number; gap?: number; currentRangeEnd?: number } | { seek: false } {
     // If no buffered ranges, cannot seek
     if (buffered.length === 0) return { seek: false };
 
@@ -265,7 +356,7 @@ class MSEBuffer {
             'buffer',
             `[mseBuffer] At buffer end with gap of ${gap.toFixed(3)}s, must jump to next range`,
           );
-          return { seek: true, targetTime: nextRangeStart };
+          return { seek: true, targetTime: nextRangeStart, gap, currentRangeEnd };
         }
       }
     }
@@ -389,11 +480,12 @@ class MSEBuffer {
     }
   }
 
-  private seek(time: number, reason: 'range-jump' | 'visibility') {
+  private seek(time: number, reason: 'range-jump' | 'visibility', deferredMs?: number) {
     events.emit('SEEK', {
       reason,
       from_ms: this.video.currentTime * 1000,
       to_ms: time * 1000,
+      ...(deferredMs !== undefined ? { deferred_ms: deferredMs } : {}),
     });
     this.video.currentTime = time;
   }

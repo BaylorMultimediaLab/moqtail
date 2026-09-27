@@ -37,6 +37,50 @@ export interface RuleConfig {
   parameters: Record<string, number>;
 }
 
+/**
+ * Controller stabilisation parameters. Every one of them is off in the
+ * defaults (the baseline controller); the experiment runner turns them on per
+ * ablation arm and records them in RUN_META. They are deliberately separate
+ * knobs: the probe fix addresses noisy link estimates on small rung gaps, the
+ * post-switch up-guard addresses control-loop frequency.
+ */
+export interface ControllerSettings {
+  /**
+   * Floor on the active probe payload in bytes (0 = the Algorithm 1 size
+   * alone). A probe sized only from a small rung gap is a few tens of KB and
+   * completes inside one burst, which reads as hundreds of Mbps.
+   */
+  probeMinBytes: number;
+  /**
+   * Discard a probe reading whose on-wire duration was shorter than this
+   * (ms, 0 = keep every reading). A reading over a few milliseconds measures
+   * burst scheduling, not link capacity.
+   */
+  probeMinDurationMs: number;
+  /**
+   * Post-switch up-guard: after any switch, no further up-switch until the
+   * switch has been released (see upGuardRelease) and this many fresh
+   * completed-group throughput samples have arrived since. Down-switches are
+   * never held. 0 = off.
+   */
+  upGuardSamples: number;
+  /**
+   * When the up-guard starts counting fresh samples: 'landed' = the target's
+   * first object was applied (t4; about one group on every mechanism and
+   * client type), 'visible' = the target's first frame was presented (t5;
+   * about one group at the live edge but the whole shift on a time-shifted
+   * client, so this choice makes the guard's duration client-type dependent).
+   */
+  upGuardRelease: 'landed' | 'visible';
+}
+
+export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
+  probeMinBytes: 0,
+  probeMinDurationMs: 0,
+  upGuardSamples: 0,
+  upGuardRelease: 'landed',
+};
+
 export interface AbrSettings {
   fastSwitching: boolean;
   videoAutoSwitch: boolean;
@@ -51,6 +95,7 @@ export interface AbrSettings {
   minBitrate: number;
   maxBitrate: number;
   rules: Record<string, RuleConfig>;
+  controller: ControllerSettings;
 }
 
 export const DEFAULT_ABR_SETTINGS: AbrSettings = {
@@ -66,6 +111,7 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
   initialBitrate: -1,
   minBitrate: -1,
   maxBitrate: -1,
+  controller: DEFAULT_CONTROLLER_SETTINGS,
   rules: {
     ThroughputRule: { active: true, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     BolaRule: { active: true, priority: SwitchRequestPriority.DEFAULT, parameters: {} },

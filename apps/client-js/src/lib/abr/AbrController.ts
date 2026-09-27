@@ -99,6 +99,15 @@ export class AbrController {
   // the link allows, so this is "the bitrate window the probe is supposed
   // to test", not the actual on-wire duration.
   #probeHorizonSec = 2;
+  // Post-switch up-guard (settings.controller.upGuardSamples > 0). Armed by
+  // every switch; an up-switch is held until the switch has been released
+  // (landed or visible, per settings.controller.upGuardRelease) and
+  // upGuardSamples fresh throughput samples have arrived since the release.
+  // Down-switches are never held. Mechanism- and client-type-neutral by
+  // construction: it counts completed groups, not seconds of buffer.
+  #upGuardArmed = false;
+  #upGuardReleasedAtSamples: number | null = null;
+  #lastSampleCount = 0;
 
   constructor(
     player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>,
@@ -113,7 +122,9 @@ export class AbrController {
     this.#tracks = [...tracks].sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
     this.#settings = settings;
     this.#onMetricsUpdate = onMetricsUpdate;
-    this.#probeManager = new ProbeManager(this.#player);
+    this.#probeManager = new ProbeManager(this.#player, {
+      minDurationMs: settings.controller?.probeMinDurationMs ?? 0,
+    });
     this.#player.setEmaHalfLives(
       settings.ewma.throughputFastHalfLifeSeconds,
       settings.ewma.throughputSlowHalfLifeSeconds,
@@ -134,6 +145,7 @@ export class AbrController {
 
   updateSettings(settings: AbrSettings): void {
     this.#settings = settings;
+    this.#probeManager.setMinDurationMs(settings.controller?.probeMinDurationMs ?? 0);
     this.#player.setEmaHalfLives(
       settings.ewma.throughputFastHalfLifeSeconds,
       settings.ewma.throughputSlowHalfLifeSeconds,
@@ -146,6 +158,35 @@ export class AbrController {
     // the snapshot — that's when MSE has decoded an actual frame from the new
     // track. Prevents rapid switches from shredding the MSE timeline.
     this.#pendingFrameAdvance = true;
+    if (this.#settings.controller?.upGuardRelease !== 'visible') this.#releaseUpGuard('landed');
+  }
+
+  /** Player fires this when the first frame of the switched-to track is presented (t5). */
+  notifySwitchVisible(): void {
+    if (this.#settings.controller?.upGuardRelease === 'visible') this.#releaseUpGuard('visible');
+  }
+
+  #armUpGuard(): void {
+    if ((this.#settings.controller?.upGuardSamples ?? 0) <= 0) return;
+    this.#upGuardArmed = true;
+    this.#upGuardReleasedAtSamples = null;
+  }
+
+  #releaseUpGuard(how: 'landed' | 'visible' | 'timeout'): void {
+    if (!this.#upGuardArmed || this.#upGuardReleasedAtSamples !== null) return;
+    this.#upGuardReleasedAtSamples = this.#lastSampleCount;
+    events.emit('ABR_UP_GUARD_RELEASED', {
+      how,
+      sample_count: this.#lastSampleCount,
+      fresh_samples_needed: this.#settings.controller?.upGuardSamples ?? 0,
+    });
+  }
+
+  /** Fresh completed-group samples since the guard was released, or null while unreleased. */
+  #upGuardFreshSamples(sampleCount: number): number | null {
+    return this.#upGuardReleasedAtSamples === null
+      ? null
+      : sampleCount - this.#upGuardReleasedAtSamples;
   }
 
   isSwitching(): boolean {
@@ -159,6 +200,7 @@ export class AbrController {
     const m = this.#player.getMetrics();
     this.#framesAtSwitch = m.totalFrames;
     this.#pendingFrameAdvance = false;
+    this.#armUpGuard();
     this.#recordHistory(m.activeTrack ?? '', trackName, 'manual', 0, 0);
     events.emit('ABR_DECISION', { from: m.activeTrack, to: trackName, reason: 'manual' });
     void this.#player.switchTrack(trackName);
@@ -224,6 +266,7 @@ export class AbrController {
     };
 
     this.#onMetricsUpdate(metrics);
+    this.#lastSampleCount = sampleCount;
 
     // Once the player signals the init segment landed, hold #switching until
     // a real new-track frame is decoded (totalVideoFrames moved past the
@@ -259,6 +302,9 @@ export class AbrController {
         held_ms: Date.now() - this.#switchingStartTs,
         cooldown_ms: AbrController.SWITCH_COOLDOWN_MS,
       });
+      // A switch that never lands must not hold up-switches forever: start the
+      // fresh-sample count now.
+      this.#releaseUpGuard('timeout');
     }
 
     // Manual mode — don't make automatic decisions
@@ -288,7 +334,13 @@ export class AbrController {
       const bIPlus1 = this.#tracks[currentIdx + 1]?.bitrate ?? 0;
       const gapBits = Math.max(0, bIPlus1 - bI);
       const probeSizeBits = this.#probeHorizonSec * (gapBits + this.#tracksize);
-      const probeSizeBytes = Math.max(1024, Math.floor(probeSizeBits / 8));
+      // settings.controller.probeMinBytes floors the payload so a small rung
+      // gap cannot produce a probe that completes inside one burst.
+      const probeSizeBytes = Math.max(
+        1024,
+        Math.floor(probeSizeBits / 8),
+        this.#settings.controller?.probeMinBytes ?? 0,
+      );
       this.#probeManager.maybeProbe(`.probe:${probeSizeBytes}:0`);
     }
 
@@ -335,6 +387,12 @@ export class AbrController {
         latency_trend: latencyTrendRatio,
         sample_count: sampleCount,
         using_bola: this.#usingBolaRule,
+        up_guard: this.#upGuardArmed
+          ? {
+              released: this.#upGuardReleasedAtSamples !== null,
+              fresh_samples: this.#upGuardFreshSamples(sampleCount),
+            }
+          : null,
         rules,
         skipped: evaluation.skipped,
         chosen:
@@ -370,6 +428,27 @@ export class AbrController {
       return;
     }
 
+    // Post-switch up-guard: an up-switch waits until the previous switch has
+    // been released and upGuardSamples fresh throughput samples describe the
+    // link as it is after that switch. Down-switches pass.
+    if (targetIndex > currentIdx && this.#upGuardArmed) {
+      const needed = this.#settings.controller?.upGuardSamples ?? 0;
+      const fresh = this.#upGuardFreshSamples(sampleCount);
+      if (fresh === null || fresh < needed) {
+        events.emit('ABR_GATED', {
+          why: 'post-switch-up-guard',
+          from_index: currentIdx,
+          to_index: targetIndex,
+          released: fresh !== null,
+          fresh_samples: fresh,
+          min_samples: needed,
+          rule_reason: switchRequest.reason,
+        });
+        return;
+      }
+      this.#upGuardArmed = false;
+    }
+
     const targetTrack = this.#tracks[targetIndex];
     if (!targetTrack) return;
 
@@ -391,6 +470,7 @@ export class AbrController {
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
+    this.#armUpGuard();
     this.#recordHistory(activeTrack ?? '', targetTrack.name, reason, bufferSeconds, fastEmaBps);
     events.emit('ABR_DECISION', {
       from: activeTrack,
