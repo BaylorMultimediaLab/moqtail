@@ -57,11 +57,20 @@ MECHANISM_URL_PARAM = {"native": None, "pr1378": "switchFloor", "switch-from": "
 # abrSettings.controller, logged in RUN_META). 'baseline' is the controller as shipped.
 # The probe fix and the post-switch up-guard are separate knobs so the 2x2 ablation
 # can attribute effects (docs/abr-controller.md, section 9).
+GUARD = {"upGuardSamples": 3, "upGuardRelease": "landed"}
+PROBE = {"probeMinBytes": 250000, "probeMinDurationMs": 300}
 CONTROLLER_PARAMS = {
     "baseline": {},
-    "probe": {"probeMinBytes": 250000, "probeMinDurationMs": 300},
-    "guard": {"upGuardSamples": 3, "upGuardRelease": "landed"},
-    "both": {"probeMinBytes": 250000, "probeMinDurationMs": 300, "upGuardSamples": 3, "upGuardRelease": "landed"},
+    "probe": PROBE,
+    "guard": GUARD,
+    "both": {**PROBE, **GUARD},
+    # Second ablation (docs/pilot-linux.md 8d): the down half of the loop is
+    # triggered by the switch itself (latency-trend on the first post-seam group,
+    # switch-history on the rung's own earlier drops), so these arms remove those
+    # triggers on top of the guard.
+    "guard-lat": {**GUARD, "latencyResetOnLanding": 1},
+    "guard-hist": {**GUARD, "switchHistoryMode": "off"},
+    "guard-lat-hist": {**GUARD, "latencyResetOnLanding": 1, "switchHistoryMode": "off"},
 }
 
 
@@ -71,7 +80,7 @@ def controller_params(args) -> dict:
         k, _, v = kv.partition("=")
         if not v:
             sys.exit(f"--controller-param expects KEY=VALUE, got {kv!r}")
-        params[k] = v if k == "upGuardRelease" else int(float(v))
+        params[k] = v if k in ("upGuardRelease", "switchHistoryMode") else int(float(v))
     return params
 
 
@@ -364,7 +373,8 @@ def main() -> int:
                     help="controller stabilisation arm: baseline | probe (payload floor + min duration) | "
                          "guard (post-switch up-guard) | both; recorded in the identity block")
     ap.add_argument("--controller-param", action="append", metavar="KEY=VALUE",
-                    help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease)")
+                    help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, "
+                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode)")
     ap.add_argument("--seed", type=int, default=None, help="recorded in run_meta; profiles are deterministic")
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")

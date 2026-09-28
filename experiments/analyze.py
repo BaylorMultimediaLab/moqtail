@@ -440,8 +440,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             weighted += (a.get("bitrate_kbps") or 0) * dt
             share[a.get("track") or "?"] = share.get(a.get("track") or "?", 0.0) + dt
         total = sum(share.values()) or 1.0
+        # Time-weighted mean played rung (0 = lowest) and the share of time on
+        # each rung: whether the controller climbs at all, independent of the
+        # ladder's bitrate spacing.
+        rung_time = sum(index_of.get(k, 0) * v for k, v in share.items() if k in index_of)
         out["bitrate"] = {
             "time_weighted_mean_kbps": weighted / total,
+            "mean_rung_index": rung_time / total,
+            "rung_share": {str(index_of[k]): v / total for k, v in sorted(share.items(), key=lambda kv: index_of.get(kv[0], -1)) if k in index_of},
             "track_share": {k: v / total for k, v in share.items()},
             "played_s": total,
             "dropped_frames": samples[-1].get("dropped_frames"),
@@ -586,6 +592,9 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "presented_frames": samples[-1].get("total_frames") if samples else None,
     }
     out["client_errors"] = [r.get("message") for r in by("ERROR")]
+    # Fatal media element errors (MEDIA_ERR_DECODE = 3 etc.): after one, every append fails.
+    out["media_errors"] = [{"ts": r["ts"], "code": r.get("code"), "message": r.get("message"), "track": r.get("track"),
+                            "playhead_ms": r.get("playhead_ms")} for r in by("MEDIA_ERROR")]
     return out
 
 
@@ -637,6 +646,7 @@ def to_markdown(s: dict) -> str:
          f"| data starvation episodes / total s | {s['starvation']['count']} / {fmt(s['starvation']['total_ms'] / 1000)}{' (open at end)' if s['starvation']['open_at_end'] else ''} |",
          f"| down-reaction / up-recovery s (played rung held {s['reaction']['sustain_s']:g} s) | {fmt((s['reaction']['down_reaction_ms'] or 0) / 1000) if s['reaction']['down_reaction_ms'] is not None else '-'} / {fmt((s['reaction']['up_recovery_ms'] or 0) / 1000) if s['reaction']['up_recovery_ms'] is not None else '-'} |",
          f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
+         f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
          f"| switches (up / down / failed) | {s['switches']['count']} ({s['switches']['up']} / {s['switches']['down']} / {s['switches']['failed']}) |",
          f"| switch delivery latency ms, t4 (median / p95) | {fmt(s['switches']['switch_delivery_latency_ms'].get('p50'))} / {fmt(s['switches']['switch_delivery_latency_ms'].get('p95'))} |",
          f"| switch visibility delay ms, t5 (median / p95) | {fmt(s['switches']['switch_visibility_delay_ms'].get('p50'))} / {fmt(s['switches']['switch_visibility_delay_ms'].get('p95'))} |",
@@ -658,7 +668,7 @@ def to_markdown(s: dict) -> str:
          f"| time-shift error ms signed mean / abs p95 | {fmt(s['time_shift']['signed_error_ms'].get('mean'))} / {fmt(s['time_shift']['abs_error_ms'].get('p95'))} |",
          f"| live-edge distance ms mean / p95 | {fmt(s['time_shift']['live_edge_distance_ms'].get('mean'))} / {fmt(s['time_shift']['live_edge_distance_ms'].get('p95'))} |",
          f"| buffer s mean / p50 | {fmt(s['time_shift']['buffer_s'].get('mean'))} / {fmt(s['time_shift']['buffer_s'].get('p50'))} |",
-         f"| played bitrate kbps (time-weighted) | {fmt(s['bitrate'].get('time_weighted_mean_kbps'))} |",
+         f"| played bitrate kbps (time-weighted); mean rung index; share per rung | {fmt(s['bitrate'].get('time_weighted_mean_kbps'))}; {fmt(s['bitrate'].get('mean_rung_index'))}; {({k: round(v, 2) for k, v in (s['bitrate'].get('rung_share') or {}).items()})} |",
          f"| relay cache total max bytes / evictions | {s['cache']['total_max_bytes']} / {s['cache']['evictions']} |",
          ]
     for name, p in s["process"].items():
@@ -695,7 +705,8 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
-                  "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded",
+                  "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
+                  "mean_rung_index",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
@@ -746,6 +757,8 @@ def agg_row(s: dict) -> dict:
         "range_jumps_deferred": s["stalls"]["range_jumps_deferred"],
         "up_guard_vetoes": s["switching"]["up_guard_vetoes"],
         "probes_discarded": s["switching"]["probes_discarded"],
+        "media_errors": len(s["media_errors"]),
+        "mean_rung_index": s["bitrate"].get("mean_rung_index"),
         "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
         "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
         "live_edge_mean_ms": s["time_shift"]["live_edge_distance_ms"].get("mean"),

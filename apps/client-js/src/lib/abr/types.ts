@@ -72,6 +72,21 @@ export interface ControllerSettings {
    * client, so this choice makes the guard's duration client-type dependent).
    */
   upGuardRelease: 'landed' | 'visible';
+  /**
+   * Reset the per-frame latency window when a switch lands, so LatencyTrendRule
+   * compares post-switch frames with post-switch frames. Without it the first
+   * group after a seam (delivered as a burst on every mechanism) raises the
+   * recent/older ratio past 1.2 and triggers a STRONG down-switch about one
+   * second after every up-switch.
+   */
+  latencyResetOnLanding: boolean;
+  /**
+   * 'evict' (the shipped rule): once a rung has more drops than
+   * switchPercentageThreshold allows, SwitchHistoryRule evicts the client from
+   * it on the first tick after landing. 'off' disables the rule. Under a loop
+   * the rule's drops are the loop's own down-switches, so it perpetuates it.
+   */
+  switchHistoryMode: 'evict' | 'off';
 }
 
 export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
@@ -79,6 +94,8 @@ export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
   probeMinDurationMs: 0,
   upGuardSamples: 0,
   upGuardRelease: 'landed',
+  latencyResetOnLanding: false,
+  switchHistoryMode: 'evict',
 };
 
 export interface AbrSettings {

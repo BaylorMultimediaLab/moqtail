@@ -50,8 +50,9 @@ and `identity.final` are always recorded.
   (`live-edge` = live-edge client, `time-shifted` = time-shifted client),
   `time_shift_s`, `delay_groups`, `target_shift_ms`, `gop_duration_ms`,
   `initial_bandwidth_bps`, `startup_track`, `abr_settings`, `controller`
-  (`probeMinBytes`, `probeMinDurationMs`, `upGuardSamples`, `upGuardRelease`;
-  all zero / `landed` on the baseline), `ladder`.
+  (`probeMinBytes`, `probeMinDurationMs`, `upGuardSamples`, `upGuardRelease`,
+  `latencyResetOnLanding`, `switchHistoryMode`; all zero / `landed` / false /
+  `evict` on the baseline), `ladder`.
 - publisher `RUN_META`: `mode` (`replay`/`live`), `gops_per_variant`, `loop`,
   `framerate`, `ladder` (track, resolution, bitrate, `gop_duration_ms`, codec).
 - runner `run_meta.json`: CLI arguments, profile (with resolved steps), git
@@ -81,6 +82,8 @@ groups, so the target is stated in groups, not in the seconds typed.
 | `PROBE_DISCARDED`                                | a probe reading was dropped for a too-short burst (controller `probeMinDurationMs`)                                                       | `bps`, `dt_ms`, `min_duration_ms`                                                                                                                                                                                                                                                                                                                                               |
 | `RANGE_JUMP_DEFERRED`                            | the buffer held a range-jump because new media was landing inside the gap (once per gap)                                                  | `playhead_ms`, `range_end_ms`, `next_start_ms`, `append_front_ms`; the eventual `SEEK` carries `deferred_ms`                                                                                                                                                                                                                                                                    |
 | `DATA_STARVED`, `DATA_RESUMED`                   | no media appended for 4 s with an empty buffer; data flows again                                                                          | `track`, `request_id`, `pending`, `last_group`, `since_last_append_ms`, `init_pending`; `starved_ms`                                                                                                                                                                                                                                                                            |
+| `MEDIA_ERROR`                                    | the media element reported a fatal error (`code` 3 = MEDIA_ERR_DECODE); every later append fails                                          | `code`, `message`, `playhead_ms`, `track`, `mse_ready_state`                                                                                                                                                                                                                                                                                                                    |
+| `LATENCY_WINDOW_RESET`                           | the latency-trend window was cleared at a switch landing (controller `latencyResetOnLanding`)                                             | `track`                                                                                                                                                                                                                                                                                                                                                                         |
 | `SWITCH_INIT_RECOVERED`, `ERROR`                 | a failed init-segment append succeeded on retry; a player error (`where` = `switch-init-append`, `append-exhausted`, `updateend-timeout`) | `track`, `attempts`; `where`, `name`, `message`, `mse_ready_state`                                                                                                                                                                                                                                                                                                              |
 | `SWITCH_SENT`, `SWITCH_OK`, `SWITCH_ERROR`       | the SWITCH request                                                                                                                        | `request_id`, `old_request_id`, `playhead_ms`, `playhead_group`, `last_received_group`, `rtt_ms`                                                                                                                                                                                                                                                                                |
 | `SWITCH_FIRST_OBJECT`                            | first object of the new track arrives                                                                                                     | `group`, `object`, `since_sent_ms`                                                                                                                                                                                                                                                                                                                                              |
@@ -167,6 +170,13 @@ catch-up stream) using the same helper; they must keep these names.
   there for `--sustain`. A one-tick excursion during a thrash does not count.
   These are the two numbers a stabilised controller must not inflate while it
   cuts switches/min, reversals and superseded switches.
+- **Played rung** (`bitrate.mean_rung_index`, `bitrate.rung_share`): the
+  time-weighted mean ladder index played (0 = lowest) and the share of time on
+  each rung. Whether the controller climbs at all, independent of the ladder's
+  bitrate spacing; on a 6 Mbps link the fitting rung of the Linux ladder is
+  index 4.
+- **Media errors** (`media_errors`): fatal media element errors
+  (`MEDIA_ERROR`); one decode error ends useful playback for the run.
 - **Data starvation** (`starvation`, column `data_starved_ms`): nothing was
   appended for 4 s while the buffer ahead of the playhead was empty
   (`DATA_STARVED`), until data flowed again or the run ended. A starving

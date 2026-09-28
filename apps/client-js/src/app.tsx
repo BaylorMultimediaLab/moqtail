@@ -238,9 +238,11 @@ function TrackGroup({
  *   ?relay=<url> ?namespace=<ns>  connection defaults
  * Together with ?clientMode, ?timeShift and the ABR overrides below.
  */
+const truthyParam = (v: string | null) => v === '1' || v === 'true';
+
 function readRunParams() {
   const params = new URLSearchParams(window.location.search);
-  const truthy = (v: string | null) => v === '1' || v === 'true';
+  const truthy = truthyParam;
   return {
     runId: params.get('run'),
     autoConnect: truthy(params.get('autoConnect')),
@@ -312,7 +314,17 @@ export function App() {
     }
     const release = params.get('upGuardRelease');
     if (release === 'landed' || release === 'visible') controller.upGuardRelease = release;
-    return { ...DEFAULT_ABR_SETTINGS, ...overrides, controller };
+    controller.latencyResetOnLanding = truthyParam(params.get('latencyResetOnLanding'));
+    const hist = params.get('switchHistoryMode');
+    if (hist === 'evict' || hist === 'off') controller.switchHistoryMode = hist;
+    const rules =
+      controller.switchHistoryMode === 'off'
+        ? {
+            ...DEFAULT_ABR_SETTINGS.rules,
+            SwitchHistoryRule: { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false },
+          }
+        : DEFAULT_ABR_SETTINGS.rules;
+    return { ...DEFAULT_ABR_SETTINGS, ...overrides, rules, controller };
   });
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
@@ -563,6 +575,7 @@ export function App() {
           setSelectedVideo(trackName);
         });
         player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());
+        player.setResetLatencyOnLanding(effectiveAbrSettings.controller.latencyResetOnLanding);
         abr.start();
 
         const bitrateMap: Record<string, number> = {};
@@ -692,6 +705,7 @@ export function App() {
           setSelectedVideo(trackName);
         });
         player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());
+        player.setResetLatencyOnLanding(effectiveAbrSettings.controller.latencyResetOnLanding);
         abr.start();
 
         const bitrateMap: Record<string, number> = {};
