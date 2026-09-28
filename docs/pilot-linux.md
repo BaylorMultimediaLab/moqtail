@@ -241,6 +241,39 @@ whether the relay delivers whole groups to a delayed subscription across a
 switch (the diagnostic runs showed 2-frame slivers and 917 ms holes at the
 seams that became visible, and 3–6 s holes after the capacity drop).
 
+## 8d. Second ablation: the post-seam triggers
+
+The first ablation showed the guard slows the loop but the switch itself
+re-arms it (latency-trend on the first post-seam group, switch-history on the
+rung's own earlier drops; `docs/abr-controller.md` 9.3). Same two conditions,
+three new arms on top of the guard, three repetitions: 18 runs, about
+1 h 15 min. The `guard` runs from 8c are the reference column.
+
+```sh
+git checkout switch/native && git reset --hard origin/switch/native
+sudo -v
+for arm in guard-lat guard-hist guard-lat-hist; do
+  python3 experiments/run_experiment.py --mechanism native --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+sudo -v
+for arm in guard-lat guard-hist guard-lat-hist; do
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+python3 experiments/analyze.py results/*/ --quiet --csv results/ablation2.csv --stats results/ablation2_stats.csv
+python3 experiments/compare.py results/*/
+experiments/pack_results.sh results ablation2-$(hostname)-$(date +%Y%m%d).tar.gz
+```
+
+The decisive rows are `mean played rung index` (does the client reach rung 4
+on 6 Mbps and rung 3 on 1.5 Mbps), `switches / min`, `A->B->A reversals`,
+`down-reaction s` and `up-recovery s` (only meaningful once the client
+actually climbs), `stalled s` and `media errors`.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

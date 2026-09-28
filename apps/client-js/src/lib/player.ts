@@ -311,6 +311,9 @@ export class Player {
   // Data-starvation watchdog: performance.now() of the last successful append
   // when a DATA_STARVED episode was opened; undefined while data flows.
   #starvedSince: number | undefined;
+  // settings.controller.latencyResetOnLanding: clear the latency-trend window
+  // when a switch lands (see ControllerSettings).
+  #resetLatencyOnLanding = false;
   #disposers: Array<() => void> = [];
   // Per-frame end-to-end latency window (last 100 samples ≈ 4 s at 25 fps).
   // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
@@ -600,11 +603,24 @@ export class Player {
     // detection above catches stalls the element never reports.
     const onWaiting = () => this.#openStall('waiting', performance.now());
     const onPlaying = () => this.#closeStall();
+    // A fatal media element error (e.g. MEDIA_ERR_DECODE = 3 from the HEVC
+    // decoder) makes every later append fail; record it as its own event so a
+    // run that died this way is classified as a decoder failure, not a stall.
+    const onError = () =>
+      events.emit('MEDIA_ERROR', {
+        code: el.error?.code ?? null,
+        message: el.error?.message ?? null,
+        playhead_ms: el.currentTime * 1000,
+        track: this.getMetrics().activeTrack,
+        mse_ready_state: this.#mse?.readyState ?? 'closed',
+      });
     el.addEventListener('waiting', onWaiting);
     el.addEventListener('playing', onPlaying);
+    el.addEventListener('error', onError);
     this.#disposers.push(() => {
       el.removeEventListener('waiting', onWaiting);
       el.removeEventListener('playing', onPlaying);
+      el.removeEventListener('error', onError);
     });
 
     // Wait for the SourceBuffer's next `updateend`. Bounded: an `updateend`
@@ -903,6 +919,10 @@ export class Player {
                 since_sent_ms: performance.now() - switchSentAt,
               });
               struct.postSwitchSeamPTS_ms = newStartPTS_ms;
+              if (this.#resetLatencyOnLanding) {
+                this.#latencyTracker.reset();
+                events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
+              }
 
               if (newStartPTS_ms !== undefined) {
                 const mediaSeamGapMs =
@@ -1656,6 +1676,11 @@ export class Player {
   /** Wires the seam-visible notification (post-switch up-guard release in 'visible' mode). */
   setOnSwitchVisible(cb: (trackName: string) => void): void {
     this.#options.onSwitchVisible = cb;
+  }
+
+  /** Controller knob: reset the per-frame latency window when a switch lands. */
+  setResetLatencyOnLanding(enabled: boolean): void {
+    this.#resetLatencyOnLanding = enabled;
   }
 
   /**

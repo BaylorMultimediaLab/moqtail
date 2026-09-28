@@ -37,6 +37,8 @@ ROWS = [
     ("up-recovery s (held 5 s)", lambda s: (s["reaction"]["up_recovery_ms"] / 1000) if s["reaction"]["up_recovery_ms"] is not None else None),
     ("up-guard vetoes", lambda s: s["switching"]["up_guard_vetoes"]),
     ("probes discarded", lambda s: s["switching"]["probes_discarded"]),
+    ("media errors", lambda s: len(s.get("media_errors", []))),
+    ("mean played rung index", lambda s: s["bitrate"].get("mean_rung_index")),
     ("played kbps", lambda s: s["bitrate"].get("time_weighted_mean_kbps")),
     ("startup ms", lambda s: s["startup"]["startup_delay_ms"]),
     ("live-edge dist mean ms", lambda s: s["time_shift"]["live_edge_distance_ms"].get("mean")),

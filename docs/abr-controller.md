@@ -309,21 +309,21 @@ A→B→A reversals in 60 s, most superseded before they were ever visible.
 
 ## 7. Hard-coded numbers
 
-| where          | value                   | meaning                                                                                           |
-| -------------- | ----------------------- | ------------------------------------------------------------------------------------------------- |
-| AbrController  | 250 ms                  | tick                                                                                              |
-| AbrController  | 3000 ms / 5000 ms       | switching-guard timeout / cool-down after it                                                      |
-| AbrController  | 3                       | throughput samples before an up-switch (slow start)                                               |
-| AbrController  | 60                      | switch-history length                                                                             |
-| AbrController  | 2 s                     | probe horizon in the size formula                                                                 |
-| controller     | 0 B / 0 ms / 0 / landed | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease (section 9; all off = baseline) |
-| ProbeManager   | 2000 / 500 / 5000 ms    | min interval / nominal duration / freshness                                                       |
-| GoodputTracker | 5                       | SWMA window (groups)                                                                              |
-| LatencyTracker | 100                     | samples in the trend window                                                                       |
-| BolaRule       | 10 s, 0.99              | MINIMUM_BUFFER_S, placeholder decay                                                               |
-| L2ARule        | 4, 2, 1.5 s             | horizon, REACT, buffer target                                                                     |
-| LoLpRule       | 0.5 s, 0.1              | emergency buffer, SOM learning rate                                                               |
-| context        | 1 s, false              | segmentDurationS, isLowLatency                                                                    |
+| where          | value                                   | meaning                                                                                                                                     |
+| -------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| AbrController  | 250 ms                                  | tick                                                                                                                                        |
+| AbrController  | 3000 ms / 5000 ms                       | switching-guard timeout / cool-down after it                                                                                                |
+| AbrController  | 3                                       | throughput samples before an up-switch (slow start)                                                                                         |
+| AbrController  | 60                                      | switch-history length                                                                                                                       |
+| AbrController  | 2 s                                     | probe horizon in the size formula                                                                                                           |
+| controller     | 0 B / 0 ms / 0 / landed / false / evict | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode (section 9; all off = baseline) |
+| ProbeManager   | 2000 / 500 / 5000 ms                    | min interval / nominal duration / freshness                                                                                                 |
+| GoodputTracker | 5                                       | SWMA window (groups)                                                                                                                        |
+| LatencyTracker | 100                                     | samples in the trend window                                                                                                                 |
+| BolaRule       | 10 s, 0.99                              | MINIMUM_BUFFER_S, placeholder decay                                                                                                         |
+| L2ARule        | 4, 2, 1.5 s                             | horizon, REACT, buffer target                                                                                                               |
+| LoLpRule       | 0.5 s, 0.1                              | emergency buffer, SOM learning rate                                                                                                         |
+| context        | 1 s, false                              | segmentDurationS, isLowLatency                                                                                                              |
 
 ## 8. Things to keep in mind before tuning
 
@@ -390,7 +390,37 @@ observed loop at its second step: probe up → insufficient-buffer down →
 (held) → three fresh samples on the low rung → the probe must prove headroom
 again before the next climb. The `guard` arm uses 3 samples, `landed`.
 
-### 9.3 What to compare between arms
+### 9.3 Post-seam triggers: `latencyResetOnLanding`, `switchHistoryMode`
+
+The first 2×2 ablation (2026-09-28, step_down_up, live edge, native and PR
+#1378 next-group, 3 reps each) showed what actually closes the loop. The
+probe arm changed nothing (on a shaped link the probe already read 2–5 Mbps;
+the floor made the readings more accurate and the switch count identical).
+The guard arm halved the rate (39 → 27 and 60 → 29 switches/min) and cut
+stalls, but every surviving up-switch was still reverted about one second
+after landing, and the client never climbed above rung 1 for long (mean
+played rung 0.3 in every arm, fit rung 4). The reversal comes from the
+switch itself:
+
+- `LatencyTrendRule`: the first group after a seam arrives as a burst, so
+  the recent/older latency ratio rises from about 1.0 to 1.25–1.38 (94 → 105
+  ms) and the rule fires a STRONG down-switch one tick after landing.
+  `latencyResetOnLanding` clears the 100-frame window when the switch lands
+  (`LATENCY_WINDOW_RESET`), so the trend compares post-switch frames with
+  post-switch frames.
+- `SwitchHistoryRule`: a rung with `drops / noDrops > 0.075` in the history
+  is "unsafe"; the rule is silent while the client sits on a safe rung and
+  evicts it on the first tick after landing on an unsafe one. Its drops are
+  the loop's own down-switches, so after one reversal the rung stays banned
+  and every later up-switch to it is reverted immediately (the modal next rule
+  after an up-switch on PR #1378). `switchHistoryMode: 'off'` disables the
+  rule (recorded in `RUN_META.abr_settings.rules` too).
+
+On native the third trigger is `InsufficientBufferRule` after the 1 GOP seam
+hole drains the 0.4 s live-edge buffer; that one is the mechanism's cost and
+is left alone.
+
+### 9.4 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
 superseded switches and up-guard vetoes should fall; `down-reaction s` and
