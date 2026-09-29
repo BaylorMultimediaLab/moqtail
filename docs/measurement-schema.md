@@ -191,6 +191,13 @@ catch-up stream) using the same helper; they must keep these names.
   subscription is a delivery failure of the relay or the client library, not a
   decoder wedge (which has data buffered ahead), and is reported separately from
   stalls so the two are never confused.
+- **Delivery integrity** (`delivery`, needs `--log-objects`): objects received
+  per group; `short_groups` received fewer than half the expected objects,
+  `truncated_groups` are the subset of which fewer than half _arrived_ at all
+  (received plus discarded), i.e. cut on the wire. **Discarded** (`discarded`,
+  column `discarded_objects` / `discarded_mb`): stale-track objects the relay
+  delivered and the client threw away (`DROP_STALE`, with `bytes`): the old
+  track's undelivered backlog arriving after a switch landed.
 - **Range-jump deferrals** (`stalls.range_jumps_deferred`,
   `range_jump_deferred_ms_total`): gaps the buffer refused to jump because the
   append front lay inside them (a catch-up or a playhead-floor switch was filling

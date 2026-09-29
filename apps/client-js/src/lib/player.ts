@@ -826,6 +826,7 @@ export class Player {
                 current: struct.trackName,
                 pending: struct.pendingSwitch?.trackName ?? null,
                 group: object.location.group,
+                bytes: object.payload.byteLength,
                 object: object.location.object,
               });
               return;
@@ -847,6 +848,7 @@ export class Player {
                 current: struct.trackName,
                 pending: struct.pendingSwitch.trackName,
                 group: object.location.group,
+                bytes: object.payload.byteLength,
                 object: object.location.object,
                 reason: 'pre-landing',
               });
@@ -970,6 +972,7 @@ export class Player {
                   current: struct.trackName,
                   pending: null,
                   group: Number(object.location.group),
+                  bytes: object.payload.byteLength,
                   object: Number(object.location.object),
                   reason: 'init-pending',
                 });
@@ -1105,6 +1108,7 @@ export class Player {
                   current: struct.trackName,
                   pending: struct.pendingSwitch?.trackName ?? null,
                   group: Number(object.location.group),
+                  bytes: object.payload.byteLength,
                   object: Number(object.location.object),
                   reason: 'init-pending',
                 });
