@@ -924,7 +924,14 @@ export class Player {
                   sourceBuffer.buffered.length > 0
                     ? sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
                     : 0;
-                if (bufferedEndSeconds <= seamSeconds + SEAM_REMOVE_GUARD_SECONDS) {
+                if (this.#options.switchFloor !== 'playhead') {
+                  // Next-group floor: the seam is the source's cut point and any
+                  // overlap is a few frames that the append's own coded-frame
+                  // removal replaces. The explicit remove() ran before every
+                  // changeType() and precedes each of the four MEDIA_ERR_DECODE
+                  // failures seen on this branch; the playhead floor, which
+                  // re-delivers the whole buffered horizon, keeps it.
+                } else if (bufferedEndSeconds <= seamSeconds + SEAM_REMOVE_GUARD_SECONDS) {
                   // nothing buffered beyond the seam: append in place
                 } else if (seamSeconds > playheadSeconds + SEAM_REMOVE_GUARD_SECONDS) {
                   try {
