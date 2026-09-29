@@ -22,10 +22,14 @@ export class SwitchHistoryRule implements AbrRule {
       ruleConfig?.parameters?.['switchPercentageThreshold'] ??
       defaultConfig.parameters['switchPercentageThreshold'];
 
-    // Rebuild per-track stats from the full switch history on each call
+    // Rebuild per-track stats from the switch history on each call, limited to
+    // the last controller.switchHistoryWindowS seconds when set.
     this.trackStats = new Map();
+    const windowS = abrSettings.controller?.switchHistoryWindowS ?? 0;
+    const cutoff = windowS > 0 ? Date.now() - windowS * 1000 : -Infinity;
 
     for (const event of switchHistory) {
+      if (event.ts < cutoff) continue;
       if (event.reason === 'auto-downgrade' || event.reason === 'auto-emergency') {
         // Downgrade/emergency: record a drop against the track being left
         const stats = this.trackStats.get(event.fromTrack) ?? { drops: 0, noDrops: 0 };

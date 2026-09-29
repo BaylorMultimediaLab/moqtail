@@ -309,21 +309,21 @@ A→B→A reversals in 60 s, most superseded before they were ever visible.
 
 ## 7. Hard-coded numbers
 
-| where          | value                                                       | meaning                                                                                                                                                                     |
-| -------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| AbrController  | 250 ms                                                      | tick                                                                                                                                                                        |
-| AbrController  | 3000 ms / 5000 ms                                           | switching-guard timeout / cool-down after it                                                                                                                                |
-| AbrController  | 3                                                           | throughput samples before an up-switch (slow start)                                                                                                                         |
-| AbrController  | 60                                                          | switch-history length                                                                                                                                                       |
-| AbrController  | 2 s                                                         | probe horizon in the size formula                                                                                                                                           |
-| controller     | 0 B / 0 ms / 0 / landed / false / evict / instant / 1250 ms | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode, bufferSignal, bufferEnvelopeMs (section 9; all off = baseline) |
-| ProbeManager   | 2000 / 500 / 5000 ms                                        | min interval / nominal duration / freshness                                                                                                                                 |
-| GoodputTracker | 5                                                           | SWMA window (groups)                                                                                                                                                        |
-| LatencyTracker | 100                                                         | samples in the trend window                                                                                                                                                 |
-| BolaRule       | 10 s, 0.99                                                  | MINIMUM_BUFFER_S, placeholder decay                                                                                                                                         |
-| L2ARule        | 4, 2, 1.5 s                                                 | horizon, REACT, buffer target                                                                                                                                               |
-| LoLpRule       | 0.5 s, 0.1                                                  | emergency buffer, SOM learning rate                                                                                                                                         |
-| context        | 1 s, false                                                  | segmentDurationS, isLowLatency                                                                                                                                              |
+| where          | value                                                             | meaning                                                                                                                                                                                           |
+| -------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AbrController  | 250 ms                                                            | tick                                                                                                                                                                                              |
+| AbrController  | 3000 ms / 5000 ms                                                 | switching-guard timeout / cool-down after it                                                                                                                                                      |
+| AbrController  | 3                                                                 | throughput samples before an up-switch (slow start)                                                                                                                                               |
+| AbrController  | 60                                                                | switch-history length                                                                                                                                                                             |
+| AbrController  | 2 s                                                               | probe horizon in the size formula                                                                                                                                                                 |
+| controller     | 0 B / 0 ms / 0 / landed / false / evict / 0 s / instant / 1250 ms | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs (section 9; all off = baseline) |
+| ProbeManager   | 2000 / 500 / 5000 ms                                              | min interval / nominal duration / freshness                                                                                                                                                       |
+| GoodputTracker | 5                                                                 | SWMA window (groups)                                                                                                                                                                              |
+| LatencyTracker | 100                                                               | samples in the trend window                                                                                                                                                                       |
+| BolaRule       | 10 s, 0.99                                                        | MINIMUM_BUFFER_S, placeholder decay                                                                                                                                                               |
+| L2ARule        | 4, 2, 1.5 s                                                       | horizon, REACT, buffer target                                                                                                                                                                     |
+| LoLpRule       | 0.5 s, 0.1                                                        | emergency buffer, SOM learning rate                                                                                                                                                               |
+| context        | 1 s, false                                                        | segmentDurationS, isLowLatency                                                                                                                                                                    |
 
 ## 8. Things to keep in mind before tuning
 
@@ -481,7 +481,43 @@ runway model, and a genuine difference from the time-shifted client, so it is
 reported (`live_edge_mean_ms`, stalls) rather than tuned away; the validator's
 live-edge check is now a setup check on the first 5 s only.
 
-### 9.6 What to compare between arms
+### 9.6 Fourth ablation: the veto needs a memory window
+
+Arms lat-env-hist, lat-env-veto, guard-lat-env-veto (2026-09-29).
+
+- **hist (rule off)** climbs highest and pays for it: native mean rung 1.9,
+  1045 kbps, 74 s stalled and 19 s of data starvation while switches were in
+  flight on a saturated link; PR #1378 rung 2.1 and 1119 kbps with all three
+  runs invalid (freezes of 25–75 s, one decode error, and a client that ended
+  26 s behind live because a 1080p subscription on a 1.5 Mbps link builds a
+  backlog at the relay that a live-edge client never catches up on). With no
+  memory of failed rungs the throughput rule re-selects the unsustainable rung
+  as soon as the buffer rule has pulled it down.
+- **veto** kills the loop: 6–12 A→B→A reversals per run (98–166 before),
+  2 s stalled on PR #1378, 15 s on native (its seam holes). But it over-corrects:
+  after the 1.5 Mbps phase every rung above 240p has drops on record, and the
+  up-visits that would clear the record are exactly what the veto prevents, so
+  the client sits at 150 kbps for the rest of the run (phase-3 rung 0.00 on both
+  mechanisms). The history is the last 60 switches with no age limit; with 25
+  switches per run that is the whole run.
+- **guard + veto** is the same pinning from the first minute (native rung
+  0.03, 8 switches in 200 s).
+
+`switchHistoryWindowS` bounds the memory: only switches younger than the
+window count. With 60 s a failed climb costs one retry per minute, which is
+the behaviour the rule was meant to have. Fifth-ablation arms `lat-env-veto60`
+and `guard-lat-env-veto60`.
+
+Two failure classes surfaced again and are now handled or counted:
+
+- a playhead parked on a group boundary with readyState 4 while the buffer
+  grew for 100 s (Firefox decoder hang); the unwedge seek no longer requires
+  readyState < 3, it fires on any 3 s freeze with 1.5 s buffered ahead;
+- `MEDIA_ERR_DECODE` (3 so far, all on PR #1378, all on 360p-200k inside a
+  burst of switches one second apart). It ends useful playback; the run is
+  counted (`media errors`) and excluded.
+
+### 9.7 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
 superseded switches and up-guard vetoes should fall; `down-reaction s` and

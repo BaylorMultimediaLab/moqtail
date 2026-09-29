@@ -208,4 +208,37 @@ describe('SwitchHistoryRule', () => {
       expect(rule.getMaxIndex(ctx)).toBeNull();
     });
   });
+
+  describe('time window (controller.switchHistoryWindowS)', () => {
+    it('ignores drops older than the window', () => {
+      const rule = new SwitchHistoryRule();
+      const old = makeHistory('1080p', 4, 4, '720p').map(e => ({ ...e, ts: Date.now() - 120_000 }));
+      const ctx = makeContext({
+        activeTrackIndex: 2,
+        switchHistory: old,
+        abrSettings: {
+          ...DEFAULT_ABR_SETTINGS,
+          controller: { ...DEFAULT_ABR_SETTINGS.controller, switchHistoryWindowS: 60 },
+        },
+      });
+      expect(rule.getMaxIndex(ctx)).toBeNull();
+    });
+
+    it('still counts drops inside the window', () => {
+      const rule = new SwitchHistoryRule();
+      const recent = makeHistory('1080p', 4, 4, '720p').map(e => ({
+        ...e,
+        ts: Date.now() - 10_000,
+      }));
+      const ctx = makeContext({
+        activeTrackIndex: 2,
+        switchHistory: recent,
+        abrSettings: {
+          ...DEFAULT_ABR_SETTINGS,
+          controller: { ...DEFAULT_ABR_SETTINGS.controller, switchHistoryWindowS: 60 },
+        },
+      });
+      expect(rule.getMaxIndex(ctx)).not.toBeNull();
+    });
+  });
 });

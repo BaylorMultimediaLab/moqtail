@@ -338,6 +338,37 @@ experiments/pack_results.sh results ablation4-$(hostname)-$(date +%Y%m%d).tar.gz
 grid is the arm with the lowest `switches / min` and `A->B->A reversals` whose
 `mean played rung index` and `played kbps` stay close to `lat-env`.
 
+## 8g. Fifth ablation: the veto with a 60 s memory
+
+The veto arm removed the loop but banned every rung for the rest of the run
+once the capacity dropped (`docs/abr-controller.md` 9.6). Two arms, same two
+conditions, three repetitions: 12 runs, about 50 min.
+
+```sh
+git checkout switch/native && git reset --hard origin/switch/native
+sudo -v
+for arm in lat-env-veto60 guard-lat-env-veto60; do
+  python3 experiments/run_experiment.py --mechanism native --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+sudo -v
+for arm in lat-env-veto60 guard-lat-env-veto60; do
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+python3 experiments/analyze.py results/*/ --quiet --csv results/ablation5.csv --stats results/ablation5_stats.csv
+python3 experiments/compare.py results/*/
+experiments/pack_results.sh results ablation5-$(hostname)-$(date +%Y%m%d).tar.gz
+```
+
+What a working arm looks like: reversals in single digits like `lat-env-veto`,
+a phase-3 played rung that recovers toward the phase-1 value instead of 0.00,
+and `up-recovery s` that is finite. The arm that does that is the grid
+controller.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
