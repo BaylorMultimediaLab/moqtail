@@ -51,8 +51,10 @@ and `identity.final` are always recorded.
   `time_shift_s`, `delay_groups`, `target_shift_ms`, `gop_duration_ms`,
   `initial_bandwidth_bps`, `startup_track`, `abr_settings`, `controller`
   (`probeMinBytes`, `probeMinDurationMs`, `upGuardSamples`, `upGuardRelease`,
-  `latencyResetOnLanding`, `switchHistoryMode`; all zero / `landed` / false /
-  `evict` on the baseline), `ladder`.
+  `latencyResetOnLanding`, `switchHistoryMode`, `bufferSignal`,
+  `bufferEnvelopeMs`; all zero / `landed` / false / `evict` / `instant` on the
+  baseline), `ladder`. `ABR_TICK.buffer_rule_s` is the buffer level the rules
+  saw (equal to `buffer_s` unless `bufferSignal = envelope`).
 - publisher `RUN_META`: `mode` (`replay`/`live`), `gops_per_variant`, `loop`,
   `framerate`, `ladder` (track, resolution, bitrate, `gop_duration_ms`, codec).
 - runner `run_meta.json`: CLI arguments, profile (with resolved steps), git
