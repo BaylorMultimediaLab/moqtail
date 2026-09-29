@@ -14,4 +14,5 @@ export {
   SwitchRequestPriority,
   DEFAULT_ABR_SETTINGS,
   DEFAULT_CONTROLLER_SETTINGS,
+  bufferEnvelope,
 } from './types';

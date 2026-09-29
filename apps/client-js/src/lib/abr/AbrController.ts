@@ -8,6 +8,7 @@ import {
   type SwitchEvent,
   type SwitchReason,
   type Track,
+  bufferEnvelope,
 } from './types';
 
 export interface AbrMetrics {
@@ -108,6 +109,9 @@ export class AbrController {
   #upGuardArmed = false;
   #upGuardReleasedAtSamples: number | null = null;
   #lastSampleCount = 0;
+  // Recent instantaneous buffer levels for settings.controller.bufferSignal =
+  // 'envelope' (see ControllerSettings).
+  #bufferSamples: { ts: number; bufferSeconds: number }[] = [];
 
   constructor(
     player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>,
@@ -268,6 +272,19 @@ export class AbrController {
     this.#onMetricsUpdate(metrics);
     this.#lastSampleCount = sampleCount;
 
+    // Buffer level for the rules: instantaneous, or the maximum over the last
+    // group (the level after each burst landed).
+    const envelopeMs = this.#settings.controller?.bufferEnvelopeMs ?? 1250;
+    const nowTs = Date.now();
+    this.#bufferSamples.push({ ts: nowTs, bufferSeconds });
+    while (this.#bufferSamples.length > 0 && nowTs - this.#bufferSamples[0]!.ts > envelopeMs) {
+      this.#bufferSamples.shift();
+    }
+    const ruleBufferSeconds =
+      this.#settings.controller?.bufferSignal === 'envelope'
+        ? bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs)
+        : bufferSeconds;
+
     // Once the player signals the init segment landed, hold #switching until
     // a real new-track frame is decoded (totalVideoFrames moved past the
     // snapshot). Only then is it safe to consider another switch.
@@ -317,7 +334,7 @@ export class AbrController {
     if (Date.now() < this.#switchBackoffUntil) return;
 
     // Update DYNAMIC strategy based on buffer level
-    this.#updateDynamicStrategy(bufferSeconds);
+    this.#updateDynamicStrategy(ruleBufferSeconds);
 
     // Active probe via the relay's synthetic `.probe:<size>:<priority>`
     // track (IETF 119 MoQ bandwidth-measurement slides + Kuo §3.4.3.1
@@ -348,7 +365,8 @@ export class AbrController {
     const context: RulesContext = {
       tracks: this.#tracks,
       activeTrackIndex: currentIdx,
-      bufferSeconds,
+      bufferSeconds: ruleBufferSeconds,
+      bufferInstantSeconds: bufferSeconds,
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
@@ -380,6 +398,7 @@ export class AbrController {
         track: activeTrack,
         active_index: currentIdx,
         buffer_s: bufferSeconds,
+        buffer_rule_s: ruleBufferSeconds,
         bandwidth_bps: bandwidthBps,
         fast_ema_bps: fastEmaBps,
         slow_ema_bps: slowEmaBps,

@@ -309,21 +309,21 @@ A→B→A reversals in 60 s, most superseded before they were ever visible.
 
 ## 7. Hard-coded numbers
 
-| where          | value                                   | meaning                                                                                                                                     |
-| -------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| AbrController  | 250 ms                                  | tick                                                                                                                                        |
-| AbrController  | 3000 ms / 5000 ms                       | switching-guard timeout / cool-down after it                                                                                                |
-| AbrController  | 3                                       | throughput samples before an up-switch (slow start)                                                                                         |
-| AbrController  | 60                                      | switch-history length                                                                                                                       |
-| AbrController  | 2 s                                     | probe horizon in the size formula                                                                                                           |
-| controller     | 0 B / 0 ms / 0 / landed / false / evict | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode (section 9; all off = baseline) |
-| ProbeManager   | 2000 / 500 / 5000 ms                    | min interval / nominal duration / freshness                                                                                                 |
-| GoodputTracker | 5                                       | SWMA window (groups)                                                                                                                        |
-| LatencyTracker | 100                                     | samples in the trend window                                                                                                                 |
-| BolaRule       | 10 s, 0.99                              | MINIMUM_BUFFER_S, placeholder decay                                                                                                         |
-| L2ARule        | 4, 2, 1.5 s                             | horizon, REACT, buffer target                                                                                                               |
-| LoLpRule       | 0.5 s, 0.1                              | emergency buffer, SOM learning rate                                                                                                         |
-| context        | 1 s, false                              | segmentDurationS, isLowLatency                                                                                                              |
+| where          | value                                                       | meaning                                                                                                                                                                     |
+| -------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AbrController  | 250 ms                                                      | tick                                                                                                                                                                        |
+| AbrController  | 3000 ms / 5000 ms                                           | switching-guard timeout / cool-down after it                                                                                                                                |
+| AbrController  | 3                                                           | throughput samples before an up-switch (slow start)                                                                                                                         |
+| AbrController  | 60                                                          | switch-history length                                                                                                                                                       |
+| AbrController  | 2 s                                                         | probe horizon in the size formula                                                                                                                                           |
+| controller     | 0 B / 0 ms / 0 / landed / false / evict / instant / 1250 ms | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode, bufferSignal, bufferEnvelopeMs (section 9; all off = baseline) |
+| ProbeManager   | 2000 / 500 / 5000 ms                                        | min interval / nominal duration / freshness                                                                                                                                 |
+| GoodputTracker | 5                                                           | SWMA window (groups)                                                                                                                                                        |
+| LatencyTracker | 100                                                         | samples in the trend window                                                                                                                                                 |
+| BolaRule       | 10 s, 0.99                                                  | MINIMUM_BUFFER_S, placeholder decay                                                                                                                                         |
+| L2ARule        | 4, 2, 1.5 s                                                 | horizon, REACT, buffer target                                                                                                                                               |
+| LoLpRule       | 0.5 s, 0.1                                                  | emergency buffer, SOM learning rate                                                                                                                                         |
+| context        | 1 s, false                                                  | segmentDurationS, isLowLatency                                                                                                                                              |
 
 ## 8. Things to keep in mind before tuning
 
@@ -420,7 +420,36 @@ On native the third trigger is `InsufficientBufferRule` after the 1 GOP seam
 hole drains the 0.4 s live-edge buffer; that one is the mechanism's cost and
 is left alone.
 
-### 9.4 What to compare between arms
+### 9.4 The buffer signal: `bufferSignal`, `bufferEnvelopeMs`
+
+The second ablation (2026-09-28, arms guard-lat, guard-hist, guard-lat-hist)
+removed both post-seam triggers exactly as intended (0 latency-trend and 0
+switch-history switches) and changed nothing else: 27–30 switches/min, mean
+played rung 0.3, every up-switch still reverted about 1.5 s after landing.
+The down half had moved to `BufferDrainRateRule` (41 of 45 down-switches on
+PR #1378, reason `buffer-drain 1.05 s/s, link ≈ 0 Mbps`) and
+`InsufficientBufferRule` (native).
+
+The cause is the shape of the buffer at the live edge. The publisher sends a
+group as a burst and idles, so buffered-ahead is a sawtooth: 1.0 → 0.72 →
+0.47 → 0.23 → 0.98 s every second (250 ms ticks). Any rule that differences
+the buffer over a 1 s window reads the falling edge as a drain of about 1 s/s,
+and `bufferTriggerThreshold = 2 s` is unreachable at the live edge, so the
+rule is permanently armed on every rung above the lowest (it abstains at
+rung 0 because nothing is lower). `InsufficientBufferRule` scales its cap by
+the same instantaneous level. Replayed on the recorded ticks of a
+guard-lat-hist run, the drain rule fires on 168 of 575 ticks with the
+instantaneous buffer and on 22 with a 1.25 s envelope.
+
+`bufferSignal = envelope` gives every rule the maximum buffer level over the
+last `bufferEnvelopeMs` (one group plus one tick): the level after each burst
+landed, which is what the dash.js rules were written for. The empty-buffer
+emergency (`insufficient-buffer-empty`) keeps the instantaneous value
+(`RulesContext.bufferInstantSeconds`). A real drain still shows: the peaks
+fall. The change is the same on every mechanism and both client types, and
+on a time-shifted client with a 10 s buffer it is a no-op.
+
+### 9.5 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
 superseded switches and up-guard vetoes should fall; `down-reaction s` and

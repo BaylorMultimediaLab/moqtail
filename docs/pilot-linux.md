@@ -274,6 +274,39 @@ on 6 Mbps and rung 3 on 1.5 Mbps), `switches / min`, `A->B->A reversals`,
 `down-reaction s` and `up-recovery s` (only meaningful once the client
 actually climbs), `stalled s` and `media errors`.
 
+## 8e. Third ablation: the buffer signal
+
+The second ablation removed the latency-trend and switch-history triggers and
+the loop continued at the same rate on the buffer rules, which read the
+per-group burst sawtooth as a drain (`docs/abr-controller.md` 9.4). Three
+arms, same two conditions, three repetitions: 18 runs, about 1 h 15 min.
+
+```sh
+git checkout switch/native && git reset --hard origin/switch/native
+sudo -v
+for arm in env lat-env guard-lat-env; do
+  python3 experiments/run_experiment.py --mechanism native --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+sudo -v
+for arm in env lat-env guard-lat-env; do
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+python3 experiments/analyze.py results/*/ --quiet --csv results/ablation3.csv --stats results/ablation3_stats.csv
+python3 experiments/compare.py results/*/
+experiments/pack_results.sh results ablation3-$(hostname)-$(date +%Y%m%d).tar.gz
+```
+
+`env` alone shows whether the buffer signal is the root cause; `lat-env`
+adds the post-seam latency reset; `guard-lat-env` adds the up-guard as a
+slow-start. Read `mean played rung index` first: an arm that works reaches
+rung 4 in the 6 Mbps phases and rung 3 at 1.5 Mbps, and `down-reaction s` /
+`up-recovery s` become meaningful for the first time.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

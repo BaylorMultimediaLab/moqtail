@@ -71,6 +71,13 @@ CONTROLLER_PARAMS = {
     "guard-lat": {**GUARD, "latencyResetOnLanding": 1},
     "guard-hist": {**GUARD, "switchHistoryMode": "off"},
     "guard-lat-hist": {**GUARD, "latencyResetOnLanding": 1, "switchHistoryMode": "off"},
+    # Third ablation (docs/pilot-linux.md 8e): with latency-trend and switch-history
+    # out of the way the down half moved to the buffer rules, which read the
+    # per-group burst sawtooth at the live edge as a 1 s/s drain. 'env' gives the
+    # rules the one-group envelope of the buffer instead.
+    "env": {"bufferSignal": "envelope"},
+    "lat-env": {"latencyResetOnLanding": 1, "bufferSignal": "envelope"},
+    "guard-lat-env": {**GUARD, "latencyResetOnLanding": 1, "bufferSignal": "envelope"},
 }
 
 
@@ -80,7 +87,7 @@ def controller_params(args) -> dict:
         k, _, v = kv.partition("=")
         if not v:
             sys.exit(f"--controller-param expects KEY=VALUE, got {kv!r}")
-        params[k] = v if k in ("upGuardRelease", "switchHistoryMode") else int(float(v))
+        params[k] = v if k in ("upGuardRelease", "switchHistoryMode", "bufferSignal") else int(float(v))
     return params
 
 
@@ -374,7 +381,7 @@ def main() -> int:
                          "guard (post-switch up-guard) | both; recorded in the identity block")
     ap.add_argument("--controller-param", action="append", metavar="KEY=VALUE",
                     help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, "
-                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode)")
+                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode, bufferSignal, bufferEnvelopeMs)")
     ap.add_argument("--seed", type=int, default=None, help="recorded in run_meta; profiles are deterministic")
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
