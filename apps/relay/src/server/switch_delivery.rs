@@ -602,7 +602,25 @@ pub(crate) async fn terminate_source(
     {
       error!("switch teardown: failed to send PUBLISH_DONE: {e:?}");
     }
-    sub.finish().await;
+    // Reset the replaced subscription's data streams instead of finishing them.
+    // A finish is a FIN: QUIC delivers everything already queued on the stream,
+    // and on a link that has just shrunk that queue is the undelivered backlog
+    // of the old track (whole groups, at the higher stream priority its lower
+    // group ids carry), which the subscriber will discard on arrival and which
+    // starved the target's streams for tens of seconds (delivery diagnostic,
+    // 2026-09-29: 78 of 222 groups cut on the wire). The subscriber asked to
+    // leave this track; nothing still queued on it is wanted.
+    let streams = sub.opened_stream_count();
+    crate::server::events::emit(
+      "SWITCH_SOURCE_RESET",
+      serde_json::json!({
+        "conn": connection_id,
+        "request_id": current_sub_req_id,
+        "track": crate::server::events::track_name_string(current_full_track_name),
+        "streams_opened": streams,
+      }),
+    );
+    sub.cancel().await;
   }
 }
 
