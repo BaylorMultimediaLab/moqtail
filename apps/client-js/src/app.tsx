@@ -309,7 +309,12 @@ export function App() {
     // Controller stabilisation knobs (experiments/run_experiment.py --controller):
     // ?probeMinBytes= ?probeMinDurationMs= ?upGuardSamples= ?upGuardRelease=landed|visible
     const controller = { ...DEFAULT_ABR_SETTINGS.controller };
-    for (const key of ['probeMinBytes', 'probeMinDurationMs', 'upGuardSamples'] as const) {
+    for (const key of [
+      'probeMinBytes',
+      'probeMinDurationMs',
+      'upGuardSamples',
+      'switchHistoryWindowS',
+    ] as const) {
       const v = params.get(key);
       if (v !== null && v !== '') {
         const n = Number(v);
