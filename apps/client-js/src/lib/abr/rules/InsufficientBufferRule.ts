@@ -29,8 +29,10 @@ export class InsufficientBufferRule implements AbrRule {
       return null;
     }
 
-    // Buffer is completely empty — force lowest quality with STRONG priority
-    if (bufferSeconds === 0) {
+    // Buffer is completely empty — force lowest quality with STRONG priority.
+    // Always judged on the instantaneous level, even when the rules otherwise
+    // see the group envelope.
+    if ((context.bufferInstantSeconds ?? bufferSeconds) === 0) {
       return {
         representationIndex: 0,
         priority: SwitchRequestPriority.STRONG,

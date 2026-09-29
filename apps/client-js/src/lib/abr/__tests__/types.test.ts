@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { DEFAULT_ABR_SETTINGS, SwitchRequestPriority } from '../types';
+import { bufferEnvelope, DEFAULT_ABR_SETTINGS, SwitchRequestPriority } from '../types';
 
 describe('DEFAULT_ABR_SETTINGS', () => {
   it('has all 11 rules defined', () => {
@@ -39,5 +39,33 @@ describe('DEFAULT_ABR_SETTINGS', () => {
 
   it('bufferTimeDefault is 18', () => {
     expect(DEFAULT_ABR_SETTINGS.bufferTimeDefault).toBe(18);
+  });
+});
+
+describe('bufferEnvelope', () => {
+  const saw = [
+    { ts: 0, bufferSeconds: 1.0 },
+    { ts: 250, bufferSeconds: 0.72 },
+    { ts: 500, bufferSeconds: 0.47 },
+    { ts: 750, bufferSeconds: 0.23 },
+    { ts: 1000, bufferSeconds: 0.98 },
+    { ts: 1250, bufferSeconds: 0.71 },
+    { ts: 1500, bufferSeconds: 0.42 },
+    { ts: 1750, bufferSeconds: 0.22 },
+  ];
+
+  it('reads the level after the last group landed, not the falling edge', () => {
+    expect(bufferEnvelope(saw, 1750, 1250)).toBeCloseTo(0.98);
+    expect(bufferEnvelope(saw, 750, 1250)).toBeCloseTo(1.0);
+  });
+
+  it('only looks inside the window', () => {
+    expect(bufferEnvelope(saw, 1750, 500)).toBeCloseTo(0.71);
+    expect(bufferEnvelope([], 0, 1250)).toBe(0);
+  });
+
+  it('follows a real drain once the peaks fall', () => {
+    const draining = saw.map(s => ({ ts: s.ts + 2000, bufferSeconds: s.bufferSeconds * 0.2 }));
+    expect(bufferEnvelope(draining, 3750, 1250)).toBeCloseTo(0.196);
   });
 });

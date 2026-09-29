@@ -87,6 +87,32 @@ export interface ControllerSettings {
    * the rule's drops are the loop's own down-switches, so it perpetuates it.
    */
   switchHistoryMode: 'evict' | 'off';
+  /**
+   * Which buffer level the rules see. 'instant' (shipped) is the element's
+   * buffered-ahead at the tick. 'envelope' is its maximum over the last
+   * `bufferEnvelopeMs`: the publisher sends each group as a burst and idles,
+   * so at the live edge the instantaneous buffer is a sawtooth (about 1.0 s
+   * to 0.2 s once a second) and every buffer-based rule reads the falling
+   * edge as a drain of ~1 s/s. The envelope is the buffer level after each
+   * group lands, which is the quantity the rules were written for. The
+   * empty-buffer emergency still uses the instantaneous value.
+   */
+  bufferSignal: 'instant' | 'envelope';
+  /** Envelope window, ms (one group plus one tick by default). */
+  bufferEnvelopeMs: number;
+}
+
+/** Maximum buffer level over the samples inside the trailing window (see ControllerSettings.bufferSignal). */
+export function bufferEnvelope(
+  samples: ReadonlyArray<{ ts: number; bufferSeconds: number }>,
+  nowMs: number,
+  windowMs: number,
+): number {
+  let max = 0;
+  for (const s of samples) {
+    if (nowMs - s.ts <= windowMs && s.bufferSeconds > max) max = s.bufferSeconds;
+  }
+  return max;
 }
 
 export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
@@ -96,6 +122,8 @@ export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
   upGuardRelease: 'landed',
   latencyResetOnLanding: false,
   switchHistoryMode: 'evict',
+  bufferSignal: 'instant',
+  bufferEnvelopeMs: 1250,
 };
 
 export interface AbrSettings {
@@ -185,7 +213,10 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
 export interface RulesContext {
   tracks: Track[];
   activeTrackIndex: number;
+  /** Buffer level the rules reason about (instantaneous, or the group envelope; ControllerSettings.bufferSignal). */
   bufferSeconds: number;
+  /** Instantaneous buffered-ahead at this tick, for the empty-buffer emergency. Defaults to bufferSeconds. */
+  bufferInstantSeconds?: number;
   bandwidthBps: number;
   fastEmaBps: number;
   slowEmaBps: number;

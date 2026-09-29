@@ -321,6 +321,10 @@ export function App() {
     controller.latencyResetOnLanding = truthyParam(params.get('latencyResetOnLanding'));
     const hist = params.get('switchHistoryMode');
     if (hist === 'evict' || hist === 'off') controller.switchHistoryMode = hist;
+    const sig = params.get('bufferSignal');
+    if (sig === 'instant' || sig === 'envelope') controller.bufferSignal = sig;
+    const envMs = Number(params.get('bufferEnvelopeMs'));
+    if (Number.isFinite(envMs) && envMs > 0) controller.bufferEnvelopeMs = envMs;
     const rules =
       controller.switchHistoryMode === 'off'
         ? {
