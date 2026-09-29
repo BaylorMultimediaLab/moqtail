@@ -396,6 +396,30 @@ Then the grid is the same command with `--repeat 5` (or 10) per condition,
 adding the other profiles as planned. `switch/pr1674` joins once its
 SWITCH_FROM hard/soft conformance is done.
 
+## 9a. Before the grid: the PR #1378 delivery diagnostic
+
+Two runs with per-object logging, so `summary.json` `delivery` can say how
+many objects of each group the client received (`truncated_groups`), and the
+relay log can be read against it. About 10 min.
+
+```sh
+git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+sudo -v
+python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group --client-mode time-shifted --time-shift 10 \
+    --controller grid --log-objects --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --final
+git checkout switch/native && git reset --hard origin/switch/native
+sudo -v
+python3 experiments/run_experiment.py --mechanism native --client-mode time-shifted --time-shift 10 \
+    --controller grid --log-objects --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --final
+python3 experiments/analyze.py results/*/ --quiet
+grep -h "delivery" results/*/summary.md
+experiments/pack_results.sh results delivery-$(hostname)-$(date +%Y%m%d).tar.gz
+```
+
+The native run is the control: its groups should be complete after the drop.
+The grid's native conditions can start in parallel; the PR #1378 time-shifted
+condition waits for this.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
