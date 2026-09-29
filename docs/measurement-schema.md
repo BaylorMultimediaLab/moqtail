@@ -40,6 +40,10 @@ rebuilt from it plus the raw logs. The controller arm is a condition key: runs
 with different arms are never pooled.
 `experiments/validate.py` checks one run and writes `validation.json`; the
 runner calls it after every run and stores `validity` in `run_meta.json`.
+The client-type checks (`live-edge`, `time-shifted`) are setup checks on the
+first `--window-s` (5 s) after the first frame: they say the client started
+where it was told to. Drifting behind live later in the run is an outcome
+(`live_edge_mean_ms`, `time_to_half_shift_ms`), not an invalid run.
 `analyze.py` excludes invalid runs (validation failed, more than one page
 session, wall-clock gaps, and with `--final` a dirty worktree) from the
 aggregate CSV and from `--stats`, which reports per condition median, IQR and

@@ -307,6 +307,37 @@ slow-start. Read `mean played rung index` first: an arm that works reaches
 rung 4 in the 6 Mbps phases and rung 3 at 1.5 Mbps, and `down-reaction s` /
 `up-recovery s` become meaningful for the first time.
 
+## 8f. Fourth ablation: the switch-history rule
+
+`lat-env` is the first arm in which the client climbs (`docs/abr-controller.md`
+9.5); what still cycles is SwitchHistoryRule's eviction. Three arms, same two
+conditions, three repetitions: 18 runs, about 1 h 15 min.
+
+```sh
+git checkout switch/native && git reset --hard origin/switch/native
+sudo -v
+for arm in lat-env-hist lat-env-veto guard-lat-env-veto; do
+  python3 experiments/run_experiment.py --mechanism native --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+sudo -v
+for arm in lat-env-hist lat-env-veto guard-lat-env-veto; do
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group --client-mode live-edge --controller $arm \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  sudo -v
+done
+python3 experiments/analyze.py results/*/ --quiet --csv results/ablation4.csv --stats results/ablation4_stats.csv
+python3 experiments/compare.py results/*/
+experiments/pack_results.sh results ablation4-$(hostname)-$(date +%Y%m%d).tar.gz
+```
+
+`lat-env-hist` removes the rule, `lat-env-veto` keeps its memory as a cap,
+`guard-lat-env-veto` adds the up-guard as a slow-start. The candidate for the
+grid is the arm with the lowest `switches / min` and `A->B->A reversals` whose
+`mean played rung index` and `played kbps` stay close to `lat-env`.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
