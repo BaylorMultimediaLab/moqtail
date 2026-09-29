@@ -83,10 +83,13 @@ export interface ControllerSettings {
   /**
    * 'evict' (the shipped rule): once a rung has more drops than
    * switchPercentageThreshold allows, SwitchHistoryRule evicts the client from
-   * it on the first tick after landing. 'off' disables the rule. Under a loop
-   * the rule's drops are the loop's own down-switches, so it perpetuates it.
+   * it on the first tick after landing. Under a loop the rule's drops are the
+   * loop's own down-switches, so it perpetuates it. 'veto': the rule caps the
+   * ladder just below the first unsafe rung above the active one, so the
+   * client is never sent to a rung that keeps dropping, and it never evicts
+   * (a real drop comes from the buffer rules). 'off' disables the rule.
    */
-  switchHistoryMode: 'evict' | 'off';
+  switchHistoryMode: 'evict' | 'veto' | 'off';
   /**
    * Which buffer level the rules see. 'instant' (shipped) is the element's
    * buffered-ahead at the tick. 'envelope' is its maximum over the last

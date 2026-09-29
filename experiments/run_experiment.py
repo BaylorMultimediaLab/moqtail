@@ -78,6 +78,12 @@ CONTROLLER_PARAMS = {
     "env": {"bufferSignal": "envelope"},
     "lat-env": {"latencyResetOnLanding": 1, "bufferSignal": "envelope"},
     "guard-lat-env": {**GUARD, "latencyResetOnLanding": 1, "bufferSignal": "envelope"},
+    # Fourth ablation (docs/pilot-linux.md 8f): with the buffer signal and the latency
+    # window fixed, the last false trigger is SwitchHistoryRule's eviction; 'veto'
+    # caps below a dropping rung instead, 'hist' turns the rule off.
+    "lat-env-hist": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "off"},
+    "lat-env-veto": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto"},
+    "guard-lat-env-veto": {**GUARD, "latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto"},
 }
 
 

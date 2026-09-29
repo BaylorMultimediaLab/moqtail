@@ -7,7 +7,7 @@ Run it on a short unshaped run of each client type before generating a series.
 Checks (each PASS / FAIL / SKIP with the numbers behind it):
 
   identity      run_meta.json carries the identity block and it matches the client RUN_META
-  live-edge     live-edge client: target shift is 0 and the mean live-edge distance is
+  live-edge     live-edge client: target shift is 0 and the mean live-edge distance in the first --window-s is
                 small (under --gop-tolerance GOPs)
   time-shifted  time-shifted client: mean live-edge distance in the first --window-s
                 seconds after the first frame is within --gop-tolerance GOPs of
@@ -112,11 +112,14 @@ def main() -> int:
 
     # live-edge / time-shifted ----------------------------------------------
     if client_type == "live-edge":
-        dist = [s["live_edge_distance_ms"] for s in samples]
+        # Setup check only: the client started at the live edge. Drifting behind
+        # live later in the run (an over-committed rung on a shrunken link) is an
+        # outcome the analyzer reports (live_edge_mean_ms), not an invalid run.
+        dist = [s["live_edge_distance_ms"] for s in pre_switch]
         mean = statistics.fmean(dist) if dist else None
         ok = bool(dist) and client_meta.get("target_shift_ms") == 0 and 0 <= mean <= args.gop_tolerance * gop
-        rep.add("live-edge", ok, f"target_shift_ms={client_meta.get('target_shift_ms')} mean_distance_ms={mean and round(mean, 1)} "
-                                 f"(n={len(dist)}, bound {args.gop_tolerance * gop:.0f})")
+        rep.add("live-edge", ok, f"initial-window [{initial['definition']}] target_shift_ms={client_meta.get('target_shift_ms')} "
+                                 f"mean_distance_ms={mean and round(mean, 1)} (n={len(dist)}, bound {args.gop_tolerance * gop:.0f})")
         rep.add("time-shifted", None, "not a time-shifted client")
     elif client_type == "time-shifted":
         dist = [s["live_edge_distance_ms"] for s in pre_switch]

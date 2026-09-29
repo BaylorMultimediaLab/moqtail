@@ -449,7 +449,39 @@ emergency (`insufficient-buffer-empty`) keeps the instantaneous value
 fall. The change is the same on every mechanism and both client types, and
 on a time-shifted client with a 10 s buffer it is a no-op.
 
-### 9.5 What to compare between arms
+### 9.5 Third ablation and the last trigger: `switchHistoryMode = veto`
+
+Arms env, lat-env, guard-lat-env (2026-09-29). The envelope removed the
+buffer-drain switches on both mechanisms (0 in `env`), and `lat-env` is the
+first configuration in which the client climbs: on PR #1378 mean played rung
+2.2 (0.3 before), 1276 kbps in the first 6 Mbps phase, 879 kbps over the run.
+On native the same arm reaches rung 1.4 in the first phase and 281 kbps; the
+1 GOP seam hole at every switch still empties the buffer and
+`InsufficientBufferRule` still fires on that real hole, which is the
+mechanism's cost and stays.
+
+Two things remain. First, once the client climbs, `SwitchHistoryRule` in its
+shipped form becomes the modal down trigger again (40–67 per run): a rung
+that dropped is unsafe, the rule waits until the client lands on it and
+evicts it, and the probe sends it back. With the guard on top the rule pins
+the client (guard-lat-env: rung 0.24 after the capacity restore because every
+rung above 240p had drops from the 1.5 Mbps phase). `switchHistoryMode =
+veto` keeps the rule's memory but changes what it does with it: cap the
+ladder just below the first unsafe rung above the active one, never evict.
+That is what the rule is for, a ban on rungs that keep dropping, without the
+eviction that turns the ban into a loop.
+
+Second, the live-edge client over-commits. With a 1 s runway, 1080p-4000k on a
+6 Mbps link (0.67 s to deliver each group) and 720p-1200k on 1.5 Mbps (0.8 s)
+are not sustainable although `throughput × 0.9` says they fit; the buffer
+rules then bring it down on a real drain, and the probe sends it up again a
+few seconds later. Two of three `lat-env` runs on PR #1378 ended 4–5 s behind
+live for that reason. This is a genuine property of a live-edge client with no
+runway model, and a genuine difference from the time-shifted client, so it is
+reported (`live_edge_mean_ms`, stalls) rather than tuned away; the validator's
+live-edge check is now a setup check on the first 5 s only.
+
+### 9.6 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
 superseded switches and up-guard vetoes should fall; `down-reaction s` and

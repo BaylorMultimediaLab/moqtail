@@ -316,7 +316,7 @@ export function App() {
     if (release === 'landed' || release === 'visible') controller.upGuardRelease = release;
     controller.latencyResetOnLanding = truthyParam(params.get('latencyResetOnLanding'));
     const hist = params.get('switchHistoryMode');
-    if (hist === 'evict' || hist === 'off') controller.switchHistoryMode = hist;
+    if (hist === 'evict' || hist === 'veto' || hist === 'off') controller.switchHistoryMode = hist;
     const sig = params.get('bufferSignal');
     if (sig === 'instant' || sig === 'envelope') controller.bufferSignal = sig;
     const envMs = Number(params.get('bufferEnvelopeMs'));
