@@ -539,7 +539,37 @@ runway (about 6 reversals per minute, one retry per rung per minute), and
 native still drops on every seam hole. Both are properties of the thing being
 measured.
 
-### 9.8 What to compare between arms
+### 9.8 Re-pilot with the frozen controller
+
+Both mechanisms, both client types, step_down_up, three repetitions
+(2026-09-29). On the time-shifted client in the stable 6 Mbps phase the
+controller does what the experiment needs: played rung 3.94 (3.8 Mbps), 3.6
+switches/min, no stalls, shift held at 9.5–10.4 s on both mechanisms. On the
+live-edge client it behaves as in the ablations (native 352 kbps, PR #1378
+668 kbps, 17–18 reversals per run, against 100–170 on the baseline).
+
+The capacity drop then shows the phenomenon the experiment is about. With a
+1080p subscription on a 1.5 Mbps link the relay accumulates a backlog of
+undelivered groups; the down-switch starts the target at the relay's delayed
+cursor, which has moved on, and the backlog is abandoned: media seam gaps of
+4–8 s (`seam buffer hole max` 7.9 s on both mechanisms), one range-jump per
+hole, and the 10 s shift is consumed within the drop (time to half shift
+63–66 s, i.e. right after the change) and never restored; both clients then
+sit 1.5–2 s behind live. Neither mechanism has a way to re-grow a behind-live
+client's shift once it has been spent. This is a measurement, not a
+controller problem, and the comparison the grid is for.
+
+Two PR #1378 defects on the time-shifted client after the drop need the
+object-level diagnostic (`docs/pilot-linux.md` 9a) before its time-shifted
+condition is run in the grid: groups delivered as 2-frame slivers followed by
+one range-jump per second (13–44 per run, native 2–7), and a promoted switch
+whose first object arrived 33 s later (`DATA_STARVED`, group 89 promoted at
+the delayed edge, first object at group 120). A fourth `MEDIA_ERR_DECODE`
+also occurred, again on 360p-200k inside a burst of switches with a seam
+`remove()` before each `changeType()`; the branch now removes only with the
+playhead floor.
+
+### 9.9 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
 superseded switches and up-guard vetoes should fall; `down-reaction s` and
