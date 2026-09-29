@@ -537,12 +537,13 @@ export class Player {
       // fired `waiting`; the interval is credited from the first frozen tick.
       this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
       const buf = el.buffered;
-      // Decoder wedge: frozen for 3 s with data buffered ahead of the playhead
-      // but the element unable to decode at this position (readyState below
-      // HAVE_FUTURE_DATA). Seen on Firefox after three switches inside two
-      // seconds. Skip forward to the next group boundary; the alternative is a
+      // Decoder wedge: frozen for 3 s while playing with data buffered ahead
+      // of the playhead. Seen on Firefox after rapid switches, with readyState
+      // 2 (cannot decode at this position) and also with readyState 4 (the
+      // playhead parked on a group boundary while the buffer kept growing for
+      // 100 s). Skip forward to the next group boundary; the alternative is a
       // frozen picture for the rest of the run.
-      if (frozenSince >= 6 && el.readyState < 3) {
+      if (frozenSince >= 6) {
         for (let i = 0; i < buf.length; i++) {
           if (el.currentTime >= buf.start(i) - 0.05 && buf.end(i) - el.currentTime > 1.5) {
             const gopS = (this.#timeMap?.gopDurationMs ?? 1000) / 1000;

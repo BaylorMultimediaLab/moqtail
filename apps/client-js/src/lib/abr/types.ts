@@ -91,6 +91,14 @@ export interface ControllerSettings {
    */
   switchHistoryMode: 'evict' | 'veto' | 'off';
   /**
+   * SwitchHistoryRule only counts switches younger than this (seconds; 0 =
+   * the whole 60-entry history). Without a window a rung that dropped stays
+   * banned for the rest of the run once the client switches rarely, because
+   * the up-visits that would clear it are the ones the ban prevents. With a
+   * window a failed climb costs one retry per window.
+   */
+  switchHistoryWindowS: number;
+  /**
    * Which buffer level the rules see. 'instant' (shipped) is the element's
    * buffered-ahead at the tick. 'envelope' is its maximum over the last
    * `bufferEnvelopeMs`: the publisher sends each group as a burst and idles,
@@ -127,6 +135,7 @@ export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
   switchHistoryMode: 'evict',
   bufferSignal: 'instant',
   bufferEnvelopeMs: 1250,
+  switchHistoryWindowS: 0,
 };
 
 export interface AbrSettings {

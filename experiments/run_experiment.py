@@ -84,6 +84,11 @@ CONTROLLER_PARAMS = {
     "lat-env-hist": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "off"},
     "lat-env-veto": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto"},
     "guard-lat-env-veto": {**GUARD, "latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto"},
+    # Fifth ablation (docs/pilot-linux.md 8g): the veto without a window bans a rung for
+    # the rest of the run (the up-visits that would clear the ban are the ones it
+    # prevents). A 60 s window makes a failed climb cost one retry per minute.
+    "lat-env-veto60": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
+    "guard-lat-env-veto60": {**GUARD, "latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
 }
 
 
@@ -387,7 +392,7 @@ def main() -> int:
                          "guard (post-switch up-guard) | both; recorded in the identity block")
     ap.add_argument("--controller-param", action="append", metavar="KEY=VALUE",
                     help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, "
-                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode, bufferSignal, bufferEnvelopeMs)")
+                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs)")
     ap.add_argument("--seed", type=int, default=None, help="recorded in run_meta; profiles are deterministic")
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
