@@ -115,11 +115,15 @@ def main() -> int:
         # Setup check only: the client started at the live edge. Drifting behind
         # live later in the run (an over-committed rung on a shrunken link) is an
         # outcome the analyzer reports (live_edge_mean_ms), not an invalid run.
+        # The client starts one group plus the live-edge delay behind live (startup
+        # seeks to buffered_end - 0.6 s while the first group is still landing), so
+        # the setup bound is one group wider than the steady-state tolerance.
         dist = [s["live_edge_distance_ms"] for s in pre_switch]
         mean = statistics.fmean(dist) if dist else None
-        ok = bool(dist) and client_meta.get("target_shift_ms") == 0 and 0 <= mean <= args.gop_tolerance * gop
+        bound = (1 + args.gop_tolerance) * gop
+        ok = bool(dist) and client_meta.get("target_shift_ms") == 0 and 0 <= mean <= bound
         rep.add("live-edge", ok, f"initial-window [{initial['definition']}] target_shift_ms={client_meta.get('target_shift_ms')} "
-                                 f"mean_distance_ms={mean and round(mean, 1)} (n={len(dist)}, bound {args.gop_tolerance * gop:.0f})")
+                                 f"mean_distance_ms={mean and round(mean, 1)} (n={len(dist)}, bound {bound:.0f})")
         rep.add("time-shifted", None, "not a time-shifted client")
     elif client_type == "time-shifted":
         dist = [s["live_edge_distance_ms"] for s in pre_switch]
