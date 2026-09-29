@@ -50,6 +50,27 @@ export class SwitchHistoryRule implements AbrRule {
       );
     };
 
+    // 'veto' (settings.controller.switchHistoryMode): never leave the active
+    // rung because of history; instead cap the ladder just below the first
+    // unsafe rung above it, so up-switch votes from the probe or throughput
+    // rules cannot land the client on a rung that keeps dropping. The cap is
+    // the active index itself when the next rung up is unsafe, which the
+    // arbiter's min() turns into "stay".
+    if (abrSettings.controller?.switchHistoryMode === 'veto') {
+      for (let i = activeTrackIndex + 1; i < tracks.length; i++) {
+        const trackName = tracks[i]?.name;
+        if (trackName && isUnsafe(trackName)) {
+          const rulePriority = ruleConfig?.priority ?? defaultConfig.priority;
+          return {
+            representationIndex: i - 1,
+            priority: rulePriority ?? SwitchRequestPriority.DEFAULT,
+            reason: `switch-history veto ${trackName}`,
+          };
+        }
+      }
+      return null;
+    }
+
     // Walk from activeTrackIndex down, looking for the highest safe index
     let highestSafeIndex: number | null = null;
 

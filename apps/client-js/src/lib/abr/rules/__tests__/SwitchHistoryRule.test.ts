@@ -167,4 +167,45 @@ describe('SwitchHistoryRule', () => {
     const ctxEmpty = makeContext({ switchHistory: [], activeTrackIndex: 2 });
     expect(rule.getMaxIndex(ctxEmpty)).toBeNull();
   });
+
+  describe("veto mode (controller.switchHistoryMode = 'veto')", () => {
+    const vetoSettings = {
+      ...DEFAULT_ABR_SETTINGS,
+      controller: { ...DEFAULT_ABR_SETTINGS.controller, switchHistoryMode: 'veto' as const },
+    };
+
+    it('caps just below an unsafe rung above the active one instead of evicting', () => {
+      const rule = new SwitchHistoryRule();
+      // 1080p has 4 drops against 4 up-visits: unsafe. Client sits on 720p.
+      const ctx = makeContext({
+        activeTrackIndex: 1,
+        switchHistory: makeHistory('1080p', 4, 4, '720p'),
+        abrSettings: vetoSettings,
+      });
+      const result = rule.getMaxIndex(ctx);
+      expect(result).not.toBeNull();
+      expect(result!.representationIndex).toBe(1); // stay on 720p
+      expect(result!.reason).toContain('veto');
+    });
+
+    it('never evicts from an unsafe active rung', () => {
+      const rule = new SwitchHistoryRule();
+      const ctx = makeContext({
+        activeTrackIndex: 2,
+        switchHistory: makeHistory('1080p', 4, 4, '720p'),
+        abrSettings: vetoSettings,
+      });
+      expect(rule.getMaxIndex(ctx)).toBeNull();
+    });
+
+    it('is silent when every rung above is safe', () => {
+      const rule = new SwitchHistoryRule();
+      const ctx = makeContext({
+        activeTrackIndex: 0,
+        switchHistory: makeHistory('1080p', 0, 8, '720p'),
+        abrSettings: vetoSettings,
+      });
+      expect(rule.getMaxIndex(ctx)).toBeNull();
+    });
+  });
 });
