@@ -605,13 +605,38 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             per_group.setdefault((r.get("track"), r.get("group")), set()).add(r.get("object"))
         counts = [len(v) for v in per_group.values()]
         expected = max(counts) if counts else 0
-        truncated = sorted(((t, g, len(v)) for (t, g), v in per_group.items() if len(v) < 0.5 * expected), key=lambda x: x[1])
+        # Objects the client received but discarded (DROP_STALE) still reached the
+        # client: a short group whose missing objects were dropped is a seam split or
+        # a stale tail, not a delivery failure. A short group with no drops was cut
+        # on the wire.
+        dropped: dict[tuple, int] = {}
+        for r in by("DROP_STALE"):
+            k = (r.get("track"), r.get("group"))
+            dropped[k] = dropped.get(k, 0) + 1
+        # Objects the relay delivered that the client threw away: the old track's
+        # undelivered backlog arriving after a switch landed. Link capacity spent
+        # for nothing (bytes are logged since 2026-09-29).
+        out["discarded"] = {"objects": len(by("DROP_STALE")),
+                            "bytes": sum(r.get("bytes") or 0 for r in by("DROP_STALE")),
+                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")})}
+        short = sorted(((t, g, len(v), dropped.get((t, g), 0)) for (t, g), v in per_group.items() if len(v) < 0.5 * expected),
+                       key=lambda x: x[1])
+        on_wire = [x for x in short if x[2] + x[3] < 0.5 * expected]
         out["delivery"] = {"logged": True, "groups": len(per_group), "expected_objects_per_group": expected,
-                           "objects_per_group": stats(counts), "truncated_groups": len(truncated),
-                           "truncated_list": [{"track": t, "group": g, "objects": n} for t, g, n in truncated[:100]]}
+                           "objects_per_group": stats(counts),
+                           # groups of which the client received fewer than half the objects
+                           "short_groups": len(short),
+                           # ... and fewer than half arrived at all (received + discarded): cut on the wire
+                           "truncated_groups": len(on_wire),
+                           "truncated_list": [{"track": t, "group": g, "objects": n, "discarded": d} for t, g, n, d in on_wire[:100]],
+                           "short_list": [{"track": t, "group": g, "objects": n, "discarded": d} for t, g, n, d in short[:100]]}
     else:
+        out["discarded"] = {"objects": len(by("DROP_STALE")),
+                            "bytes": sum(r.get("bytes") or 0 for r in by("DROP_STALE")),
+                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")})}
         out["delivery"] = {"logged": False, "groups": 0, "expected_objects_per_group": None,
-                           "objects_per_group": stats([]), "truncated_groups": None, "truncated_list": []}
+                           "objects_per_group": stats([]), "short_groups": None, "truncated_groups": None,
+                           "truncated_list": [], "short_list": []}
     out["client_errors"] = [r.get("message") for r in by("ERROR")]
     # Fatal media element errors (MEDIA_ERR_DECODE = 3 etc.): after one, every append fails.
     out["media_errors"] = [{"ts": r["ts"], "code": r.get("code"), "message": r.get("message"), "track": r.get("track"),
@@ -667,7 +692,8 @@ def to_markdown(s: dict) -> str:
          f"| data starvation episodes / total s | {s['starvation']['count']} / {fmt(s['starvation']['total_ms'] / 1000)}{' (open at end)' if s['starvation']['open_at_end'] else ''} |",
          f"| down-reaction / up-recovery s (played rung held {s['reaction']['sustain_s']:g} s) | {fmt((s['reaction']['down_reaction_ms'] or 0) / 1000) if s['reaction']['down_reaction_ms'] is not None else '-'} / {fmt((s['reaction']['up_recovery_ms'] or 0) / 1000) if s['reaction']['up_recovery_ms'] is not None else '-'} |",
          f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
-         f"| delivery (needs --log-objects): groups / objects per group p50,min / truncated | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['truncated_groups']} |",
+         f"| delivery (needs --log-objects): groups / objects per group p50,min / short (received < half) / truncated on the wire (arrived < half) | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
+         f"| discarded by the client (stale-track objects / groups / MB) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f} |",
          f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
          f"| switches (up / down / failed) | {s['switches']['count']} ({s['switches']['up']} / {s['switches']['down']} / {s['switches']['failed']}) |",
          f"| switch delivery latency ms, t4 (median / p95) | {fmt(s['switches']['switch_delivery_latency_ms'].get('p50'))} / {fmt(s['switches']['switch_delivery_latency_ms'].get('p95'))} |",
@@ -728,7 +754,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
                   "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
-                  "mean_rung_index", "truncated_groups",
+                  "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
@@ -782,6 +808,8 @@ def agg_row(s: dict) -> dict:
         "media_errors": len(s["media_errors"]),
         "mean_rung_index": s["bitrate"].get("mean_rung_index"),
         "truncated_groups": s["delivery"]["truncated_groups"],
+        "discarded_objects": s["discarded"]["objects"],
+        "discarded_mb": s["discarded"]["bytes"] / 1e6,
         "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
         "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
         "live_edge_mean_ms": s["time_shift"]["live_edge_distance_ms"].get("mean"),

@@ -40,6 +40,7 @@ ROWS = [
     ("media errors", lambda s: len(s.get("media_errors", []))),
     ("mean played rung index", lambda s: s["bitrate"].get("mean_rung_index")),
     ("truncated groups (log-objects)", lambda s: s["delivery"]["truncated_groups"]),
+    ("discarded stale objects", lambda s: s["discarded"]["objects"]),
     ("played kbps", lambda s: s["bitrate"].get("time_weighted_mean_kbps")),
     ("startup ms", lambda s: s["startup"]["startup_delay_ms"]),
     ("live-edge dist mean ms", lambda s: s["time_shift"]["live_edge_distance_ms"].get("mean")),
