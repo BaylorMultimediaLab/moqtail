@@ -913,9 +913,27 @@ export class Player {
               if (newStartPTS_ms !== undefined) {
                 const seamSeconds = newStartPTS_ms / 1000;
                 const playheadSeconds = this.#element?.currentTime ?? 0;
-                if (seamSeconds > playheadSeconds + SEAM_REMOVE_GUARD_SECONDS) {
+                // Only remove when old-track media actually exists at or past the
+                // seam (the playhead floor re-delivers the buffered horizon). With
+                // the next-group floor the seam is the buffered end and the
+                // remove() would be a no-op that still flushes Firefox's decoder
+                // pipeline right before changeType(); the three MEDIA_ERR_DECODE
+                // failures seen so far were all on this branch, inside bursts of
+                // switches one second apart.
+                const bufferedEndSeconds =
+                  sourceBuffer.buffered.length > 0
+                    ? sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
+                    : 0;
+                if (bufferedEndSeconds <= seamSeconds + SEAM_REMOVE_GUARD_SECONDS) {
+                  // nothing buffered beyond the seam: append in place
+                } else if (seamSeconds > playheadSeconds + SEAM_REMOVE_GUARD_SECONDS) {
                   try {
                     if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+                    events.emit('SEAM_REMOVE', {
+                      to: newTrackName,
+                      seam_ms: newStartPTS_ms,
+                      buffered_end_ms: bufferedEndSeconds * 1000,
+                    });
                     sourceBuffer.remove(seamSeconds, Infinity);
                     await waitForBufferUpdate(sourceBuffer);
                   } catch (removeError) {
