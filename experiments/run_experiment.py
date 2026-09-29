@@ -89,6 +89,9 @@ CONTROLLER_PARAMS = {
     # prevents). A 60 s window makes a failed climb cost one retry per minute.
     "lat-env-veto60": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
     "guard-lat-env-veto60": {**GUARD, "latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
+    # The frozen controller for the re-pilot and the grid (docs/abr-controller.md 9.7):
+    # identical to lat-env-veto60, named so the identity block says what it is.
+    "grid": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
 }
 
 

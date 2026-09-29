@@ -517,7 +517,29 @@ Two failure classes surfaced again and are now handled or counted:
   burst of switches one second apart). It ends useful playback; the run is
   counted (`media errors`) and excluded.
 
-### 9.7 What to compare between arms
+### 9.7 Fifth ablation and the frozen controller
+
+Arms lat-env-veto60 and guard-lat-env-veto60 (2026-09-29), all twelve runs
+valid, no decode errors. The 60 s window does what it was added for: the
+phase-3 played rung recovers (PR #1378 1.40, native 0.85, against 0.00 with
+the unbounded veto) while reversals stay at 18–20 per run (98–166 on the
+baseline). Per mechanism, `lat-env-veto60` plays 603 kbps with 15 s stalled on
+PR #1378 and 335 kbps with 26 s stalled on native; adding the guard buys
+fewer stalls on PR #1378 (5 s) at 382 kbps, and on native it pins the client
+again (173 kbps, phase-3 rung 0.13) because native's seam holes keep feeding
+drops into the history faster than the guard lets the client retry.
+
+**Frozen controller = `lat-env-veto60`, runner arm `grid`:**
+`latencyResetOnLanding`, `bufferSignal = envelope`, `switchHistoryMode =
+veto`, `switchHistoryWindowS = 60`; probe floor off, up-guard off. It is the
+smallest set of changes that removes the self-induced loop on both mechanisms
+and both client types without a client-type-specific policy. What remains is
+real: the live-edge client still climbs to rungs it cannot sustain with a 1 s
+runway (about 6 reversals per minute, one retry per rung per minute), and
+native still drops on every seam hole. Both are properties of the thing being
+measured.
+
+### 9.8 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
 superseded switches and up-guard vetoes should fall; `down-reaction s` and

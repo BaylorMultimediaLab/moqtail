@@ -369,6 +369,33 @@ a phase-3 played rung that recovers toward the phase-1 value instead of 0.00,
 and `up-recovery s` that is finite. The arm that does that is the grid
 controller.
 
+## 8h. Re-pilot with the frozen controller, then the grid
+
+`--controller grid` is the frozen configuration (`docs/abr-controller.md`
+9.7). The re-pilot is both mechanisms and both client types, three
+repetitions: 12 runs, about 50 min. It checks that the controller behaves on
+the time-shifted client (where the envelope and the window are near no-ops)
+before the grid is launched.
+
+```sh
+for branch in native pr1378; do
+  git checkout switch/$branch && git reset --hard origin/switch/$branch
+  mech=$([ $branch = native ] && echo "--mechanism native" || echo "--mechanism pr1378 --mechanism-mode next-group")
+  for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+    sudo -v
+    python3 experiments/run_experiment.py $mech $client --controller grid \
+        --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --final
+  done
+done
+python3 experiments/analyze.py results/*/ --quiet --csv results/repilot.csv --stats results/repilot_stats.csv
+python3 experiments/compare.py results/*/
+experiments/pack_results.sh results repilot-$(hostname)-$(date +%Y%m%d).tar.gz
+```
+
+Then the grid is the same command with `--repeat 5` (or 10) per condition,
+adding the other profiles as planned. `switch/pr1674` joins once its
+SWITCH_FROM hard/soft conformance is done.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
