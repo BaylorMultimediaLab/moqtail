@@ -420,6 +420,17 @@ The native run is the control: its groups should be complete after the drop.
 The grid's native conditions can start in parallel; the PR #1378 time-shifted
 condition waits for this.
 
+First result (2026-09-29): PR #1378 had 78 of 222 groups cut on the wire
+(one to two objects of 24 received, nothing discarded by the client), all
+after the capacity drop; native had none cut on the wire but 830 stale-track
+objects delivered and discarded. The cause is in the relay: a replaced
+subscription was finished with a QUIC FIN, which delivers everything already
+queued on its streams, so the abandoned backlog (lower group ids, higher
+stream priority) kept the link while the target's streams got a trickle.
+The pr1378 relay now resets the replaced subscription's data streams
+(`SWITCH_SOURCE_RESET`). Re-run the two commands above after
+`git reset --hard origin/switch/pr1378`; `truncated on the wire` should be 0.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
