@@ -622,12 +622,32 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         short = sorted(((t, g, len(v), dropped.get((t, g), 0)) for (t, g), v in per_group.items() if len(v) < 0.5 * expected),
                        key=lambda x: x[1])
         on_wire = [x for x in short if x[2] + x[3] < 0.5 * expected]
+        # With relay OBJECT_SENT records (runner --log-objects), split the wire cut:
+        # the relay never wrote the objects (its filter / the subscription state) vs.
+        # it wrote them and the client never appended them (stream reset, transport,
+        # or the client library).
+        sent_by_group: dict[tuple, set] = {}
+        for r in by("OBJECT_SENT"):
+            if r.get("sent") is False:
+                continue
+            for t in ladder:
+                if track_matches(r.get("track"), t["track"]):
+                    sent_by_group.setdefault((t["track"], r.get("group")), set()).add(r.get("object"))
+                    break
+        relay_cut = [x for x in on_wire if sent_by_group and len(sent_by_group.get((x[0], x[1]), ())) < 0.5 * expected]
+        lost_after_send = [x for x in on_wire if sent_by_group and len(sent_by_group.get((x[0], x[1]), ())) >= 0.5 * expected]
         out["delivery"] = {"logged": True, "groups": len(per_group), "expected_objects_per_group": expected,
                            "objects_per_group": stats(counts),
                            # groups of which the client received fewer than half the objects
                            "short_groups": len(short),
                            # ... and fewer than half arrived at all (received + discarded): cut on the wire
                            "truncated_groups": len(on_wire),
+                           "relay_logged": bool(sent_by_group),
+                           # of the wire-cut groups: the relay wrote fewer than half / at least half
+                           "cut_at_relay": len(relay_cut) if sent_by_group else None,
+                           "lost_after_send": len(lost_after_send) if sent_by_group else None,
+                           "lost_after_send_list": [{"track": t, "group": g, "received": n, "sent": len(sent_by_group.get((t, g), ()))}
+                                                    for t, g, n, _ in lost_after_send[:50]],
                            "truncated_list": [{"track": t, "group": g, "objects": n, "discarded": d} for t, g, n, d in on_wire[:100]],
                            "short_list": [{"track": t, "group": g, "objects": n, "discarded": d} for t, g, n, d in short[:100]]}
     else:
@@ -636,6 +656,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                             "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")})}
         out["delivery"] = {"logged": False, "groups": 0, "expected_objects_per_group": None,
                            "objects_per_group": stats([]), "short_groups": None, "truncated_groups": None,
+                           "relay_logged": False, "cut_at_relay": None, "lost_after_send": None, "lost_after_send_list": [],
                            "truncated_list": [], "short_list": []}
     out["client_errors"] = [r.get("message") for r in by("ERROR")]
     # Fatal media element errors (MEDIA_ERR_DECODE = 3 etc.): after one, every append fails.
@@ -693,6 +714,7 @@ def to_markdown(s: dict) -> str:
          f"| down-reaction / up-recovery s (played rung held {s['reaction']['sustain_s']:g} s) | {fmt((s['reaction']['down_reaction_ms'] or 0) / 1000) if s['reaction']['down_reaction_ms'] is not None else '-'} / {fmt((s['reaction']['up_recovery_ms'] or 0) / 1000) if s['reaction']['up_recovery_ms'] is not None else '-'} |",
          f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
          f"| delivery (needs --log-objects): groups / objects per group p50,min / short (received < half) / truncated on the wire (arrived < half) | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
+         f"| of the wire-cut groups (relay OBJECT_SENT): cut at the relay / lost after send | {s['delivery']['cut_at_relay']} / {s['delivery']['lost_after_send']} |",
          f"| discarded by the client (stale-track objects / groups / MB) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f} |",
          f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
          f"| switches (up / down / failed) | {s['switches']['count']} ({s['switches']['up']} / {s['switches']['down']} / {s['switches']['failed']}) |",
