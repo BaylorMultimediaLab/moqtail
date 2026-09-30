@@ -461,9 +461,13 @@ python3 experiments/compare.py results/*/
 ```
 
 Read `probe load Mbps`, `relay->client latency p50 ms`, `truncated groups`
-and `stalled s`. The arm that brings the latency down to the RTT and the
-truncation to zero on PR #1378 replaces `grid` as the frozen controller
-(one line in `CONTROLLER_PARAMS`).
+and `stalled s`.
+
+Result (2026-09-30): `grid-probe64k` won on every row (PR #1378: stalls
+27 s → 4.8 s, 2.9 Mbps played, shift kept for 81 s; native latency p50
+92 ms) and `grid` now includes the 64 KB cap. The grid (section 8h, with
+`--repeat 5`) can start; its first three repetitions per condition are the
+re-pilot of the final controller.
 
 ## 9. What to look at, and what to send
 
