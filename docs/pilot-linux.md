@@ -437,8 +437,33 @@ the live cadence, until a later landing restores full groups. To tell a relay
 filter from a client-library drop the relay now logs `OBJECT_SENT` per object
 (the runner passes `--enable-object-logging` with `--log-objects`), and the
 analyzer splits the wire-cut groups into `cut at the relay` / `lost after
-send`. Re-run the pr1378 command above after `git reset --hard
-origin/switch/pr1378` and read that line.
+send`.
+
+Third result (2026-09-30): 44 of the 55 cut groups were written in full by
+the relay and lost after send; relay-to-client latency was 0.9–3.4 s during
+the drop and the probe alone carried 1.2 Mbps of the 1.5 Mbps link
+(`docs/abr-controller.md` 9.9). Two candidate fixes, both mechanisms, with
+per-object logging (4 runs, about 20 min):
+
+```sh
+for arm in grid-noprobe grid-probe64k; do
+  git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+  sudo -v
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group --client-mode time-shifted --time-shift 10 \
+      --controller $arm --log-objects --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --final
+  git checkout switch/native && git reset --hard origin/switch/native
+  sudo -v
+  python3 experiments/run_experiment.py --mechanism native --client-mode time-shifted --time-shift 10 \
+      --controller $arm --log-objects --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --final
+done
+python3 experiments/analyze.py results/*/ --quiet
+python3 experiments/compare.py results/*/
+```
+
+Read `probe load Mbps`, `relay->client latency p50 ms`, `truncated groups`
+and `stalled s`. The arm that brings the latency down to the RTT and the
+truncation to zero on PR #1378 replaces `grid` as the frozen controller
+(one line in `CONTROLLER_PARAMS`).
 
 ## 9. What to look at, and what to send
 

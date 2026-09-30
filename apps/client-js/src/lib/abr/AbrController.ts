@@ -346,18 +346,20 @@ export class AbrController {
     // gap to the next-higher track, and tracksize is the carry-over from
     // the most recent switch. Convert to bytes for the track-name string.
     const currentIdx = activeTrackIndex >= 0 ? activeTrackIndex : 0;
-    if (currentIdx < this.#tracks.length - 1) {
+    if (currentIdx < this.#tracks.length - 1 && this.#settings.controller?.probeMode !== 'off') {
       const bI = this.#tracks[currentIdx]?.bitrate ?? 0;
       const bIPlus1 = this.#tracks[currentIdx + 1]?.bitrate ?? 0;
       const gapBits = Math.max(0, bIPlus1 - bI);
       const probeSizeBits = this.#probeHorizonSec * (gapBits + this.#tracksize);
       // settings.controller.probeMinBytes floors the payload so a small rung
       // gap cannot produce a probe that completes inside one burst.
-      const probeSizeBytes = Math.max(
+      let probeSizeBytes = Math.max(
         1024,
         Math.floor(probeSizeBits / 8),
         this.#settings.controller?.probeMinBytes ?? 0,
       );
+      const cap = this.#settings.controller?.probeMaxBytes ?? 0;
+      if (cap > 0) probeSizeBytes = Math.min(probeSizeBytes, cap);
       this.#probeManager.maybeProbe(`.probe:${probeSizeBytes}:0`);
     }
 

@@ -92,6 +92,10 @@ CONTROLLER_PARAMS = {
     # The frozen controller for the re-pilot and the grid (docs/abr-controller.md 9.7):
     # identical to lat-env-veto60, named so the identity block says what it is.
     "grid": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
+    # Probe load (docs/abr-controller.md 9.9): the probe fills a FIFO bottleneck queue
+    # (1.2 Mbps of probe on a 1.5 Mbps link, 0.9 s standing delay). Off, or capped.
+    "grid-noprobe": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60, "probeMode": "off"},
+    "grid-probe64k": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60, "probeMaxBytes": 65536},
 }
 
 
@@ -101,7 +105,7 @@ def controller_params(args) -> dict:
         k, _, v = kv.partition("=")
         if not v:
             sys.exit(f"--controller-param expects KEY=VALUE, got {kv!r}")
-        params[k] = v if k in ("upGuardRelease", "switchHistoryMode", "bufferSignal") else int(float(v))
+        params[k] = v if k in ("upGuardRelease", "switchHistoryMode", "bufferSignal", "probeMode") else int(float(v))
     return params
 
 
@@ -395,7 +399,8 @@ def main() -> int:
                          "guard (post-switch up-guard) | both; recorded in the identity block")
     ap.add_argument("--controller-param", action="append", metavar="KEY=VALUE",
                     help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, "
-                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs)")
+                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs, "
+                         "probeMode, probeMaxBytes)")
     ap.add_argument("--seed", type=int, default=None, help="recorded in run_meta; profiles are deterministic")
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
