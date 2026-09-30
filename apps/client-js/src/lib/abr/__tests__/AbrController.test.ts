@@ -461,6 +461,30 @@ describe('AbrController', () => {
       expect(player.probeTrackBandwidth).toHaveBeenCalledWith('.probe:250000:0', 500);
     });
 
+    it('caps the probe at probeMaxBytes', async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 100 },
+        {
+          videoAutoSwitch: true,
+          controller: { ...DEFAULT_ABR_SETTINGS.controller, probeMaxBytes: 65_536 },
+        },
+      );
+      await controller._tick();
+      expect(player.probeTrackBandwidth).toHaveBeenCalledWith('.probe:65536:0', 500);
+    });
+
+    it('sends no probe at all when probeMode is off', async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 100 },
+        {
+          videoAutoSwitch: true,
+          controller: { ...DEFAULT_ABR_SETTINGS.controller, probeMode: 'off' },
+        },
+      );
+      await controller._tick();
+      expect(player.probeTrackBandwidth).not.toHaveBeenCalled();
+    });
+
     it('never sends a probe smaller than probeMinBytes', async () => {
       const { controller, player } = makeController(
         { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 100 },

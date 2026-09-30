@@ -111,6 +111,19 @@ export interface ControllerSettings {
   bufferSignal: 'instant' | 'envelope';
   /** Envelope window, ms (one group plus one tick by default). */
   bufferEnvelopeMs: number;
+  /**
+   * 'on' (shipped): the Algorithm 1 active probe runs whenever the client is
+   * below the top rung. 'off': no probe subscriptions at all and ProbeRule is
+   * inactive; up-switches come from the group-burst SWMA (ThroughputRule),
+   * which on this relay reads the link rate because groups are delivered as
+   * bursts. The probe is "lowest priority" only inside the relay's QUIC
+   * scheduler; a FIFO bottleneck queue does not know that, so a probe sized
+   * from the rung gap (up to 1.4 MB on the Linux ladder) fills the queue and
+   * puts 0.7-0.9 s of standing delay in front of every media packet.
+   */
+  probeMode: 'on' | 'off';
+  /** Cap on the probe payload in bytes (0 = uncapped). */
+  probeMaxBytes: number;
 }
 
 /** Maximum buffer level over the samples inside the trailing window (see ControllerSettings.bufferSignal). */
@@ -136,6 +149,8 @@ export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
   bufferSignal: 'instant',
   bufferEnvelopeMs: 1250,
   switchHistoryWindowS: 0,
+  probeMode: 'on',
+  probeMaxBytes: 0,
 };
 
 export interface AbrSettings {
