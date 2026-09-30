@@ -308,6 +308,7 @@ export function App() {
     for (const key of [
       'probeMinBytes',
       'probeMinDurationMs',
+      'probeMaxBytes',
       'upGuardSamples',
       'switchHistoryWindowS',
     ] as const) {
@@ -326,13 +327,15 @@ export function App() {
     if (sig === 'instant' || sig === 'envelope') controller.bufferSignal = sig;
     const envMs = Number(params.get('bufferEnvelopeMs'));
     if (Number.isFinite(envMs) && envMs > 0) controller.bufferEnvelopeMs = envMs;
-    const rules =
-      controller.switchHistoryMode === 'off'
-        ? {
-            ...DEFAULT_ABR_SETTINGS.rules,
-            SwitchHistoryRule: { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false },
-          }
-        : DEFAULT_ABR_SETTINGS.rules;
+    const probe = params.get('probeMode');
+    if (probe === 'on' || probe === 'off') controller.probeMode = probe;
+    const rules = { ...DEFAULT_ABR_SETTINGS.rules };
+    if (controller.switchHistoryMode === 'off') {
+      rules.SwitchHistoryRule = { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false };
+    }
+    if (controller.probeMode === 'off') {
+      rules.ProbeRule = { ...DEFAULT_ABR_SETTINGS.rules.ProbeRule, active: false };
+    }
     return { ...DEFAULT_ABR_SETTINGS, ...overrides, rules, controller };
   });
   const [abrMetrics, setAbrMetrics] = useState<AbrMetrics | null>(null);

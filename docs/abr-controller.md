@@ -569,7 +569,33 @@ also occurred, again on 360p-200k inside a burst of switches with a seam
 `remove()` before each `changeType()`; the branch now removes only with the
 playhead floor.
 
-### 9.9 What to compare between arms
+### 9.9 Probe load on a FIFO bottleneck: `probeMode`, `probeMaxBytes`
+
+The delivery diagnostics with relay `OBJECT_SENT` records (2026-09-30)
+showed the relay writing every group in full within 20 ms and the client
+seeing the first one or two objects about 0.9 s later, just before the next
+switch reset that stream. Relay-to-client object latency was 280–415 ms at
+the median even in the stable 6 Mbps phase and 0.9–3.4 s during the 1.5 Mbps
+phase, on a link with 40 ms RTT. The load is the probe: 1.49 MB of probe
+payload in one 10 s bucket of the drop is 1.2 Mbps of a 1.5 Mbps link. The
+probe is "lowest priority" only inside the relay's QUIC scheduler; the
+shaper's 100-packet FIFO queue does not know that, so every media packet
+waits behind a full queue (100 × 1350 B at 1.5 Mbps ≈ 0.7 s). With switches
+once a second and PR #1378 resetting the old subscription's streams at each
+switch, a group's stream was reset before its packets got through, the
+buffer never grew, and the controller kept switching.
+
+- `probeMode = off`: no probe subscriptions, `ProbeRule` inactive. The
+  group-burst SWMA already reads the link rate on this relay (5.7 Mbps on
+  the 6 Mbps link, 1.45 on 1.5 Mbps), so `ThroughputRule` still climbs.
+- `probeMaxBytes`: cap the payload (arm `grid-probe64k` = 64 KB, 85 ms on
+  6 Mbps, 350 ms on 1.5 Mbps).
+
+Arms `grid-noprobe` and `grid-probe64k`; the analyzer reports
+`probe load Mbps` and `relay->client latency p50 ms` so the effect is
+measured on both mechanisms (`docs/pilot-linux.md` 9a).
+
+### 9.10 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
 superseded switches and up-guard vetoes should fall; `down-reaction s` and

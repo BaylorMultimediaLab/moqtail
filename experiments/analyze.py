@@ -658,6 +658,23 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                            "objects_per_group": stats([]), "short_groups": None, "truncated_groups": None,
                            "relay_logged": False, "cut_at_relay": None, "lost_after_send": None, "lost_after_send_list": [],
                            "truncated_list": [], "short_list": []}
+    # Probe load on the link and relay->client object latency (the latter needs the
+    # relay's OBJECT_SENT records, i.e. --log-objects). On a FIFO bottleneck the probe's
+    # "lowest priority" means nothing: its bytes queue in front of every media packet.
+    probes = by("PROBE")
+    probe_bytes = sum(r.get("p_bytes") or 0 for r in probes if r.get("src") == "client")
+    span_s = ((recs[-1]["ts"] - recs[0]["ts"]) / 1000) if len(recs) > 1 else 0
+    sent_ts: dict[tuple, float] = {}
+    for r in by("OBJECT_SENT"):
+        for t in ladder:
+            if track_matches(r.get("track"), t["track"]):
+                sent_ts.setdefault((t["track"], r.get("group"), r.get("object")), r["ts"])
+                break
+    lat = [r["ts"] - sent_ts[(r.get("track"), r.get("group"), r.get("object"))] for r in by("OBJECT_RECV")
+           if (r.get("track"), r.get("group"), r.get("object")) in sent_ts]
+    out["link"] = {"probe_bytes": probe_bytes, "probe_mbps": (probe_bytes * 8 / span_s / 1e6) if span_s else None,
+                   "probes": sum(1 for r in probes if r.get("src") == "client"),
+                   "send_recv_latency_ms": stats(lat)}
     out["client_errors"] = [r.get("message") for r in by("ERROR")]
     # Fatal media element errors (MEDIA_ERR_DECODE = 3 etc.): after one, every append fails.
     out["media_errors"] = [{"ts": r["ts"], "code": r.get("code"), "message": r.get("message"), "track": r.get("track"),
@@ -715,6 +732,7 @@ def to_markdown(s: dict) -> str:
          f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
          f"| delivery (needs --log-objects): groups / objects per group p50,min / short (received < half) / truncated on the wire (arrived < half) | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
          f"| of the wire-cut groups (relay OBJECT_SENT): cut at the relay / lost after send | {s['delivery']['cut_at_relay']} / {s['delivery']['lost_after_send']} |",
+         f"| probe load: probes / MB / mean Mbps; relay->client object latency ms p50 / p95 (needs --log-objects) | {s['link']['probes']} / {s['link']['probe_bytes'] / 1e6:.1f} / {fmt(s['link']['probe_mbps'])}; {fmt(s['link']['send_recv_latency_ms'].get('p50'))} / {fmt(s['link']['send_recv_latency_ms'].get('p95'))} |",
          f"| discarded by the client (stale-track objects / groups / MB) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f} |",
          f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
          f"| switches (up / down / failed) | {s['switches']['count']} ({s['switches']['up']} / {s['switches']['down']} / {s['switches']['failed']}) |",
@@ -777,6 +795,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
                   "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
                   "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
+                  "probe_mbps", "send_recv_latency_p50_ms",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
@@ -832,6 +851,8 @@ def agg_row(s: dict) -> dict:
         "truncated_groups": s["delivery"]["truncated_groups"],
         "discarded_objects": s["discarded"]["objects"],
         "discarded_mb": s["discarded"]["bytes"] / 1e6,
+        "probe_mbps": s["link"]["probe_mbps"],
+        "send_recv_latency_p50_ms": s["link"]["send_recv_latency_ms"].get("p50"),
         "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
         "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
         "live_edge_mean_ms": s["time_shift"]["live_edge_distance_ms"].get("mean"),
