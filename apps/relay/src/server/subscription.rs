@@ -1211,6 +1211,22 @@ impl Subscription {
                 object_received_time,
               )
               .await;
+            // Experiment log: one record per object handed to this subscriber's
+            // QUIC stream (the client logs OBJECT_RECV per object appended), so a
+            // group the client did not get can be traced to the relay's filter,
+            // the stream (reset / never sent) or the client library.
+            crate::server::events::emit(
+              "OBJECT_SENT",
+              serde_json::json!({
+                "conn": self.client_connection_id,
+                "relay_track_id": self.relay_track_id,
+                "track": crate::server::events::track_name_string(&self.full_track_name),
+                "request_id": self.request_id,
+                "group": object.location.group,
+                "object": object.location.object,
+                "sent": send_status,
+              }),
+            );
           }
         } else {
           error!(

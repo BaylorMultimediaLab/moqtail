@@ -428,8 +428,17 @@ subscription was finished with a QUIC FIN, which delivers everything already
 queued on its streams, so the abandoned backlog (lower group ids, higher
 stream priority) kept the link while the target's streams got a trickle.
 The pr1378 relay now resets the replaced subscription's data streams
-(`SWITCH_SOURCE_RESET`). Re-run the two commands above after
-`git reset --hard origin/switch/pr1378`; `truncated on the wire` should be 0.
+(`SWITCH_SOURCE_RESET`).
+
+Second result (2026-09-29, with the reset): no starvation, no long stalls,
+nothing discarded, but 50 of 217 groups still cut on the wire. After some
+landings the target subscription delivers only object 0 of each group, at
+the live cadence, until a later landing restores full groups. To tell a relay
+filter from a client-library drop the relay now logs `OBJECT_SENT` per object
+(the runner passes `--enable-object-logging` with `--log-objects`), and the
+analyzer splits the wire-cut groups into `cut at the relay` / `lost after
+send`. Re-run the pr1378 command above after `git reset --hard
+origin/switch/pr1378` and read that line.
 
 ## 9. What to look at, and what to send
 
