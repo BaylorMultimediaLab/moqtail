@@ -126,6 +126,15 @@ interface MOQStreamStruct {
    * stream, which used to end delivery for the rest of the run silently.
    */
   pendingInit?: { mimeType: string; initData: ArrayBuffer; attempts: number };
+  /**
+   * Set when a new init segment has been applied: objects are discarded until
+   * the first object 0 of a group (the keyframe). A mechanism that lands
+   * mid-group (native SWITCH lands on object 1) otherwise hands the decoder
+   * non-keyframe HEVC frames right after a configuration change; Firefox
+   * drops them to the next keyframe on a good day and fails with
+   * MEDIA_ERR_DECODE on a bad one. The visible seam is the same either way.
+   */
+  awaitKeyframe?: boolean;
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -519,13 +528,22 @@ export class Player {
     // the gap.
     const el = this.#element;
     let lastFrames = 0;
+    let lastTime = -1;
     let frozenSince = 0;
     const wedgeIntervalId = setInterval(() => {
       const q = el.getVideoPlaybackQuality?.();
       const frames = q?.totalVideoFrames ?? 0;
       this.#checkStarvation(el);
-      if (frames > lastFrames) {
-        lastFrames = frames;
+      // Progress means the playhead moved. Decoded frames alone do not: one
+      // run sat at the same currentTime with readyState 2 for 28 s while
+      // totalVideoFrames rose by 9000 (the decoder chewing through a 37 s
+      // buffer it never presented), and the old frame-based test called that
+      // "playing" and never seeked.
+      const time = el.currentTime;
+      const advanced = time > lastTime + 0.01 || (lastTime < 0 && frames > lastFrames);
+      lastFrames = frames;
+      if (advanced) {
+        lastTime = time;
         frozenSince = 0;
         this.#closeStall();
         return;
@@ -657,6 +675,11 @@ export class Player {
     ): Promise<boolean> => {
       try {
         if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+        // Reset the segment parser before the new codec configuration, as
+        // dash.js does when it switches representations: leftover parser
+        // state from the old track's last partial append is one way to hand
+        // the decoder frames that do not match the new init segment.
+        if (this.#mse?.readyState === 'open') sourceBuffer.abort();
         sourceBuffer.changeType(mimeType);
         sourceBuffer.appendBuffer(initData);
         await waitForBufferUpdate(sourceBuffer);
@@ -923,6 +946,7 @@ export class Player {
                 since_sent_ms: performance.now() - switchSentAt,
               });
               struct.postSwitchSeamPTS_ms = newStartPTS_ms;
+              struct.awaitKeyframe = object.location.object !== 0n;
               if (this.#resetLatencyOnLanding) {
                 this.#latencyTracker.reset();
                 events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
@@ -1025,6 +1049,22 @@ export class Player {
                 });
                 return;
               }
+            }
+
+            if (struct.awaitKeyframe) {
+              if (object.location.object !== 0n) {
+                events.emit('DROP_STALE', {
+                  track: objectTrackName,
+                  current: struct.trackName,
+                  pending: struct.pendingSwitch?.trackName ?? null,
+                  group: Number(object.location.group),
+                  object: Number(object.location.object),
+                  bytes: object.payload.byteLength,
+                  reason: 'pre-keyframe',
+                });
+                return;
+              }
+              struct.awaitKeyframe = false;
             }
 
             // Append the data

@@ -469,6 +469,38 @@ Result (2026-09-30): `grid-probe64k` won on every row (PR #1378: stalls
 `--repeat 5`) can start; its first three repetitions per condition are the
 re-pilot of the final controller.
 
+## 9b. Grid status after the first batch (2026-09-30)
+
+First batch: 5 repetitions × 4 conditions with `--controller grid` (probe cap
+included; runs recorded under `grid` before 2026-09-30 have no cap and are
+told apart by `identity.controller_params`). Live-edge: 10 of 10 valid.
+Time-shifted: 3 of 5 valid per mechanism. Three of the four invalid runs
+died of Firefox `MEDIA_ERR_DECODE` at a switch to 720p/1080p (the
+time-shifted client now spends most of its time at the top rungs, which is
+where the decoder fails); the fourth sat at one position with readyState 2
+for 28 s while the decoder chewed through the buffer, which the frozen-frame
+watchdog did not see because it counted decoded frames.
+
+Player changes for the next batch (mechanism-neutral): `abort()` before
+`changeType()`, objects discarded between a new init segment and the first
+keyframe (`DROP_STALE` reason `pre-keyframe`; native lands on object 1),
+and freeze detection on `currentTime`. Top up the time-shifted conditions
+to five valid runs with extra repetitions (indices continue from 5):
+
+```sh
+for branch in native pr1378; do
+  git checkout switch/$branch && git reset --hard origin/switch/$branch
+  mech=$([ $branch = native ] && echo "--mechanism native" || echo "--mechanism pr1378 --mechanism-mode next-group")
+  sudo -v
+  python3 experiments/run_experiment.py $mech --client-mode time-shifted --time-shift 10 --controller grid \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 3 --repeat-start 5 --final
+done
+```
+
+Then the other profiles of the grid with the same command shape. `analyze.py
+--stats` pools by condition and ignores `repeat_index`, so extra repetitions
+simply join their condition; invalid runs stay excluded.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
