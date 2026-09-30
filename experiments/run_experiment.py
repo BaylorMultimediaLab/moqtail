@@ -89,9 +89,11 @@ CONTROLLER_PARAMS = {
     # prevents). A 60 s window makes a failed climb cost one retry per minute.
     "lat-env-veto60": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
     "guard-lat-env-veto60": {**GUARD, "latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
-    # The frozen controller for the re-pilot and the grid (docs/abr-controller.md 9.7):
-    # identical to lat-env-veto60, named so the identity block says what it is.
-    "grid": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60},
+    # The frozen controller for the grid (docs/abr-controller.md 9.7 and 9.9):
+    # lat-env-veto60 plus the 64 KB probe cap (= grid-probe64k), named so the
+    # identity block says what it is. Runs recorded before 2026-09-30 under
+    # "grid" had no probe cap (identity.controller_params shows which).
+    "grid": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60, "probeMaxBytes": 65536},
     # Probe load (docs/abr-controller.md 9.9): the probe fills a FIFO bottleneck queue
     # (1.2 Mbps of probe on a 1.5 Mbps link, 0.9 s standing delay). Off, or capped.
     "grid-noprobe": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60, "probeMode": "off"},

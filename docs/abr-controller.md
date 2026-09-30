@@ -595,6 +595,16 @@ Arms `grid-noprobe` and `grid-probe64k`; the analyzer reports
 `probe load Mbps` and `relay->client latency p50 ms` so the effect is
 measured on both mechanisms (`docs/pilot-linux.md` 9a).
 
+The four-run test (2026-09-30, time-shifted, one run per arm and mechanism)
+decided it. `grid-probe64k` cut the probe to 0.06 Mbps, brought the
+relay-to-client median latency to 92 ms on native and 370 ms on PR #1378,
+and on PR #1378 turned 27 s of stalls into 4.8 s, played 2.9 Mbps against
+1.6, and kept the shift for 81 s instead of 65. `grid-noprobe` was worse on
+PR #1378 (22 s stalled, 42 groups cut, median latency 219 ms but p95 12 s
+from the 1080p backlog) and its native run died of a decode error at 30 s.
+**`grid` now includes `probeMaxBytes = 65536`**; the probe's readings still
+drive up-switches, but a probe no longer occupies the bottleneck.
+
 ### 9.10 What to compare between arms
 
 `experiments/compare.py` on the ablation runs: switches/min, A→B→A reversals,
