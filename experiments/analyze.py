@@ -618,7 +618,9 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         # for nothing (bytes are logged since 2026-09-29).
         out["discarded"] = {"objects": len(by("DROP_STALE")),
                             "bytes": sum(r.get("bytes") or 0 for r in by("DROP_STALE")),
-                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")})}
+                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")}),
+                            # objects dropped between a new init segment and the first keyframe
+                            "pre_keyframe": sum(1 for r in by("DROP_STALE") if r.get("reason") == "pre-keyframe")}
         short = sorted(((t, g, len(v), dropped.get((t, g), 0)) for (t, g), v in per_group.items() if len(v) < 0.5 * expected),
                        key=lambda x: x[1])
         on_wire = [x for x in short if x[2] + x[3] < 0.5 * expected]
@@ -653,7 +655,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     else:
         out["discarded"] = {"objects": len(by("DROP_STALE")),
                             "bytes": sum(r.get("bytes") or 0 for r in by("DROP_STALE")),
-                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")})}
+                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")}),
+                            "pre_keyframe": sum(1 for r in by("DROP_STALE") if r.get("reason") == "pre-keyframe")}
         out["delivery"] = {"logged": False, "groups": 0, "expected_objects_per_group": None,
                            "objects_per_group": stats([]), "short_groups": None, "truncated_groups": None,
                            "relay_logged": False, "cut_at_relay": None, "lost_after_send": None, "lost_after_send_list": [],
@@ -733,7 +736,7 @@ def to_markdown(s: dict) -> str:
          f"| delivery (needs --log-objects): groups / objects per group p50,min / short (received < half) / truncated on the wire (arrived < half) | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
          f"| of the wire-cut groups (relay OBJECT_SENT): cut at the relay / lost after send | {s['delivery']['cut_at_relay']} / {s['delivery']['lost_after_send']} |",
          f"| probe load: probes / MB / mean Mbps; relay->client object latency ms p50 / p95 (needs --log-objects) | {s['link']['probes']} / {s['link']['probe_bytes'] / 1e6:.1f} / {fmt(s['link']['probe_mbps'])}; {fmt(s['link']['send_recv_latency_ms'].get('p50'))} / {fmt(s['link']['send_recv_latency_ms'].get('p95'))} |",
-         f"| discarded by the client (stale-track objects / groups / MB) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f} |",
+         f"| discarded by the client (stale-track objects / groups / MB; of which pre-keyframe) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f}; {s['discarded']['pre_keyframe']} |",
          f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
          f"| switches (up / down / failed) | {s['switches']['count']} ({s['switches']['up']} / {s['switches']['down']} / {s['switches']['failed']}) |",
          f"| switch delivery latency ms, t4 (median / p95) | {fmt(s['switches']['switch_delivery_latency_ms'].get('p50'))} / {fmt(s['switches']['switch_delivery_latency_ms'].get('p95'))} |",
