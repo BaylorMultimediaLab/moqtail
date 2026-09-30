@@ -107,16 +107,17 @@ groups, so the target is stated in groups, not in the seconds typed.
 
 ### Relay (`apps/relay/src/server/events.rs`)
 
-| event             | fields                                                                                                                                                           |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SUBSCRIBE_RECV`  | `conn`, `request_id`, `track`, `is_switch`, `delay_groups`, `decision` (`live`/`ready`/`clamped`), `largest_group`, `oldest_cached_group`, `start_group`, `held` |
-| `SUBSCRIBE_HOLD`  | a delayed SUBSCRIBE waiting for the live edge                                                                                                                    |
-| `SWITCH_RECV`     | `conn`, `request_id`, `old_request_id`, `track`                                                                                                                  |
-| `SWITCH_PROMOTED` | the new track became Current: `trigger_group`, `start_group`                                                                                                     |
-| `PROBE`           | synthetic probe served                                                                                                                                           |
-| `CACHE_STATS`     | once per second per track: `groups`, `bytes`, `oldest_group`, `newest_group`                                                                                     |
-| `CACHE_GROUP`     | a group's first object entered a track's cache: `relay_track_id`, `group`, `first_object` (joins publisher `GROUP_EMIT` to client `OBJECT_RECV`)                 |
-| `CACHE_EVICT`     | `group`, `objects`, `bytes`, `cause`                                                                                                                             |
+| event             | fields                                                                                                                                                                                                    |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SUBSCRIBE_RECV`  | `conn`, `request_id`, `track`, `is_switch`, `delay_groups`, `decision` (`live`/`ready`/`clamped`), `largest_group`, `oldest_cached_group`, `start_group`, `held`                                          |
+| `SUBSCRIBE_HOLD`  | a delayed SUBSCRIBE waiting for the live edge                                                                                                                                                             |
+| `SWITCH_RECV`     | `conn`, `request_id`, `old_request_id`, `track`                                                                                                                                                           |
+| `SWITCH_PROMOTED` | the new track became Current: `trigger_group`, `start_group`                                                                                                                                              |
+| `PROBE`           | synthetic probe served                                                                                                                                                                                    |
+| `OBJECT_SENT`     | one object handed to a subscriber's stream (only with `--enable-object-logging`, which the runner passes for `--log-objects`): `conn`, `relay_track_id`, `track`, `request_id`, `group`, `object`, `sent` |
+| `CACHE_STATS`     | once per second per track: `groups`, `bytes`, `oldest_group`, `newest_group`                                                                                                                              |
+| `CACHE_GROUP`     | a group's first object entered a track's cache: `relay_track_id`, `group`, `first_object` (joins publisher `GROUP_EMIT` to client `OBJECT_RECV`)                                                          |
+| `CACHE_EVICT`     | `group`, `objects`, `bytes`, `cause`                                                                                                                                                                      |
 
 Mechanism branches add their own relay events (for example a fill or
 catch-up stream) using the same helper; they must keep these names.
@@ -194,7 +195,9 @@ catch-up stream) using the same helper; they must keep these names.
 - **Delivery integrity** (`delivery`, needs `--log-objects`): objects received
   per group; `short_groups` received fewer than half the expected objects,
   `truncated_groups` are the subset of which fewer than half _arrived_ at all
-  (received plus discarded), i.e. cut on the wire. **Discarded** (`discarded`,
+  (received plus discarded), i.e. cut on the wire; with relay `OBJECT_SENT`
+  records these split into `cut_at_relay` (the relay wrote fewer than half) and
+  `lost_after_send` (it wrote them, the client never appended them). **Discarded** (`discarded`,
   column `discarded_objects` / `discarded_mb`): stale-track objects the relay
   delivered and the client threw away (`DROP_STALE`, with `bytes`): the old
   track's undelivered backlog arriving after a switch landed.

@@ -478,6 +478,9 @@ def run_once(args, repeat_index: int) -> int:
             "--log-folder", str(out / "relay-logs"),
             "--event-log", str(out / "relay-events.jsonl"),
             "--cache-size", str(args.cache_size),
+            # --log-objects: the relay logs OBJECT_SENT per object handed to a subscriber
+            # (and its per-subscription object files under relay-logs/).
+            *(["--enable-object-logging"] if args.log_objects else []),
         ], out / "relay.log")
         time.sleep(1.5)
 
