@@ -501,6 +501,78 @@ Then the other profiles of the grid with the same command shape. `analyze.py
 --stats` pools by condition and ignores `repeat_index`, so extra repetitions
 simply join their condition; invalid runs stay excluded.
 
+## 10. After the step_down_up grid: the remaining batches
+
+The step_down_up condition is complete (five or more valid runs per condition,
+`grid_capped*.csv`). Everything below uses the frozen controller
+(`--controller grid`). First move the pre-cap `grid` runs out of the way so
+nothing pools them by accident (`compare.py` labels them `grid(uncapped)` and
+`analyze.py --stats` keeps them apart by `controller_params`, but a clean
+folder is simpler):
+
+```sh
+mkdir -p results-uncapped && mv results/20260929*_ctl-grid results-uncapped/ 2>/dev/null || true
+```
+
+The batches, in the order that serves the paper. Each line is 20 runs
+(2 mechanisms × 2 client types × 5 repetitions), about 80 minutes.
+
+```sh
+run_batch() {  # $1 profile, $2.. extra args (e.g. --time-shift 20, --bg-flows 2)
+  local profile=$1; shift
+  for branch in native pr1378; do
+    git checkout switch/$branch && git reset --hard origin/switch/$branch
+    mech=$([ $branch = native ] && echo "--mechanism native" || echo "--mechanism pr1378 --mechanism-mode next-group")
+    for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift ${SHIFT:-10}"; do
+      sudo -v
+      python3 experiments/run_experiment.py $mech $client --controller grid \
+          --profile experiments/profiles/$profile.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 5 --final "$@"
+    done
+  done
+}
+run_batch stable_3mbps                 # steady state between rungs: the per-switch seam cost with no capacity event
+run_batch step_down_up_fqcodel         # same steps, AQM queue: are the FIFO-queue findings queue-model specific?
+run_batch step_down_up --bg-flows 2    # competing TCP (host default CUBIC; record it)
+SHIFT=5  run_batch step_down_up        # shift-depth sweep: the behind-live axis the paper is about
+SHIFT=20 run_batch step_down_up        # (10 s is the completed grid)
+```
+
+Pack each batch separately (`pack_results.sh results <name>.tar.gz`) and
+send it; `analyze.py --stats` and `compare.py` pool by condition, so the
+batches can be analysed together at the end.
+
+### 10b. The third mechanism: SWITCH_FROM (switch/pr1674)
+
+`switch/pr1674` carries the harness and the frozen controller but has never
+run the validation or a diagnostic. Its soft mode is the one closest to the
+paper's idea (the target starts at the playhead group and the old track
+drains up to it), so it belongs in the grid once it passes the same gate the
+others did:
+
+1. Section 5 (one validation run per client type, `--mechanism switch-from
+--mechanism-mode soft`), then the same with `hard`.
+2. Section 8b's shape: both modes × both client types × 3 repetitions on
+   step_down_up with `--controller grid` (12 runs), plus one time-shifted soft
+   run with `--log-objects`.
+3. Read `compare.py` next to the pr1378 and native columns, and the
+   `delivery`, `discarded` and `truncated` lines of the time-shifted run. Soft
+   mode re-delivers `[playhead, live)` like pr1378's playhead floor, so the
+   range-jump deferral and the seam removal rules matter; send the bundle and
+   the branch gets the same treatment the others had before it joins the grid.
+
+### 10c. Optional: the media-second-82 decoder hotspot
+
+Eight decode errors and several readyState-2 freezes sit at media second 82
+(720p, 1080p, 480p) and second 23 (1080p). If the cache keeps one file per
+group, decoding those groups offline tells whether the content is the cause:
+
+```sh
+ffmpeg -v error -i <init-of-720p> -i <group-82-of-720p> -f null - 2>&1 | head   # any decode errors printed = content
+```
+
+If they are clean, the position is a coincidence of where the time-shifted
+client meets the capacity drop (media 82 s is run time 72 s with a 10 s shift).
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
