@@ -350,6 +350,9 @@ export class Player {
   // settings.controller.latencyResetOnLanding: clear the latency-trend window
   // when a switch lands (see ControllerSettings).
   #resetLatencyOnLanding = false;
+  // Watchdog heartbeat, logged in SAMPLE: one run froze for 46 s without a
+  // single watchdog action and the log could not say whether the watchdog ran.
+  #watchdog = { ticks: 0, frozen: 0, unhandled: 0 };
   #disposers: Array<() => void> = [];
   // Per-frame end-to-end latency window (last 100 samples ≈ 4 s at 25 fps).
   // Fed by PRFT timestamps extracted from the head of each CMAF chunk.
@@ -558,6 +561,7 @@ export class Player {
     let lastTime = -1;
     let frozenSince = 0;
     const wedgeIntervalId = setInterval(() => {
+      this.#watchdog.ticks += 1;
       const q = el.getVideoPlaybackQuality?.();
       const frames = q?.totalVideoFrames ?? 0;
       this.#checkStarvation(el);
@@ -572,11 +576,13 @@ export class Player {
       if (advanced) {
         lastTime = time;
         frozenSince = 0;
+        this.#watchdog.frozen = 0;
         this.#closeStall();
         return;
       }
       if (el.paused || el.ended) return;
       frozenSince += 1;
+      this.#watchdog.frozen = frozenSince;
       if (frozenSince < 2) return; // wait ~1s of confirmed freeze
       // Frozen frames while playing is a stall whether or not the element
       // fired `waiting`; the interval is credited from the first frozen tick.
@@ -620,12 +626,15 @@ export class Player {
         // keeps every old range (Chrome coalesces or evicts them), so without the
         // lower bound an old hole far behind the playhead matches and the seek
         // throws playback back by many seconds.
+        // A gap of any size once the freeze has lasted 3 s: the buffer's own
+        // range-jump should have crossed it, so if we are still here something
+        // held it back and the picture is frozen either way.
         if (
           el.currentTime >= start - 0.05 &&
           el.currentTime >= end - 0.05 &&
           el.currentTime <= end + 0.25 &&
           nextStart > end &&
-          nextStart - end < 1.5
+          (nextStart - end < 1.5 || frozenSince >= 6)
         ) {
           logger.info(
             'media',
@@ -641,6 +650,23 @@ export class Player {
           frozenSince = 0;
           return;
         }
+      }
+      // Frozen for 3 s and no branch applied: say what the watchdog saw, once
+      // every 10 s, so the next such run is diagnosable from the log.
+      if (frozenSince >= 6 && (frozenSince - 6) % 20 === 0) {
+        this.#watchdog.unhandled += 1;
+        const parts: string[] = [];
+        for (let i = 0; i < buf.length; i++)
+          parts.push(`${buf.start(i).toFixed(3)}-${buf.end(i).toFixed(3)}`);
+        events.emit('WEDGE_UNHANDLED', {
+          playhead_ms: el.currentTime * 1000,
+          ready_state: el.readyState,
+          paused: el.paused,
+          ended: el.ended,
+          frozen_ticks: frozenSince,
+          buffered_ranges: parts.join(','),
+          mse_ready_state: this.#mse?.readyState ?? 'closed',
+        });
       }
     }, 500);
     this.#disposers.push(() => clearInterval(wedgeIntervalId));
@@ -1417,6 +1443,9 @@ export class Player {
     sampleCount: number;
     readyState: number;
     paused: boolean;
+    ended: boolean;
+    watchdogTicks: number;
+    frozenTicks: number;
     currentTime: number;
     bufferedRanges: string;
     mseReadyState: string;
@@ -1485,6 +1514,9 @@ export class Player {
       sampleCount: videoStruct?.tracker.getSampleCount() ?? 0,
       readyState: el?.readyState ?? 0,
       paused: el?.paused ?? true,
+      ended: el?.ended ?? false,
+      watchdogTicks: this.#watchdog.ticks,
+      frozenTicks: this.#watchdog.frozen,
       currentTime: el?.currentTime ?? 0,
       bufferedRanges,
       mseReadyState: this.#mse?.readyState ?? 'closed',
