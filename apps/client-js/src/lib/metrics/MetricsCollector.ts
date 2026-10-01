@@ -99,6 +99,10 @@ export class MetricsCollector {
       group: sample.activeGroup,
       ready_state: m.readyState,
       paused: m.paused,
+      ended: m.ended,
+      buffered_ranges: m.bufferedRanges,
+      watchdog_ticks: m.watchdogTicks,
+      frozen_ticks: m.frozenTicks,
     });
 
     this.#samples.push(sample);
