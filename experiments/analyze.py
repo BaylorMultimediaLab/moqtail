@@ -429,6 +429,11 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "target_shift_ms": client_meta.get("target_shift_ms"),
         },
         "buffer_s": stats([s.get("buffer_s") for s in samples]),
+        # Shift retained: mean live-edge distance over the last 60 s of the run (after
+        # the profile's events), and the closest the client came to live at any point.
+        "retained_live_edge_ms": statistics.fmean([s["live_edge_distance_ms"] for s in samples[-240:]
+                                                   if s.get("live_edge_distance_ms") is not None] or [float("nan")]),
+        "min_live_edge_ms": min((s["live_edge_distance_ms"] for s in samples if s.get("live_edge_distance_ms") is not None), default=None),
         "playback_rate": stats([s.get("playback_rate") for s in samples]),
         "latency_ms": stats([s.get("last_latency_ms") for s in samples if s.get("last_latency_ms")]),
     }
@@ -777,6 +782,7 @@ def to_markdown(s: dict) -> str:
          f"| switches followed within {s['feedback']['window_s']:g} s (by latency trend) | {s['feedback']['summary']['followed_within_window']} ({s['feedback']['summary']['followed_within_window_by_latency_trend']}) of {s['feedback']['summary']['switches']} |",
          f"| initial-window live-edge distance ms (mean, n) | {fmt(s['time_shift']['initial_window']['live_edge_distance_ms'].get('mean'))} (n={s['time_shift']['initial_window']['live_edge_distance_ms'].get('n')}), target {s['time_shift']['initial_window']['target_shift_ms']} |",
          f"| time-shift error ms signed mean / abs p95 | {fmt(s['time_shift']['signed_error_ms'].get('mean'))} / {fmt(s['time_shift']['abs_error_ms'].get('p95'))} |",
+         f"| shift retained in the last 60 s (mean live-edge distance ms) / closest to live ms | {fmt(s['time_shift'].get('retained_live_edge_ms'))} / {fmt(s['time_shift'].get('min_live_edge_ms'))} |",
          f"| live-edge distance ms mean / p95 | {fmt(s['time_shift']['live_edge_distance_ms'].get('mean'))} / {fmt(s['time_shift']['live_edge_distance_ms'].get('p95'))} |",
          f"| buffer s mean / p50 | {fmt(s['time_shift']['buffer_s'].get('mean'))} / {fmt(s['time_shift']['buffer_s'].get('p50'))} |",
          f"| played bitrate kbps (time-weighted); mean rung index; share per rung | {fmt(s['bitrate'].get('time_weighted_mean_kbps'))}; {fmt(s['bitrate'].get('mean_rung_index'))}; {({k: round(v, 2) for k, v in (s['bitrate'].get('rung_share') or {}).items()})} |",
@@ -819,6 +825,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
                   "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
                   "probe_mbps", "send_recv_latency_p50_ms", "down_t2_ms", "down_t4_ms", "up_t2_ms", "down_reliable", "up_reliable",
+                  "retained_live_edge_ms", "min_live_edge_ms",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
@@ -878,6 +885,8 @@ def agg_row(s: dict) -> dict:
         "probe_mbps": s["link"]["probe_mbps"],
         "down_t2_ms": s["reaction"]["down_t2_ms"], "down_t4_ms": s["reaction"]["down_t4_ms"], "up_t2_ms": s["reaction"]["up_t2_ms"],
         "down_reliable": s["reaction"]["down_reliable"], "up_reliable": s["reaction"]["up_reliable"],
+        "retained_live_edge_ms": s["time_shift"].get("retained_live_edge_ms"),
+        "min_live_edge_ms": s["time_shift"].get("min_live_edge_ms"),
         "send_recv_latency_p50_ms": s["link"]["send_recv_latency_ms"].get("p50"),
         "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
         "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
