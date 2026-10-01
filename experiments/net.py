@@ -168,7 +168,8 @@ class NetnsBackend:
             return ["ip", "netns", "exec", self.ns] + cmd
         user = os.environ.get("SUDO_USER") or os.environ.get("USER") or str(os.getuid())
         keep = [f"{k}={v}" for k, v in os.environ.items()
-                if k in ("HOME", "PATH", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LANG", "MOZ_LOG", "MOZ_LOG_FILE")]
+                if k in ("HOME", "PATH", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LANG", "MOZ_LOG", "MOZ_LOG_FILE",
+                         "MOZ_HEADLESS")]
         # `runuser` (util-linux) lets root become the user without consulting the
         # sudo policy. `setsid -w` detaches the command into its own session only
         # *after* sudo has run: Ubuntu's sudo caches credentials per terminal, so
