@@ -557,6 +557,13 @@ def run_once(args, repeat_index: int) -> int:
         # command line, which is how the browser is found again to stop it when it
         # runs behind privilege wrappers.
         browser_pattern = str(out / ("firefox-profile" if browser_kind(browser) == "firefox" else "chrome-profile"))
+        if not args.headed:
+            # A headless browser must not depend on the desktop session: a DISPLAY
+            # that points at a logged-out or changed X/Wayland session makes GTK
+            # fail at startup and the browser exits before loading the page.
+            for k in ("DISPLAY", "WAYLAND_DISPLAY"):
+                os.environ.pop(k, None)
+            os.environ["MOZ_HEADLESS"] = "1"
         procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed, backend.vite_host, args.vite_port)),
                                  out / "browser.log",
                                  new_session=not backend.detaches_itself)
