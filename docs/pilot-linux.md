@@ -515,11 +515,17 @@ mkdir -p results-uncapped && mv results/20260929*_ctl-grid results-uncapped/ 2>/
 ```
 
 The batches, in the order that serves the paper. Each line is 20 runs
-(2 mechanisms × 2 client types × 5 repetitions), about 80 minutes.
+(2 mechanisms × 2 client types × 5 repetitions), about 80 minutes. Run them
+inside `tmux` (or `screen`) so a dropped SSH session does not kill a batch,
+with `systemd-inhibit --what=sleep sleep infinity &` so the machine cannot
+suspend, after `export ENC=...` and `sudo -v` in that same terminal. The
+`run_batch` function lives only in the terminal where it was pasted; paste it
+again in a new one.
 
 ```sh
-run_batch() {  # $1 profile, $2.. extra args (e.g. --time-shift 20, --bg-flows 2)
+run_batch() {  # $1 profile, $2.. extra args (e.g. --bg-flows 2); SHIFT=<s> sets the time shift (default 10)
   local profile=$1; shift
+  git fetch -q origin
   for branch in native pr1378; do
     git checkout switch/$branch && git reset --hard origin/switch/$branch
     mech=$([ $branch = native ] && echo "--mechanism native" || echo "--mechanism pr1378 --mechanism-mode next-group")
