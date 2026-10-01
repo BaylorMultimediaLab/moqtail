@@ -171,6 +171,14 @@ catch-up stream) using the same helper; they must keep these names.
   within `--reversal-window`, default 5 s) and A→B→A reversals, cooldown
   activations (`ABR_GUARD_TIMEOUT`), slow-start vetoes, up-guard vetoes,
   probes discarded, switches by triggering rule.
+- **Detection attribution** (`detection[i].reliable`, `detection_reliable`):
+  a change's t1..t5 timeline is attributable only if the controller made no
+  decision in the `--feedback-window` (5 s) before t0 (`quiet_before`); whether
+  a throughput sample of the new rate preceded the decision is recorded as
+  `sample_before_decision` but not required, since a buffer rule may react to
+  the drop's effect first. `reaction.down_t2_ms`, `down_t4_ms` and `up_t2_ms`
+  are filled only for attributable events. The old whole-run criterion (median
+  inter-switch interval ≥ the window) is kept as `switching_quiet`.
 - **Reaction and recovery** (`reaction`, columns `down_reaction_ms`,
   `up_recovery_ms`): after the profile's first capacity drop, the time until the
   _played_ rung (from `SAMPLE`) is one that fits the new capacity (highest rung
