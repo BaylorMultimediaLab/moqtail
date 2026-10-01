@@ -450,6 +450,32 @@ describe('AbrController', () => {
     });
   });
 
+  describe('maxBitrate cap', () => {
+    it('clamps every rule to the highest rung under maxBitrate and does not probe above it', async () => {
+      // 10 Mbps bandwidth: ThroughputRule alone would go to 1080p (4 Mbps).
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        { videoAutoSwitch: true, maxBitrate: 1_500_000 },
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('720p');
+      player.switchTrack.mockClear();
+      controller.releaseSwitchingGuard();
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          totalFrames: 2000,
+          bandwidthBps: 10_000_000,
+        }),
+      );
+      player.probeTrackBandwidth.mockClear();
+      await controller._tick();
+      expect(player.switchTrack).not.toHaveBeenCalled();
+      expect(player.probeTrackBandwidth).not.toHaveBeenCalled(); // already at the cap
+    });
+  });
+
   describe('probe payload floor (settings.controller.probeMinBytes)', () => {
     it('sizes the probe from the rung gap by default', async () => {
       const { controller, player } = makeController(
