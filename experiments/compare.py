@@ -60,7 +60,14 @@ def cond_key(s: dict) -> str:
     ct = i.get("client_type") or s.get("client_mode")
     if ct == "time-shifted":
         ct += f" {i.get('time_shift_s') or s.get('time_shift_s') or ''}s"
-    return f"{mech}\n{ct}\n{i.get('network_profile') or s.get('profile')}\nctl {i.get('controller') or 'baseline'}"
+    ctl = i.get("controller") or "baseline"
+    params = i.get("controller_params") or {}
+    # "grid" before 2026-09-30 had no probe cap; keep the two apart in the table.
+    if ctl == "grid" and not params.get("probeMaxBytes"):
+        ctl = "grid(uncapped)"
+    bg = i.get("background_flows") or 0
+    shift = f"{ct}" if ct else ""
+    return f"{mech}\n{shift}\n{i.get('network_profile') or s.get('profile')}{' bg' + str(bg) if bg else ''}\nctl {ctl}"
 
 
 def main() -> int:

@@ -785,7 +785,7 @@ def to_markdown(s: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "client_type", "delay_groups",
+IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "controller_params", "client_type", "delay_groups",
                     "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "background_flows",
                     "repeat_index", "timestamp_start"]
 METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down",
@@ -815,6 +815,7 @@ def agg_row(s: dict) -> dict:
     ident.setdefault("network_profile", s["profile"])
     ident.setdefault("background_flows", s["bg_flows"])
     row = {k: ident.get(k) for k in IDENTITY_COLUMNS}
+    row["controller_params"] = json.dumps(ident.get("controller_params") or {}, sort_keys=True)
     row.update({
         "startup_delay_ms": s["startup"]["startup_delay_ms"], "stall_count": s["stalls"]["count"],
         "stall_total_ms": s["stalls"]["total_ms"], "switch_count": s["switches"]["count"],
@@ -867,7 +868,9 @@ def agg_row(s: dict) -> dict:
     return row
 
 
-CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "client_type", "delay_groups", "network_profile", "qdisc",
+# controller_params is a condition key too: the arm name "grid" was used before and
+# after the probe cap was added (2026-09-30), and those must never be pooled.
+CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "controller_params", "client_type", "delay_groups", "network_profile", "qdisc",
                   "background_flows", "ladder_id"]
 
 
