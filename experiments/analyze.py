@@ -500,6 +500,16 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                "t3_ms": (sw["ts"] - t0) if sw else None,
                "t4_ms": (sw["ts"] + sw["switch_delivery_latency_ms"] - t0) if sw and sw["switch_delivery_latency_ms"] else None,
                "t5_ms": (sw["ts"] + sw["switch_visibility_delay_ms"] - t0) if sw and sw["switch_visibility_delay_ms"] else None}
+        # Attribution: t2 is the controller's reaction to THIS change only if the
+        # controller was quiet before it (no decision in the feedback window before
+        # t0); otherwise the first decision after t0 may just be the next switch of
+        # an ongoing sequence. Whether a throughput sample of the new rate preceded
+        # the decision (t1 <= t2) is recorded but not required: a buffer rule can
+        # legitimately react to the drop's effect before a full group sample exists.
+        decisions_before = [r for r in by("ABR_DECISION") if t0 - feedback_window_s * 1000 <= r["ts"] < t0]
+        rec["quiet_before"] = len(decisions_before) == 0
+        rec["sample_before_decision"] = bool(t1 and t2 and t1["ts"] <= t2["ts"])
+        rec["reliable"] = rec["quiet_before"]
         if direction == "down":
             fitting = [i_ for i_, t in enumerate(ladder) if (t.get("bitrate") or 0) <= target_bps]
             fit_index = max(fitting) if fitting else 0
@@ -534,19 +544,29 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                     hold_start = None
             rec["offset_recovery_ms"] = (off - t0) if off else None
         detections.append(rec)
-    # Detection timelines only mean something when the controller is otherwise
-    # quiet: with a switch every second the "first decision after the change"
-    # is just the next oscillation.
+    # Detection timelines (t1..t5) mean something only when the decision after a
+    # change can be attributed to it: per event, the controller was quiet in the
+    # feedback window before t0. The whole-run flag is the conjunction; the per-event flags are in
+    # each detection record. (The old criterion, median inter-switch interval >=
+    # the window, is kept as switching_quiet.)
     med_gap = out["switching"]["median_inter_switch_interval_ms"]
-    out["detection_reliable"] = med_gap is None or med_gap >= feedback_window_s * 1000
+    out["switching_quiet"] = med_gap is None or med_gap >= feedback_window_s * 1000
+    out["detection_reliable"] = bool(detections) and all(d["reliable"] for d in detections)
     out["detection"] = detections
     # Headline reaction/recovery: the first down-step and the first up-step of the profile.
     first_down = next((d for d in detections if d["direction"] == "down"), None)
     first_up = next((d for d in detections if d["direction"] == "up"), None)
     out["reaction"] = {
         "sustain_s": sustain_s,
+        # outcome metrics (played rung held sustain_s): no attribution needed
         "down_reaction_ms": first_down.get("down_reaction_ms") if first_down else None,
         "up_recovery_ms": first_up.get("up_recovery_ms") if first_up else None,
+        # attribution-based reaction (t0 -> first decision), only when reliable
+        "down_t2_ms": first_down["t2_ms"] if first_down and first_down["reliable"] else None,
+        "down_t4_ms": first_down["t4_ms"] if first_down and first_down["reliable"] else None,
+        "up_t2_ms": first_up["t2_ms"] if first_up and first_up["reliable"] else None,
+        "down_reliable": first_down["reliable"] if first_down else None,
+        "up_reliable": first_up["reliable"] if first_up else None,
     }
 
     # Relay cache and process stats -----------------------------------------
@@ -749,7 +769,7 @@ def to_markdown(s: dict) -> str:
          f"| switches superseded before visible; skipped (previous not landed) | {s['switches']['superseded']} of {s['switches']['count']}; {s['switches']['skipped_not_landed']} |",
          f"| playback advancing fraction / longest no-progress s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} |",
          f"| time to half shift (s) | {fmt((s['time_shift']['time_to_half_shift_ms'] or 0) / 1000) if s['time_shift']['time_to_half_shift_ms'] else '-'} |",
-         f"| detection timelines reliable | {s['detection_reliable']} (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
+         f"| detection attributable (per change: quiet before t0 and t1 <= t2) | {s['detection_reliable']}; down t2/t4 {fmt(s['reaction']['down_t2_ms'])}/{fmt(s['reaction']['down_t4_ms'])} ms, up t2 {fmt(s['reaction']['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
          f"| seam dropped source frames (median / max); landed on keyframe | {fmt(s['switches']['seam_dropped_source_frames'].get('p50'))} / {fmt(s['switches']['seam_dropped_source_frames'].get('max'))}; {s['switches']['landed_on_group_start']} of {s['switches']['count']} |",
          f"| switches/min; reversals (A->B->A) | {fmt(s['switching']['switches_per_minute'])}; {s['switching']['direction_reversals']} ({s['switching']['aba_reversals']}) |",
          f"| inter-switch interval ms (median / min) | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])} |",
@@ -766,10 +786,10 @@ def to_markdown(s: dict) -> str:
         L.append(f"| {name} max RSS MB / mean CPU % | {p['max_rss_bytes'] / 1e6:.1f} / {p['mean_cpu_pct']:.1f} |")
     if s["detection"]:
         L += ["", "## Detection timelines (ms after the capacity change)", "",
-              "| change | t1 sample | t2 decision (rule) | t3 sent | t4 first obj | t5 first frame | quality rec. | offset rec. | sustained reaction/recovery |",
-              "|---|---|---|---|---|---|---|---|---|"]
+              "| change | attributable (quiet / t1<=t2) | t1 sample | t2 decision (rule) | t3 sent | t4 first obj | t5 first frame | quality rec. | offset rec. | sustained reaction/recovery |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
         for d in s["detection"]:
-            L.append(f"| {d['from_mbps']}->{d['to_mbps']} Mbps | {fmt(d['t1_ms'])} | {fmt(d['t2_ms'])} ({d['t2_rule']}) | "
+            L.append(f"| {d['from_mbps']}->{d['to_mbps']} Mbps | {d['reliable']} ({d['quiet_before']} / {d['sample_before_decision']}) | {fmt(d['t1_ms'])} | {fmt(d['t2_ms'])} ({d['t2_rule']}) | "
                      f"{fmt(d['t3_ms'])} | {fmt(d['t4_ms'])} | {fmt(d['t5_ms'])} | "
                      f"{fmt(d.get('quality_recovery_ms'))} | {fmt(d.get('offset_recovery_ms'))} | "
                      f"{fmt(d.get('down_reaction_ms', d.get('up_recovery_ms')))} |")
@@ -785,7 +805,7 @@ def to_markdown(s: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "controller_params", "client_type", "delay_groups",
+IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups",
                     "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "background_flows",
                     "repeat_index", "timestamp_start"]
 METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down",
@@ -798,7 +818,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
                   "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
                   "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
-                  "probe_mbps", "send_recv_latency_p50_ms",
+                  "probe_mbps", "send_recv_latency_p50_ms", "down_t2_ms", "down_t4_ms", "up_t2_ms", "down_reliable", "up_reliable",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
@@ -856,6 +876,8 @@ def agg_row(s: dict) -> dict:
         "discarded_objects": s["discarded"]["objects"],
         "discarded_mb": s["discarded"]["bytes"] / 1e6,
         "probe_mbps": s["link"]["probe_mbps"],
+        "down_t2_ms": s["reaction"]["down_t2_ms"], "down_t4_ms": s["reaction"]["down_t4_ms"], "up_t2_ms": s["reaction"]["up_t2_ms"],
+        "down_reliable": s["reaction"]["down_reliable"], "up_reliable": s["reaction"]["up_reliable"],
         "send_recv_latency_p50_ms": s["link"]["send_recv_latency_ms"].get("p50"),
         "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
         "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
@@ -870,7 +892,7 @@ def agg_row(s: dict) -> dict:
 
 # controller_params is a condition key too: the arm name "grid" was used before and
 # after the probe cap was added (2026-09-30), and those must never be pooled.
-CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "controller_params", "client_type", "delay_groups", "network_profile", "qdisc",
+CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups", "network_profile", "qdisc",
                   "background_flows", "ladder_id"]
 
 

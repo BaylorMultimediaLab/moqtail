@@ -33,6 +33,9 @@ ROWS = [
     ("data starved s", lambda s: s["starvation"]["total_ms"] / 1000),
     ("range-jumps", lambda s: s["stalls"]["seeks"]["range-jump"]),
     ("range-jumps deferred", lambda s: s["stalls"]["range_jumps_deferred"]),
+    ("down detection attributable (frac)", lambda s: 1 if s["reaction"].get("down_reliable") else 0),
+    ("down t2 decision s (attributable only)", lambda s: (s["reaction"]["down_t2_ms"] / 1000) if s["reaction"].get("down_t2_ms") is not None else None),
+    ("down t4 landed s (attributable only)", lambda s: (s["reaction"]["down_t4_ms"] / 1000) if s["reaction"].get("down_t4_ms") is not None else None),
     ("down-reaction s (held 5 s)", lambda s: (s["reaction"]["down_reaction_ms"] / 1000) if s["reaction"]["down_reaction_ms"] is not None else None),
     ("up-recovery s (held 5 s)", lambda s: (s["reaction"]["up_recovery_ms"] / 1000) if s["reaction"]["up_recovery_ms"] is not None else None),
     ("up-guard vetoes", lambda s: s["switching"]["up_guard_vetoes"]),
@@ -61,6 +64,8 @@ def cond_key(s: dict) -> str:
     if ct == "time-shifted":
         ct += f" {i.get('time_shift_s') or s.get('time_shift_s') or ''}s"
     ctl = i.get("controller") or "baseline"
+    if i.get("abr_overrides"):
+        ctl += " " + i["abr_overrides"]
     params = i.get("controller_params") or {}
     # "grid" before 2026-09-30 had no probe cap; keep the two apart in the table.
     if ctl == "grid" and not params.get("probeMaxBytes"):
