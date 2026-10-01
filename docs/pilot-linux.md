@@ -560,6 +560,36 @@ others did:
    range-jump deferral and the seam removal rules matter; send the bundle and
    the branch gets the same treatment the others had before it joins the grid.
 
+### 10d. Reaction time, measured where it can be attributed
+
+In the step_down_up grid every run carries `detection_reliable = false`.
+The flag is now per capacity change and means: the controller made a
+decision in the 5 s before the change, so the first decision after it cannot
+be attributed to the change. With the frozen controller the live-edge client
+switches every 1.3–1.8 s and the time-shifted client flips 1080p/720p on the
+latency-trend rule at about 47 s and 56 s, so in that grid only some
+live-edge down-steps are quiet-before (native 3 of 5, pr1378 4 of 5; t2 about
+0.3–0.5 s, t4 about 1.3–2.6 s) and no time-shifted one is. The outcome
+metrics `down-reaction s` and `up-recovery s` (played rung held 5 s) need no
+attribution, but on the live-edge client the down one reads near zero only
+because the client was already below the fitting rung when the drop came.
+Neither is a reaction-time claim.
+
+`detect_step` is the profile for that claim: 6 → 0.8 → 6 Mbps, run with
+`--abr maxBitrate=1200000`, so both client types sit stably at 720p-1200k
+before the drop (0.2 s per group at 6 Mbps; the controller clamps every rule
+to the cap and does not probe above it) and must leave it at 0.8 Mbps (1.5 s
+per group). The cap is part of the run identity (`abr_overrides`), so these
+runs never pool with the grid. 20 runs, about 80 minutes:
+
+```sh
+run_batch detect_step --abr maxBitrate=1200000
+```
+
+Read `down detection attributable (frac)`, then `down t2 decision s` and
+`down t4 landed s` (attributable events only), `down-reaction s` and
+`up-recovery s`, per mechanism and client type.
+
 ### 10c. Optional: the media-second-82 decoder hotspot
 
 Eight decode errors and several readyState-2 freezes sit at media second 82

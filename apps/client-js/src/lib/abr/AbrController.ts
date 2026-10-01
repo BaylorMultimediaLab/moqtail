@@ -346,7 +346,18 @@ export class AbrController {
     // gap to the next-higher track, and tracksize is the carry-over from
     // the most recent switch. Convert to bytes for the track-name string.
     const currentIdx = activeTrackIndex >= 0 ? activeTrackIndex : 0;
-    if (currentIdx < this.#tracks.length - 1 && this.#settings.controller?.probeMode !== 'off') {
+    // settings.maxBitrate caps the ladder for every rule (ThroughputRule honours
+    // it on its own; ProbeRule and the buffer rules do not), and the probe does
+    // not probe above the cap. -1 = uncapped.
+    const maxBitrate = this.#settings.maxBitrate;
+    let capIdx = this.#tracks.length - 1;
+    if (maxBitrate !== -1) {
+      capIdx = 0;
+      for (let i = 0; i < this.#tracks.length; i++) {
+        if ((this.#tracks[i]?.bitrate ?? 0) <= maxBitrate) capIdx = i;
+      }
+    }
+    if (currentIdx < capIdx && this.#settings.controller?.probeMode !== 'off') {
       const bI = this.#tracks[currentIdx]?.bitrate ?? 0;
       const bIPlus1 = this.#tracks[currentIdx + 1]?.bitrate ?? 0;
       const gapBits = Math.max(0, bIPlus1 - bI);
@@ -428,7 +439,7 @@ export class AbrController {
     }
     if (switchRequest === null) return;
 
-    const targetIndex = switchRequest.representationIndex;
+    const targetIndex = Math.min(switchRequest.representationIndex, capIdx);
 
     // Only switch if the target differs from current
     if (targetIndex === currentIdx) return;
