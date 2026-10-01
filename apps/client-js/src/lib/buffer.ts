@@ -92,6 +92,15 @@ interface MSEBufferConfig {
   gapFillProbe?: () => GapFillState;
   /** Give up deferring a range-jump once the append front has not moved for this long (ms). */
   rangeJumpNoProgressMs: number;
+  /**
+   * Do not jump into a last range shorter than this (s): a 40 ms range at the
+   * far end of the buffer is the first object of a group still arriving, and
+   * jumping there stalls at its end immediately while throwing away every
+   * second of shift in between (a 5 s time-shifted client went 78.0 -> 82.0 s
+   * in one seek and sat at readyState 2). The wedge watchdog still crosses any
+   * gap after 3 s if nothing else moves.
+   */
+  minJumpTargetS: number;
 }
 
 class MSEBuffer {
@@ -104,6 +113,7 @@ class MSEBuffer {
   // Range-jump deferral state: the gap being waited on (its next-range start),
   // when the wait began, and the append front's last position/movement time.
   private deferGapKey: number | null = null;
+  private shortTargetKey: number | null = null;
   private deferSince = 0;
   private deferFrontS: number | undefined;
   private deferFrontMovedAt = 0;
@@ -119,6 +129,7 @@ class MSEBuffer {
       stallThreshold: DEFAULT_STALL_THRESHOLD,
       catchupPlaybackRate: DEFAULT_CATCHUP_PLAYBACK_RATE,
       rangeJumpNoProgressMs: 3000,
+      minJumpTargetS: 0.5,
       ...config,
     };
 
@@ -340,7 +351,26 @@ class MSEBuffer {
     if (currentRangeIndex + 1 < buffered.length) {
       for (let nextRange = currentRangeIndex + 1; nextRange < buffered.length; nextRange++) {
         const nextRangeStart = buffered.start(currentRangeIndex + 1);
+        const nextRangeEnd = buffered.end(currentRangeIndex + 1);
         const gap = nextRangeStart - currentRangeEnd;
+        // The last range is still being filled; a sliver there is a group's
+        // first object, not a place to play from.
+        if (
+          currentRangeIndex + 1 === buffered.length - 1 &&
+          nextRangeEnd - nextRangeStart < this.config.minJumpTargetS
+        ) {
+          if (this.shortTargetKey !== nextRangeStart) {
+            this.shortTargetKey = nextRangeStart;
+            events.emit('RANGE_JUMP_DEFERRED', {
+              reason: 'short-target',
+              playhead_ms: currentTime * 1000,
+              range_end_ms: currentRangeEnd * 1000,
+              next_start_ms: nextRangeStart * 1000,
+              next_end_ms: nextRangeEnd * 1000,
+            });
+          }
+          return { seek: false };
+        }
 
         // If gap is too small, seek to next range immediately
         if (gap < MSE_IMMEDIATE_SEEK_THRESHOLD) {

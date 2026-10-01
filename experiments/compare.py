@@ -51,6 +51,8 @@ ROWS = [
     ("live-edge dist mean ms", lambda s: s["time_shift"]["live_edge_distance_ms"].get("mean")),
     ("initial-window dist ms", lambda s: s["time_shift"]["initial_window"]["live_edge_distance_ms"].get("mean")),
     ("time to half shift s", lambda s: (s["time_shift"]["time_to_half_shift_ms"] or 0) / 1000 or None),
+    ("shift retained, last 60 s (s)", lambda s: (s["time_shift"].get("retained_live_edge_ms") or 0) / 1000 or None),
+    ("closest to live (s)", lambda s: s["time_shift"].get("min_live_edge_ms") and s["time_shift"]["min_live_edge_ms"] / 1000),
     ("buffer mean s", lambda s: s["time_shift"]["buffer_s"].get("mean")),
     ("followed <5 s (frac)", lambda s: s["feedback"]["summary"]["followed_within_window"] / s["switches"]["count"] if s["switches"]["count"] else None),
     ("by latency trend (frac)", lambda s: s["feedback"]["summary"]["followed_within_window_by_latency_trend"] / s["switches"]["count"] if s["switches"]["count"] else None),
