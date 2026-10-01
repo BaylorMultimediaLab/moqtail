@@ -318,6 +318,25 @@ def browser_kind(path: str) -> str:
     return "firefox" if "firefox" in Path(path).name.lower() else "chromium"
 
 
+def refuse_snap_wrapper(path: str) -> None:
+    """Ubuntu's `firefox` deb is a shell script that execs the snap, and a snap
+    cannot be launched inside the network namespace (snap-confine: "cannot find
+    tracking cgroup"; the browser exits before loading the page). Ubuntu's
+    package also wins over Mozilla's by epoch unless packages.mozilla.org is
+    pinned, so an unattended upgrade can swap the binary between batches."""
+    try:
+        head = Path(path).read_bytes()[:4096]
+    except OSError:
+        return
+    if head.startswith(b"#!") and b"snap" in head:
+        raise SystemExit(
+            f"{path} is the snap wrapper, which the runner cannot launch in the namespace.\n"
+            "Install Mozilla's deb and pin it (docs/pilot-linux.md section 1, 'If Firefox became the snap'):\n"
+            "  apt-cache policy firefox          # shows which origin won\n"
+            "  sudo apt install --allow-downgrades firefox   # with the packages.mozilla.org pin in place\n"
+            "or pass --browser /path/to/mozilla/firefox.")
+
+
 FIREFOX_PREFS = """
 user_pref("media.autoplay.default", 0);
 user_pref("media.autoplay.blocking_policy", 0);
@@ -564,6 +583,8 @@ def run_once(args, repeat_index: int) -> int:
             for k in ("DISPLAY", "WAYLAND_DISPLAY"):
                 os.environ.pop(k, None)
             os.environ["MOZ_HEADLESS"] = "1"
+        if browser_kind(browser) == "firefox":
+            refuse_snap_wrapper(browser)
         procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed, backend.vite_host, args.vite_port)),
                                  out / "browser.log",
                                  new_session=not backend.detaches_itself)

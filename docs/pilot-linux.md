@@ -58,6 +58,26 @@ firefox --version
 Node 18+ is required by Vite; if the distro's `nodejs` is older, install it
 from NodeSource or nvm.
 
+**If Firefox became the snap.** Ubuntu's own `firefox` package is a script
+that launches the snap, and its version has an epoch (`1:1snap...`) that
+beats Mozilla's unless the pin above is in place, so an unattended upgrade
+can replace the binary between batches. The symptom is every run aborting
+with "browser exited early" and `browser.log` saying
+`cannot find tracking cgroup`; `firefox --version` still prints a version.
+The runner now refuses the wrapper with a pointer here. To recover:
+
+```sh
+apt-cache policy firefox                      # Installed: 1:1snap... means the wrapper won
+cat /etc/apt/preferences.d/mozilla            # the pin must exist with Pin-Priority: 1000
+sudo apt update && sudo apt install -y --allow-downgrades firefox
+sudo snap remove firefox                      # optional; stops it coming back through the snap
+head -c 200 /usr/bin/firefox | file -         # must be an ELF binary, not a shell script
+firefox --version
+```
+
+Then re-run section 5's two validation runs before continuing a batch, since
+the Firefox version changed.
+
 ## 2. Build once
 
 ```sh
