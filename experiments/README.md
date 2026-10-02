@@ -93,6 +93,31 @@ has every number, including per-switch timelines and per-capacity-change
 detection timelines. `analyze.py --csv` writes one row per run for plotting.
 Record and metric definitions: `docs/measurement-schema.md`.
 
+`compare.py results/*/` prints one column per condition (mechanism, client
+type, profile + background flows, controller arm) with the median over valid
+repetitions.
+
+### Figures
+
+`plot.py` turns analyzed runs into paper figures. It groups runs into the same
+conditions as `compare.py` and de-duplicates runs that appear in several
+extracted bundles.
+
+```sh
+pip install matplotlib                                                          # once
+python3 experiments/plot.py results-linux-*/grid/results/*/ --list              # conditions, rep counts
+python3 experiments/plot.py results-linux-*/grid/results/*/ --filter ctl=grid --out figures/grid
+```
+
+Outputs (pdf and png by default, `--format png` for one): `bars_<metric>`
+(median over repetitions, IQR error bar, one dot per repetition), `summary`
+(the headline metrics stacked), `traj_live_edge_*` / `traj_rung_*` /
+`traj_buffer_*` (per-repetition trajectories with a median line and dashed
+network-change markers, one file per profile x controller x client type),
+`seam_*` (ECDFs of viewer pause, buffer hole and visibility delay per switch),
+and `index.md` listing every file. `--x`, `--hue` and `--facet` choose which
+condition field becomes the bar group, the bar colour and the panel.
+
 ## Notes
 
 - The relay's QUIC congestion control is BBR; iperf3 uses the host default
