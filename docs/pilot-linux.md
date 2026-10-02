@@ -779,21 +779,44 @@ runs pass, and native time-shifted starvation is systematic: 4 of 5 reps,
 apparatus share of any stall time stays visible (0.0-0.8 s here, the
 watchdog's own 3-6 s reaction windows at most).
 
-**A pr1378 finding from the same inspection.** The one long pr1378 stall
-(9.4 s, time-shifted rep 0, after the shift was consumed) is a different
-mechanism: the client's `next-group` floor is "last received group of the
-current subscription + 1", and after an earlier catch-up had filled the
-element buffer to 109.6 s while the current 1080p subscription lagged at
-group 105, the 1080p -> 240p switch asked for Minimum Switching Group 106,
-behind the playhead at 108.6. The relay re-delivered groups 106-109 (already
-buffered), the ABR flipped back to 1080p with floor 107 (2.7 s per group on
-1.5 Mbps), and the playhead sat at the buffered end for 9.4 s while the
-link carried content behind it. 5 of 156 pr1378 time-shifted switches
-landed more than 0.5 s behind the playhead (0 on the live edge, 0 for
-native). The clean fix is floor = max(last received group, group holding
-the buffered end) + 1, i.e. never re-request what is already in the
-buffer; it changes the pr1378 client, so the pr1378 cells would need a
-re-run. Not applied yet: decide before the remaining batches.
+**A pr1378 finding from the same inspection: buffer-unaware
+minimum-switching-group selection.** The one long pr1378 stall (9.4 s,
+time-shifted rep 0, after the shift was consumed) is not starvation. The
+client's `next-group` floor was "last received group of the current
+subscription + 1", computed from transport progress alone. After an
+earlier catch-up had filled the element buffer to 109.6 s while the
+current 1080p subscription lagged at group 105, the 1080p -> 240p switch
+asked for Minimum Switching Group 106, behind the playhead at 108.6. The
+relay re-delivered groups 106-109 (already buffered), the ABR flipped back
+to 1080p with floor 107 (2.7 s per group on 1.5 Mbps), and the playhead
+sat at the buffered end for 9.4 s while the link carried content behind
+it. 5 of 156 pr1378 time-shifted switches landed more than 0.5 s behind
+the playhead (0 on the live edge, 0 for native); the analyzer now reports
+that count as `landed_behind_playhead` for every mechanism. The floor
+itself is legitimate; the fix (applied on switch/pr1378, 2026-10-02) makes
+it buffer-aware: `1 + max(last received group, highest group completely
+present in a buffered range ahead of the playhead)`. A group the range ends
+partway through does not count, so its missing tail is still re-requested.
+Every switch now emits `SWITCH_FLOOR` (recv_floor_group,
+buffer_floor_group, selected_min_group, playhead_group, buffer_end_s,
+buffered_ranges), so the selection stays observable. The two pr1378 cells
+of the fresh grid predate the fix and are re-run with it (10 runs,
+~70 min) alongside the native forward-trigger arm:
+
+```sh
+cd ~/Documents/Baylor\ Research/moqtail && export ENC=data/encoded/tears_of_steel_240s_1080p
+git fetch origin && git checkout switch/pr1378 && git reset --hard origin/switch/pr1378
+for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+  sudo -v
+  python3 experiments/run_experiment.py --mechanism pr1378 --mechanism-mode next-group $client --controller grid \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 5 --final
+done
+bash experiments/pack_results.sh results fresh-pr1378-v2.tar.gz
+```
+
+The pre-fix pr1378 runs stay in the bundle as the record of the defect
+(`git_sha` before this commit); the paper's pr1378 numbers come from the
+re-run.
 
 Two measurement notes from this batch. `seam_buffer_hole_ms` was reading
 the hole behind the presented frame's buffered range, which after a native
