@@ -564,6 +564,7 @@ pub(crate) async fn terminate_source(
   current_full_track_name: &FullTrackName,
   connection_id: usize,
   current_sub_req_id: u64,
+  g_switch: u64,
 ) {
   let sub_arc = current_track
     .read()
@@ -603,13 +604,13 @@ pub(crate) async fn terminate_source(
       error!("switch teardown: failed to send PUBLISH_DONE: {e:?}");
     }
     // Reset the replaced subscription's data streams instead of finishing them.
-    // A finish is a FIN: QUIC delivers everything already queued on the stream,
-    // and on a link that has just shrunk that queue is the undelivered backlog
-    // of the old track (whole groups, at the higher stream priority its lower
-    // group ids carry), which the subscriber will discard on arrival and which
-    // starved the target's streams for tens of seconds (delivery diagnostic,
-    // 2026-09-29: 78 of 222 groups cut on the wire). The subscriber asked to
-    // leave this track; nothing still queued on it is wanted.
+    // A finish is a FIN: QUIC delivers everything already queued on the stream.
+    // Above the seam that queue is the old track's backlog, which the subscriber
+    // will discard and which starved the target's streams (delivery diagnostic,
+    // 2026-09-29: 78 of 222 groups cut on the wire): reset those. Below the seam
+    // it is media the subscriber will play before it reaches the seam (a
+    // deep-buffer subscriber on a saturated link has a group or two in flight):
+    // finish those.
     let streams = sub.opened_stream_count();
     crate::server::events::emit(
       "SWITCH_SOURCE_RESET",
@@ -618,9 +619,11 @@ pub(crate) async fn terminate_source(
         "request_id": current_sub_req_id,
         "track": crate::server::events::track_name_string(current_full_track_name),
         "streams_opened": streams,
+        "seam_group": g_switch,
       }),
     );
-    sub.cancel().await;
+    // Streams at/above the seam are reset; streams below it finish and deliver.
+    sub.cancel_from_group(g_switch).await;
   }
 }
 

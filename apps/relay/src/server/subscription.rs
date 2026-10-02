@@ -919,6 +919,40 @@ impl Subscription {
     }
   }
 
+  /// Ends a subscription replaced by a switch at `seam_group`: data streams of
+  /// groups at or above the seam are reset (the target covers them and the
+  /// subscriber will discard them), streams of groups below it are finished so
+  /// that whatever is still queued on them is delivered. On a saturated link a
+  /// deep-buffer subscriber has one or two groups below the seam still in
+  /// flight; resetting those left holes 10-20 s ahead of its playhead
+  /// (shift-20 s batch, 2026-10-02), while finishing everything let the backlog
+  /// above the seam starve the target (delivery diagnostic, 2026-09-29).
+  pub async fn cancel_from_group(&self, seam_group: u64) {
+    info!(
+      "Ending replaced subscription for subscriber={} relay_track_id={}: resetting streams at/above group {}",
+      self.client_connection_id, self.relay_track_id, seam_group
+    );
+    let above: Vec<StreamId> = {
+      let mut map = self.send_stream_last_object_ids.write().await;
+      let keys: Vec<StreamId> = map
+        .keys()
+        .filter(|id| id.group_id.is_some_and(|g| g >= seam_group))
+        .cloned()
+        .collect();
+      for k in &keys {
+        map.remove(k);
+      }
+      keys
+    };
+    for stream_id in above {
+      self
+        .subscriber
+        .reset_stream(&stream_id, StreamResetCode::Cancelled.to_u64())
+        .await;
+    }
+    self.finish().await;
+  }
+
   /// Ends the subscription because the subscriber cancelled it.
   ///
   /// A cancelled subscription's streams are reset, not finished. A finish is a FIN,

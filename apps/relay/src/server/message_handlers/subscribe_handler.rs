@@ -1904,6 +1904,7 @@ async fn handle_switch_message(
       &current_full_track_name,
       connection_id,
       current_sub_req_id,
+      g_switch,
     )
     .await;
 
