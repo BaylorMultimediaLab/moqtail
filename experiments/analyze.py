@@ -363,6 +363,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "seam_buffer_hole_ms": fframe.get("seam_buffer_hole_ms") if fframe else None,
             # Whether the target began on object 0 of its group (its keyframe).
             "landed_on_group_start": applied.get("landed_on_group_start") if applied else None,
+            # Whether the landing object's moof carries the sync-sample flag (a real keyframe).
+            "landed_on_keyframe": applied.get("landed_on_keyframe") if applied else None,
             # Source-track objects that arrived after the target landed and were discarded
             # (the relay kept delivering the source's in-progress group).
             "seam_dropped_source_frames": sum(
@@ -395,6 +397,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "seam_buffer_hole_ms": stats([s["seam_buffer_hole_ms"] for s in switches]),
         "seam_dropped_source_frames": stats([s["seam_dropped_source_frames"] for s in switches]),
         "landed_on_group_start": sum(1 for s in switches if s["landed_on_group_start"]),
+        "landed_on_keyframe": sum(1 for s in switches if s["landed_on_keyframe"]),
+        "landed_on_keyframe_known": sum(1 for s in switches if s["landed_on_keyframe"] is not None),
         "list": switches,
         "guard_timeouts": len(by("ABR_GUARD_TIMEOUT")),
         "gated_slow_start": len(by("ABR_GATED")),
@@ -779,7 +783,7 @@ def to_markdown(s: dict) -> str:
          f"| playback advancing fraction / longest no-progress s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} |",
          f"| time to half shift (s) | {fmt((s['time_shift']['time_to_half_shift_ms'] or 0) / 1000) if s['time_shift']['time_to_half_shift_ms'] else '-'} |",
          f"| detection attributable (per change: quiet before t0 and t1 <= t2) | {s['detection_reliable']}; down t2/t4 {fmt(s['reaction']['down_t2_ms'])}/{fmt(s['reaction']['down_t4_ms'])} ms, up t2 {fmt(s['reaction']['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
-         f"| seam dropped source frames (median / max); landed on keyframe | {fmt(s['switches']['seam_dropped_source_frames'].get('p50'))} / {fmt(s['switches']['seam_dropped_source_frames'].get('max'))}; {s['switches']['landed_on_group_start']} of {s['switches']['count']} |",
+         f"| seam dropped source frames (median / max); landed on object 0; landed on a keyframe (sync flag) | {fmt(s['switches']['seam_dropped_source_frames'].get('p50'))} / {fmt(s['switches']['seam_dropped_source_frames'].get('max'))}; {s['switches']['landed_on_group_start']} of {s['switches']['count']}; {s['switches']['landed_on_keyframe']} of {s['switches']['landed_on_keyframe_known']} known |",
          f"| switches/min; reversals (A->B->A) | {fmt(s['switching']['switches_per_minute'])}; {s['switching']['direction_reversals']} ({s['switching']['aba_reversals']}) |",
          f"| inter-switch interval ms (median / min) | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])} |",
          f"| switches by rule | {s['switching']['switches_by_rule']} |",
@@ -823,7 +827,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "switches_per_minute", "direction_reversals", "aba_reversals", "median_inter_switch_ms",
                   "cooldown_activations", "switch_delivery_latency_p50_ms", "switch_visibility_delay_p50_ms",
                   "media_seam_gap_p50_ms", "seam_ahead_p50_ms", "seam_buffer_hole_p50_ms", "seam_dropped_frames_p50",
-                  "landed_on_group_start", "superseded", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
+                  "landed_on_group_start", "landed_on_keyframe", "superseded", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
@@ -866,6 +870,7 @@ def agg_row(s: dict) -> dict:
         "seam_buffer_hole_p50_ms": s["switches"]["seam_buffer_hole_ms"].get("p50"),
         "seam_dropped_frames_p50": s["switches"]["seam_dropped_source_frames"].get("p50"),
         "landed_on_group_start": s["switches"]["landed_on_group_start"],
+        "landed_on_keyframe": s["switches"]["landed_on_keyframe"],
         "superseded": s["switches"]["superseded"],
         "abs_playback_jump_p95_ms": s["switches"]["abs_playback_position_jump_ms"].get("p95"),
         "viewer_pause_p95_ms": s["switches"]["viewer_pause_ms"].get("p95"),
