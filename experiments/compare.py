@@ -28,6 +28,7 @@ ROWS = [
     ("switch delivery p50 ms", lambda s: s["switches"]["switch_delivery_latency_ms"].get("p50")),
     ("dropped source frames p50", lambda s: s["switches"]["seam_dropped_source_frames"].get("p50")),
     ("superseded", lambda s: s["switches"]["superseded"]),
+    ("landed behind playhead", lambda s: s["switches"].get("landed_behind_playhead")),
     ("stalls", lambda s: s["stalls"]["count"]),
     ("stalled s", lambda s: s["stalls"]["total_ms"] / 1000),
     ("stall max ms", lambda s: s["stalls"]["max_ms"]),
