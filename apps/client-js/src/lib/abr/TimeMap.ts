@@ -35,6 +35,20 @@ export class TimeMap {
   }
 
   /**
+   * Start PTS of `groupId`, from the nearest recorded boundary at or below it
+   * (else the earliest), extrapolated by `gopDurationMs`. Undefined before any
+   * boundary is recorded.
+   */
+  startPTSOfGroup(groupId: number): number | undefined {
+    if (this.boundaries.length === 0) return undefined;
+    let base = this.boundaries[0];
+    for (const b of this.boundaries) {
+      if (b.groupId <= groupId && b.groupId >= base.groupId) base = b;
+    }
+    return base.startPTS_ms + (groupId - base.groupId) * this.gopDurationMs;
+  }
+
+  /**
    * Return the groupId whose [startPTS, startPTS + gopDurationMs) covers `pts_ms`.
    * Returns `undefined` if no boundary has been recorded yet.
    *
