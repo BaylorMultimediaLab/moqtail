@@ -164,7 +164,11 @@ describe('parseMoofBaseMediaDecodeTime', () => {
  * `decodeTimeTicks` and `sampleDurationTicks` are written verbatim — the caller
  * picks a timescale that lines up with the assertions.
  */
-function makePublisherMoof(decodeTimeTicks: bigint, sampleDurationTicks: number): Uint8Array {
+function makePublisherMoof(
+  decodeTimeTicks: bigint,
+  sampleDurationTicks: number,
+  sampleFlags = 0x02000000,
+): Uint8Array {
   // mfhd
   const mfhd = new Uint8Array(16);
   const mfhdView = new DataView(mfhd.buffer);
@@ -197,7 +201,7 @@ function makePublisherMoof(decodeTimeTicks: bigint, sampleDurationTicks: number)
   trunView.setInt32(16, 0, false); // data_offset (unused by parser)
   trunView.setUint32(20, sampleDurationTicks, false); // sample_duration
   trunView.setUint32(24, 1234, false); // sample_size (unused)
-  trunView.setUint32(28, 0x02000000, false); // sample_flags (unused)
+  trunView.setUint32(28, sampleFlags, false); // sample_flags: 0x02000000 keyframe, 0x01010000 non-sync
 
   const trafSize = 8 + tfhd.length + tfdt.length + trun.length; // 8 + 16 + 20 + 32 = 76
   const traf = new Uint8Array(trafSize);
@@ -224,6 +228,11 @@ function makePublisherMoof(decodeTimeTicks: bigint, sampleDurationTicks: number)
 }
 
 describe('parseMoofMediaInfo', () => {
+  it('reads the sync-sample flag of the publisher-shaped moof', () => {
+    expect(parseMoofMediaInfo(makePublisherMoof(0n, 500, 0x02000000), 12000)!.isSync).toBe(true);
+    expect(parseMoofMediaInfo(makePublisherMoof(0n, 500, 0x01010000), 12000)!.isSync).toBe(false);
+  });
+
   it('returns decodeTimeMs and frameDurationMs from publisher-shaped moof', () => {
     // 24fps at timescale=12000 → frame duration = 500 ticks; decode at group 24 frame 0.
     const decodeTicks = 24n * 12000n; // 24 seconds

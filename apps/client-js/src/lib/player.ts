@@ -883,16 +883,18 @@ export class Player {
               // metric: signed difference between the first appended frame's PTS on
               // the new track and the last appended frame's end PTS on the old track.
               const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const landingBytes = new Uint8Array(
+                object.payload.buffer,
+                object.payload.byteOffset,
+                object.payload.byteLength,
+              );
               const newStartPTS_ms =
                 newTimescale && newTimescale > 0
-                  ? parseMoofBaseMediaDecodeTime(
-                      new Uint8Array(
-                        object.payload.buffer,
-                        object.payload.byteOffset,
-                        object.payload.byteLength,
-                      ),
-                      newTimescale,
-                    )
+                  ? parseMoofBaseMediaDecodeTime(landingBytes, newTimescale)
+                  : undefined;
+              const landingIsSync =
+                newTimescale && newTimescale > 0
+                  ? parseMoofMediaInfo(landingBytes, newTimescale)?.isSync
                   : undefined;
 
               events.emit('SWITCH_APPLIED', {
@@ -911,8 +913,11 @@ export class Player {
                   newStartPTS_ms !== undefined && sourceEndAtApplyPTS_ms !== undefined
                     ? newStartPTS_ms - sourceEndAtApplyPTS_ms
                     : null,
-                // A switch that lands on object 0 starts on the group's keyframe.
+                // Object 0 of a group is where a keyframe is expected ...
                 landed_on_group_start: object.location.object === 0n,
+                // ... and this is whether the landing object actually is one
+                // (trun sync-sample flag of its moof). null when the moof has no flags.
+                landed_on_keyframe: landingIsSync ?? null,
                 playhead_ms: playheadPTS_ms ?? null,
                 // How far ahead of the viewer the new representation lands: the
                 // media the viewer still has to play before seeing it. NOT a
@@ -924,7 +929,9 @@ export class Player {
                 since_sent_ms: performance.now() - switchSentAt,
               });
               struct.postSwitchSeamPTS_ms = newStartPTS_ms;
-              struct.awaitKeyframe = object.location.object !== 0n;
+              // Discard until a sync sample. The flag is read from each object's
+              // moof; object index 0 is the fallback when a moof carries no flags.
+              struct.awaitKeyframe = !(landingIsSync ?? object.location.object === 0n);
               if (this.#resetLatencyOnLanding) {
                 this.#latencyTracker.reset();
                 events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
@@ -981,30 +988,17 @@ export class Player {
             // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
             const timescale = this.catalog?.getTimescale(struct.trackName);
             let decodeTimeMs: number | undefined;
-            if (timescale && timescale > 0) {
-              const info = parseMoofMediaInfo(
-                new Uint8Array(
-                  object.payload.buffer,
-                  object.payload.byteOffset,
-                  object.payload.byteLength,
-                ),
-                timescale,
-              );
-              if (info !== undefined) {
-                decodeTimeMs = info.decodeTimeMs;
-                struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-                struct.lastFrameDurationMs = info.frameDurationMs;
-                // Feed the TimeMap so measurements can resolve playhead -> group.
-                // Only the first object of each group records (idempotent in TimeMap),
-                // and frame 0 of a group has decodeTime == group start PTS.
-                if (this.#timeMap) {
-                  this.#timeMap.recordGroupBoundary(
-                    Number(object.location.group),
-                    info.decodeTimeMs,
-                  );
-                }
-              }
-            }
+            const info =
+              timescale && timescale > 0
+                ? parseMoofMediaInfo(
+                    new Uint8Array(
+                      object.payload.buffer,
+                      object.payload.byteOffset,
+                      object.payload.byteLength,
+                    ),
+                    timescale,
+                  )
+                : undefined;
 
             if (struct.pendingInit) {
               const pi = struct.pendingInit;
@@ -1030,7 +1024,8 @@ export class Player {
             }
 
             if (struct.awaitKeyframe) {
-              if (object.location.object !== 0n) {
+              const isSync = info?.isSync ?? object.location.object === 0n;
+              if (!isSync) {
                 events.emit('DROP_STALE', {
                   track: objectTrackName,
                   current: struct.trackName,
@@ -1043,6 +1038,18 @@ export class Player {
                 return;
               }
               struct.awaitKeyframe = false;
+            }
+
+            if (info !== undefined) {
+              decodeTimeMs = info.decodeTimeMs;
+              struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
+              struct.lastFrameDurationMs = info.frameDurationMs;
+              // Feed the TimeMap so measurements can resolve playhead -> group.
+              // Only the first object of each group records (idempotent in TimeMap),
+              // and frame 0 of a group has decodeTime == group start PTS.
+              if (this.#timeMap) {
+                this.#timeMap.recordGroupBoundary(Number(object.location.group), info.decodeTimeMs);
+              }
             }
 
             // Append the data

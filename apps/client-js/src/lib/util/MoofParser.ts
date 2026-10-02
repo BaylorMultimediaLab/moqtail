@@ -34,7 +34,7 @@ export function parseMoofBaseMediaDecodeTime(
 export function parseMoofMediaInfo(
   buffer: Uint8Array,
   timescale: number,
-): { decodeTimeMs: number; frameDurationMs: number } | undefined {
+): { decodeTimeMs: number; frameDurationMs: number; isSync?: boolean } | undefined {
   if (timescale <= 0) return undefined;
 
   const moof = findBox(buffer, 0, buffer.byteLength, FOURCC_MOOF);
@@ -69,7 +69,21 @@ export function parseMoofMediaInfo(
   const sampleDurationTicks = view.getUint32(p, false);
   const frameDurationMs = (sampleDurationTicks * 1000) / timescale;
 
-  return { decodeTimeMs, frameDurationMs };
+  // Sync-sample flag of the (single) sample: per-sample flags if present, else
+  // first_sample_flags. Bit 16 is sample_is_non_sync_sample, so a keyframe has
+  // it clear. Undefined when neither field is present.
+  let isSync: boolean | undefined;
+  let flagsPos: number | undefined;
+  if (trunFlags & TRUN_FLAG_SAMPLE_FLAGS) {
+    flagsPos = p + 4 + (trunFlags & TRUN_FLAG_SAMPLE_SIZE ? 4 : 0);
+  } else if (trunFlags & TRUN_FLAG_FIRST_SAMPLE_FLAGS) {
+    flagsPos = trun.payloadStart + 8 + (trunFlags & TRUN_FLAG_DATA_OFFSET ? 4 : 0);
+  }
+  if (flagsPos !== undefined && flagsPos + 4 <= trun.payloadEnd) {
+    isSync = (view.getUint32(flagsPos, false) & 0x00010000) === 0;
+  }
+
+  return { decodeTimeMs, frameDurationMs, isSync };
 }
 
 function readTfdtMs(
@@ -108,6 +122,8 @@ const FOURCC_TRUN = 0x7472756e; // 'trun'
 const TRUN_FLAG_DATA_OFFSET = 0x000001;
 const TRUN_FLAG_FIRST_SAMPLE_FLAGS = 0x000004;
 const TRUN_FLAG_SAMPLE_DURATION = 0x000100;
+const TRUN_FLAG_SAMPLE_SIZE = 0x000200;
+const TRUN_FLAG_SAMPLE_FLAGS = 0x000400;
 
 /**
  * Scans ISOBMFF boxes in [start, end) for the first matching fourcc.

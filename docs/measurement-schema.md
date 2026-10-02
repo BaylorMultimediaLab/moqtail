@@ -161,7 +161,10 @@ catch-up stream) using the same helper; they must keep these names.
   plays through to the seam), `t5` = **switch_visibility_delay_ms**
   (`SWITCH_FIRST_FRAME`, the first presented frame past the seam) with
   **playback_position_jump_ms**, **viewer_pause_ms** and **seam_buffer_hole_ms**
-  measured at that crossing, plus **seam_dropped_source_frames** (source objects
+  measured at that crossing, plus **landed_on_keyframe** (the landing object's
+  moof carries the sync-sample flag; `landed_on_group_start` only says it was
+  object 0, which on the misaligned caches of 2026-09 was not a keyframe), plus
+  **seam_dropped_source_frames** (source objects
   discarded after landing because the relay kept delivering the source's
   in-progress group), **landed_on_group_start**, and **superseded** (a later
   switch landed before this seam was reached, so it was never visible). The names deliberately separate the buffer seam from the viewer's
