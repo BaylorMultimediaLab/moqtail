@@ -276,13 +276,76 @@ export function computeSwitchMinimumGroup(opts: {
   targetGroup: number | undefined;
   /** Latest group id received on the current track; -1n when none yet. */
   latestGroup: bigint;
-}): { minimumSwitchingGroupId: number; timeMapMiss: boolean } {
-  const naiveFloor = opts.latestGroup >= 0n ? Number(opts.latestGroup) + 1 : 0;
+  /**
+   * Highest group completely present in the element's buffered horizon ahead
+   * of the playhead (see highestCompleteBufferedGroup); undefined when unknown.
+   * The 'next-group' floor is 1 + max(latestGroup, bufferedGroup): transport
+   * progress alone is buffer-unaware, and after a catch-up has filled the
+   * element further ahead than the current subscription has delivered, a floor
+   * from latestGroup alone re-requests media the client already holds (and
+   * the relay then spends the link behind the playhead).
+   */
+  bufferedGroup?: number;
+}): {
+  minimumSwitchingGroupId: number;
+  timeMapMiss: boolean;
+  recvFloorGroup: number;
+  bufferFloorGroup: number | null;
+} {
+  const recvFloorGroup = opts.latestGroup >= 0n ? Number(opts.latestGroup) + 1 : 0;
+  const bufferFloorGroup = opts.bufferedGroup !== undefined ? opts.bufferedGroup + 1 : null;
+  const naiveFloor = Math.max(recvFloorGroup, bufferFloorGroup ?? 0);
+  const base = { recvFloorGroup, bufferFloorGroup };
   if (opts.switchFloor !== 'playhead')
-    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: false };
+    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: false, ...base };
   if (opts.targetGroup === undefined)
-    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: true };
-  return { minimumSwitchingGroupId: opts.targetGroup, timeMapMiss: false };
+    return { minimumSwitchingGroupId: naiveFloor, timeMapMiss: true, ...base };
+  return { minimumSwitchingGroupId: opts.targetGroup, timeMapMiss: false, ...base };
+}
+
+/**
+ * Highest group completely present in a buffered range that ends ahead of the
+ * playhead (the client's buffered horizon), or undefined when the TimeMap has
+ * no anchor or nothing complete is buffered ahead. A group counts as complete
+ * only when its whole [start, start + gop) lies inside one buffered range,
+ * with `tolMs` slack at both ends for the element's frame-boundary rounding;
+ * a group the range ends partway through is NOT counted, so a floor derived
+ * from this value re-requests exactly the missing tail and nothing more.
+ *
+ * Exported for unit testing.
+ */
+export function highestCompleteBufferedGroup(opts: {
+  /** Element TimeRanges as [startSeconds, endSeconds] pairs. */
+  ranges: Array<[number, number]>;
+  timeMap: {
+    gopDurationMs: number;
+    groupContainingPTS(pts_ms: number): number | undefined;
+    startPTSOfGroup(groupId: number): number | undefined;
+  };
+  playheadMs: number;
+  tolMs?: number;
+}): number | undefined {
+  const tol = opts.tolMs ?? 25;
+  const gop = opts.timeMap.gopDurationMs;
+  let best: number | undefined;
+  for (const [startS, endS] of opts.ranges) {
+    const s = startS * 1000;
+    const e = endS * 1000;
+    if (e <= opts.playheadMs) continue;
+    let g = opts.timeMap.groupContainingPTS(e - tol);
+    if (g === undefined) return undefined;
+    for (;;) {
+      const start = opts.timeMap.startPTSOfGroup(g);
+      if (start === undefined) return undefined;
+      if (start < s - tol) break; // the range begins inside this group: not complete
+      if (start + gop <= e + tol) {
+        best = best === undefined ? g : Math.max(best, g);
+        break;
+      }
+      g -= 1; // the range ends inside this group: try the one before it
+    }
+  }
+  return best;
 }
 
 /**
@@ -1957,14 +2020,45 @@ export class Player {
     if (this.#options.switchFloor === 'playhead' && this.#timeMap && playheadPTS_ms !== undefined) {
       targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
     }
-    const { minimumSwitchingGroupId, timeMapMiss } = computeSwitchMinimumGroup({
-      switchFloor: this.#options.switchFloor,
-      targetGroup,
-      latestGroup: videoStruct.lastGroupId,
-    });
+    // Buffer-aware floor: the highest group completely buffered ahead of the
+    // playhead, so the switch never re-requests media the element already holds.
+    const bufferedPairs: Array<[number, number]> = [];
+    const buffered = this.#element?.buffered;
+    if (buffered) {
+      for (let i = 0; i < buffered.length; i++)
+        bufferedPairs.push([buffered.start(i), buffered.end(i)]);
+    }
+    const bufferedGroup =
+      this.#timeMap && this.#timeMap.hasAnchor() && playheadPTS_ms !== undefined
+        ? highestCompleteBufferedGroup({
+            ranges: bufferedPairs,
+            timeMap: this.#timeMap,
+            playheadMs: playheadPTS_ms,
+            tolMs: (videoStruct.lastFrameDurationMs ?? 1000 / 30) / 2,
+          })
+        : undefined;
+    const { minimumSwitchingGroupId, timeMapMiss, recvFloorGroup, bufferFloorGroup } =
+      computeSwitchMinimumGroup({
+        switchFloor: this.#options.switchFloor,
+        targetGroup,
+        latestGroup: videoStruct.lastGroupId,
+        bufferedGroup,
+      });
     if (timeMapMiss) {
       logger.warn('media', 'playhead switch floor: TimeMap miss; falling through to next-group');
     }
+    events.emit('SWITCH_FLOOR', {
+      switch_floor: this.#options.switchFloor,
+      recv_floor_group: recvFloorGroup,
+      buffer_floor_group: bufferFloorGroup,
+      selected_min_group: minimumSwitchingGroupId,
+      playhead_group:
+        playheadPTS_ms !== undefined && this.#timeMap?.hasAnchor()
+          ? (this.#timeMap.groupContainingPTS(playheadPTS_ms) ?? null)
+          : null,
+      buffer_end_s: bufferedPairs.length ? bufferedPairs[bufferedPairs.length - 1][1] : null,
+      buffered_ranges: bufferedPairs.map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}`).join(','),
+    });
 
     // Per SWITCH PR #1378 the subscriber does NOT allocate a Request ID for a
     // SWITCH: the relay allocates the Request ID of the PUBLISH it opens for

@@ -124,8 +124,17 @@ implementation this document originally described:
 
 - The player's `switchFloor` option (URL `?switchFloor=next-group|playhead`,
   Settings panel "Switch Floor") chooses the SWITCH's Minimum Switching Group
-  ID: `next-group` names the boundary after the latest received group (the
-  switch lands as close to live as possible), `playhead` names the group the
+  ID: `next-group` names the boundary after the latest group the client holds,
+  `1 + max(last received group, highest group completely present in a buffered
+range ahead of the playhead)`, so the switch lands as close to live as
+  possible without re-requesting media the element already has. Until
+  2026-10-02 it used the last received group alone (buffer-unaware
+  minimum-switching-group selection): after a catch-up had filled the element
+  further ahead than the current subscription had delivered, the floor pointed
+  behind the playhead, the relay re-delivered buffered groups, and the link was
+  spent behind the playhead (a 9.4 s freeze on the fresh grid). The
+  `SWITCH_FLOOR` event records both candidate floors and the selection on
+  every switch. `playhead` names the group the
   player is currently showing (a time-shifted client switches at the point it
   is watching and re-fetches the buffered groups on the new track). The
   default is `next-group`. The chosen floor is recorded in the client's

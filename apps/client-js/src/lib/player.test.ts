@@ -3,7 +3,9 @@ import {
   buildSubscribeParameters,
   computeSwitchMinimumGroup,
   computeStartupTarget,
+  highestCompleteBufferedGroup,
 } from './player';
+import { TimeMap } from './abr/TimeMap';
 
 describe('buildSubscribeParameters', () => {
   it('returns undefined for live-edge mode', () => {
@@ -118,6 +120,104 @@ describe('computeSwitchMinimumGroup', () => {
     });
     expect(r.minimumSwitchingGroupId).toBe(0);
     expect(r.timeMapMiss).toBe(true);
+  });
+});
+
+describe('computeSwitchMinimumGroup (buffer-aware next-group)', () => {
+  it('takes 1 + max(latest received, highest complete buffered group)', () => {
+    const r = computeSwitchMinimumGroup({
+      switchFloor: 'next-group',
+      targetGroup: undefined,
+      latestGroup: 105n,
+      bufferedGroup: 108,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(109);
+    expect(r.recvFloorGroup).toBe(106);
+    expect(r.bufferFloorGroup).toBe(109);
+  });
+
+  it('keeps the transport floor when the buffer is behind or unknown', () => {
+    expect(
+      computeSwitchMinimumGroup({
+        switchFloor: 'next-group',
+        targetGroup: undefined,
+        latestGroup: 105n,
+        bufferedGroup: 100,
+      }).minimumSwitchingGroupId,
+    ).toBe(106);
+    const r = computeSwitchMinimumGroup({
+      switchFloor: 'next-group',
+      targetGroup: undefined,
+      latestGroup: 105n,
+    });
+    expect(r.minimumSwitchingGroupId).toBe(106);
+    expect(r.bufferFloorGroup).toBeNull();
+  });
+
+  it('does not change the playhead floor', () => {
+    expect(
+      computeSwitchMinimumGroup({
+        switchFloor: 'playhead',
+        targetGroup: 103,
+        latestGroup: 105n,
+        bufferedGroup: 108,
+      }).minimumSwitchingGroupId,
+    ).toBe(103);
+  });
+});
+
+describe('highestCompleteBufferedGroup', () => {
+  const tm = new TimeMap(1000);
+  tm.recordGroupBoundary(100, 100000);
+
+  it('counts only groups whose whole span is inside one range ahead of the playhead', () => {
+    // 109 is partially present (ends at 109.6): the highest complete group is 108.
+    expect(
+      highestCompleteBufferedGroup({ ranges: [[94, 109.6]], timeMap: tm, playheadMs: 108600 }),
+    ).toBe(108);
+    // Range end exactly on a boundary: 109 is complete.
+    expect(
+      highestCompleteBufferedGroup({ ranges: [[94, 110.0]], timeMap: tm, playheadMs: 108600 }),
+    ).toBe(109);
+    // Frame-boundary rounding within the tolerance still counts.
+    expect(
+      highestCompleteBufferedGroup({
+        ranges: [[94, 109.99]],
+        timeMap: tm,
+        playheadMs: 108600,
+        tolMs: 25,
+      }),
+    ).toBe(109);
+  });
+
+  it('uses the whole buffered horizon, ignoring ranges behind the playhead', () => {
+    expect(
+      highestCompleteBufferedGroup({
+        ranges: [
+          [13, 22.67],
+          [94, 109.6],
+          [111, 112],
+        ],
+        timeMap: tm,
+        playheadMs: 108600,
+      }),
+    ).toBe(111);
+    expect(
+      highestCompleteBufferedGroup({ ranges: [[13, 22.67]], timeMap: tm, playheadMs: 108600 }),
+    ).toBeUndefined();
+  });
+
+  it('is undefined when a range holds no complete group or the TimeMap has no anchor', () => {
+    expect(
+      highestCompleteBufferedGroup({ ranges: [[108.5, 109.6]], timeMap: tm, playheadMs: 108600 }),
+    ).toBeUndefined();
+    expect(
+      highestCompleteBufferedGroup({
+        ranges: [[94, 110]],
+        timeMap: new TimeMap(1000),
+        playheadMs: 100,
+      }),
+    ).toBeUndefined();
   });
 });
 
