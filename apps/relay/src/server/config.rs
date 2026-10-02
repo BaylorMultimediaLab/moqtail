@@ -78,6 +78,11 @@ pub struct Cli {
   /// Enable object logging
   #[arg(long, default_value_t = false)]
   pub enable_object_logging: bool,
+  /// Native SWITCH: forward the object that triggers promotion when it is at or
+  /// after the new start location (upstream never forwards it, so a client whose
+  /// target variant runs a group ahead of the source lands on object 1).
+  #[arg(long, default_value_t = false)]
+  pub forward_promotion_trigger: bool,
   /// Enable token logging
   #[arg(long, default_value_t = false)]
   pub enable_token_logging: bool,
@@ -170,6 +175,7 @@ pub struct AppConfig {
   pub cache_expiration_type: CacheExpirationType,
   pub cache_expiration_minutes: u64,
   pub enable_object_logging: bool,
+  pub forward_promotion_trigger: bool,
   pub enable_token_logging: bool,
   pub token_log_path: String,
   pub io_sockets: usize,
@@ -222,6 +228,7 @@ impl AppConfig {
       cache_expiration_type: cli.cache_expiration_type,
       cache_expiration_minutes: cli.cache_expiration_minutes,
       enable_object_logging: cli.enable_object_logging,
+      forward_promotion_trigger: cli.forward_promotion_trigger,
       enable_token_logging: cli.enable_token_logging,
       token_log_path: cli.token_log_path,
       io_sockets: cli.io_sockets,
@@ -380,6 +387,7 @@ mod tests {
       cache_expiration_type: CacheExpirationType::Ttl,
       cache_expiration_minutes: 30,
       enable_object_logging: false,
+      forward_promotion_trigger: false,
       enable_token_logging: false,
       token_log_path: "/tmp/moqtail_relay_tokens.csv".to_string(),
       io_sockets: 1,

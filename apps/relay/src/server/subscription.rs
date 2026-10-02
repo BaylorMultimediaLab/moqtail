@@ -805,6 +805,8 @@ impl Subscription {
         // if so, set this track as current
         let mut switch_at_next_group = false;
         let mut new_start_location = None;
+        // Whether the triggering object itself is forwarded (see below).
+        let mut forward_trigger = false;
 
         if let Some(current_track_name) = self.subscriber.switch_context.get_current().await {
           let current_subscription_opt = self
@@ -868,6 +870,18 @@ impl Subscription {
 
           state.end_group = 0; // remove end group limit
 
+          // Upstream returns false below for the triggering object too ("wait for
+          // the next group"), but when the target variant's group g reached the
+          // relay before the source's group g, the trigger IS object 0 of the start
+          // group, and dropping it makes the client land on object 1 and discard the
+          // whole group to the next keyframe. With --forward-promotion-trigger the
+          // trigger is forwarded whenever it is at or after the start location.
+          forward_trigger = self.config.forward_promotion_trigger
+            && state
+              .start_location
+              .as_ref()
+              .is_some_and(|start| object_location >= start);
+
           events::emit(
             "SWITCH_PROMOTED",
             serde_json::json!({
@@ -877,6 +891,7 @@ impl Subscription {
               "trigger_group": object_location.group,
               "trigger_object": object_location.object,
               "start_group": state.start_location.as_ref().map(|l| l.group),
+              "trigger_forwarded": forward_trigger,
             }),
           );
 
@@ -897,9 +912,10 @@ impl Subscription {
             self.subscription_state.write().await.forward = false;
           }
         }
-        // even if the switch_at_next_group is true,
-        // we return false here to wait for the next group to switch
-        false
+        // Even if switch_at_next_group is true, the triggering object is not
+        // forwarded (the switch starts at the next group) unless
+        // --forward-promotion-trigger applies and it is at/after the start.
+        forward_trigger
       }
       SwitchStatus::Current => true,
       SwitchStatus::None => {

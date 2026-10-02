@@ -453,6 +453,7 @@ mod tests_group_bounds {
       cache_expiration_type: CacheExpirationType::Ttl,
       cache_expiration_minutes: 30,
       enable_object_logging: false,
+      forward_promotion_trigger: false,
       enable_token_logging: false,
       token_log_path: String::new(),
       io_sockets: 1,
