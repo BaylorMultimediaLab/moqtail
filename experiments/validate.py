@@ -20,9 +20,12 @@ Checks (each PASS / FAIL / SKIP with the numbers behind it):
   join          for several groups G: publisher GROUP_EMIT(G) <= relay CACHE_GROUP(G)
                 <= client receipt of G (OBJECT_RECV with --log-objects, else the
                 THROUGHPUT_SAMPLE that finalises G), on the track the client was on
-  playback      the playhead advanced in at least half of the sample intervals,
-                never stood still longer than --max-freeze-s, and the MoQ session
-                was not destroyed by a failed switch
+  playback      the measurement stayed interpretable: the playhead never stood
+                still longer than --max-freeze-s WHILE PLAYABLE DATA EXISTED (a
+                player wedge), and the MoQ session was not destroyed by a failed
+                switch. A freeze with nothing to play is starvation, an outcome
+                of the system under test, and keeps the run valid however long
+                it lasts (the advancing fraction is reported, not judged)
   clean-worktree (--final only) the run was made from a committed tree
 
 Writes validation.json into the run directory; analyze.py excludes runs whose
@@ -195,13 +198,22 @@ def main() -> int:
             + ("" if by("OBJECT_RECV") else " (client side from THROUGHPUT_SAMPLE; use --log-objects for exact receipt)"))
 
     # playback ---------------------------------------------------------------
+    # A run is invalid when the experiment cannot be interpreted because the
+    # apparatus failed; it stays valid when the system under test performs badly,
+    # even catastrophically, as long as the measurement remains correct. So only
+    # a freeze WITH playable data (a player wedge) or a destroyed session fails
+    # this check; starvation of any length is a stall, not an exclusion.
     pb = summary.get("playback", {})
     frac = pb.get("advancing_fraction"); longest = pb.get("longest_no_progress_ms") or 0
+    wedged = pb.get("longest_frozen_with_data_ms")
+    if wedged is None:  # summary from an older analyzer: fall back to the raw freeze length
+        wedged = longest
     destroyed = summary.get("switches", {}).get("session_destroyed")
-    ok = frac is not None and frac >= 0.5 and longest <= args.max_freeze_s * 1000 and not destroyed
+    ok = frac is not None and wedged <= args.max_freeze_s * 1000 and not destroyed
     starved = (summary.get("starvation") or {}).get("total_ms") or 0
-    rep.add("playback", ok, f"playhead advancing in {fmt_pct(frac)} of sample intervals (need >= 50 %); longest no-progress "
-                            f"{longest / 1000:.1f} s (max {args.max_freeze_s:g}); session destroyed={destroyed}; "
+    rep.add("playback", ok, f"playhead advancing in {fmt_pct(frac)} of sample intervals (reported, not judged); longest no-progress "
+                            f"{longest / 1000:.1f} s, of which frozen with playable data {wedged / 1000:.1f} s (max {args.max_freeze_s:g}: "
+                            f"a player wedge is an apparatus failure, starvation is an outcome); session destroyed={destroyed}; "
                             f"data starved {starved / 1000:.1f} s")
 
     # worktree ---------------------------------------------------------------

@@ -202,6 +202,18 @@ catch-up stream) using the same helper; they must keep these names.
   index 4.
 - **Media errors** (`media_errors`): fatal media element errors
   (`MEDIA_ERROR`); one decode error ends useful playback for the run.
+- **Validity** (validate.py, `validation.json`): a run is invalid when the
+  experiment cannot be interpreted because the apparatus failed; it stays
+  valid when the system under test performs badly, even catastrophically, as
+  long as the measurement remains correct. The playback check therefore
+  fails only on a destroyed session or on **longest_frozen_with_data_ms**
+  above the limit (playhead not advancing while `buffer_s` >= 0.5 s or a
+  later buffered range existed: a player wedge). A freeze with nothing to
+  play is starvation and counts as a stall of that length
+  (`frozen_with_data_ms_total` is also reported so the apparatus share of a
+  run's stall time is visible). Before 2026-10-02 the check also required the
+  playhead to advance in half the intervals and never freeze over 10 s for
+  any reason, which would have hidden an 11.6 s native starvation.
 - **Data starvation** (`starvation`, column `data_starved_ms`): nothing was
   appended for 4 s while the buffer ahead of the playhead was empty
   (`DATA_STARVED`), until data flowed again or the run ended. A starving
