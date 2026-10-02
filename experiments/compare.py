@@ -32,6 +32,7 @@ ROWS = [
     ("stalled s", lambda s: s["stalls"]["total_ms"] / 1000),
     ("stall max ms", lambda s: s["stalls"]["max_ms"]),
     ("data starved s", lambda s: s["starvation"]["total_ms"] / 1000),
+    ("frozen with playable data s (apparatus)", lambda s: (s["playback"].get("frozen_with_data_ms_total") or 0) / 1000),
     ("range-jumps", lambda s: s["stalls"]["seeks"]["range-jump"]),
     ("range-jumps deferred", lambda s: s["stalls"]["range_jumps_deferred"]),
     ("down detection attributable (frac)", lambda s: 1 if s["reaction"].get("down_reliable") else 0),
