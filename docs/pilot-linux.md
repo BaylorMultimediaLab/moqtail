@@ -670,6 +670,30 @@ python3 scripts/realign_cache.py "$ENC"               # rewrites in place, keeps
 python3 scripts/check_cache.py "$ENC"                 # must end with "OK: every group starts with a keyframe and has one"
 ```
 
+### 11a. Fresh start
+
+Everything measured before the realignment is archived on the analysis
+machine, so the Linux results can go. In the terminal that runs batches:
+
+```sh
+# 1. stop whatever is running (Ctrl-C in its tmux window first), then clear leftovers
+pkill -f run_experiment.py; pkill -f target/release/relay; pkill -f target/release/publisher; pkill -f firefox; pkill -f vite
+sudo ip netns del moqc 2>/dev/null; sudo ip link del veth-moqh 2>/dev/null; true
+
+# 2. archive the old runs out of the way (or delete them; the bundles already sent are the record)
+cd ~/Documents/Baylor\ Research/moqtail
+mv results results-prealign-$(date +%Y%m%d) 2>/dev/null; mv logs logs-prealign-$(date +%Y%m%d) 2>/dev/null; rm -rf results-uncapped; mkdir -p results logs
+
+# 3. current code, realigned cache
+git fetch origin && git checkout harness && git reset --hard origin/harness
+export ENC=data/encoded/tears_of_steel_240s_1080p
+python3 scripts/check_cache.py "$ENC"
+python3 scripts/realign_cache.py "$ENC"
+python3 scripts/check_cache.py "$ENC"      # must end with OK
+
+# 4. validation, one run per client type (section 5), then the grid (section 8h) and the shift sweep (section 10)
+```
+
 Then section 5's two validation runs, then the grid again with the frozen
 controller (section 8h with `--repeat 5`, then the shift sweep of section
 10). Keep the earlier bundles: they are the record of how the controller was
