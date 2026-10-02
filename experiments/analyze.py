@@ -222,9 +222,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     bitrate_of = {t["track"]: (t.get("bitrate") or 0) for t in ladder}
 
     identity = meta.get("identity") or {}
+    clock = first(recs, "CLOCK_MAP")
+    ua = (clock or {}).get("user_agent") or ""
+    browser_version = next((ua[ua.index(k) + len(k):].split()[0] for k in ("Firefox/", "Chrome/") if k in ua), None)
     out: dict = {
         "run_id": meta.get("run_id", run.name),
         "identity": identity,
+        "browser_version": browser_version,
         "mechanism": identity.get("mechanism") or meta.get("args", {}).get("mechanism"),
         "mechanism_mode": identity.get("mechanism_mode"),
         "repeat_index": identity.get("repeat_index"),
@@ -812,6 +816,7 @@ def to_markdown(s: dict) -> str:
 
 
 IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups",
+                    "browser_version",
                     "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "background_flows",
                     "repeat_index", "timestamp_start"]
 METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down",
@@ -843,6 +848,8 @@ def agg_row(s: dict) -> dict:
     ident.setdefault("background_flows", s["bg_flows"])
     row = {k: ident.get(k) for k in IDENTITY_COLUMNS}
     row["controller_params"] = json.dumps(ident.get("controller_params") or {}, sort_keys=True)
+    # The browser build changed between batches once (Firefox 156 -> 157); keep it per run.
+    row["browser_version"] = s.get("browser_version")
     row.update({
         "startup_delay_ms": s["startup"]["startup_delay_ms"], "stall_count": s["stalls"]["count"],
         "stall_total_ms": s["stalls"]["total_ms"], "switch_count": s["switches"]["count"],
