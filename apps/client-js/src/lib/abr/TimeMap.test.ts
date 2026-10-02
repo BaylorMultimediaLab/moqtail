@@ -1,6 +1,19 @@
 import { describe, it, expect } from 'vitest';
 import { TimeMap } from './TimeMap';
 
+describe('TimeMap.startPTSOfGroup', () => {
+  it('extrapolates from the nearest recorded boundary at or below the group', () => {
+    const tm = new TimeMap(1000);
+    expect(tm.startPTSOfGroup(5)).toBeUndefined();
+    tm.recordGroupBoundary(10, 10000);
+    tm.recordGroupBoundary(20, 20500); // a later anchor with its own offset
+    expect(tm.startPTSOfGroup(10)).toBe(10000);
+    expect(tm.startPTSOfGroup(13)).toBe(13000);
+    expect(tm.startPTSOfGroup(22)).toBe(22500);
+    expect(tm.startPTSOfGroup(7)).toBe(7000); // before every anchor: backward from the earliest
+  });
+});
+
 describe('TimeMap', () => {
   it('returns the recorded group when PTS falls inside it', () => {
     const t = new TimeMap(1000);

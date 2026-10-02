@@ -421,6 +421,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     out["switches"] = {
         "count": len(switches),
         "superseded": sum(1 for s in switches if s["superseded"]),
+        # Landed more than half a GOP behind the playhead: the mechanism (re)delivered
+        # media the client had already played or buffered (buffer-unaware floor
+        # selection, catch-up fills). Observable for every mechanism.
+        "landed_behind_playhead": sum(
+            1 for s in switches
+            if s["seam_ahead_of_playhead_ms"] is not None
+            and s["seam_ahead_of_playhead_ms"] < -(client_meta.get("gop_duration_ms") or 1000) / 2),
         "up": sum(1 for s in switches if s["direction"] == "up"),
         "down": sum(1 for s in switches if s["direction"] == "down"),
         "failed": sum(1 for s in switches if s["error"]),
@@ -881,7 +888,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "switches_per_minute", "direction_reversals", "aba_reversals", "median_inter_switch_ms",
                   "cooldown_activations", "switch_delivery_latency_p50_ms", "switch_visibility_delay_p50_ms",
                   "media_seam_gap_p50_ms", "seam_ahead_p50_ms", "seam_buffer_hole_p50_ms", "seam_dropped_frames_p50",
-                  "landed_on_group_start", "landed_on_keyframe", "superseded", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
+                  "landed_on_group_start", "landed_on_keyframe", "superseded", "landed_behind_playhead", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
@@ -925,6 +932,7 @@ def agg_row(s: dict) -> dict:
         "seam_dropped_frames_p50": s["switches"]["seam_dropped_source_frames"].get("p50"),
         "landed_on_group_start": s["switches"]["landed_on_group_start"],
         "landed_on_keyframe": s["switches"]["landed_on_keyframe"],
+        "landed_behind_playhead": s["switches"].get("landed_behind_playhead"),
         "superseded": s["switches"]["superseded"],
         "abs_playback_jump_p95_ms": s["switches"]["abs_playback_position_jump_ms"].get("p95"),
         "viewer_pause_p95_ms": s["switches"]["viewer_pause_ms"].get("p95"),
