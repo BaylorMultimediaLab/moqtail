@@ -132,6 +132,27 @@ def seam_hole(fframe: dict | None, tol_ms: float = 100.0) -> float | None:
     return hole if presented - seam > tol_ms else 0
 
 
+def playable_data_ahead(sample: dict, min_buffer_s: float = 0.5, min_later_range_s: float = 0.1) -> bool:
+    """True when the SAMPLE shows data the player could have played: at least
+    `min_buffer_s` buffered ahead of the playhead, or a buffered range beginning
+    later than the playhead (a range-jump target). `buffered_ranges` is the
+    element's TimeRanges as "s-e,s-e" in seconds (empty/missing = unknown -> False)."""
+    if (sample.get("buffer_s") or 0) >= min_buffer_s:
+        return True
+    ranges = sample.get("buffered_ranges")
+    playhead_s = (sample.get("playhead_ms") or 0) / 1000
+    if not ranges:
+        return False
+    for part in str(ranges).split(","):
+        try:
+            start_s, end_s = (float(x) for x in part.split("-"))
+        except ValueError:
+            continue
+        if start_s > playhead_s + min_later_range_s and end_s - start_s >= min_later_range_s:
+            return True
+    return False
+
+
 def rule_name(rule_reason) -> str:
     """'latency trend 156% > 120%' -> 'latency trend'; 'throughput' -> 'throughput'."""
     if not rule_reason:
@@ -628,19 +649,33 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     }
     out["publisher"] = {"groups_emitted": len(by("GROUP_EMIT"))}
     # Playback progress: fraction of sample intervals in which the playhead
-    # advanced, and the longest stretch without progress.
+    # advanced, the longest stretch without progress, and the longest stretch
+    # without progress WHILE PLAYABLE DATA EXISTED (buffer ahead of the playhead,
+    # or a later buffered range the watchdog could jump to). The latter is a
+    # player wedge, i.e. an apparatus failure; a freeze with nothing to play is
+    # starvation, an outcome of the system under test, and is kept as a stall.
     prog_ok, prog_n, longest, run_start = 0, 0, 0.0, None
+    longest_with_data, with_data_total, data_start = 0.0, 0.0, None
     for a, b in zip(samples, samples[1:]):
         prog_n += 1
         if b.get("playhead_ms", 0) > a.get("playhead_ms", 0) + 1:
             prog_ok += 1
             run_start = None
+            data_start = None
         else:
             run_start = run_start if run_start is not None else a["ts"]
             longest = max(longest, b["ts"] - run_start)
+            if playable_data_ahead(a):
+                data_start = data_start if data_start is not None else a["ts"]
+                longest_with_data = max(longest_with_data, b["ts"] - data_start)
+                with_data_total += b["ts"] - a["ts"]
+            else:
+                data_start = None
     out["playback"] = {
         "advancing_fraction": (prog_ok / prog_n) if prog_n else None,
         "longest_no_progress_ms": longest,
+        "longest_frozen_with_data_ms": longest_with_data,
+        "frozen_with_data_ms_total": with_data_total,
         "presented_frames": samples[-1].get("total_frames") if samples else None,
     }
     # Delivery integrity (needs --log-objects): how many objects of each group the
@@ -799,7 +834,7 @@ def to_markdown(s: dict) -> str:
          f"| viewer pause at seam ms (median / p95) | {fmt(s['switches']['viewer_pause_ms'].get('p50'))} / {fmt(s['switches']['viewer_pause_ms'].get('p95'))} |",
          f"| seam buffer hole ms (median / max) | {fmt(s['switches']['seam_buffer_hole_ms'].get('p50'))} / {fmt(s['switches']['seam_buffer_hole_ms'].get('max'))} |",
          f"| switches superseded before visible; skipped (previous not landed) | {s['switches']['superseded']} of {s['switches']['count']}; {s['switches']['skipped_not_landed']} |",
-         f"| playback advancing fraction / longest no-progress s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} |",
+         f"| playback advancing fraction / longest no-progress s / longest frozen with playable data s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} / {fmt((s['playback'].get('longest_frozen_with_data_ms') or 0) / 1000)} |",
          f"| time to half shift (s) | {fmt((s['time_shift']['time_to_half_shift_ms'] or 0) / 1000) if s['time_shift']['time_to_half_shift_ms'] else '-'} |",
          f"| detection attributable (per change: quiet before t0 and t1 <= t2) | {s['detection_reliable']}; down t2/t4 {fmt(s['reaction']['down_t2_ms'])}/{fmt(s['reaction']['down_t4_ms'])} ms, up t2 {fmt(s['reaction']['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
          f"| seam dropped source frames (median / max); landed on object 0; landed on a keyframe (sync flag) | {fmt(s['switches']['seam_dropped_source_frames'].get('p50'))} / {fmt(s['switches']['seam_dropped_source_frames'].get('max'))}; {s['switches']['landed_on_group_start']} of {s['switches']['count']}; {s['switches']['landed_on_keyframe']} of {s['switches']['landed_on_keyframe_known']} known |",
@@ -848,7 +883,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "media_seam_gap_p50_ms", "seam_ahead_p50_ms", "seam_buffer_hole_p50_ms", "seam_dropped_frames_p50",
                   "landed_on_group_start", "landed_on_keyframe", "superseded", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
-                  "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "session_destroyed",
+                  "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
                   "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
                   "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
@@ -899,6 +934,7 @@ def agg_row(s: dict) -> dict:
         "time_to_half_shift_ms": s["time_shift"]["time_to_half_shift_ms"],
         "advancing_fraction": s["playback"]["advancing_fraction"],
         "longest_no_progress_ms": s["playback"]["longest_no_progress_ms"],
+        "longest_frozen_with_data_ms": s["playback"].get("longest_frozen_with_data_ms"),
         "session_destroyed": s["switches"]["session_destroyed"],
         "detection_reliable": s["detection_reliable"],
         "down_reaction_ms": s["reaction"]["down_reaction_ms"],
