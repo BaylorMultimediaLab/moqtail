@@ -645,6 +645,40 @@ ffmpeg -v error -i <init-of-720p> -i <group-82-of-720p> -f null - 2>&1 | head   
 If they are clean, the position is a coincidence of where the time-shifted
 client meets the capacity drop (media 82 s is run time 72 s with a 10 s shift).
 
+## 11. The cache was misaligned: check it, realign it, then re-measure
+
+Every batch so far lost at least one run to a decode error or a readyState-2
+freeze at a seam, and the per-object logs showed why: the publisher's encode
+path stamped each packet the encoder emitted with the decode time and the
+keyframe flag of the frame it had just _sent_, but x265 emits with a latency
+of about ten frames. Every cached group file therefore holds the last ten
+frames of the previous GOP followed by the first frames of its own; object 0
+is a P-frame and the IDR sits at packet 10. No switch mechanism can land on a
+keyframe at a group boundary with such a cache, `landed_on_group_start` does
+not mean "landed on a keyframe", and Firefox either skips to the next IDR
+(part of the seam holes) or fails (`MEDIA_ERR_DECODE`, the freezes). Both
+mechanisms were affected equally, so the comparison stands, but the absolute
+seam numbers of every Linux batch include this artifact.
+
+The encoder is fixed (packets are bucketed by their own pts and keyframe
+flag) and two tools exist. Stop any running batch first.
+
+```sh
+git fetch origin && git checkout harness && git reset --hard origin/harness
+python3 scripts/check_cache.py "$ENC"                 # expect PROBLEM lines: packet 0 not a random-access picture
+python3 scripts/realign_cache.py "$ENC"               # rewrites in place, keeps $ENC.bak
+python3 scripts/check_cache.py "$ENC"                 # must end with "OK: every group starts with a keyframe and has one"
+```
+
+Then section 5's two validation runs, then the grid again with the frozen
+controller (section 8h with `--repeat 5`, then the shift sweep of section
+10). Keep the earlier bundles: they are the record of how the controller was
+fixed, and the controller findings (buffer sawtooth, probe load, latency
+trend, switch history) do not depend on keyframe alignment. The seam and
+stall numbers for the paper come from the realigned runs only, and
+`identity` tells them apart by `git_sha` (realigned runs are at or after the
+commit that added this section).
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
