@@ -703,6 +703,73 @@ stall numbers for the paper come from the realigned runs only, and
 `identity` tells them apart by `git_sha` (realigned runs are at or after the
 commit that added this section).
 
+### 11b. The fresh grid (2026-10-02) and the native promotion defect
+
+`results-linux-2026-10-01/fresh-grid` (step_down_up, controller `grid`, 5
+reps per cell, 19 of 20 valid; one native time-shifted run starved for
+11.6 s after it had consumed its shift and was excluded by the playback
+check). First batch on the realigned cache, and the first with
+`landed_on_keyframe` read from each landing object's moof:
+
+| condition (ctl grid)      | sw/min | landed on a keyframe | stalled s | viewer pause p95 ms | seam hole p50 ms | mean rung | shift kept (last 60 s) |
+| ------------------------- | ------ | -------------------- | --------- | ------------------- | ---------------- | --------- | ---------------------- |
+| native, live-edge         | 20     | 0.41                 | 22        | 2019                | 0 (max 3000)     | 1.54      | 1.2 s                  |
+| native, time-shifted 10 s | 15     | 0.40                 | 16        | 1888                | 458 (max 8958)   | 2.51      | 1.7 s                  |
+| pr1378 next-group, live   | 17     | 1.00                 | 0.17      | 42                  | 0                | 2.29      | 1.1 s                  |
+| pr1378 next-group, 10 s   | 10     | 1.00                 | 0.04      | 46                  | 0 (max 958)      | 3.22      | 11 s                   |
+
+pr1378 lands on object 0 and on a keyframe every time, with no stall worth
+the name. Native lands on object 1 in 60 % of switches, and the sync flag
+confirms object 1 is never a keyframe, so the player discards the rest of
+that group (`DROP_STALE` pre-keyframe, 23 objects) and the seam is a 1 s
+hole: a ~1 s viewer pause at the live edge, a 1 s range-jump when
+time-shifted. Relay `SWITCH_PROMOTED` records show exactly when: upstream's
+`check_switch_context` promotes on the first object of the target track
+whose group is >= the source's last sent group and sets the start location
+to (source last sent group + 1, object 0). When the target variant's group g
+reaches the relay before the source's group g (half the time; the variants
+are encoded and published independently), the trigger is object 0 of group
+g and the start location is group g itself, and the code still returns
+"do not forward" for the triggering object ("wait for the next group"). The
+client's first object is then object 1. When the source is level with the
+target, the trigger is one group early, the start is the next group, and
+the landing is object 0 a second later.
+
+This is an upstream implementation defect, not the mechanism's design (the
+intent is clearly "start at the group boundary"), so it is measured both
+ways: `--mechanism native` is upstream as shipped; `--mechanism native
+--mechanism-mode forward-trigger` adds `--forward-promotion-trigger` to the
+relay (switch/native only), which forwards the triggering object when it is
+at or after the start location. `SWITCH_PROMOTED.trigger_forwarded` records
+which happened. Run the fixed arm next to the as-shipped grid before the
+remaining section 10 batches (10 runs, ~70 min):
+
+```sh
+cd ~/Documents/Baylor\ Research/moqtail && export ENC=data/encoded/tears_of_steel_240s_1080p
+git fetch origin && git checkout switch/native && git reset --hard origin/switch/native
+for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+  sudo -v
+  python3 experiments/run_experiment.py --mechanism native --mechanism-mode forward-trigger $client --controller grid \
+      --profile experiments/profiles/step_down_up.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 5 --final
+done
+bash experiments/pack_results.sh results fresh-native-ft.tar.gz
+```
+
+Then the section 10 batches; to include the fixed native arm there, add
+`native-ft` to `run_batch`'s branch loop with
+`mech="--mechanism native --mechanism-mode forward-trigger"` on branch
+`switch/native`.
+
+Two measurement notes from this batch. `seam_buffer_hole_ms` was reading
+the hole behind the presented frame's buffered range, which after a native
+object-1 landing is still in the buffer a switch later, so keyframe
+landings were charged a 1 s hole they did not cause; the player now reports
+that raw value as `buffer_hole_behind_ms` and both it and the analyzer
+attribute a hole to the seam only when the first presented frame skipped
+past it (the table above is after re-analysis). And the detection
+attribution flag is still false on three of four cells, so the t0->t2
+numbers are still not reportable (section 10d stands).
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

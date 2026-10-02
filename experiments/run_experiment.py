@@ -49,7 +49,12 @@ from net import BackgroundFlows, Shape, make_backend  # noqa: E402
 
 # Mechanism label -> the modes it accepts (empty = takes none), the branch it
 # runs on, and the player URL parameter that selects the mode.
-MECHANISM_MODES = {"native": set(), "pr1378": {"next-group", "playhead"}, "switch-from": {"hard", "soft"}}
+MECHANISM_MODES = {"native": {"forward-trigger"}, "pr1378": {"next-group", "playhead"}, "switch-from": {"hard", "soft"}}
+# Mechanisms whose mode is optional: no mode = the mechanism as shipped upstream.
+# native/forward-trigger is the one-line relay fix for the promotion defect found on
+# the fresh grid (docs/pilot-linux.md 11b): upstream drops the promotion-triggering
+# object even when it is object 0 of the start group, so the client lands on object 1.
+MECHANISM_MODE_OPTIONAL = {"native"}
 MECHANISM_BRANCH = {"native": "switch/native", "pr1378": "switch/pr1378", "switch-from": "switch/pr1674"}
 MECHANISM_URL_PARAM = {"native": None, "pr1378": "switchFloor", "switch-from": "switchFromMode"}
 
@@ -435,10 +440,11 @@ def main() -> int:
     args = ap.parse_args()
 
     modes = MECHANISM_MODES[args.mechanism]
-    if modes and args.mechanism_mode not in modes:
+    if args.mechanism_mode is not None and args.mechanism_mode not in modes:
+        ap.error(f"--mechanism {args.mechanism} takes --mechanism-mode one of {sorted(modes)}"
+                 + (" (or none)" if args.mechanism in MECHANISM_MODE_OPTIONAL else ""))
+    if args.mechanism_mode is None and modes and args.mechanism not in MECHANISM_MODE_OPTIONAL:
         ap.error(f"--mechanism {args.mechanism} needs --mechanism-mode one of {sorted(modes)}")
-    if not modes and args.mechanism_mode is not None:
-        ap.error(f"--mechanism {args.mechanism} takes no --mechanism-mode")
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
     if args.final and worktree_dirty():
         ap.error("--final requires a clean git worktree (commit or stash first)")
@@ -507,6 +513,10 @@ def run_once(args, repeat_index: int) -> int:
             # --log-objects: the relay logs OBJECT_SENT per object handed to a subscriber
             # (and its per-subscription object files under relay-logs/).
             *(["--enable-object-logging"] if args.log_objects else []),
+            # native/forward-trigger: relay forwards the promotion-triggering object when it
+            # is at or after the start location (switch/native only; other relays lack the flag).
+            *(["--forward-promotion-trigger"]
+              if args.mechanism == "native" and args.mechanism_mode == "forward-trigger" else []),
         ], out / "relay.log")
         time.sleep(1.5)
 
@@ -560,7 +570,7 @@ def run_once(args, repeat_index: int) -> int:
                f"&relay=https://{backend.relay_host}:{args.relay_port}")
         if args.log_objects:
             url += "&logObjects=1"
-        if args.mechanism_mode:
+        if args.mechanism_mode and MECHANISM_URL_PARAM[args.mechanism]:
             url += f"&{MECHANISM_URL_PARAM[args.mechanism]}={args.mechanism_mode}"
         for k, v in controller_params(args).items():
             url += f"&{k}={v}"
