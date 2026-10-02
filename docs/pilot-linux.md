@@ -567,6 +567,22 @@ Pack each batch separately (`pack_results.sh results <name>.tar.gz`) and
 send it; `analyze.py --stats` and `compare.py` pool by condition, so the
 batches can be analysed together at the end.
 
+### 10a. Shift-depth results so far (2026-10-02)
+
+| time shift | native stalled s / retained s / kbps | pr1378 stalled s / retained s / kbps |
+| ---------- | ------------------------------------ | ------------------------------------ |
+| 5 s        | 17 / 1.7 / 1454 (n=4)                | 7.2 / 4.6 / 1924 (n=5)               |
+| 10 s       | 24 / 1.5 / 1514 (n=6)                | 12 / 4.9 / 1647 (n=5)                |
+| 20 s       | 3.4 / 6.5 / 1861 (n=5)               | 0.16 / 20 / 1513 (n=3)               |
+
+At 20 s the buffer carries both clients through the 60 s drop (native's seam
+holes become invisible: pause p95 42 ms). The two invalid pr1378 20 s runs
+froze at holes 10–20 s ahead of the playhead: the stream reset on switch had
+discarded the source's last groups below the seam. The pr1378 relay now
+resets only streams at or above the seam and finishes the rest; the 20 s
+pr1378 condition needs two more repetitions (`--repeat 2 --repeat-start 5`)
+after `git reset --hard origin/switch/pr1378`.
+
 ### 10b. The third mechanism: SWITCH_FROM (switch/pr1674)
 
 `switch/pr1674` carries the harness and the frozen controller but has never
