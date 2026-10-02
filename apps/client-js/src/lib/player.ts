@@ -1508,18 +1508,21 @@ export class Player {
           const pauseMs = prevNowMs !== undefined ? Math.max(0, now - prevNowMs - frameMs) : null;
           const targetTrack = struct.postSwitchToTrack;
           // Ground truth for the seam: the hole in the element's buffered ranges
-          // just before the range that holds the presented frame (0 = the seam
-          // lies inside one contiguous range). This is what a range-jump seek
-          // crosses; the parsed-PTS gap above cannot see frames the decoder
-          // never presented.
+          // at the seam (0 = the seam lies inside one contiguous range). This is
+          // what a range-jump seek crosses; the parsed-PTS gap above cannot see
+          // frames the decoder never presented. The hole behind the presented
+          // frame's range counts only when that range begins at or after the
+          // seam; otherwise it is an older hole still sitting in the buffer, and
+          // the seam itself was contiguous. The raw value stays available as
+          // buffer_hole_behind_ms.
           let bufferHoleMs: number | null = null;
+          let bufferHoleBehindMs: number | null = null;
           const ranges = this.#element.buffered;
           for (let i = 0; i < ranges.length; i++) {
-            if (
-              ranges.start(i) * 1000 - frameMs <= mediaMs &&
-              mediaMs <= ranges.end(i) * 1000 + frameMs
-            ) {
-              bufferHoleMs = i > 0 ? (ranges.start(i) - ranges.end(i - 1)) * 1000 : 0;
+            const startMs = ranges.start(i) * 1000;
+            if (startMs - frameMs <= mediaMs && mediaMs <= ranges.end(i) * 1000 + frameMs) {
+              bufferHoleBehindMs = i > 0 ? startMs - ranges.end(i - 1) * 1000 : 0;
+              bufferHoleMs = startMs >= seam - frameMs / 2 ? bufferHoleBehindMs : 0;
               break;
             }
           }
@@ -1532,6 +1535,7 @@ export class Player {
             playback_position_jump_ms: jumpMs,
             viewer_pause_ms: pauseMs,
             seam_buffer_hole_ms: bufferHoleMs,
+            buffer_hole_behind_ms: bufferHoleBehindMs,
           });
 
           if (typeof window !== 'undefined' && window.__moqtailMetrics) {

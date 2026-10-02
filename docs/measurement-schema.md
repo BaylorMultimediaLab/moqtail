@@ -161,7 +161,11 @@ catch-up stream) using the same helper; they must keep these names.
   plays through to the seam), `t5` = **switch_visibility_delay_ms**
   (`SWITCH_FIRST_FRAME`, the first presented frame past the seam) with
   **playback_position_jump_ms**, **viewer_pause_ms** and **seam_buffer_hole_ms**
-  measured at that crossing, plus **landed_on_keyframe** (the landing object's
+  measured at that crossing (the client reports the hole behind the presented
+  frame's buffered range as `buffer_hole_behind_ms`; the analyzer attributes it
+  to this seam only when the first presented frame is more than 100 ms past
+  the seam PTS, otherwise an older hole was still sitting in the buffer and
+  the seam itself was contiguous), plus **landed_on_keyframe** (the landing object's
   moof carries the sync-sample flag; `landed_on_group_start` only says it was
   object 0, which on the misaligned caches of 2026-09 was not a keyframe), plus
   **seam_dropped_source_frames** (source objects
