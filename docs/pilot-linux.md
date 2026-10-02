@@ -706,15 +706,13 @@ commit that added this section).
 ### 11b. The fresh grid (2026-10-02) and the native promotion defect
 
 `results-linux-2026-10-01/fresh-grid` (step_down_up, controller `grid`, 5
-reps per cell, 19 of 20 valid; one native time-shifted run starved for
-11.6 s after it had consumed its shift and was excluded by the playback
-check). First batch on the realigned cache, and the first with
-`landed_on_keyframe` read from each landing object's moof:
+reps per cell, 20 of 20 valid). First batch on the realigned cache, and the
+first with `landed_on_keyframe` read from each landing object's moof:
 
 | condition (ctl grid)      | sw/min | landed on a keyframe | stalled s | viewer pause p95 ms | seam hole p50 ms | mean rung | shift kept (last 60 s) |
 | ------------------------- | ------ | -------------------- | --------- | ------------------- | ---------------- | --------- | ---------------------- |
 | native, live-edge         | 20     | 0.41                 | 22        | 2019                | 0 (max 3000)     | 1.54      | 1.2 s                  |
-| native, time-shifted 10 s | 15     | 0.40                 | 16        | 1888                | 458 (max 8958)   | 2.51      | 1.7 s                  |
+| native, time-shifted 10 s | 15     | 0.37                 | 16        | 1903                | 0 (max 8958)     | 2.20      | 1.6 s                  |
 | pr1378 next-group, live   | 17     | 1.00                 | 0.17      | 42                  | 0                | 2.29      | 1.1 s                  |
 | pr1378 next-group, 10 s   | 10     | 1.00                 | 0.04      | 46                  | 0 (max 958)      | 3.22      | 11 s                   |
 
@@ -759,6 +757,43 @@ Then the section 10 batches; to include the fixed native arm there, add
 `native-ft` to `run_batch`'s branch loop with
 `mech="--mechanism native --mechanism-mode forward-trigger"` on branch
 `switch/native`.
+
+**Validity rule.** The validator first excluded one native time-shifted
+rep for a 10.3 s freeze (the old rule: playhead advancing in half the
+intervals, never still for 10 s). Inspection showed no apparatus fault:
+one session, no media error, no logging gap, processes alive, the watchdog
+correctly reporting "frozen at the buffered end, nothing later to play".
+The client had consumed its shift, dropped to 240p at the live edge, asked
+for 480p, and then starved for 11.6 s while the 1.5 Mbps link carried
+1.34 Mbps of the abandoned 720p/1080p groups (83-90) that the relay kept
+delivering and the client discarded; the promoted 480p objects queued
+behind them. That is the native mechanism's lack of source cancellation,
+a real outcome, and excluding it would have flattered native. The rule is
+now: a run is invalid when the experiment cannot be interpreted because
+the apparatus failed (destroyed session, or the playhead frozen over 10 s
+_while playable data existed_: a player wedge); it stays valid however
+badly the system under test performs. Re-validated under that rule all 20
+runs pass, and native time-shifted starvation is systematic: 4 of 5 reps,
+6.3-11.6 s each, all after the shift was consumed. `analyze.py` reports
+`longest_frozen_with_data_ms` and `frozen_with_data_ms_total` so the
+apparatus share of any stall time stays visible (0.0-0.8 s here, the
+watchdog's own 3-6 s reaction windows at most).
+
+**A pr1378 finding from the same inspection.** The one long pr1378 stall
+(9.4 s, time-shifted rep 0, after the shift was consumed) is a different
+mechanism: the client's `next-group` floor is "last received group of the
+current subscription + 1", and after an earlier catch-up had filled the
+element buffer to 109.6 s while the current 1080p subscription lagged at
+group 105, the 1080p -> 240p switch asked for Minimum Switching Group 106,
+behind the playhead at 108.6. The relay re-delivered groups 106-109 (already
+buffered), the ABR flipped back to 1080p with floor 107 (2.7 s per group on
+1.5 Mbps), and the playhead sat at the buffered end for 9.4 s while the
+link carried content behind it. 5 of 156 pr1378 time-shifted switches
+landed more than 0.5 s behind the playhead (0 on the live edge, 0 for
+native). The clean fix is floor = max(last received group, group holding
+the buffered end) + 1, i.e. never re-request what is already in the
+buffer; it changes the pr1378 client, so the pr1378 cells would need a
+re-run. Not applied yet: decide before the remaining batches.
 
 Two measurement notes from this batch. `seam_buffer_hole_ms` was reading
 the hole behind the presented frame's buffered range, which after a native
