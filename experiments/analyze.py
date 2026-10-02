@@ -117,6 +117,21 @@ def first(recs: list[dict], event: str, after: float = -1, pred=None) -> dict | 
 RULE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z \-]*?(?=\s*[\d≥>=<(]|$)")
 
 
+def seam_hole(fframe: dict | None, tol_ms: float = 100.0) -> float | None:
+    """Buffer hole attributable to this seam: the reported hole when the first presented frame
+    after the seam lies more than `tol_ms` past the seam PTS, else 0 (the hole behind the
+    presented range is then an older one that playback already crossed or will cross later)."""
+    if not fframe:
+        return None
+    hole = fframe.get("seam_buffer_hole_ms")
+    if hole is None:
+        return None
+    seam, presented = fframe.get("seam_pts_ms"), fframe.get("presented_pts_ms")
+    if seam is None or presented is None:
+        return hole
+    return hole if presented - seam > tol_ms else 0
+
+
 def rule_name(rule_reason) -> str:
     """'latency trend 156% > 120%' -> 'latency trend'; 'throughput' -> 'throughput'."""
     if not rule_reason:
@@ -360,7 +375,11 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             # Wall-clock pause at the seam beyond one frame period.
             "viewer_pause_ms": fframe.get("viewer_pause_ms") if fframe else None,
             # Hole in the element's buffered ranges at the seam (what a range-jump seek crosses).
-            "seam_buffer_hole_ms": fframe.get("seam_buffer_hole_ms") if fframe else None,
+            # The client reports the hole just behind the presented frame's range, which can be
+            # an older hole still in the buffer; attribute it to this seam only when the first
+            # presented frame is later than the seam itself (something at the seam was skipped).
+            "seam_buffer_hole_ms": seam_hole(fframe),
+            "buffer_hole_behind_ms": fframe.get("seam_buffer_hole_ms") if fframe else None,
             # Whether the target began on object 0 of its group (its keyframe).
             "landed_on_group_start": applied.get("landed_on_group_start") if applied else None,
             # Whether the landing object's moof carries the sync-sample flag (a real keyframe).
