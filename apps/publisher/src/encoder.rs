@@ -565,7 +565,7 @@ fn encode_blocking(
     height,
     scaled_rx,
     on_gop,
-    |enc, gop, seq| encode_gop_sw(enc, gop, width, height, framerate, seq),
+    |enc, gop| encode_gop_sw(enc, gop, width, height, framerate),
   )
 }
 
@@ -630,7 +630,7 @@ fn encode_blocking_vaapi(
     height,
     scaled_rx,
     on_gop,
-    |enc, gop, seq| encode_gop_vaapi(enc, gop, width, height, framerate, frames_ctx_raw, seq),
+    |enc, gop| encode_gop_vaapi(enc, gop, width, height, framerate, frames_ctx_raw),
   )
 }
 
@@ -673,11 +673,9 @@ fn encode_gop_vaapi(
   height: u32,
   framerate: f64,
   frames_ctx: *mut ffmpeg_next::sys::AVBufferRef,
-  sequence_number: &mut u32,
-) -> Result<EncodedGop> {
+) -> Result<Vec<RawPacket>> {
   let gop_frames = gop_size(framerate) as u64;
-  let sample_duration = (TIMESCALE as f64 / framerate).round() as u32;
-  let mut encoded_packets = Vec::with_capacity(gop.frames.len());
+  let mut out = Vec::with_capacity(gop.frames.len());
 
   for (frame_idx, frame_data) in gop.frames.iter().enumerate() {
     // VAAPI frames context uses NV12 sw_format (required by AMD driver).
@@ -687,28 +685,9 @@ fn encode_gop_vaapi(
     let is_keyframe = frame_idx == 0;
 
     upload_and_send_vaapi(encoder, &sw_frame, frames_ctx, global_frame, is_keyframe)?;
-
-    let mut packet = ffmpeg_next::Packet::empty();
-    while encoder.receive_packet(&mut packet).is_ok() {
-      let raw = packet.data().unwrap_or(&[]);
-      let hvcc_data = cmaf::annex_b_to_hvcc(raw);
-      let decode_time = global_frame * sample_duration as u64;
-      let chunk = cmaf::wrap_cmaf_chunk(
-        *sequence_number,
-        decode_time,
-        sample_duration,
-        is_keyframe,
-        &hvcc_data,
-      );
-      *sequence_number += 1;
-      encoded_packets.push(chunk);
-    }
+    drain_packets(encoder, &mut out);
   }
-
-  Ok(EncodedGop {
-    group_id: gop.gop_id,
-    packets: encoded_packets,
-  })
+  Ok(out)
 }
 
 // ── Software encode path ─────────────────────────────────────────────────────
@@ -719,45 +698,97 @@ fn encode_gop_sw(
   width: u32,
   height: u32,
   framerate: f64,
-  sequence_number: &mut u32,
-) -> Result<EncodedGop> {
+) -> Result<Vec<RawPacket>> {
   let gop_frames = gop_size(framerate) as u64;
-  let sample_duration = (TIMESCALE as f64 / framerate).round() as u32;
-  let mut encoded_packets = Vec::with_capacity(gop.frames.len());
+  let mut out = Vec::with_capacity(gop.frames.len());
 
   for (frame_idx, frame_data) in gop.frames.iter().enumerate() {
     let mut video_frame = yuv420p_to_video_frame(frame_data, width, height);
     let global_frame = gop.gop_id * gop_frames + frame_idx as u64;
     video_frame.set_pts(Some(global_frame as i64));
 
-    let is_keyframe = frame_idx == 0;
-    if is_keyframe {
+    if frame_idx == 0 {
       video_frame.set_kind(ffmpeg_next::util::picture::Type::I);
     }
 
     encoder.send_frame(&video_frame)?;
-
-    let mut packet = ffmpeg_next::Packet::empty();
-    while encoder.receive_packet(&mut packet).is_ok() {
-      let raw = packet.data().unwrap_or(&[]);
-      let hvcc_data = cmaf::annex_b_to_hvcc(raw);
-      let decode_time = global_frame * sample_duration as u64;
-      let chunk = cmaf::wrap_cmaf_chunk(
-        *sequence_number,
-        decode_time,
-        sample_duration,
-        is_keyframe,
-        &hvcc_data,
-      );
-      *sequence_number += 1;
-      encoded_packets.push(chunk);
-    }
+    drain_packets(encoder, &mut out);
   }
+  Ok(out)
+}
 
-  Ok(EncodedGop {
-    group_id: gop.gop_id,
-    packets: encoded_packets,
-  })
+/// One encoded access unit as the encoder emitted it, identified by ITS OWN
+/// presentation timestamp (the global frame index we set on the input frame)
+/// and keyframe flag. The encoder emits with a latency of several frames, so
+/// the packet that comes out while frame f goes in is not frame f; stamping
+/// it with f's time and keyframe flag (the previous behaviour) produced caches
+/// where every group file started with the tail of the previous GOP and the
+/// IDR sat at packet D.
+pub struct RawPacket {
+  pub pts: u64,
+  pub is_keyframe: bool,
+  pub hvcc: Vec<u8>,
+}
+
+fn drain_packets(encoder: &mut encoder::Video, out: &mut Vec<RawPacket>) {
+  let mut packet = ffmpeg_next::Packet::empty();
+  while encoder.receive_packet(&mut packet).is_ok() {
+    let raw = packet.data().unwrap_or(&[]);
+    out.push(RawPacket {
+      pts: packet.pts().unwrap_or(0).max(0) as u64,
+      is_keyframe: packet
+        .flags()
+        .contains(ffmpeg_next::codec::packet::Flags::KEY),
+      hvcc: cmaf::annex_b_to_hvcc(raw),
+    });
+  }
+}
+
+/// Groups raw packets by `pts / gop_frames`, wraps each as a CMAF chunk with
+/// the decode time derived from its own pts, and returns every GOP whose
+/// frame count is complete (or everything when `flush` is set), in order.
+/// Packets of later GOPs stay in `pending` until theirs completes.
+pub(crate) fn complete_gops(
+  pending: &mut std::collections::BTreeMap<u64, Vec<RawPacket>>,
+  frames_of: &std::collections::HashMap<u64, usize>,
+  gop_frames: u64,
+  sample_duration: u32,
+  sequence_number: &mut u32,
+  flush: bool,
+) -> Vec<EncodedGop> {
+  let mut done = Vec::new();
+  let ready: Vec<u64> = pending
+    .iter()
+    .filter(|(gid, pk)| flush || frames_of.get(gid).is_some_and(|&n| pk.len() >= n))
+    .map(|(gid, _)| *gid)
+    .collect();
+  for gid in ready {
+    // Only emit in order: an earlier incomplete GOP blocks the later ones.
+    if !flush && pending.keys().next() != Some(&gid) {
+      break;
+    }
+    let mut packets = pending.remove(&gid).unwrap_or_default();
+    packets.sort_by_key(|p| p.pts);
+    let chunks = packets
+      .into_iter()
+      .map(|p| {
+        let chunk = cmaf::wrap_cmaf_chunk(
+          *sequence_number,
+          p.pts * sample_duration as u64,
+          sample_duration,
+          p.is_keyframe || p.pts % gop_frames == 0,
+          &p.hvcc,
+        );
+        *sequence_number += 1;
+        chunk
+      })
+      .collect();
+    done.push(EncodedGop {
+      group_id: gid,
+      packets: chunks,
+    });
+  }
+  done
 }
 
 // ── Shared encode loop ───────────────────────────────────────────────────────
@@ -774,62 +805,70 @@ fn run_encode_loop<F>(
   encode_one_gop: F,
 ) -> Result<()>
 where
-  F: Fn(&mut encoder::Video, &ScaledGop, &mut u32) -> Result<EncodedGop>,
+  F: Fn(&mut encoder::Video, &ScaledGop) -> Result<Vec<RawPacket>>,
 {
-  let mut pending_last_gop: Option<EncodedGop> = None;
+  let gop_frames = gop_size(framerate) as u64;
+  let sample_duration = (TIMESCALE as f64 / framerate).round() as u32;
   let mut sequence_number: u32 = 0;
+  // Packets are bucketed by the GOP their own pts belongs to; a GOP is sent
+  // once the encoder has emitted all of its frames (the encoder's latency
+  // means that happens while the next GOP is being fed).
+  let mut pending: std::collections::BTreeMap<u64, Vec<RawPacket>> = Default::default();
+  let mut frames_of: std::collections::HashMap<u64, usize> = Default::default();
 
   while let Some(gop) = scaled_rx.blocking_recv() {
-    let encoded = encode_one_gop(encoder, &gop, &mut sequence_number)?;
-
-    if let Some(previous) = pending_last_gop.replace(encoded)
-      && on_gop.blocking_send(previous).is_err()
-    {
-      warn!("Encoder: receiver dropped, stopping");
-      return Ok(());
+    frames_of.insert(gop.gop_id, gop.frames.len());
+    for p in encode_one_gop(encoder, &gop)? {
+      pending.entry(p.pts / gop_frames).or_default().push(p);
+    }
+    for done in complete_gops(
+      &mut pending,
+      &frames_of,
+      gop_frames,
+      sample_duration,
+      &mut sequence_number,
+      false,
+    ) {
+      if on_gop.blocking_send(done).is_err() {
+        warn!("Encoder: receiver dropped, stopping");
+        return Ok(());
+      }
     }
   }
 
-  // Flush frames buffered inside the encoder and attach trailing packets to
-  // the final GOP before sending it downstream.
+  // Flush the frames still buffered inside the encoder; they complete the
+  // last GOPs.
   encoder.send_eof()?;
-  let sample_duration = (TIMESCALE as f64 / framerate).round() as u32;
-  let mut flushed_packets = Vec::new();
-  let mut packet = ffmpeg_next::Packet::empty();
-  while encoder.receive_packet(&mut packet).is_ok() {
-    let raw = packet.data().unwrap_or(&[]);
-    let hvcc_data = cmaf::annex_b_to_hvcc(raw);
-    let pts = packet.pts().unwrap_or(0) as u64;
-    let decode_time = pts * sample_duration as u64;
-    let chunk = cmaf::wrap_cmaf_chunk(
-      sequence_number,
-      decode_time,
-      sample_duration,
-      false,
-      &hvcc_data,
-    );
-    sequence_number += 1;
-    flushed_packets.push(chunk);
+  let mut tail = Vec::new();
+  drain_packets(encoder, &mut tail);
+  for p in tail {
+    pending.entry(p.pts / gop_frames).or_default().push(p);
   }
-
-  if let Some(mut final_gop) = pending_last_gop {
-    let flushed_count = flushed_packets.len();
-    if flushed_count > 0 {
-      final_gop.packets.extend(flushed_packets);
-      info!(
-        "Encoder: appended {} trailing packet(s) to final GOP {}",
-        flushed_count, final_gop.group_id
+  for done in complete_gops(
+    &mut pending,
+    &frames_of,
+    gop_frames,
+    sample_duration,
+    &mut sequence_number,
+    true,
+  ) {
+    if done.packets.len()
+      != frames_of
+        .get(&done.group_id)
+        .copied()
+        .unwrap_or(done.packets.len())
+    {
+      warn!(
+        "Encoder: GOP {} has {} packets for {} frames",
+        done.group_id,
+        done.packets.len(),
+        frames_of.get(&done.group_id).copied().unwrap_or(0)
       );
     }
-    if on_gop.blocking_send(final_gop).is_err() {
+    if on_gop.blocking_send(done).is_err() {
       warn!("Encoder: receiver dropped, stopping");
       return Ok(());
     }
-  } else if !flushed_packets.is_empty() {
-    warn!(
-      "Encoder: received {} trailing packet(s) at flush with no GOP to attach",
-      flushed_packets.len()
-    );
   }
 
   info!("Encoder: all GOPs processed");
@@ -861,6 +900,41 @@ mod tests {
   fn test_gop_size_always_at_least_one() {
     assert_eq!(gop_size(0.5), 1);
     assert_eq!(gop_size(1.0), 1);
+  }
+
+  #[test]
+  fn complete_gops_buckets_by_own_pts_and_waits_for_full_groups() {
+    use std::collections::{BTreeMap, HashMap};
+    let gop_frames = 4u64;
+    let mut pending: BTreeMap<u64, Vec<RawPacket>> = BTreeMap::new();
+    let mut frames_of = HashMap::new();
+    frames_of.insert(0u64, 4usize);
+    frames_of.insert(1u64, 4usize);
+    // The encoder emits frames 0..=5 while GOP 1 is being fed: GOP 0 is
+    // complete, GOP 1 is not.
+    for pts in 0..6u64 {
+      pending
+        .entry(pts / gop_frames)
+        .or_default()
+        .push(RawPacket {
+          pts,
+          is_keyframe: pts % 4 == 0,
+          hvcc: vec![0, 0, 0, 1, 0x26],
+        });
+    }
+    let mut seq = 0u32;
+    let done = complete_gops(&mut pending, &frames_of, gop_frames, 3000, &mut seq, false);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].group_id, 0);
+    assert_eq!(done[0].packets.len(), 4);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[&1].len(), 2);
+    // Flush emits the rest even when incomplete.
+    let rest = complete_gops(&mut pending, &frames_of, gop_frames, 3000, &mut seq, true);
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].group_id, 1);
+    assert_eq!(rest[0].packets.len(), 2);
+    assert_eq!(seq, 6);
   }
 
   #[test]
