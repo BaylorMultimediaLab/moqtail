@@ -880,6 +880,59 @@ in place of `run_batch`, same arguments (`run_grid stable_3mbps`,
 `SHIFT=5 run_grid step_down_up`, ...), so every later batch carries all
 three arms.
 
+### 11d. fresh-grid-v2 (2026-10-03): three arms, 30 of 30 valid
+
+`results-linux-2026-10-01/fresh-grid-v2`, step_down_up, controller `grid`,
+5 reps per cell, every run on the realigned cache with both fixes in:
+
+| condition                    | sw/min | keyframe landings | behind playhead | stalled s | pause p95 ms | mean rung | stale objects discarded | shift kept |
+| ---------------------------- | ------ | ----------------- | --------------- | --------- | ------------ | --------- | ----------------------- | ---------- |
+| native, live-edge            | 19     | 0.36              | 0               | 22        | 2061         | 1.35      | 1002                    | 1.2 s      |
+| native, 10 s shift           | 16     | 0.35              | 0               | 7.6       | 1403         | 1.88      | 892                     | 1.8 s      |
+| native forward-trigger, live | 17     | 1.00              | 0               | 0.36      | 26           | 2.21      | 161                     | 1.1 s      |
+| native forward-trigger, 10 s | 9.6    | 1.00              | 0               | 0.00      | 34           | 3.04      | 47                      | 11 s       |
+| pr1378 next-group, live      | 18     | 1.00              | 0               | 0.14      | 32           | 1.92      | 0                       | 1.1 s      |
+| pr1378 next-group, 10 s      | 12     | 1.00              | 0               | 0.05      | 42           | 2.76      | 0                       | 11 s       |
+
+Both fixes do what they were meant to: the forward-trigger arm lands on a
+keyframe on every switch (as-shipped native: 35 %), and no pr1378 switch
+lands behind the playhead any more (5 of 156 before). With the keyframe
+problem removed, the two mechanisms are close on seam cost; what separates
+them is source cancellation (native keeps delivering the abandoned track:
+~1000 discarded stale objects per run as shipped, 47-161 with the fix, 0
+for pr1378) and, on the time-shifted client, the shift itself: the fixed
+native arm and pr1378 both keep the 10 s shift through the drop, as-shipped
+native consumes it. As-shipped native time-shifted did not starve this time
+(4 of 5 reps did in the first grid), so that outcome is variable.
+
+**Open item: post-switch delivery pauses on pr1378, time-shifted only.**
+Two pr1378 time-shifted reps starved (9.0 s and 10.8 s without an append;
+one of them stalled 9.4 s because its buffer was already empty after a
+burst of flapping switches). The signature across all ten pr1378
+time-shifted runs of both grids: after a promotion, delivery resumes 3.5 to
+14 s late in 3-6 switches per run, then the relay flushes the missing
+groups in one burst (rep 0: group 126 held from 103.6 s to 112.9 s, then
+groups 126-133 in 0.3 s). The five pr1378 live-edge runs and all ten
+forward-trigger runs have no such gap; as-shipped native shows only the
+3-4 s gaps its object-1 landings explain. The relay had every group cached
+(CACHE_STATS), the connection was healthy (probes completed during the
+hold), no REQUEST_UPDATE was sent, and the DELAY_GROUPS hold path was not
+taken (no SUBSCRIBE_HOLD). The remaining candidates are the joining cache
+replay of the switch's live subscription (`subscription.rs` "Joining state
+... from location to end", whose end bound and `read_objects` wait decide
+when live forwarding starts) and stream-credit back-pressure on
+`open_uni`. Both show in `relay.log`, which the bundle does not include.
+From the Linux box, for the stalled rep:
+
+```sh
+cd ~/Documents/Baylor\ Research/moqtail
+R=results/20261003T041151Z_pr1378-next-group_shift10s_step_down_up_bg0_r0_ctl-grid
+tar czf pr1378-r0-logs.tar.gz "$R"/relay.log "$R"/browser.log "$R"/relay-logs
+```
+
+Until this is understood, pr1378's time-shifted stall and starvation
+numbers are provisional (the other columns do not depend on it).
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
