@@ -828,6 +828,58 @@ past it (the table above is after re-analysis). And the detection
 attribution flag is still false on three of four cells, so the t0->t2
 numbers are still not reportable (section 10d stands).
 
+### 11c. The grid again, from the beginning (2026-10-02)
+
+Both fixes above change what the grid measures (native forward-trigger is a
+new arm; pr1378 next-group is buffer-aware now), so the step_down_up grid is
+re-run in full on the current code and the results folder holds only that.
+The fresh-grid bundle already extracted on the analysis machine is the
+record of the pre-fix runs; the Linux copy can go.
+
+```sh
+# 1. nothing running, clean netns
+pkill -f run_experiment.py; pkill -f target/release/relay; pkill -f target/release/publisher; pkill -f firefox; pkill -f vite
+sudo ip netns del moqc 2>/dev/null; sudo ip link del veth-moqh 2>/dev/null; true
+
+# 2. empty results (the bundle fresh-grid.tar.gz is already on the analysis machine)
+cd ~/Documents/Baylor\ Research/moqtail
+rm -rf results logs && mkdir -p results logs
+export ENC=data/encoded/tears_of_steel_240s_1080p
+python3 scripts/check_cache.py "$ENC" | tail -1        # must say OK
+
+# 3. the grid: three arms x two client types x 5 reps = 30 runs, about 2 h
+run_grid() {  # $1 profile, $2.. extra args; SHIFT=<s> sets the time shift (default 10)
+  local profile=$1; shift
+  git fetch -q origin
+  for arm in native native-ft pr1378; do
+    case $arm in
+      native)    branch=switch/native; mech="--mechanism native" ;;
+      native-ft) branch=switch/native; mech="--mechanism native --mechanism-mode forward-trigger" ;;
+      pr1378)    branch=switch/pr1378; mech="--mechanism pr1378 --mechanism-mode next-group" ;;
+    esac
+    git checkout $branch && git reset --hard origin/$branch
+    for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift ${SHIFT:-10}"; do
+      sudo -v
+      python3 experiments/run_experiment.py $mech $client --controller grid \
+          --profile experiments/profiles/$profile.json --duration 200 --net netns --encoded-dir "$ENC" --repeat 5 --final "$@"
+    done
+  done
+}
+run_grid step_down_up
+
+# 4. pack and send
+bash experiments/pack_results.sh results fresh-grid-v2.tar.gz
+```
+
+Every run is validated as it finishes (apparatus-only rule, 11b), so no
+separate validation runs are needed; a FAIL in the runner's summary line
+means an apparatus fault and is worth a look before the next arm. If the
+terminal is new, `run_grid` has to be pasted again (it lives only in the
+shell where it was defined). The section 10 batches then use `run_grid`
+in place of `run_batch`, same arguments (`run_grid stable_3mbps`,
+`SHIFT=5 run_grid step_down_up`, ...), so every later batch carries all
+three arms.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
