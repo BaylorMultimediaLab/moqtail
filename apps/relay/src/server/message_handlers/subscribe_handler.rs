@@ -338,7 +338,7 @@ async fn upstream_subscribe_exchange(
   new_sub: Subscribe,
   context: Arc<SessionContext>,
 ) {
-  let (send, recv) = match publisher.connection.open_bi().await {
+  let (send, recv) = match publisher.connection.open_request_stream().await {
     Ok(streams) => streams,
     Err(e) => {
       error!("Failed to open upstream subscribe stream: {:?}", e);

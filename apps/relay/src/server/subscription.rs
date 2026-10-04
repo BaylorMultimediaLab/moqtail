@@ -303,6 +303,8 @@ impl From<SubscriptionOrigin> for SubscriptionState {
 /// Within each band, group_id determines relative position according to group_order:
 ///   Ascending / Original – lower group_id = higher priority (counts down from band_max)
 ///   Descending            – higher group_id = higher priority (counts up from band_min)
+/// The result is shifted down by one (saturating at i32::MIN) so it is always below
+/// `CONTROL_STREAM_PRIORITY`: control and request streams go first.
 pub(crate) fn compute_stream_priority(
   sub_prio: u8,
   pub_prio: u8,
@@ -313,10 +315,16 @@ pub(crate) fn compute_stream_priority(
   let priority_index = (255 - sub_prio as i64) * 256 + (255 - pub_prio as i64);
   let band_min = i32::MIN as i64 + priority_index * BAND_SIZE;
   let group_slot = (group_id % BAND_SIZE as u64) as i64;
-  match group_order {
-    GroupOrder::Ascending | GroupOrder::Original => (band_min + BAND_SIZE - 1 - group_slot) as i32,
-    GroupOrder::Descending => (band_min + group_slot) as i32,
-  }
+  let priority = match group_order {
+    GroupOrder::Ascending | GroupOrder::Original => band_min + BAND_SIZE - 1 - group_slot,
+    GroupOrder::Descending => band_min + group_slot,
+  };
+  // The bands fill the whole i32 range, so the top slot of the top band (sub 0,
+  // pub 0) would be i32::MAX, the priority of control and request streams. Every
+  // slot moves down by one so data stays strictly below them (R3-D2); the bottom
+  // slot saturates, so the two lowest slots of the (255, 255) band share i32::MIN
+  // (where the probe sits). Relative order is otherwise unchanged.
+  (priority - 1).max(i32::MIN as i64) as i32
 }
 
 /// QUIC stream priority of the relay's synthetic `.probe:` streams (M3).
@@ -1828,6 +1836,40 @@ mod tests {
         }
       }
     }
+  }
+
+  /// R3-D2: control/request streams > every video stream > the probe, for every
+  /// subscriber and publisher priority, both group orders and the band-edge group
+  /// slots. The probe ties only with the lowest video slots of the (255, 255) band.
+  #[test]
+  fn control_outranks_every_video_band_which_outranks_the_probe() {
+    use moqtail::transport::connection::CONTROL_STREAM_PRIORITY;
+    let probe = probe_stream_priority();
+    for sub in 0u8..=255 {
+      for pub_ in 0u8..=255 {
+        for &order in &[GroupOrder::Ascending, GroupOrder::Descending] {
+          for group in [0u64, 1, 65534, 65535, 65536, u64::MAX] {
+            let video = compute_stream_priority(sub, pub_, order, group);
+            assert!(
+              video < CONTROL_STREAM_PRIORITY,
+              "video (sub={sub} pub={pub_} order={order:?} group={group}) = {video} ties control"
+            );
+            if (sub, pub_) == (255, 255) {
+              assert!(video >= probe);
+            } else {
+              assert!(
+                video > probe,
+                "video (sub={sub} pub={pub_} order={order:?} group={group}) = {video} vs probe"
+              );
+            }
+          }
+        }
+      }
+    }
+    // The harness's values: player SUBSCRIBE/SWITCH at 0, publisher at 128.
+    let harness_video = compute_stream_priority(0, 128, GroupOrder::Ascending, 0);
+    assert!(harness_video > 2_000_000_000, "{harness_video}");
+    assert_eq!(CONTROL_STREAM_PRIORITY, i32::MAX);
   }
 
   /// A literal 0 (the previous probe priority) is NOT below video for a

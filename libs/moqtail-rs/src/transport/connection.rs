@@ -25,6 +25,12 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use wtransport::quinn;
 
+/// QUIC send priority of every control and request stream (the control stream, and
+/// each bidirectional request stream opened or accepted): above every data stream,
+/// so a response such as SUBSCRIBE_OK or a PUBLISH is never queued behind media
+/// that depends on it. Data-stream priorities stay strictly below it.
+pub const CONTROL_STREAM_PRIORITY: i32 = i32::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
   WebTransport,
@@ -451,6 +457,26 @@ impl TransportConnection {
     Ok((send, recv))
   }
 
+  /// Opens the session's control stream (uni) at [`CONTROL_STREAM_PRIORITY`].
+  pub async fn open_control_stream(&self) -> Result<TransportSendStream, TransportConnectionError> {
+    self.open_uni_with_priority(CONTROL_STREAM_PRIORITY).await
+  }
+
+  /// Opens a request stream (bidi) at [`CONTROL_STREAM_PRIORITY`].
+  pub async fn open_request_stream(
+    &self,
+  ) -> Result<(TransportSendStream, TransportRecvStream), TransportConnectionError> {
+    self.open_bi_with_priority(CONTROL_STREAM_PRIORITY).await
+  }
+
+  /// Accepts a request stream (bidi) the peer opened; its responses go out at
+  /// [`CONTROL_STREAM_PRIORITY`].
+  pub async fn accept_request_stream(
+    &self,
+  ) -> Result<(TransportSendStream, TransportRecvStream), TransportConnectionError> {
+    self.accept_bi_with_priority(CONTROL_STREAM_PRIORITY).await
+  }
+
   /// Opens a unidirectional stream scheduled at `priority` from its first byte (the
   /// WebTransport stream header included); see [`Self::open_bi_with_priority`].
   pub async fn open_uni_with_priority(
@@ -733,6 +759,28 @@ mod tests {
   async fn quic_prioritised_streams_roundtrip() {
     let (client, server) = quic_pair().await.expect("quic_pair");
     prioritised_open_roundtrip(client, server).await;
+  }
+
+  /// R3-D2: control and request streams, opened or accepted, sit above every data
+  /// stream.
+  #[tokio::test]
+  async fn control_and_request_streams_take_the_control_priority() {
+    for (client, server) in [
+      webtransport_pair().await.expect("webtransport_pair"),
+      quic_pair().await.expect("quic_pair"),
+    ] {
+      let control = server.open_control_stream().await.expect("control");
+      assert_eq!(control.priority(), Some(CONTROL_STREAM_PRIORITY));
+      let (opened, _) = server.open_request_stream().await.expect("open request");
+      assert_eq!(opened.priority(), Some(CONTROL_STREAM_PRIORITY));
+      let (mut send, _recv) = client.open_bi().await.expect("peer open");
+      send.write_all(b"x").await.unwrap();
+      let (accepted, _) = server
+        .accept_request_stream()
+        .await
+        .expect("accept request");
+      assert_eq!(accepted.priority(), Some(CONTROL_STREAM_PRIORITY));
+    }
   }
 
   /// An accepted request stream gets its priority before the first response byte.

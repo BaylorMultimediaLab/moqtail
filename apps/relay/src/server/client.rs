@@ -949,6 +949,83 @@ mod tests_write_stream_object {
     assert_eq!(stream.lock().await.priority(), Some(123_456));
   }
 
+  /// Video bytes the subscriber had read when a response on its request stream
+  /// reached it, with a 1 MB top-band video backlog queued ahead of the response.
+  async fn video_read_before_response(
+    accept: impl AsyncFnOnce(
+      &TransportConnection,
+    ) -> (
+      TransportSendStream,
+      moqtail::transport::connection::TransportRecvStream,
+    ),
+  ) -> usize {
+    use crate::server::subscription::compute_stream_priority;
+    use moqtail::model::control::constant::GroupOrder;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const VIDEO_BYTES: usize = 1024 * 1024;
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+
+    let (mut request, mut response) = peer.open_bi().await.unwrap();
+    request.write_all(b"SUBSCRIBE").await.unwrap();
+    let (mut relay_send, _relay_recv) = accept(&client.connection).await;
+
+    // No yield from here until both are queued: the backlog first, then the response.
+    let stream_id = StreamId::new_subgroup(1, 7, Some(0));
+    let video_priority = compute_stream_priority(0, 128, GroupOrder::Ascending, 7);
+    let video = client
+      .open_stream(&stream_id, header(), video_priority)
+      .await
+      .unwrap();
+    video
+      .lock()
+      .await
+      .write_all(&vec![1u8; VIDEO_BYTES])
+      .await
+      .unwrap();
+    relay_send.write_all(b"SUBSCRIBE_OK").await.unwrap();
+
+    let video_read = Arc::new(AtomicUsize::new(0));
+    let reader = {
+      let video_read = video_read.clone();
+      tokio::spawn(async move {
+        let mut recv = peer.accept_uni().await.unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(Some(n)) = recv.read(&mut buf).await {
+          if video_read.fetch_add(n, Ordering::SeqCst) + n >= VIDEO_BYTES {
+            break;
+          }
+        }
+        peer
+      })
+    };
+    let mut buf = [0u8; 12];
+    let mut got = 0;
+    while got < buf.len() {
+      got += response.read(&mut buf[got..]).await.unwrap().unwrap();
+    }
+    let at_response = video_read.load(Ordering::SeqCst);
+    assert_eq!(&buf, b"SUBSCRIBE_OK");
+    let _ = tokio::time::timeout(Duration::from_secs(10), reader).await;
+    at_response
+  }
+
+  /// R3-D2: a response on a request stream the relay accepted goes ahead of video,
+  /// so a SWITCH's SUBSCRIBE_OK cannot arrive after the target's data (which the
+  /// client discards as unrouted). quinn's default stream priority is 0, below the
+  /// whole band a priority-0 subscriber's video sits in.
+  #[tokio::test]
+  async fn a_request_stream_response_is_not_queued_behind_video() {
+    let read = video_read_before_response(async |conn: &TransportConnection| {
+      conn.accept_request_stream().await.unwrap()
+    })
+    .await;
+    assert!(
+      read < 256 * 1024,
+      "the response arrived after {read} B of video"
+    );
+  }
+
   /// The whole connection going away is reported too (ConnectionLost).
   #[tokio::test]
   async fn write_after_the_connection_closed_is_an_error() {
