@@ -185,6 +185,31 @@ RELAY_BRANCH_OPTIONAL = {"--t-switch-ms": "3000"}
 RELAY_REQUIRED_NEW = ("--congestion-controller",)
 PUBLISHER_REQUIRED_NEW = {"--variant-priority": "128"}
 
+# Readiness and safety constants (rebuild contract, "Shaping", runner paragraph).
+WARMUP_S = 15.0  # publisher first GROUP_EMIT -> browser start, both client types
+RELAY_READY_TIMEOUT_S = 15.0  # relay.log listening line
+PUBLISHER_READY_TIMEOUT_S = 30.0  # first GROUP_EMIT in publisher-events.jsonl
+CLIENT_STARTUP_TIMEOUT_S = 30.0  # STARTUP in client-events.jsonl after browser spawn
+CACHE_MARGIN_S = 30.0  # refuse duration + warmup + margin > gops_per_variant
+RELAY_LISTENING_NEEDLE = "is running on"  # apps/relay/src/server.rs start(): "<version> is running on N UDP socket(s)"
+
+
+def check_cache_length(duration: float, warmup: float, gops: int | None, margin: float = CACHE_MARGIN_S) -> str | None:
+    """Error text when the prepared cache is too short for the run (publisher
+    exits when it runs out, aborting the run), else None."""
+    if gops is None:
+        return "meta.json has no gops_per_variant"
+    need = duration + warmup + margin
+    if need > gops:
+        return (f"the GOP cache holds {gops} groups (1 s each) but the run needs duration {duration:g} + warmup "
+                f"{warmup:g} + margin {margin:g} = {need:g}; shorten --duration or prepare a longer cache")
+    return None
+
+
+def aborted_validation(final: bool) -> dict:
+    """validation.json for a run that did not complete; analyze/compare exclude it (M20)."""
+    return {"passed": False, "final": final, "failed": ["aborted"], "checks": []}
+
 
 def binary_flags(binary: Path) -> set[str]:
     """Long option names a clap binary lists in `--help`."""
@@ -528,6 +553,9 @@ def main() -> int:
     ap.add_argument("--time-shift", type=float, default=10.0, help="seconds behind live for time-shifted clients")
     ap.add_argument("--profile", type=Path, required=True)
     ap.add_argument("--duration", type=float, default=180.0, help="seconds of playback to record")
+    ap.add_argument("--warmup", type=float, default=WARMUP_S,
+                    help="seconds between the publisher's first GROUP_EMIT and the browser start, the same for "
+                         "both client types (recorded as identity.warmup_s); must exceed --time-shift + 2")
     ap.add_argument("--net", choices=["none", "netns"], default="none")
     ap.add_argument("--offloads", default=",".join(DEFAULT_OFFLOADS),
                     help="ethtool -K features turned off on both veth ends before any qdisc is added (netns only); "
@@ -583,6 +611,17 @@ def main() -> int:
         ap.error("--final requires a clean git worktree (commit or stash first)")
     if args.final and args.allow_missing_relay_flags:
         ap.error("--final refuses --allow-missing-relay-flags: every relay/publisher flag must be pinned")
+    if args.client_mode == "time-shifted" and args.time_shift + 2.0 > args.warmup:
+        ap.error(f"--warmup {args.warmup:g} is too short for --time-shift {args.time_shift:g}: the relay cache must "
+                 "hold more than the shift before the client subscribes (need time_shift + 2)")
+    if str(args.encoded_dir) in ("", "."):
+        ap.error("--encoded-dir is empty: if you pass \"$ENC\", export it in this shell first (docs/pilot-linux.md step 3)")
+    if not (args.encoded_dir / "meta.json").exists():
+        ap.error(f"no prepared GOP cache at {args.encoded_dir} (no meta.json); prepare it with the publisher as in "
+                 "docs/pilot-linux.md step 3")
+    err = check_cache_length(args.duration, args.warmup, cache_gops(args.encoded_dir))
+    if err:
+        ap.error(err)
     expected_branch = MECHANISM_BRANCH[args.mechanism]
     if branch != expected_branch:
         ap.error(f"--mechanism {args.mechanism} runs on branch {expected_branch}, but HEAD is {branch}")
@@ -670,7 +709,9 @@ def run_once(args, repeat_index: int) -> int:
             *(["--forward-promotion-trigger"]
               if args.mechanism == "native" and args.mechanism_mode == "forward-trigger" else []),
         ], out / "relay.log")
-        time.sleep(1.5)
+        if not wait_log_line(out / "relay.log", RELAY_LISTENING_NEEDLE, RELAY_READY_TIMEOUT_S, procs["relay"], "relay"):
+            raise SystemExit(f"relay did not log its listening line ({RELAY_LISTENING_NEEDLE!r}) within "
+                             f"{RELAY_READY_TIMEOUT_S:g} s; see {out / 'relay.log'}")
         # The relay's own view of its configuration (RELAY_CONFIG, W4) is the
         # record of what actually ran; kept in run_meta as `relay_config`.
         relay_config = wait_record(out / "relay-events.jsonl", "RELAY_CONFIG", 5.0, procs["relay"], "relay")
@@ -682,13 +723,8 @@ def run_once(args, repeat_index: int) -> int:
                              f"runner asked for {args.cc!r}")
 
         # Publisher (replay from the prepared cache, no loop so the media
-        # timeline never wraps inside a run) ---------------------------------
-        if str(args.encoded_dir) in ("", "."):
-            raise SystemExit("--encoded-dir is empty: if you pass \"$ENC\", export it in this shell first "
-                             "(see docs/pilot-linux.md step 3)")
-        if not (args.encoded_dir / "meta.json").exists():
-            raise SystemExit(f"no prepared GOP cache at {args.encoded_dir} (no meta.json); prepare it with the "
-                             "publisher as in docs/pilot-linux.md step 3")
+        # timeline never wraps inside a run; cache presence and length were
+        # checked in main()) -------------------------------------------------
         procs["publisher"] = spawn([
             str(publisher_bin), f"https://{backend.relay_host}:{args.relay_port}",
             "--encoded-dir", str(args.encoded_dir), "--max-variants", str(args.max_variants),
@@ -707,11 +743,20 @@ def run_once(args, repeat_index: int) -> int:
             raise SystemExit("vite did not come up")
         warm_vite(f"http://{backend.vite_host}:{args.vite_port}")
 
-        # Let the publisher fill the relay cache past the requested shift so
-        # a time-shifted SUBSCRIBE is never held (and never clamped) at startup.
-        warmup = max(5.0, args.time_shift + 3.0) if args.client_mode == "time-shifted" else 5.0
-        print(f"[run] warming up publisher for {warmup:.0f}s")
-        time.sleep(warmup)
+        # Browser start is gated on the publisher's first GROUP_EMIT plus a fixed
+        # warm-up, the same for both client types, so the media second at which
+        # a profile step hits does not depend on the client type or on how long
+        # vite took (audit report 4, "live-edge offset at client join").
+        first_group = wait_record(out / "publisher-events.jsonl", "GROUP_EMIT", PUBLISHER_READY_TIMEOUT_S,
+                                  procs["publisher"], "publisher")
+        if first_group is None:
+            raise SystemExit(f"publisher emitted no GROUP_EMIT within {PUBLISHER_READY_TIMEOUT_S:g} s; "
+                             f"see {out / 'publisher.log'}")
+        first_group_seen = time.time()
+        warmup = args.warmup
+        rlog.emit("PUBLISHER_READY", {"first_group_emit_ts": first_group.get("ts"), "warmup_s": warmup})
+        print(f"[run] first GROUP_EMIT seen; warming up for {warmup:g}s")
+        time.sleep(max(0.0, first_group_seen + warmup - time.time()))
 
         # Initial network state, then background flows -----------------------
         steps = profile["steps"]
@@ -769,11 +814,20 @@ def run_once(args, repeat_index: int) -> int:
         t0 = time.time()
         step_idx = 1
         last_stats = 0.0
+        client_log = ROOT / "logs" / run_id / "client-events.jsonl"
+        startup_seen = False
         while time.time() - t0 < args.duration:
             elapsed = time.time() - t0
             if step_idx < len(steps) and elapsed >= steps[step_idx]["at_s"]:
                 apply_step(step_idx)
                 step_idx += 1
+            if not startup_seen:
+                if find_record(client_log, "STARTUP") is not None:
+                    startup_seen = True
+                    rlog.emit("CLIENT_READY", {"after_browser_spawn_s": round(elapsed, 3)})
+                elif elapsed > CLIENT_STARTUP_TIMEOUT_S:
+                    raise SystemExit(f"client logged no STARTUP within {CLIENT_STARTUP_TIMEOUT_S:g} s of the browser "
+                                     f"spawn; see {out / 'browser.log'} and {client_log}")
             bg.tick()
             if time.time() - last_stats >= 1.0:
                 last_stats = time.time()
@@ -795,6 +849,10 @@ def run_once(args, repeat_index: int) -> int:
         print(f"[run] aborting: {e!r}")
         rlog.emit("RUN_ABORT", {"error": repr(e)})
     finally:
+        if exit_code != 0:
+            # First thing, before anything else in this block can fail: an aborted
+            # run is marked invalid so analyze/compare exclude it (M20).
+            (out / "validation.json").write_text(json.dumps(aborted_validation(args.final), indent=2))
         # Give the browser a moment to flush its event buffer, then stop it first.
         time.sleep(1.5)
         stop(procs.get("browser"), "browser", browser_pattern if backend.detaches_itself else None)
@@ -861,6 +919,8 @@ def run_once(args, repeat_index: int) -> int:
             # kept for older readers
             "run_id": run_id, "git_branch": identity["branch"], "git_sha": identity["git_sha"], "started": stamp,
         }
+        if exit_code != 0:
+            meta["validity"] = {"passed": False, "final": args.final, "aborted": True}
         (out / "run_meta.json").write_text(json.dumps(meta, indent=2))
         print(f"[run] wrote {out / 'run_meta.json'}")
         if not args.no_analyze and exit_code == 0:

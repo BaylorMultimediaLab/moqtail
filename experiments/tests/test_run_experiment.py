@@ -97,6 +97,44 @@ class RelayFlags(unittest.TestCase):
         self.assertEqual((argv, rec["missing"]), ([], ["--variant-priority"]))
 
 
+class Safety(unittest.TestCase):
+    def test_cache_length_guard(self):
+        # 200 s run + 15 s warm-up + 30 s margin = 245 > 240 groups: refused
+        self.assertIn("245", rx.check_cache_length(200, 15, 240))
+        self.assertIsNone(rx.check_cache_length(180, 15, 240))
+        self.assertIsNotNone(rx.check_cache_length(60, 15, None))
+
+    def test_aborted_validation_shape(self):
+        v = rx.aborted_validation(final=True)
+        self.assertEqual(v, {"passed": False, "final": True, "failed": ["aborted"], "checks": []})
+        self.assertFalse(rx.aborted_validation(final=False)["final"])
+
+    def test_readiness_constants(self):
+        self.assertEqual(rx.WARMUP_S, 15.0)
+        self.assertEqual(rx.RELAY_READY_TIMEOUT_S, 15.0)
+        self.assertEqual(rx.CLIENT_STARTUP_TIMEOUT_S, 30.0)
+        # the needle must match the relay's start() log line in apps/relay/src/server.rs
+        server_rs = HERE.parent.parent / "apps/relay/src/server.rs"
+        if server_rs.exists():
+            self.assertIn(rx.RELAY_LISTENING_NEEDLE, server_rs.read_text())
+
+    def test_wait_record_times_out_and_detects_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "events.jsonl"
+            self.assertIsNone(rx.wait_record(p, "GROUP_EMIT", timeout=0.3))
+            import subprocess
+            dead = subprocess.Popen(["true"])
+            dead.wait()
+            with self.assertRaises(SystemExit):
+                rx.wait_record(p, "GROUP_EMIT", timeout=2.0, proc=dead, what="publisher")
+            p.write_text('{"event":"GROUP_EMIT","ts":5}\n')
+            self.assertEqual(rx.wait_record(p, "GROUP_EMIT", timeout=0.3)["ts"], 5)
+            log = Path(d) / "relay.log"
+            log.write_text("2026-10-04 INFO moqtail-relay 0.1 is running on 1 UDP socket(s) -- ...\n")
+            self.assertTrue(rx.wait_log_line(log, rx.RELAY_LISTENING_NEEDLE, 0.3))
+            self.assertFalse(rx.wait_log_line(log, "no such line", 0.3))
+
+
 class Records(unittest.TestCase):
     def test_find_record_and_cache_meta(self):
         with tempfile.TemporaryDirectory() as d:
