@@ -5,7 +5,9 @@ import { AbrRulesCollection } from '../AbrRulesCollection';
 import {
   DEFAULT_ABR_SETTINGS,
   MIN_ARM_RULES,
+  RULE_ORDER,
   SwitchRequestPriority,
+  describeController,
   resolveControllerSettings,
 } from '../types';
 import type { AbrSettings, ControllerSettings, Track } from '../types';
@@ -526,23 +528,93 @@ describe('min arm: (f) a phantom switch is not history', () => {
   });
 });
 
+function gridSettings(): AbrSettings {
+  return {
+    ...DEFAULT_ABR_SETTINGS,
+    controller: {
+      ...DEFAULT_ABR_SETTINGS.controller,
+      arm: 'grid',
+      latencyResetOnLanding: true,
+      bufferSignal: 'envelope',
+      switchHistoryMode: 'veto',
+      switchHistoryWindowS: 60,
+      probeMaxBytes: 65_536,
+    },
+  };
+}
+
+describe('(g) probe veto (grid arm, M18)', () => {
+  // 10 Mbps SWMA: ThroughputRule and InsufficientBufferRule want 1080p from
+  // 360p. The probe fires on the first tick (slow start holds the decision),
+  // its reading lands before the next one.
+  const climb = async (probeBps: number) => {
+    const h = harness(
+      { activeTrack: '360p', bandwidthBps: 10_000_000, bufferContigSeconds: 5 },
+      { settings: gridSettings(), startupGroups: 1 },
+    );
+    h.player.probeTrackBandwidth.mockResolvedValue({ bps: probeBps, dtMs: 400 });
+    await h.tick(); // slow start (1 sample); probe sent
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.player.probeTrackBandwidth).toHaveBeenCalledTimes(1);
+    expect(h.player.probeTrackBandwidth.mock.calls[0]![0]).toMatch(/^\.probe:\d+:0$/);
+    h.complete(5);
+    for (let i = 0; i < 3; i++) await h.tick(); // past InsufficientBufferRule's warm-up
+    return h.switches();
+  };
+
+  it('a fresh probe without headroom for the next rung (0.8 x 1 Mbps < 1.5 Mbps) holds the active rung', async () => {
+    expect(await climb(1_000_000)).toEqual([]);
+  });
+
+  it('a fresh probe with headroom abstains and lets the throughput rule climb several rungs', async () => {
+    expect(await climb(10_000_000)).toEqual(['1080p']);
+  });
+
+  it('no reading (failed probe) is no veto', async () => {
+    expect(await climb(0)).toEqual(['1080p']);
+  });
+
+  it('the min arm never probes', async () => {
+    const h = harness({ activeTrack: '360p', bandwidthBps: 10_000_000, bufferContigSeconds: 5 });
+    for (let i = 0; i < 3; i++) await h.tick();
+    expect(h.player.probeTrackBandwidth).not.toHaveBeenCalled();
+  });
+});
+
+describe('(h) describeController for the min arm', () => {
+  it('describes what the controller and the collection built from the same settings run', () => {
+    const h = harness({ activeTrack: '360p', bandwidthBps: 1_000_000, bufferContigSeconds: 5 });
+    const d = describeController(minSettings());
+    // Idempotent over the resolved settings the controller runs.
+    expect(describeController(h.controller.settings)).toEqual(d);
+    expect(d.activeRules).toEqual(RULE_ORDER.filter(n => h.collection.isRuleActive(n)));
+    expect(d).toMatchObject({
+      arm: 'min',
+      tickMs: 250,
+      upDwellGroups: 3,
+      historyIgnoreGroupsAfterLanding: 2,
+      switchHistoryMode: 'veto',
+      switchHistoryWindowS: 60,
+      bufferSource: 'contiguous',
+      bufferSignal: 'envelope',
+      bufferEnvelopeMs: 1250,
+      bandwidthSafetyFactor: 0.9,
+      throughputDownToLowest: true,
+      emergencyLowBufferS: 0.5,
+      emergencyThroughputSafetyFactor: 0.7,
+      probeMode: 'off',
+      upGuardSamples: 0,
+      latencyResetOnLanding: false,
+    });
+  });
+});
+
 describe('grid and baseline keep the total buffer (only min reads the contiguous one)', () => {
   it('grid: a hole ahead of the playhead with 5 s behind it is still 5 s of buffer to its rules', async () => {
-    const grid: AbrSettings = {
-      ...DEFAULT_ABR_SETTINGS,
-      controller: {
-        ...DEFAULT_ABR_SETTINGS.controller,
-        arm: 'grid',
-        latencyResetOnLanding: true,
-        bufferSignal: 'envelope',
-        switchHistoryMode: 'veto',
-        switchHistoryWindowS: 60,
-        probeMaxBytes: 65_536,
-      },
-    };
     const h = harness(
       { activeTrack: '1080p', bandwidthBps: 10_000_000, bufferContigSeconds: 0, bufferSeconds: 5 },
-      { settings: grid },
+      { settings: gridSettings() },
     );
     // InsufficientBufferRule's two warm-up calls, then it would read 0 as
     // "empty" (STRONG rung 0) if it saw the contiguous buffer.
