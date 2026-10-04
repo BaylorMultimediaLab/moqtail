@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SeamTracker } from './seam';
+import { SeamTracker, switchAppliedFields } from './seam';
 
 const send = (t: SeamTracker, from: string, to: string, sentAt = 1000) =>
   t.sent(from, to, { playheadMs: 10_000, appendFrontMs: 12_000, sentAt });
@@ -88,5 +88,60 @@ describe('SeamTracker: switch identity (C1)', () => {
     expect(a.seamPtsMs).toBe(12_000);
     expect(a.targetAppendFrontMs).toBe(12_080);
     expect(a.firstFrameSeen).toBe(false);
+  });
+});
+
+describe('SeamTracker: the seam is the first appended target object (M9)', () => {
+  // Native SWITCH lands on object 1 of a group: the landing object and the rest
+  // of its group are discarded by the keyframe gate, and the first frame that
+  // reaches the buffer is object 0 of the next group, one GOP later.
+  const nativeLanding = () => {
+    const t = new SeamTracker();
+    const a = send(t, 'low', 'mid');
+    t.landed(a, { group: 5, object: 1, landedOnKeyframe: false, sourceEndMs: 12_000, now: 1100 });
+    for (let i = 0; i < 24; i++) t.discarded();
+    return { t, a };
+  };
+
+  it('counts target objects dropped between the landing and the first append', () => {
+    const { t, a } = nativeLanding();
+    expect(t.seam).toBeNull();
+    expect(t.appended({ ptsMs: 13_000, endPtsMs: 13_040, group: 6, object: 0, now: 1600 })).toBe(a);
+    expect(a.discardedBeforeKeyframe).toBe(24);
+    expect(a.landingObject).toBe(1);
+    expect(a.firstAppendedGroup).toBe(6);
+    expect(a.firstAppendedObject).toBe(0);
+    expect(a.seamPtsMs).toBe(13_000);
+    // Once applied, later drops are not part of this landing.
+    t.discarded();
+    expect(a.discardedBeforeKeyframe).toBe(24);
+  });
+
+  it('builds SWITCH_APPLIED from the first appended object, keeping the landing fields', () => {
+    const { t, a } = nativeLanding();
+    t.appended({ ptsMs: 13_000, endPtsMs: 13_040, group: 6, object: 0, now: 1600 });
+    expect(switchAppliedFields(a, { now: 1600, playheadMs: 10_500 })).toEqual({
+      switch_seq: 1,
+      from: 'low',
+      to: 'mid',
+      group: 5,
+      object: 1,
+      landing_object: 1,
+      first_appended_group: 6,
+      first_appended_object: 0,
+      discarded_before_keyframe: 24,
+      landed_on_group_start: false,
+      landed_on_keyframe: false,
+      new_start_pts_ms: 13_000,
+      old_end_pts_ms: 12_000,
+      old_end_pts_at_send_ms: 12_000,
+      // The real hole: one GOP, not the ~0 the landing object's PTS would give.
+      media_seam_gap_ms: 1000,
+      playhead_ms: 10_000,
+      playhead_at_apply_ms: 10_500,
+      seam_ahead_of_playhead_ms: 3000,
+      since_sent_ms: 600,
+      since_landed_ms: 500,
+    });
   });
 });

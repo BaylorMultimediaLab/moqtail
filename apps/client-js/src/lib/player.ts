@@ -29,13 +29,13 @@ import { CMSFCatalog, MessageParameters, type MessageParameter } from 'moqtail/m
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
-import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
+import { parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
 import { events } from '@/lib/events/EventLog';
 import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
 import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
-import { SeamTracker, nextPageSwitchSeq, type SwitchRecord } from '@/lib/seam';
+import { SeamTracker, nextPageSwitchSeq, switchAppliedFields, type SwitchRecord } from '@/lib/seam';
 
 interface PendingSwitch {
   trackName: string;
@@ -773,46 +773,45 @@ export class Player {
 
             if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
               const { initData, mimeType, trackName: newTrackName, record } = struct.pendingSwitch;
-              const switchSentAt = record.sentAt;
-              const oldEndPTS_ms = record.appendFrontAtSendMs;
-              const playheadPTS_ms = record.playheadAtSendMs;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
               // The source's last appended frame at the moment the switch lands
               // (the send-time snapshot in the record predates ~1 GOP of source
               // frames that arrived while the SWITCH was in flight).
-              const sourceEndAtApplyPTS_ms = struct.lastAppendedEndPTS_ms;
+              const sourceEndAtLandingMs = struct.lastAppendedEndPTS_ms;
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
-              // The landing object's PTS and sync flag (trun sync-sample flag of its moof).
+              // Whether the landing object is a keyframe: the trun sync-sample flag
+              // of its moof (undefined when the moof carries no flags).
               const newTimescale = this.catalog?.getTimescale(newTrackName);
-              const landingBytes = new Uint8Array(
-                object.payload.buffer,
-                object.payload.byteOffset,
-                object.payload.byteLength,
-              );
-              const newStartPTS_ms =
-                newTimescale && newTimescale > 0
-                  ? parseMoofBaseMediaDecodeTime(landingBytes, newTimescale)
-                  : undefined;
               const landingIsSync =
                 newTimescale && newTimescale > 0
-                  ? parseMoofMediaInfo(landingBytes, newTimescale)?.isSync
+                  ? parseMoofMediaInfo(
+                      new Uint8Array(
+                        object.payload.buffer,
+                        object.payload.byteOffset,
+                        object.payload.byteLength,
+                      ),
+                      newTimescale,
+                    )?.isSync
                   : undefined;
 
+              // The landing object. The seam fields come from the first object
+              // that passes the keyframe gate (SWITCH_APPLIED, M9).
               events.emit('SWITCH_FIRST_OBJECT', {
                 switch_seq: record.seq,
                 from: fromTrack,
                 to: newTrackName,
                 group: object.location.group,
                 object: object.location.object,
-                since_sent_ms: performance.now() - switchSentAt,
+                landed_on_keyframe: landingIsSync ?? null,
+                since_sent_ms: performance.now() - record.sentAt,
               });
               // A previous landing whose seam was never presented is overwritten now.
               const { superseded } = this.#seams.landed(record, {
                 group: Number(object.location.group),
                 object: Number(object.location.object),
                 landedOnKeyframe: landingIsSync ?? null,
-                sourceEndMs: sourceEndAtApplyPTS_ms,
+                sourceEndMs: sourceEndAtLandingMs,
                 now: performance.now(),
               });
               for (const old of superseded) {
@@ -822,12 +821,21 @@ export class Player {
                   playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
                 });
               }
+              // Nothing of the target is appended before a sync sample, the landing
+              // object included: the gate below decides for every object, and the
+              // first one it lets into the buffer applies the switch.
+              struct.awaitKeyframe = true;
+              if (this.#resetLatencyOnLanding) {
+                this.#latencyTracker.reset();
+                events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
+              }
 
               if (!(await applyInit(sourceBuffer, mimeType, initData, newTrackName))) {
                 // Keep the pipeline alive: retry the init before the next object
                 // append and drop this object (it cannot be decoded without it).
                 struct.pendingInit = { mimeType, initData, attempts: 1 };
                 this.#options.onTrackSwitched?.(newTrackName);
+                this.#seams.discarded();
                 events.emit('DROP_STALE', {
                   track: objectTrackName,
                   current: struct.trackName,
@@ -840,63 +848,11 @@ export class Player {
                 return;
               }
 
-              if (newStartPTS_ms !== undefined) {
-                this.#seams.appended({
-                  ptsMs: newStartPTS_ms,
-                  endPtsMs: newStartPTS_ms,
-                  group: Number(object.location.group),
-                  object: Number(object.location.object),
-                  now: performance.now(),
-                });
-              }
-
-              events.emit('SWITCH_APPLIED', {
-                switch_seq: record.seq,
-                from: fromTrack,
-                to: newTrackName,
-                group: object.location.group,
-                object: object.location.object,
-                new_start_pts_ms: newStartPTS_ms ?? null,
-                old_end_pts_ms: sourceEndAtApplyPTS_ms ?? null,
-                old_end_pts_at_send_ms: oldEndPTS_ms ?? null,
-                // Seam continuity of the appended media: first target frame PTS
-                // minus the last appended source frame's end PTS at landing time
-                // (0 = contiguous, >0 = hole, <0 = overlap: the target restarts
-                // inside media the source already covered).
-                media_seam_gap_ms:
-                  newStartPTS_ms !== undefined && sourceEndAtApplyPTS_ms !== undefined
-                    ? newStartPTS_ms - sourceEndAtApplyPTS_ms
-                    : null,
-                // Object 0 of a group is where a keyframe is expected ...
-                landed_on_group_start: object.location.object === 0n,
-                // ... and this is whether the landing object actually is one
-                // (trun sync-sample flag of its moof). null when the moof has no flags.
-                landed_on_keyframe: landingIsSync ?? null,
-                playhead_ms: playheadPTS_ms ?? null,
-                // How far ahead of the viewer the new representation lands: the
-                // media the viewer still has to play before seeing it. NOT a
-                // playback-position jump; that is measured at the seam crossing.
-                seam_ahead_of_playhead_ms:
-                  newStartPTS_ms !== undefined && playheadPTS_ms !== undefined
-                    ? newStartPTS_ms - playheadPTS_ms
-                    : null,
-                since_sent_ms: performance.now() - switchSentAt,
-              });
-              // Discard until a sync sample. The flag is read from each object's
-              // moof; object index 0 is the fallback when a moof carries no flags.
-              struct.awaitKeyframe = !(landingIsSync ?? object.location.object === 0n);
-              if (this.#resetLatencyOnLanding) {
-                this.#latencyTracker.reset();
-                events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
-              }
-
               // NOW release the ABR switching guard — the relay has completed the
               // transition and delivered data on the new track. Safe to switch again.
               this.#options.onTrackSwitched?.(newTrackName);
             }
 
-            // Update lastAppendedEndPTS_ms before appending. C3 will read this for the
-            // "old end PTS" half of the discontinuity calculation.
             // Publisher emits one moof+mdat per access unit (see apps/publisher/src/cmaf.rs),
             // so each moof's tfdt is a per-frame decode time and the trun carries that
             // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
@@ -923,7 +879,11 @@ export class Player {
                   attempts: pi.attempts,
                 });
                 struct.pendingInit = undefined;
+                // The landing block's gate, which a failed init used to skip: the
+                // switch is applied by the first sync sample after the recovery.
+                struct.awaitKeyframe = true;
               } else {
+                this.#seams.discarded();
                 events.emit('DROP_STALE', {
                   track: objectTrackName,
                   current: struct.trackName,
@@ -940,6 +900,7 @@ export class Player {
             if (struct.awaitKeyframe) {
               const isSync = info?.isSync ?? object.location.object === 0n;
               if (!isSync) {
+                this.#seams.discarded();
                 events.emit('DROP_STALE', {
                   track: objectTrackName,
                   current: struct.trackName,
@@ -951,20 +912,8 @@ export class Player {
                 });
                 return;
               }
-              struct.awaitKeyframe = false;
             }
-
-            if (info !== undefined) {
-              decodeTimeMs = info.decodeTimeMs;
-              struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-              struct.lastFrameDurationMs = info.frameDurationMs;
-              // Feed the TimeMap so measurements can resolve playhead -> group.
-              // Only the first object of each group records (idempotent in TimeMap),
-              // and frame 0 of a group has decodeTime == group start PTS.
-              if (this.#timeMap) {
-                this.#timeMap.recordGroupBoundary(Number(object.location.group), info.decodeTimeMs);
-              }
-            }
+            decodeTimeMs = info?.decodeTimeMs;
 
             // Append the data
             let maxRetries = 5;
@@ -1018,6 +967,43 @@ export class Player {
                 this.#starvedSince = undefined;
               }
               struct.lastAppendPerf = nowPerf;
+              // The gate stays armed until a sync sample is actually in the buffer.
+              struct.awaitKeyframe = false;
+              // Append front and TimeMap move only for a frame that is in the buffer.
+              if (info !== undefined) {
+                struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
+                struct.lastFrameDurationMs = info.frameDurationMs;
+                // Feed the TimeMap so measurements can resolve playhead -> group.
+                // Only the first object of each group records (idempotent in TimeMap),
+                // and frame 0 of a group has decodeTime == group start PTS.
+                if (this.#timeMap) {
+                  this.#timeMap.recordGroupBoundary(
+                    Number(object.location.group),
+                    info.decodeTimeMs,
+                  );
+                }
+                // Every target frame moves the pending switch's append front; the
+                // first one applies the switch (M9). Only the video track switches.
+                const applied =
+                  this.catalog?.getRole(struct.trackName) === 'video'
+                    ? this.#seams.appended({
+                        ptsMs: info.decodeTimeMs,
+                        endPtsMs: info.decodeTimeMs + info.frameDurationMs,
+                        group: Number(object.location.group),
+                        object: Number(object.location.object),
+                        now: nowPerf,
+                      })
+                    : null;
+                if (applied !== null) {
+                  events.emit(
+                    'SWITCH_APPLIED',
+                    switchAppliedFields(applied, {
+                      now: nowPerf,
+                      playheadMs: this.#element ? this.#element.currentTime * 1000 : undefined,
+                    }),
+                  );
+                }
+              }
             }
 
             // Check the buffered amount

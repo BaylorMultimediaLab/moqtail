@@ -54,6 +54,8 @@ export interface SwitchRecord {
   seamPtsMs?: number;
   firstAppendedGroup?: number;
   firstAppendedObject?: number;
+  /** Target objects dropped (pre-keyframe, init pending) between the landing and the first append. */
+  discardedBeforeKeyframe: number;
   /** End PTS (ms) of the last appended target frame. */
   targetAppendFrontMs?: number;
 
@@ -98,6 +100,7 @@ export class SeamTracker {
       sentAt: at.sentAt,
       playheadAtSendMs: at.playheadMs,
       appendFrontAtSendMs: at.appendFrontMs,
+      discardedBeforeKeyframe: 0,
       firstFrameSeen: false,
     };
   }
@@ -141,6 +144,12 @@ export class SeamTracker {
     return this.#pending !== null && this.#pending.seamPtsMs !== undefined ? this.#pending : null;
   }
 
+  /** A target object of the pending switch was dropped before anything was appended. */
+  discarded(): void {
+    const rec = this.#pending;
+    if (rec !== null && rec.seamPtsMs === undefined) rec.discardedBeforeKeyframe += 1;
+  }
+
   /**
    * A target frame [ptsMs, endPtsMs) was appended. The first one applies the
    * pending switch (returned); later ones only move its target append front.
@@ -175,4 +184,56 @@ export class SeamTracker {
     this.#pending = null;
     return rec;
   }
+}
+
+/**
+ * SWITCH_APPLIED for a record that has just been applied (M9): the switch's
+ * first appended target object, which is where the new representation really
+ * begins in the buffer. The landing object (SWITCH_FIRST_OBJECT) can be
+ * dropped by the keyframe gate, in which case the seam is up to one GOP later
+ * than the landing object's PTS. `group`/`object` stay the landing object's,
+ * as before.
+ */
+export function switchAppliedFields(
+  rec: SwitchRecord,
+  at: { now: number; playheadMs: number | undefined },
+): Record<string, unknown> {
+  const seam = rec.seamPtsMs;
+  return {
+    switch_seq: rec.seq,
+    from: rec.from,
+    to: rec.to,
+    group: rec.landingGroup ?? null,
+    object: rec.landingObject ?? null,
+    landing_object: rec.landingObject ?? null,
+    first_appended_group: rec.firstAppendedGroup ?? null,
+    first_appended_object: rec.firstAppendedObject ?? null,
+    discarded_before_keyframe: rec.discardedBeforeKeyframe,
+    // Object 0 of a group is where a keyframe is expected ...
+    landed_on_group_start: rec.landingObject === 0,
+    // ... and this is whether the landing object actually is one (trun
+    // sync-sample flag of its moof; null when the moof carries no flags).
+    landed_on_keyframe: rec.landedOnKeyframe ?? null,
+    new_start_pts_ms: seam ?? null,
+    // Source append front at landing, and at send (the latter predates the
+    // source frames that arrived while the SWITCH was in flight).
+    old_end_pts_ms: rec.sourceEndAtLandingMs ?? null,
+    old_end_pts_at_send_ms: rec.appendFrontAtSendMs ?? null,
+    // Seam continuity of the appended media: first appended target frame PTS
+    // minus the source's append front at landing (0 = contiguous, >0 = hole,
+    // <0 = overlap: the target restarts inside media the source covered).
+    media_seam_gap_ms:
+      seam !== undefined && rec.sourceEndAtLandingMs !== undefined
+        ? seam - rec.sourceEndAtLandingMs
+        : null,
+    playhead_ms: rec.playheadAtSendMs ?? null,
+    playhead_at_apply_ms: at.playheadMs ?? null,
+    // How far ahead of the viewer (playhead at send) the new representation
+    // begins: the media still played before it. Negative = seam behind the
+    // playhead.
+    seam_ahead_of_playhead_ms:
+      seam !== undefined && rec.playheadAtSendMs !== undefined ? seam - rec.playheadAtSendMs : null,
+    since_sent_ms: at.now - rec.sentAt,
+    since_landed_ms: rec.landedAt !== undefined ? at.now - rec.landedAt : null,
+  };
 }
