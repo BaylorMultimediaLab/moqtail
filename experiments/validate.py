@@ -52,7 +52,15 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
   pf-warmup         BROWSER_START.warmup_measured_s within 15 +- 1 s (reported)
   pf-offloads       identity.offloads_disabled is true (reported)
   pf-loss           unshaped profile: CONN_STATS loss rate < 0.1 %
-  pf-probe-rate     lowest step <= 1.5 Mbps: probe-measured throughput p50 >= 0.8 x rate
+  pf-delivery-rate  every rate-limited step: over [step + 10 s, next step), the median
+                    THROUGHPUT_SAMPLE rate of link-limited groups (bytes x 8 / 50 ms >= rate, i.e. a
+                    group the publisher's ~50 ms burst cannot deliver faster than the link) lies in
+                    [0.6, 1.15] x rate. When it does not, the 64 KB probe's pure transfer rate in the
+                    same window tells the cause: probe as low as video = the connection delivered
+                    less than the link (transport / congestion control); probe near the rate while
+                    video is low = client-side timing (M11)
+  pf-probe-rate     lowest step <= 1.5 Mbps: probe-measured throughput p50 >= 0.8 x rate (reported;
+                    the min arm runs without the probe)
 
 Writes validation.json into the run directory; analyze.py and compare.py exclude
 runs whose validation did not pass (``valid is not True``) unless told otherwise.
@@ -76,6 +84,73 @@ END_GRACE_MS = 5000.0  # switches sent this close to the run end may legitimatel
 
 def fmt_pct(v) -> str:
     return "-" if v is None else f"{v * 100:.0f} %"
+
+
+# Delivery rate (pf-delivery-rate). The publisher writes a group's objects ~2 ms apart,
+# so a group leaves the relay within ~50 ms; a group whose bytes cannot cross the link in
+# that time is link-limited and its intra-group arrival rate measures the link. Smaller
+# groups (low rungs) are publisher-paced and say nothing about capacity.
+ESTIMATOR_SETTLE_MS = 10_000
+ESTIMATOR_BURST_S = 0.05
+ESTIMATOR_MIN_SAMPLES = 3
+ESTIMATOR_BAND = (0.6, 1.15)
+
+
+def _median(vals: list[float]) -> float:
+    vals = sorted(vals)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+def delivery_rate(applied: list[dict], tput: list[dict], probes: list[dict] | None, client_end: float | None) -> tuple[bool | None, str]:
+    """Per rate-limited step, the median THROUGHPUT_SAMPLE.bps of link-limited groups over
+    [step + settle, next step) must lie in ESTIMATOR_BAND x rate. Returns (ok, detail);
+    ok is None when no step had enough link-limited samples to judge. A step out of band is
+    attributed with the probe's pure transfer rate (p_bytes x 8 / dt_ms, probes >= 60 KB) in
+    the same window when probes exist: within 25 % of the video rate means the connection
+    itself delivered that little (transport); at least 0.6 x rate means client-side timing."""
+    steps = sorted((c for c in applied if c.get("rate_mbps") is not None), key=lambda c: c["ts"])
+    if not steps:
+        return None, "no rate-limited step"
+    ends = [c["ts"] for c in sorted(applied, key=lambda c: c["ts"])]
+    parts, judged, bad = [], 0, 0
+    for c in steps:
+        rate_bps = c["rate_mbps"] * 1e6
+        later = [t for t in ends if t > c["ts"]]
+        end = later[0] if later else (client_end if client_end is not None else float("inf"))
+        lo_t = c["ts"] + ESTIMATOR_SETTLE_MS
+        vals = sorted(r["bps"] for r in tput
+                      if r.get("bps") and r.get("bytes") and lo_t <= r["ts"] < end
+                      and r["bytes"] * 8 / ESTIMATOR_BURST_S >= rate_bps)
+        if len(vals) < ESTIMATOR_MIN_SAMPLES:
+            parts.append(f"{c['rate_mbps']} Mbps at_s={c.get('at_s')}: {len(vals)} link-limited samples (not judged)")
+            continue
+        n = len(vals)
+        med = _median(vals)
+        lo, hi = ESTIMATOR_BAND
+        ok = lo * rate_bps <= med <= hi * rate_bps
+        judged += 1
+        bad += 0 if ok else 1
+        cause = ""
+        if not ok:
+            pr = [r["p_bytes"] * 8 / (r["dt_ms"] / 1000) for r in (probes or [])
+                  if r.get("src", "client") == "client" and r.get("dt_ms") and (r.get("p_bytes") or 0) >= 60_000
+                  and lo_t <= r["ts"] < end]
+            if pr:
+                pmed = _median(pr)
+                if abs(pmed - med) <= 0.25 * med:
+                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: the connection delivered this little (transport)"
+                elif pmed >= lo * rate_bps:
+                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: the link was there, client-side timing (M11)"
+                else:
+                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: inconclusive"
+            else:
+                cause = "; no probe in the window to attribute the cause (see CONN_STATS cwnd/rtt)"
+        parts.append(f"{c['rate_mbps']} Mbps at_s={c.get('at_s')}: median {med / 1e6:.2f} Mbps over {n} link-limited groups "
+                     f"(required {lo * c['rate_mbps']:.2f}-{hi * c['rate_mbps']:.2f}){'' if ok else ' OUT OF BAND' + cause}")
+    if not judged:
+        return None, "; ".join(parts)
+    return bad == 0, "; ".join(parts)
 
 
 class Report:
@@ -401,14 +476,16 @@ def main() -> int:
                     f"unshaped profile: CONN_STATS loss rate={conn.get('loss_rate'):.5f} (lost {conn.get('lost_packets')} of {conn.get('sent_packets')}; required < 0.1 %)")
         else:
             rep.add("pf-loss", None, "shaped profile or no CONN_STATS" if not unshaped else "no CONN_STATS records")
+        est_ok, est_detail = delivery_rate(applied, list(by("THROUGHPUT_SAMPLE")), list(by("PROBE")), client_end)
+        rep.add("pf-delivery-rate", est_ok, est_detail)
         steps = [p for p in (summary.get("link") or {}).get("probe_measured_per_step", []) if p.get("rate_mbps") is not None and p["rate_mbps"] <= 1.5]
         if steps:
             low = min(steps, key=lambda p: p["rate_mbps"])
             p50 = low.get("p50_mbps")
-            rep.add("pf-probe-rate", p50 is not None and p50 >= 0.8 * low["rate_mbps"],
-                    f"step {low['rate_mbps']} Mbps (at_s={low.get('at_s')}): probe-measured p50={p50 and round(p50, 2)} Mbps over {low['probes']} probes (required >= {0.8 * low['rate_mbps']:.2f})")
+            rep.info("pf-probe-rate", f"step {low['rate_mbps']} Mbps (at_s={low.get('at_s')}): probe-measured p50={p50 and round(p50, 2)} Mbps "
+                                      f"over {low['probes']} probes (expected >= {0.8 * low['rate_mbps']:.2f}; reported only)")
         else:
-            rep.add("pf-probe-rate", None, "no step <= 1.5 Mbps in this run")
+            rep.info("pf-probe-rate", "no probe on a step <= 1.5 Mbps (the min arm runs without the probe)")
 
     print(rep.render())
     if not args.no_write:
