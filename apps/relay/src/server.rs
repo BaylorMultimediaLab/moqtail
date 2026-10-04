@@ -228,6 +228,9 @@ impl Server {
       },
       _ = sigterm.recv() => {
         info!("SIGTERM received, draining (GOAWAY, timeout {}ms)...", DRAIN_TIMEOUT_MS);
+        // The runner may follow up with SIGKILL before the drain ends; everything
+        // recorded up to the stop request is on disk first.
+        events::flush();
         self.draining.store(true, Ordering::Relaxed);
         self.broadcast_goaway(DRAIN_TIMEOUT_MS).await;
         // Keep accepting while draining; a second Ctrl-C cuts it short.
@@ -242,6 +245,7 @@ impl Server {
     for accept_loop in accept_loops {
       let _ = accept_loop.await;
     }
+    events::flush();
     Ok(())
   }
 
