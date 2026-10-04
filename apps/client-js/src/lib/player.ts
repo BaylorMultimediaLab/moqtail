@@ -755,10 +755,8 @@ export class Player {
             //      arrives after pendingSwitch was overwritten to C.
             //   2. Old-track trailing packets delivered after a switch has
             //      already activated and pendingSwitch was cleared.
-            if (
-              objectTrackName !== struct.trackName &&
-              objectTrackName !== struct.pendingSwitch?.trackName
-            ) {
+            const route = this.#route(struct, objectTrackName);
+            if (route === 'stale') {
               logger.info(
                 'media',
                 `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
@@ -774,21 +772,14 @@ export class Player {
               return;
             }
 
-            if (
-              struct.pendingSwitch &&
-              objectTrackName === struct.pendingSwitch.trackName &&
-              this.#options.landingRequiresAliasMapping &&
-              objectTrackName !== struct.trackName &&
-              this.client !== null &&
-              !this.client.subscriptionAliasMap.has(struct.requestId)
-            ) {
+            if (route === 'pre-landing') {
               // Same track name, but the library has not yet seen a stream for
               // the switched subscription: this is a trailing object of the
               // earlier subscription to that track, not the switch landing.
               this.#dropStale(struct, object, objectTrackName, {
                 track: objectTrackName,
                 current: struct.trackName,
-                pending: struct.pendingSwitch.trackName,
+                pending: struct.pendingSwitch?.trackName ?? null,
                 group: object.location.group,
                 bytes: object.payload.byteLength,
                 object: object.location.object,
@@ -797,7 +788,7 @@ export class Player {
               return;
             }
 
-            if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
+            if (route === 'land' && struct.pendingSwitch) {
               const { initData, mimeType, trackName: newTrackName, record } = struct.pendingSwitch;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
               // The source's last appended frame at the moment the switch lands
@@ -1142,6 +1133,45 @@ export class Player {
         }
       });
     }
+  }
+
+  /**
+   * What the write handler does with an object of `objectTrackName` on
+   * `struct`: `stale` (neither the current track nor the pending switch
+   * target: dropped), `pre-landing` (the pending target's name, but the
+   * library has not mapped the switched subscription yet: a trailing object
+   * of an earlier subscription to that track, dropped), `land` (the pending
+   * switch lands on it) or `current` (append).
+   */
+  #route(
+    struct: MOQStreamStruct,
+    objectTrackName: string,
+  ): 'stale' | 'pre-landing' | 'land' | 'current' {
+    const pending = struct.pendingSwitch;
+    if (objectTrackName !== struct.trackName && objectTrackName !== pending?.trackName) {
+      return 'stale';
+    }
+    if (
+      pending &&
+      objectTrackName === pending.trackName &&
+      this.#options.landingRequiresAliasMapping &&
+      objectTrackName !== struct.trackName &&
+      this.client !== null &&
+      !this.client.subscriptionAliasMap.has(struct.requestId)
+    ) {
+      return 'pre-landing';
+    }
+    if (pending && objectTrackName === pending.trackName) return 'land';
+    return 'current';
+  }
+
+  /**
+   * The write handler's routing of a video object of `trackName` right now
+   * (see #route); null without a video stream. For tests.
+   */
+  routeVideoObject(trackName: string): 'stale' | 'pre-landing' | 'land' | 'current' | null {
+    const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    return vs ? this.#route(vs, trackName) : null;
   }
 
   /**
@@ -1798,6 +1828,28 @@ export class Player {
       buffered_end_ms: videoStruct.lastAppendedEndPTS_ms ?? null,
     });
 
+    // Arm the write handler provisionally, before awaiting the SWITCH (F12).
+    // The library maps the new subscription's alias when it processes
+    // SWITCH_OK, and a target data stream can deliver objects to the write
+    // handler before this function's continuation runs; armed only after the
+    // await, those objects were dropped as stale, and if the first was the
+    // keyframe the seam moved a GOP later. The alias check in #route still
+    // keeps objects from before SWITCH_OK out ('pre-landing'). Rolled back on
+    // a refusal or an error unless the switch already landed.
+    const pending: PendingSwitch = {
+      trackName,
+      initData: initData.buffer as ArrayBuffer,
+      mimeType,
+      record,
+    };
+    const previousPending = videoStruct.pendingSwitch;
+    videoStruct.pendingSwitch = pending;
+    const rollback = () => {
+      if (videoStruct.pendingSwitch === pending && record.landedAt === undefined) {
+        videoStruct.pendingSwitch = previousPending;
+      }
+    };
+
     try {
       const result = await this.client.switch({
         requestId: newRequestId,
@@ -1807,6 +1859,7 @@ export class Player {
       });
 
       if (result instanceof RequestError) {
+        rollback();
         logger.error(
           'media',
           `switchTrack: SWITCH rejected for ${trackName}:`,
@@ -1826,20 +1879,16 @@ export class Player {
         return record.seq;
       }
 
-      // Arm the write handler for init segment re-injection at the next group
-      // boundary. The onTrackSwitched callback (which releases the ABR switching
-      // guard) is NOT called here — it fires in the write handler AFTER the relay
-      // has actually delivered data on the new track. This prevents rapid
-      // consecutive SWITCH messages that corrupt the relay's switch context.
-      // Tracker is intentionally not reset — the previous-track bandwidth
-      // estimate is still a valid indicator of network capacity. (dash.js
-      // doesn't reset throughput on quality switches either.)
-      this.#armPendingSwitch(videoStruct, {
-        trackName,
-        initData: initData.buffer as ArrayBuffer,
-        mimeType,
-        record,
-      });
+      // Confirm the arming: the write handler re-injects the init segment at
+      // the landing. The onTrackSwitched callback (which releases the ABR
+      // switching guard) is NOT called here — it fires in the write handler
+      // AFTER the relay has actually delivered data on the new track. This
+      // prevents rapid consecutive SWITCH messages that corrupt the relay's
+      // switch context. Tracker is intentionally not reset — the
+      // previous-track bandwidth estimate is still a valid indicator of
+      // network capacity. (dash.js doesn't reset throughput on quality
+      // switches either.)
+      this.#confirmPendingSwitch(videoStruct, pending);
       events.emit('SWITCH_OK', {
         switch_seq: record.seq,
         to: trackName,
@@ -1847,6 +1896,7 @@ export class Player {
         rtt_ms: performance.now() - switchSentAt,
       });
     } catch (error) {
+      rollback();
       logger.error('media', 'switchTrack: unexpected error', error);
       events.emit('SWITCH_ERROR', {
         switch_seq: record.seq,
@@ -1873,20 +1923,34 @@ export class Player {
   }
 
   /**
-   * Waits for `pending` to land. A switch that was accepted earlier and has not
-   * landed is replaced here and can never land: it ends in SWITCH_SUPERSEDED
-   * (C1), so every switch has exactly one terminal record.
+   * The relay accepted `pending` (armed provisionally before the SWITCH was
+   * awaited, F12; it may even have landed already). A switch that was
+   * accepted earlier and has not landed was replaced and can never land: it
+   * ends in SWITCH_SUPERSEDED (C1), so every switch has exactly one terminal
+   * record. If a newer switch re-armed the stream in the meantime, this one
+   * can never land either and is superseded by it.
    */
-  #armPendingSwitch(struct: MOQStreamStruct, pending: PendingSwitch): void {
+  #confirmPendingSwitch(struct: MOQStreamStruct, pending: PendingSwitch): void {
+    const playheadMs = (this.#element?.currentTime ?? 0) * 1000;
+    const newer = struct.pendingSwitch;
+    if (newer !== pending && pending.record.landedAt === undefined) {
+      pending.record.supersededBy = newer?.record.seq;
+      events.emit('SWITCH_SUPERSEDED', {
+        switch_seq: pending.record.seq,
+        by_switch_seq: newer?.record.seq ?? null,
+        playhead_ms: playheadMs,
+        landed: false,
+      });
+      return;
+    }
     for (const old of this.#seams.armed(pending.record).superseded) {
       events.emit('SWITCH_SUPERSEDED', {
         switch_seq: old.seq,
         by_switch_seq: pending.record.seq,
-        playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
+        playhead_ms: playheadMs,
         landed: false,
       });
     }
-    struct.pendingSwitch = pending;
   }
 
   async #newSourceBufferMSE(struct: MOQStreamStruct, trackName: string) {

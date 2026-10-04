@@ -178,7 +178,9 @@ export class SeamTracker {
   /**
    * The relay accepted `rec` (SWITCH_OK) and the player now waits for it to
    * land. A previously accepted switch that has not landed is replaced and
-   * therefore superseded: it can never land any more.
+   * therefore superseded: it can never land any more. `rec` may already have
+   * landed (the player arms before the SWITCH is acknowledged, F12); it is
+   * then not waited for.
    */
   armed(rec: SwitchRecord): { superseded: SwitchRecord[] } {
     const superseded: SwitchRecord[] = [];
@@ -187,7 +189,7 @@ export class SeamTracker {
       prev.supersededBy = rec.seq;
       superseded.push(prev);
     }
-    this.#armed = rec;
+    this.#armed = rec.landedAt === undefined ? rec : null;
     return { superseded };
   }
 

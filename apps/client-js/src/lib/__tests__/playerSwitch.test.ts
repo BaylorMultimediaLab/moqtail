@@ -20,7 +20,9 @@ function fakeCatalog() {
   };
 }
 
-async function makePlayer(opts: { switchResult?: () => Promise<unknown> } = {}) {
+async function makePlayer(
+  opts: { switchResult?: (req: { requestId: bigint }) => Promise<unknown> } = {},
+) {
   const player = new Player({ namespace: Tuple.fromUtf8Path('/test') });
   const aliasMap = new Map<bigint, bigint>();
   let nextId = 10n;
@@ -88,5 +90,66 @@ describe('Player.switchTrack: the switch_seq it allocated (F14)', () => {
     await p;
     expect(typeof seq).toBe('number');
     expect(callbacks).toEqual([['360p', seq]]);
+  });
+});
+
+describe('Player.switchTrack: a target object that arrives before switch() resolves (F12)', () => {
+  beforeEach(() => {
+    vi.spyOn(events, 'emit').mockImplementation(() => {});
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('lands the switch instead of being dropped as stale', async () => {
+    let routed: string | null = null;
+    const env: { player?: Player; aliasMap?: Map<bigint, bigint> } = {};
+    const made = await makePlayer({
+      switchResult: async req => {
+        // SWITCH_OK processed by the library (alias mapped) and a target data
+        // stream delivered its first object before this promise resolves.
+        env.aliasMap!.set(req.requestId, 8n);
+        routed = env.player!.routeVideoObject('720p');
+        return { requestId: req.requestId };
+      },
+    });
+    env.player = made.player;
+    env.aliasMap = made.aliasMap;
+    await made.player.switchTrack('720p');
+    expect(routed).toBe('land');
+    expect(made.player.hasSwitchInFlight()).toBe(true);
+  });
+
+  it('before SWITCH_OK the target name is still a trailing object of an earlier subscription', async () => {
+    let routed: string | null = null;
+    const env: { player?: Player } = {};
+    const made = await makePlayer({
+      switchResult: async req => {
+        routed = env.player!.routeVideoObject('720p'); // alias not mapped yet
+        return { requestId: req.requestId };
+      },
+    });
+    env.player = made.player;
+    await made.player.switchTrack('720p');
+    expect(routed).toBe('pre-landing');
+  });
+
+  it('a refused switch rolls the provisional arming back', async () => {
+    const { player } = await makePlayer({
+      switchResult: async () =>
+        Object.create(RequestError.prototype, { reasonPhrase: { value: { phrase: 'no' } } }),
+    });
+    await player.switchTrack('720p');
+    expect(player.routeVideoObject('720p')).toBe('stale');
+    expect(player.hasSwitchInFlight()).toBe(false);
+  });
+
+  it('a switch that throws rolls the provisional arming back', async () => {
+    const { player } = await makePlayer({
+      switchResult: async () => {
+        throw new Error('boom');
+      },
+    });
+    await player.switchTrack('720p');
+    expect(player.routeVideoObject('720p')).toBe('stale');
+    expect(player.hasSwitchInFlight()).toBe(false);
   });
 });

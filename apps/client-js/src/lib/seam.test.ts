@@ -359,3 +359,18 @@ describe('SeamTracker: the append front is dated at the appendBuffer call (F9)',
     expect(t.presented({ mediaMs: 10_000, frameMs: 33.3, now: 99 })).toBeNull();
   });
 });
+
+describe('SeamTracker: a switch that lands before it is acknowledged (F12)', () => {
+  it('supersedes the previously armed switch at the acknowledgement and is not waited for itself', () => {
+    const t = new SeamTracker();
+    const a = send(t, 'low', 'mid');
+    t.armed(a); // accepted, never lands
+    const b = send(t, 'low', 'high', 1500);
+    land(t, b, 6, 1600); // landed before its SWITCH_OK continuation ran
+    expect(t.armed(b).superseded).toEqual([a]);
+    // b is not armed: a later acknowledgement does not supersede it.
+    const c = send(t, 'high', 'mid', 2000);
+    expect(t.armed(c).superseded).toEqual([]);
+    expect(b.supersededBy).toBeUndefined();
+  });
+});
