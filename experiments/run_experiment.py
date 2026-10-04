@@ -148,6 +148,150 @@ def ladder_id(encoded_dir: Path, ladder_spec: str) -> str:
     return f"{ladder_spec}@{encoded_dir.name}"
 
 
+def cache_meta_hash(encoded_dir: Path) -> str | None:
+    """sha256 of the prepared cache's meta.json: the cache can change under the
+    same directory name (pilot-linux.md 11), so the name alone is not an identity."""
+    import hashlib
+    p = encoded_dir / "meta.json"
+    if not p.exists():
+        return None
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def cache_gops(encoded_dir: Path) -> int | None:
+    try:
+        v = json.loads((encoded_dir / "meta.json").read_text()).get("gops_per_variant")
+        return int(v) if v is not None else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+# Relay flags the runner pins explicitly, with identical values on every
+# mechanism branch (M20: branch defaults differ, e.g. switch/pr1674 raised
+# track_alias_resolution_timeout_ms 500 -> 2000; switch/pr1378 adds
+# --t-switch-ms). Units follow the relay's flag names (seconds unless _ms).
+RELAY_PINNED = {
+    "--keep-alive-interval": "3",
+    "--max-idle-timeout": "7",
+    "--track-alias-resolution-timeout-ms": "2000",
+    "--downstream-alias-timeout-ms": "3000",
+    "--publish-done-stream-timeout-ms": "2000",
+}
+# Flags only some relays know; passed when `--help` lists them, else skipped
+# (recorded as skipped in run_meta).
+RELAY_BRANCH_OPTIONAL = {"--t-switch-ms": "3000"}
+# Relay flags the contract requires (W4 adds them); their absence is an error
+# unless --allow-missing-relay-flags, and a --final run never allows it.
+RELAY_REQUIRED_NEW = ("--congestion-controller",)
+PUBLISHER_REQUIRED_NEW = {"--variant-priority": "128"}
+
+
+def binary_flags(binary: Path) -> set[str]:
+    """Long option names a clap binary lists in `--help`."""
+    import re
+    try:
+        out = subprocess.run([str(binary), "--help"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(re.findall(r"(?m)^\s*(?:-\w, )?(--[a-z0-9][a-z0-9-]*)", out.stdout + out.stderr))
+
+
+def pinned_relay_args(flags: set[str], cc: str, cache_size: int, allow_missing: bool) -> tuple[list[str], dict]:
+    """Relay argv additions and a record of what was pinned/skipped/missing."""
+    argv: list[str] = ["--cache-size", str(cache_size)]
+    record = {"pinned": {"--cache-size": str(cache_size)}, "skipped": [], "missing": []}
+    for flag, value in RELAY_PINNED.items():
+        if flag in flags:
+            argv += [flag, value]
+            record["pinned"][flag] = value
+        else:
+            record["missing"].append(flag)
+    for flag, value in RELAY_BRANCH_OPTIONAL.items():
+        if flag in flags:
+            argv += [flag, value]
+            record["pinned"][flag] = value
+        else:
+            record["skipped"].append(flag)
+    if "--congestion-controller" in flags:
+        argv += ["--congestion-controller", cc]
+        record["pinned"]["--congestion-controller"] = cc
+    else:
+        record["missing"].append("--congestion-controller")
+    if record["missing"] and not allow_missing:
+        raise SystemExit(
+            "the relay binary does not accept " + ", ".join(record["missing"]) + " (checked `relay --help`).\n"
+            "The contract (docs/rebuild-2026-10-04.md, Transport fairness) requires every timeout and the\n"
+            "congestion controller to be pinned by the runner. Rebuild the relay from a branch that has W4's\n"
+            "flags, or pass --allow-missing-relay-flags for a smoke test (refused with --final).")
+    return argv, record
+
+
+def pinned_publisher_args(flags: set[str], allow_missing: bool) -> tuple[list[str], dict]:
+    argv: list[str] = []
+    record = {"pinned": {}, "missing": []}
+    for flag, value in PUBLISHER_REQUIRED_NEW.items():
+        if flag in flags:
+            argv += [flag, value]
+            record["pinned"][flag] = value
+        else:
+            record["missing"].append(flag)
+    if record["missing"] and not allow_missing:
+        raise SystemExit(
+            "the publisher binary does not accept " + ", ".join(record["missing"]) + " (checked `publisher --help`).\n"
+            "The contract requires one priority for all variants, passed explicitly. Rebuild the publisher from a\n"
+            "branch that has W4's flag, or pass --allow-missing-relay-flags for a smoke test (refused with --final).")
+    return argv, record
+
+
+def find_record(path: Path, event: str) -> dict | None:
+    """First JSONL record with `event` in `path`, or None."""
+    if not path.exists():
+        return None
+    try:
+        with path.open() as f:
+            for line in f:
+                if f'"{event}"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") == event:
+                    return rec
+    except OSError:
+        return None
+    return None
+
+
+def wait_record(path: Path, event: str, timeout: float, proc: subprocess.Popen | None = None,
+                what: str = "") -> dict | None:
+    """Poll `path` for `event` up to `timeout` s; None on timeout. Raises if `proc` exits meanwhile."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rec = find_record(path, event)
+        if rec is not None:
+            return rec
+        if proc is not None and proc.poll() is not None:
+            raise SystemExit(f"{what or event}: process exited with {proc.returncode} before emitting {event}")
+        time.sleep(0.2)
+    return None
+
+
+def wait_log_line(path: Path, needle: str, timeout: float, proc: subprocess.Popen | None = None,
+                  what: str = "") -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if needle in path.read_text(errors="replace"):
+                return True
+        except OSError:
+            pass
+        if proc is not None and proc.poll() is not None:
+            raise SystemExit(f"{what}: process exited with {proc.returncode} before logging {needle!r}; see {path}")
+        time.sleep(0.2)
+    return False
+
+
 def client_delay_groups(out: Path):
     return _client_run_meta(out).get("delay_groups")
 
@@ -396,6 +540,12 @@ def main() -> int:
     ap.add_argument("--ladder-spec", default="cache",
                     help="publisher ladder; `cache` (default) uses the ladder the GOP cache was prepared with")
     ap.add_argument("--cache-size", type=int, default=1000, help="relay --cache-size (groups per track)")
+    ap.add_argument("--cc", choices=["cubic", "bbr"], default="cubic",
+                    help="relay QUIC congestion controller (--congestion-controller), recorded as "
+                         "identity.congestion_controller; cubic is the paper's primary, bbr the sensitivity batch")
+    ap.add_argument("--allow-missing-relay-flags", action="store_true",
+                    help="smoke tests only: run even if the relay/publisher binary lacks the contract's flags "
+                         "(--congestion-controller, timeouts, --variant-priority); refused with --final")
     ap.add_argument("--relay-port", type=int, default=4433)
     ap.add_argument("--vite-port", type=int, default=5173)
     ap.add_argument("--browser", default=None, help="path to a Firefox or Chromium binary (default: Firefox if found, else Chromium)")
@@ -411,7 +561,6 @@ def main() -> int:
                     help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, "
                          "upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs, "
                          "probeMode, probeMaxBytes)")
-    ap.add_argument("--seed", type=int, default=None, help="recorded in run_meta; profiles are deterministic")
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
     ap.add_argument("--no-analyze", action="store_true")
@@ -432,6 +581,8 @@ def main() -> int:
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
     if args.final and worktree_dirty():
         ap.error("--final requires a clean git worktree (commit or stash first)")
+    if args.final and args.allow_missing_relay_flags:
+        ap.error("--final refuses --allow-missing-relay-flags: every relay/publisher flag must be pinned")
     expected_branch = MECHANISM_BRANCH[args.mechanism]
     if branch != expected_branch:
         ap.error(f"--mechanism {args.mechanism} runs on branch {expected_branch}, but HEAD is {branch}")
@@ -479,6 +630,10 @@ def run_once(args, repeat_index: int) -> int:
     procs: dict[str, subprocess.Popen] = {}
     browser: str | None = None
     browser_pattern: str | None = None
+    relay_config: dict | None = None
+    relay_pins: dict = {}
+    publisher_pins: dict = {}
+    warmup = 0.0
     bg = BackgroundFlows(backend, args.bg_flows, args.bg_pattern, cc=args.bg_cc, log=rlog.emit)
     exit_code = 0
     try:
@@ -489,13 +644,24 @@ def run_once(args, repeat_index: int) -> int:
             if not b.exists():
                 raise SystemExit(f"missing {b}; run: cargo build --release --workspace")
         (out / "relay-logs").mkdir()
+        # Every timeout and the congestion controller are pinned explicitly, with
+        # identical values on every branch (M20); what each binary accepts is read
+        # from its --help so a missing flag is a clear error, not a clap failure.
+        relay_flags = binary_flags(relay_bin)
+        relay_pin_argv, relay_pins = pinned_relay_args(relay_flags, args.cc, args.cache_size,
+                                                       args.allow_missing_relay_flags)
+        publisher_flags = binary_flags(publisher_bin)
+        publisher_pin_argv, publisher_pins = pinned_publisher_args(publisher_flags, args.allow_missing_relay_flags)
+        if args.mechanism == "native" and args.mechanism_mode == "forward-trigger" \
+                and "--forward-promotion-trigger" not in relay_flags:
+            raise SystemExit("this relay has no --forward-promotion-trigger; build it from switch/native")
         procs["relay"] = spawn([
             str(relay_bin), "--port", str(args.relay_port), "--host", backend.relay_host,
             "--cert-file", str(args.cert_dir / "cert.pem"),
             "--key-file", str(args.cert_dir / "key.pem"),
             "--log-folder", str(out / "relay-logs"),
             "--event-log", str(out / "relay-events.jsonl"),
-            "--cache-size", str(args.cache_size),
+            *relay_pin_argv,
             # --log-objects: the relay logs OBJECT_SENT per object handed to a subscriber
             # (and its per-subscription object files under relay-logs/).
             *(["--enable-object-logging"] if args.log_objects else []),
@@ -505,6 +671,15 @@ def run_once(args, repeat_index: int) -> int:
               if args.mechanism == "native" and args.mechanism_mode == "forward-trigger" else []),
         ], out / "relay.log")
         time.sleep(1.5)
+        # The relay's own view of its configuration (RELAY_CONFIG, W4) is the
+        # record of what actually ran; kept in run_meta as `relay_config`.
+        relay_config = wait_record(out / "relay-events.jsonl", "RELAY_CONFIG", 5.0, procs["relay"], "relay")
+        if relay_config is None and not args.allow_missing_relay_flags:
+            raise SystemExit("relay emitted no RELAY_CONFIG within 5 s of start; this relay predates the contract "
+                             "(docs/rebuild-2026-10-04.md). Rebuild it, or --allow-missing-relay-flags for a smoke test")
+        if relay_config is not None and relay_config.get("congestion_controller") not in (None, args.cc):
+            raise SystemExit(f"relay reports congestion_controller={relay_config.get('congestion_controller')!r}, "
+                             f"runner asked for {args.cc!r}")
 
         # Publisher (replay from the prepared cache, no loop so the media
         # timeline never wraps inside a run) ---------------------------------
@@ -519,6 +694,7 @@ def run_once(args, repeat_index: int) -> int:
             "--encoded-dir", str(args.encoded_dir), "--max-variants", str(args.max_variants),
             "--ladder-spec", args.ladder_spec, "--no-loop",
             "--event-log", str(out / "publisher-events.jsonl"),
+            *publisher_pin_argv,
         ], out / "publisher.log")
 
         # Vite dev server (serves the player and receives client events) -----
@@ -663,7 +839,14 @@ def run_once(args, repeat_index: int) -> int:
             "duration_s": args.duration,
             "abr_overrides": args.abr or None,
             "browser": browser_kind(browser) if browser else None,
-            "seed": args.seed,
+            # Transport and apparatus identity (rebuild contract, "Identity").
+            "congestion_controller": args.cc,
+            "relay_config": relay_config,
+            "cache_meta_hash": cache_meta_hash(args.encoded_dir),
+            "kernel": os.uname().release,
+            "tc_version": tc_version(),
+            "offloads_disabled": bool((backend.offloads or {}).get("all_off")) if backend.name != "none" else None,
+            "warmup_s": warmup,
         }
         meta = {
             "identity": identity,
@@ -672,6 +855,9 @@ def run_once(args, repeat_index: int) -> int:
             "net_backend": backend.name,
             "net": {"topology": {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(topo).items()},
                     "offloads": backend.offloads or None, "kernel": os.uname().release, "tc_version": tc_version()},
+            "relay_config": relay_config,
+            "publisher_config": find_record(out / "publisher-events.jsonl", "PUBLISHER_CONFIG"),
+            "relay_flags": relay_pins, "publisher_flags": publisher_pins,
             # kept for older readers
             "run_id": run_id, "git_branch": identity["branch"], "git_sha": identity["git_sha"], "started": stamp,
         }
