@@ -210,8 +210,16 @@ async fn handle_probe_subscribe(
 
   let stream_id = StreamId::new_subgroup(track_alias, 0, Some(0));
 
-  // Stream-scheduling priority 0 -- yield to real video under congestion.
-  let send_stream = match client.open_stream(&stream_id, header_bytes, 0).await {
+  // Stream-scheduling priority: the lowest slot of the lowest band, so the probe
+  // yields to every video stream whatever subscriber priority they carry (M3).
+  let send_stream = match client
+    .open_stream(
+      &stream_id,
+      header_bytes,
+      crate::server::subscription::probe_stream_priority(),
+    )
+    .await
+  {
     Ok(s) => s,
     Err(e) => {
       warn!("probe: failed to open stream: {:?}", e);

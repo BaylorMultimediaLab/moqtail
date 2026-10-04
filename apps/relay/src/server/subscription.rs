@@ -277,7 +277,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
 /// Within each band, group_id determines relative position according to group_order:
 ///   Ascending / Original – lower group_id = higher priority (counts down from band_max)
 ///   Descending            – higher group_id = higher priority (counts up from band_min)
-fn compute_stream_priority(
+pub(crate) fn compute_stream_priority(
   sub_prio: u8,
   pub_prio: u8,
   group_order: GroupOrder,
@@ -291,6 +291,19 @@ fn compute_stream_priority(
     GroupOrder::Ascending | GroupOrder::Original => (band_min + BAND_SIZE - 1 - group_slot) as i32,
     GroupOrder::Descending => (band_min + group_slot) as i32,
   }
+}
+
+/// QUIC stream priority of the relay's synthetic `.probe:` streams (M3).
+///
+/// The lowest slot the formula above can produce: subscriber and publisher priority
+/// 255 (the lowest band) and the last group slot of that band. A literal 0 sat in the
+/// middle of the i32 range, which is above every video stream of a subscriber whose
+/// priority is 128 (the default the promoted subscription fell back to) and below
+/// those of a priority-0 subscriber, so whether the probe starved video depended on
+/// which SUBSCRIBE created the subscription. This value is below every video stream
+/// for any subscriber priority other than the (255, 255) corner, where it ties.
+pub(crate) fn probe_stream_priority() -> i32 {
+  compute_stream_priority(255, 255, GroupOrder::Ascending, u64::MAX)
 }
 
 #[derive(Debug, Clone)]
@@ -1652,6 +1665,50 @@ mod tests {
     let high = compute_stream_priority(10, 0, GroupOrder::Ascending, 0);
     let low = compute_stream_priority(10, 1, GroupOrder::Ascending, 0);
     assert!(high > low, "lower pub_prio number = higher priority");
+  }
+
+  /// M3: the probe must never outrank video, whatever subscriber priority the
+  /// SUBSCRIBE (or a promoted SWITCH subscription) ended up with. Checked for the
+  /// two priorities that occur in the harness (0 from the player, 128 the relay
+  /// default) across every publisher priority, both group orders and the group
+  /// slots at the band edges.
+  #[test]
+  fn probe_priority_is_below_every_video_band_for_subscriber_priorities_0_and_128() {
+    let probe = probe_stream_priority();
+    assert_eq!(
+      probe,
+      i32::MIN,
+      "probe takes the lowest slot of the lowest band"
+    );
+    for sub in [0u8, 128] {
+      for pub_ in 0u8..=255 {
+        for &order in &[
+          GroupOrder::Ascending,
+          GroupOrder::Original,
+          GroupOrder::Descending,
+        ] {
+          for group in [0u64, 1, 1000, 65534, 65535, 65536, u64::MAX] {
+            let video = compute_stream_priority(sub, pub_, order, group);
+            assert!(
+              video > probe,
+              "video (sub={sub} pub={pub_} order={order:?} group={group}) = {video} must outrank probe {probe}"
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /// A literal 0 (the previous probe priority) is NOT below video for a
+  /// priority-128 subscriber: this is the defect the derived value fixes.
+  #[test]
+  fn literal_zero_would_outrank_default_priority_video() {
+    let video_default_sub = compute_stream_priority(128, 128, GroupOrder::Ascending, 0);
+    assert!(
+      video_default_sub < 0,
+      "literal 0 sits above a 128/128 video stream"
+    );
+    assert!(probe_stream_priority() < video_default_sub);
   }
 
   #[test]

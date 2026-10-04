@@ -19,7 +19,7 @@ use clap::Parser;
 use cli::Cli;
 use connection::MoqConnection;
 use encoder::{EncodedGop, HardwareEncoder};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Barrier, mpsc};
@@ -99,6 +99,14 @@ async fn run_live(cli: Cli) -> Result<()> {
       })).collect::<Vec<_>>(),
     }),
   );
+  emit_publisher_config(
+    &cli,
+    "live",
+    &catalog_tracks,
+    video_info.framerate,
+    None,
+    None,
+  );
 
   let mut moq = MoqConnection::establish(&cli.endpoint, cli.validate_cert).await?;
   let track_aliases =
@@ -115,10 +123,11 @@ async fn run_live(cli: Cli) -> Result<()> {
   let (raw_txs, mut raw_rxs) = make_raw_channels(variants.len());
 
   let emit_barrier = Arc::new(Barrier::new(variants.len()));
-  let variant_count = variants.len();
   for (i, variant) in variants.into_iter().enumerate() {
     let track_alias = track_aliases[i];
-    let publisher_priority = (variant_count as u8).saturating_sub(i as u8);
+    // One priority for every variant (M3): the relay schedules by priority band
+    // before group recency, so distinct per-variant values decided the seam order.
+    let publisher_priority = cli.variant_priority;
     let conn = moq.connection.clone();
     let raw_rx = raw_rxs.remove(0);
     let cancel_v = cancel.clone();
@@ -536,6 +545,21 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
       })).collect::<Vec<_>>(),
     }),
   );
+  let meta_sha256 = match cache::top_meta_sha256(&encoded_dir) {
+    Ok(h) => Some(h),
+    Err(e) => {
+      error!("cannot hash {}/meta.json: {:#}", encoded_dir.display(), e);
+      None
+    }
+  };
+  emit_publisher_config(
+    &cli,
+    "replay",
+    &catalog_tracks,
+    top_meta.framerate,
+    Some(&encoded_dir),
+    meta_sha256,
+  );
 
   let mut moq = MoqConnection::establish(&cli.endpoint, cli.validate_cert).await?;
   // Build a borrowed-variant view of the cache so publish_all_tracks works
@@ -573,13 +597,13 @@ async fn run_replay(cli: Cli, encoded_dir: PathBuf) -> Result<()> {
   ));
 
   let emit_barrier = Arc::new(Barrier::new(variant_metas.len()));
-  let variant_count = variant_metas.len();
   let gop_duration_secs = top_meta.framerate.recip() * encoder::gop_size(top_meta.framerate) as f64;
   let loop_replay = !cli.no_loop;
 
   for (i, vm) in variant_metas.into_iter().enumerate() {
     let track_alias = track_aliases[i];
-    let publisher_priority = (variant_count as u8).saturating_sub(i as u8);
+    // One priority for every variant (M3); see run_live.
+    let publisher_priority = cli.variant_priority;
     let conn = moq.connection.clone();
     let cancel_v = cancel.clone();
     let barrier = emit_barrier.clone();
@@ -665,6 +689,51 @@ async fn run_replay_variant(
 }
 
 // ── shared helpers ───────────────────────────────────────────────────────────
+
+/// PUBLISHER_CONFIG, once at start: the ladder with bitrates, the GOP size and
+/// duration, the one publisher priority every variant carries, the cache path and
+/// the SHA-256 of its `meta.json` (both null in live mode), so a run's identity
+/// records exactly what was published.
+fn emit_publisher_config(
+  cli: &Cli,
+  mode: &str,
+  catalog_tracks: &[catalog::CatalogTrack],
+  framerate: f64,
+  cache_path: Option<&Path>,
+  meta_sha256: Option<String>,
+) {
+  events::emit(
+    "PUBLISHER_CONFIG",
+    serde_json::json!({
+      "mode": mode,
+      "namespace": cli.namespace,
+      "endpoint": cli.endpoint,
+      "ladder_spec": cli.ladder_spec,
+      "max_variants": cli.max_variants,
+      "variant_priority": cli.variant_priority,
+      "framerate": framerate,
+      "gop_size_frames": encoder::gop_size(framerate),
+      "gop_duration_ms": encoder::gop_duration_ms(framerate),
+      "target_latency_ms": cli.target_latency_ms,
+      "no_loop": cli.no_loop,
+      "replay_inter_object_delay_ms": (mode == "replay")
+        .then_some(REPLAY_INTER_OBJECT_DELAY.as_millis() as u64),
+      "cache_path": cache_path.map(|p| p.display().to_string()),
+      "meta_sha256": meta_sha256,
+      "ladder": catalog_tracks.iter().enumerate().map(|(i, t)| serde_json::json!({
+        "index": i,
+        "track": t.name,
+        "width": t.width,
+        "height": t.height,
+        "bitrate_bps": t.bitrate_bps,
+        "framerate": t.framerate,
+        "gop_duration_ms": t.gop_duration_ms,
+        "codec": t.codec,
+        "publisher_priority": cli.variant_priority,
+      })).collect::<Vec<_>>(),
+    }),
+  );
+}
 
 fn log_variants(variants: &[adaptive::QualityVariant]) {
   info!("{} adaptive variants", variants.len());

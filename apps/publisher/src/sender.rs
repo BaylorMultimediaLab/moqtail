@@ -23,10 +23,12 @@ const SINGLE_SUBGROUP_ID: u8 = 0;
 /// Each GOP maps to one MoQ group; each encoded packet within the GOP maps to
 /// one MoQ object within that group's subgroup stream.
 ///
-/// `publisher_priority` controls drop precedence at the relay under congestion:
-/// lower numbers = higher priority = relay delivers these first.
-/// Assign lower numbers to lower-quality tracks so the baseline quality remains
-/// available under network stress.
+/// `publisher_priority` is the MoQ Publisher Priority written into every subgroup
+/// header (lower number = higher priority). The relay's QUIC scheduler orders
+/// streams by (subscriber priority, publisher priority) band before group recency,
+/// so every video variant is given the same value (`--variant-priority`, default
+/// 128): with distinct per-variant values the order in which the old and new
+/// track's bytes left the relay at a switch seam depended on ladder position (M3).
 ///
 /// # Stream-per-group note
 /// A new QUIC stream is opened per GOP (~1 per second). This preserves MoQ
