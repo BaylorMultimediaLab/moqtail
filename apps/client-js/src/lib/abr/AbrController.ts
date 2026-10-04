@@ -463,13 +463,17 @@ export class AbrController {
    * null before the first landing.
    *
    * With `samplesByTrack` this is exact: the landed track's samples now minus
-   * at the landing. Without it, the total sample count minus one: the player
-   * calls back on the landing object *before* recording it, and recording it
-   * finalises the source's last group (the tracker closes a group when the
-   * next group's first object arrives), so the first sample after a landing is
-   * the old track's. Discounting it keeps "N groups of the new track" true on
-   * that player and errs by one group too many (never too few) on a player
-   * that finalises before calling back.
+   * at the landing (the player keys samples by the group's own track, one per
+   * (track, group), F5). Without it, the total sample count minus one. The
+   * tracker keeps one accumulator per (track, group) and a target object
+   * never closes a source group, so the source's last group, which is usually
+   * still open when the target lands (the landing object is the target's
+   * first), closes after the landing: at its own last object, or after two
+   * group times without one. That sample is the old track's and is in the
+   * total; discounting one for it keeps "N groups of the new track" from
+   * running ahead. On a player whose source group had already closed before
+   * the callback, the discount errs by one group too many (the dwell waits one
+   * group longer), never too few.
    */
   groupsSinceLanding(m: Pick<AbrPlayerMetrics, 'sampleCount' | 'samplesByTrack'>): number | null {
     const landing = this.#landing;
