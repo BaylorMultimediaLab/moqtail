@@ -458,6 +458,10 @@ impl AppConfig {
       "downstream_alias_timeout_ms": self.downstream_alias_timeout.as_millis() as u64,
       "publish_done_stream_timeout_ms": self.publish_done_stream_timeout.as_millis() as u64,
       "dedup_retained_groups": self.dedup_retained_groups,
+      // As shipped (harness) the native SWITCH never forwards the object that
+      // triggers promotion; the flag exists only on the native-ft branch. Recorded
+      // here too so every bundle carries the field.
+      "forward_promotion_trigger": false,
       "quinn_transport": quinn_transport,
     })
   }
@@ -759,6 +763,7 @@ mod tests {
       "max_subscriber_lag",
       "write_kbps_limit",
       "dedup_retained_groups",
+      "forward_promotion_trigger",
       "event_log",
       "quinn_transport",
     ] {
@@ -770,6 +775,7 @@ mod tests {
     assert_eq!(record["max_idle_timeout_s"], 7);
     assert_eq!(record["track_alias_resolution_timeout_ms"], 500);
     assert_eq!(record["cache_expiration_type"], "ttl");
+    assert_eq!(record["forward_promotion_trigger"], false);
     assert_eq!(
       CongestionController::Cubic.default_initial_window_bytes(),
       12_000
