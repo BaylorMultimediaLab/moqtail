@@ -62,8 +62,6 @@ interface MOQStreamStruct {
   lastAppendedEndPTS_ms: number | undefined;
   /** Frame duration (ms) of the most recently parsed object, for seam arithmetic. */
   lastFrameDurationMs?: number;
-  /** tracker.getSampleCount() after the previous object; a change means a THROUGHPUT_SAMPLE was finalised. */
-  lastSampleCount?: number;
   /** performance.now() of the last successful media append (data-starvation watchdog). */
   lastAppendPerf?: number;
   /**
@@ -743,7 +741,7 @@ export class Player {
                 'media',
                 `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
               );
-              events.emit('DROP_STALE', {
+              this.#dropStale(struct, object, objectTrackName, {
                 track: objectTrackName,
                 current: struct.trackName,
                 pending: struct.pendingSwitch?.trackName ?? null,
@@ -765,7 +763,7 @@ export class Player {
               // Same track name, but the library has not yet seen a stream for
               // the switched subscription: this is a trailing object of the
               // earlier subscription to that track, not the switch landing.
-              events.emit('DROP_STALE', {
+              this.#dropStale(struct, object, objectTrackName, {
                 track: objectTrackName,
                 current: struct.trackName,
                 pending: struct.pendingSwitch.trackName,
@@ -842,7 +840,7 @@ export class Player {
                 struct.pendingInit = { mimeType, initData, attempts: 1 };
                 this.#options.onTrackSwitched?.(newTrackName);
                 this.#seams.discarded();
-                events.emit('DROP_STALE', {
+                this.#dropStale(struct, object, objectTrackName, {
                   track: objectTrackName,
                   current: struct.trackName,
                   pending: null,
@@ -890,7 +888,7 @@ export class Player {
                 struct.awaitKeyframe = true;
               } else {
                 this.#seams.discarded();
-                events.emit('DROP_STALE', {
+                this.#dropStale(struct, object, objectTrackName, {
                   track: objectTrackName,
                   current: struct.trackName,
                   pending: struct.pendingSwitch?.trackName ?? null,
@@ -907,7 +905,7 @@ export class Player {
               const isSync = info?.isSync ?? object.location.object === 0n;
               if (!isSync) {
                 this.#seams.discarded();
-                events.emit('DROP_STALE', {
+                this.#dropStale(struct, object, objectTrackName, {
                   track: objectTrackName,
                   current: struct.trackName,
                   pending: struct.pendingSwitch?.trackName ?? null,
@@ -1020,28 +1018,10 @@ export class Player {
               if (bufferDuration > 1.0) bufferNotification(maxEnd);
             }
 
-            // Record goodput sample — SWMA on per-group object timing.
-            // The publisher bursts a GOP's objects back-to-back so the
-            // intra-group rate reflects link capacity, not source bitrate.
-            const previousGroupId = struct.lastGroupId;
-            struct.tracker.recordObject(object.payload.byteLength, object.location.group);
+            // Throughput: arrival spacing of this object's group (M11). A frame
+            // that could not be appended still crossed the link.
             struct.lastGroupId = object.location.group;
-            // A group roll-over finalises the previous group's throughput sample.
-            const sampleCountNow = struct.tracker.getSampleCount();
-            if (struct.lastSampleCount !== undefined && sampleCountNow > struct.lastSampleCount) {
-              events.emit('THROUGHPUT_SAMPLE', {
-                track: struct.trackName,
-                group: previousGroupId,
-                bytes: struct.tracker.getLastSampleBytes(),
-                duration_ms: struct.tracker.getLastDeliveryTimeMs(),
-                bps: struct.tracker.getLastSampleBps(),
-                swma_bps: struct.tracker.getBandwidthBps(),
-                fast_ema_bps: struct.tracker.getFastEmaBps(),
-                slow_ema_bps: struct.tracker.getSlowEmaBps(),
-                sample_count: sampleCountNow,
-              });
-            }
-            struct.lastSampleCount = sampleCountNow;
+            this.#recordArrival(struct, object, objectTrackName, info, maxRetries < 0);
 
             // First-received-group export for E2E smoke + connect-time metrics (Phase C).
             // Only set once across all streams to capture the earliest received group.
@@ -1123,6 +1103,78 @@ export class Player {
         if (!['AbortError', 'InternalError'].includes(error.name)) {
           logger.error('media', 'Stream pipe error:', error);
         }
+      });
+    }
+  }
+
+  /**
+   * DROP_STALE for an object the write handler will not append; the object is
+   * still a link arrival of its group (THROUGHPUT_SAMPLE discarded_bytes).
+   */
+  #dropStale(
+    struct: MOQStreamStruct,
+    object: MoqtObject,
+    objectTrackName: string,
+    fields: Record<string, unknown>,
+  ): void {
+    events.emit('DROP_STALE', fields);
+    this.#recordArrival(struct, object, objectTrackName, undefined, true);
+  }
+
+  /**
+   * Feeds one received object into the stream's throughput tracker, timed by
+   * the library's receive stamp and kept per (track, group) (M11), and emits a
+   * THROUGHPUT_SAMPLE for every group sample that closes. `info` is the
+   * object's parsed moof when the caller already has it.
+   */
+  #recordArrival(
+    struct: MOQStreamStruct,
+    object: MoqtObject,
+    objectTrackName: string,
+    info: { frameDurationMs: number } | undefined,
+    discarded: boolean,
+  ): void {
+    const bytes = object.payload?.byteLength ?? 0;
+    if (info === undefined && object.payload) {
+      const timescale = this.catalog?.getTimescale(objectTrackName);
+      info =
+        timescale && timescale > 0
+          ? parseMoofMediaInfo(
+              new Uint8Array(
+                object.payload.buffer,
+                object.payload.byteOffset,
+                object.payload.byteLength,
+              ),
+              timescale,
+            )
+          : undefined;
+    }
+    // The last object of a group: object ids run 0..frames-1 with one frame per
+    // object, frames = GOP / frame duration.
+    const gopMs = this.#timeMap?.gopDurationMs;
+    const lastInGroup =
+      info !== undefined && gopMs !== undefined && info.frameDurationMs > 0
+        ? Number(object.location.object) >= Math.round(gopMs / info.frameDurationMs) - 1
+        : undefined;
+    const samples = struct.tracker.recordObject(bytes, object.location.group, {
+      recvAt: object.recvAt,
+      track: objectTrackName,
+      lastInGroup,
+      discarded,
+    });
+    for (const sample of samples) {
+      events.emit('THROUGHPUT_SAMPLE', {
+        track: sample.track,
+        group: sample.group,
+        bytes: sample.bytes,
+        duration_ms: sample.durationMs,
+        bps: sample.bps,
+        discarded_bytes: sample.discardedBytes,
+        objects: sample.objects,
+        swma_bps: struct.tracker.getBandwidthBps(),
+        fast_ema_bps: struct.tracker.getFastEmaBps(),
+        slow_ema_bps: struct.tracker.getSlowEmaBps(),
+        sample_count: struct.tracker.getSampleCount(),
       });
     }
   }
@@ -1889,7 +1941,14 @@ export class Player {
       });
     }
 
-    const tracker = new GoodputTracker();
+    // Abandoned groups are closed after two group times (GOP from the catalog).
+    const tracker = new GoodputTracker(
+      3,
+      8,
+      params.trackName !== 'catalog' && this.catalog
+        ? this.catalog.getGopDurationMs(params.trackName)
+        : undefined,
+    );
     struct = {
       trackName: params.trackName,
       requestId: result.requestId,

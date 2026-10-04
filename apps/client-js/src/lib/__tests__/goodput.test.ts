@@ -174,4 +174,81 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
     expect(t.getSampleCount()).toBe(0);
     expect(t.getBandwidthBps()).toBe(0);
   });
+
+  // M11: arrival spacing from the library's receive stamps, one accumulator per
+  // (track, group) so interleaved groups do not finalise each other.
+  describe('receive stamps and per-(track, group) samples (M11)', () => {
+    it('times a group by the receive stamps of its first and last object', () => {
+      const t = new GoodputTracker();
+      // Recorded all at once (a slow consumer), but received 100 ms apart.
+      t.recordObject(5_000, 0n, { recvAt: 1_000, track: 'v' });
+      t.recordObject(10_000, 0n, { recvAt: 1_100, track: 'v' });
+      t.recordObject(10_000, 0n, { recvAt: 1_200, track: 'v' });
+      const [sample] = t.recordObject(5_000, 1n, { recvAt: 2_000, track: 'v' });
+      expect(sample).toMatchObject({ track: 'v', group: 0n, bytes: 20_000, durationMs: 200 });
+      expect(sample!.bps).toBe(800_000);
+      expect(t.getBandwidthBps()).toBe(800_000);
+    });
+
+    it('finalises a group at its last object, without waiting for the next group', () => {
+      const t = new GoodputTracker();
+      t.recordObject(1_000, 7n, { recvAt: 0, track: 'v', lastInGroup: false });
+      const samples = t.recordObject(1_000, 7n, { recvAt: 10, track: 'v', lastInGroup: true });
+      expect(samples).toHaveLength(1);
+      expect(samples[0]).toMatchObject({ group: 7n, bytes: 1_000, durationMs: 10 });
+      expect(t.getSampleCount()).toBe(1);
+    });
+
+    it('keeps interleaved groups of one track apart', () => {
+      const t = new GoodputTracker();
+      // Group 4 (a catch-up) and group 5 (live) arrive interleaved.
+      const out = [
+        ...t.recordObject(1_000, 4n, { recvAt: 0, track: 'v', lastInGroup: false }),
+        ...t.recordObject(1_000, 5n, { recvAt: 5, track: 'v', lastInGroup: false }),
+        ...t.recordObject(2_000, 4n, { recvAt: 10, track: 'v', lastInGroup: false }),
+        ...t.recordObject(4_000, 5n, { recvAt: 15, track: 'v', lastInGroup: false }),
+        ...t.recordObject(2_000, 4n, { recvAt: 20, track: 'v', lastInGroup: true }),
+        ...t.recordObject(4_000, 5n, { recvAt: 25, track: 'v', lastInGroup: true }),
+      ];
+      expect(out.map(s => [s.group, s.bytes, s.durationMs])).toEqual([
+        [4n, 4_000, 20],
+        [5n, 8_000, 20],
+      ]);
+    });
+
+    it('keeps two tracks apart and names the track the group belonged to', () => {
+      const t = new GoodputTracker();
+      // Old track's trailing group 5 overlaps the new track's group 6 after a switch.
+      const out = [
+        ...t.recordObject(1_000, 5n, { recvAt: 0, track: 'old', lastInGroup: false }),
+        ...t.recordObject(1_000, 6n, { recvAt: 2, track: 'new', lastInGroup: false }),
+        ...t.recordObject(1_000, 5n, { recvAt: 4, track: 'old', lastInGroup: true }),
+        ...t.recordObject(1_000, 6n, { recvAt: 8, track: 'new', lastInGroup: true }),
+      ];
+      expect(out.map(s => [s.track, s.group, s.durationMs])).toEqual([
+        ['old', 5n, 4],
+        ['new', 6n, 6],
+      ]);
+    });
+
+    it('counts dropped objects in the arrival sample and reports them as discarded', () => {
+      const t = new GoodputTracker();
+      t.recordObject(1_000, 3n, { recvAt: 0, track: 'v', discarded: true });
+      t.recordObject(3_000, 3n, { recvAt: 10, track: 'v', discarded: true });
+      t.recordDiscardedBytes(500, 3n, 'v'); // library-level discard of the same group
+      const [s] = t.recordObject(1_000, 3n, { recvAt: 20, track: 'v', lastInGroup: true });
+      expect(s).toMatchObject({ bytes: 4_000, durationMs: 20, discardedBytes: 4_500 });
+    });
+
+    it('closes a group nobody finishes once it has been idle for two group times', () => {
+      const t = new GoodputTracker();
+      t.recordObject(1_000, 5n, { recvAt: 0, track: 'old', lastInGroup: false });
+      t.recordObject(1_000, 5n, { recvAt: 10, track: 'old', lastInGroup: false });
+      expect(t.recordObject(1_000, 6n, { recvAt: 500, track: 'new', lastInGroup: false })).toEqual(
+        [],
+      );
+      const out = t.recordObject(1_000, 6n, { recvAt: 2_100, track: 'new', lastInGroup: false });
+      expect(out.map(s => [s.track, s.group])).toEqual([['old', 5n]]);
+    });
+  });
 });
