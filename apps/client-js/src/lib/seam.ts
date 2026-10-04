@@ -86,7 +86,13 @@ export class SeamTracker {
    * target from its seam onward replaces everything buffered after it, so a
    * new seam drops every transition at or after it.
    */
-  #transitions: Array<{ seamMs: number; track: string; regionFromMs: number }> = [];
+  #transitions: Array<{
+    seamMs: number;
+    track: string;
+    regionFromMs: number;
+    /** The switch that applied this seam (absent for the startup track). */
+    rec?: SwitchRecord;
+  }> = [];
 
   /**
    * @param allocateSeq - Source of switch numbers. The player passes the
@@ -108,11 +114,20 @@ export class SeamTracker {
   /**
    * The track whose media sits at `playheadMs` in the buffer, i.e. the track
    * being presented (M13); null before the initial track is known.
+   *
+   * A switch whose first frame has not been seen yet covers only
+   * [seam, target append front]: the target has delivered nothing beyond its
+   * front, so media after it (e.g. at the playhead, when the seam landed
+   * behind it) is still the previous track's (F8). Once its first frame is
+   * seen it covers everything up to the next seam.
    */
   presentedTrack(playheadMs: number): string | null {
     let track: string | null = null;
     for (const t of this.#transitions) {
       if (t.seamMs > playheadMs) break;
+      if (t.rec !== undefined && !t.rec.firstFrameSeen) {
+        if (playheadMs > (t.rec.targetAppendFrontMs ?? t.seamMs)) continue;
+      }
       track = t.track;
     }
     return track;
@@ -251,6 +266,7 @@ export class SeamTracker {
       seamMs: at.ptsMs,
       track: rec.to,
       regionFromMs: Math.min(at.ptsMs, rec.sourceEndAtLandingMs ?? at.ptsMs),
+      rec,
     });
     return rec;
   }

@@ -189,10 +189,14 @@ describe('SeamTracker: first frame only for a presented target frame (M10)', () 
 });
 
 describe('SeamTracker: presented track from (seam, track) transitions (M13)', () => {
-  const apply = (t: SeamTracker, from: string, to: string, seamMs: number) => {
+  /** `to` is applied at `seamMs` and has delivered media up to `frontMs` (one frame by default). */
+  const apply = (t: SeamTracker, from: string, to: string, seamMs: number, frontMs?: number) => {
     const r = t.sent(from, to, { playheadMs: 0, appendFrontMs: 0, sentAt: 0 });
     t.landed(r, { group: 0, object: 0, landedOnKeyframe: true, sourceEndMs: 0, now: 0 });
     t.appended({ ptsMs: seamMs, endPtsMs: seamMs + 40, group: 0, object: 0, now: 0 });
+    if (frontMs !== undefined) {
+      t.appended({ ptsMs: frontMs - 40, endPtsMs: frontMs, group: 0, object: 1, now: 0 });
+    }
     return r;
   };
 
@@ -209,8 +213,8 @@ describe('SeamTracker: presented track from (seam, track) transitions (M13)', ()
   it('keeps a superseded seam that is still in the buffer ahead of a later one', () => {
     const t = new SeamTracker();
     t.setInitialTrack('low');
-    apply(t, 'low', 'mid', 20_000);
-    apply(t, 'mid', 'high', 21_000); // supersedes the first, whose media 20-21 s stays
+    apply(t, 'low', 'mid', 20_000, 21_000);
+    apply(t, 'mid', 'high', 21_000, 22_000); // supersedes the first, whose media 20-21 s stays
     expect(t.presentedTrack(20_500)).toBe('mid');
     expect(t.presentedTrack(21_500)).toBe('high');
   });
@@ -218,8 +222,8 @@ describe('SeamTracker: presented track from (seam, track) transitions (M13)', ()
   it('drops transitions the new target overwrote (a seam behind an earlier one)', () => {
     const t = new SeamTracker();
     t.setInitialTrack('low');
-    apply(t, 'low', 'mid', 20_000);
-    apply(t, 'mid', 'high', 18_000); // re-fetched from earlier: replaces 18 s onward
+    apply(t, 'low', 'mid', 20_000, 21_000);
+    apply(t, 'mid', 'high', 18_000, 21_000); // re-fetched from earlier: replaces 18 s onward
     expect(t.presentedTrack(17_000)).toBe('low');
     expect(t.presentedTrack(20_500)).toBe('high');
   });
@@ -286,5 +290,41 @@ describe('SeamTracker: the seam region the playhead is in (F2)', () => {
     t.appended({ ptsMs: 16_000, endPtsMs: 16_033, group: 9, object: 0, now: 1401 });
     expect(t.seamRegionAt(12_010, 33)).toBe(12_000);
     expect(t.seamRegionAt(16_010, 33)).toBe(16_000);
+  });
+});
+
+describe('SeamTracker: presented track before the first frame (F8)', () => {
+  it('a seam behind the playhead covers only [seam, target append front] until its first frame is seen', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('A');
+    const r = t.sent('A', 'B', { playheadMs: 6000, appendFrontMs: 15_000, sentAt: 0 });
+    t.armed(r);
+    t.landed(r, { group: 5, object: 0, landedOnKeyframe: true, sourceEndMs: 15_000, now: 1 });
+    t.appended({ ptsMs: 5000, endPtsMs: 5033, group: 5, object: 0, now: 2 });
+    // The playhead is on source media: B has only delivered [5000, 5033].
+    expect(t.presentedTrack(6000)).toBe('A');
+    expect(t.presentedTrack(5010)).toBe('B');
+    expect(t.presentedTrack(4990)).toBe('A');
+    // B's append front passes the playhead: B's media is at the playhead now.
+    for (let o = 1; o <= 31; o++) {
+      t.appended({
+        ptsMs: 5000 + o * 33,
+        endPtsMs: 5033 + o * 33,
+        group: 5,
+        object: o,
+        now: 2 + o,
+      });
+    }
+    expect(t.presentedTrack(6000)).toBe('B');
+  });
+
+  it('once the first frame is seen the transition covers everything after the seam', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('A');
+    const r = t.sent('A', 'B', { playheadMs: 4000, appendFrontMs: 5000, sentAt: 0 });
+    t.landed(r, { group: 5, object: 0, landedOnKeyframe: true, sourceEndMs: 5000, now: 1 });
+    t.appended({ ptsMs: 5000, endPtsMs: 5033, group: 5, object: 0, now: 2 });
+    expect(t.presented({ mediaMs: 5000, frameMs: 33, now: 3 })).toBe(r);
+    expect(t.presentedTrack(9000)).toBe('B');
   });
 });
