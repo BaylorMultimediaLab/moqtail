@@ -1725,6 +1725,10 @@ export class Player {
           ? this.#timeMap.groupContainingPTS(playheadPTS_ms)
           : null,
       last_received_group: videoStruct.lastGroupId,
+      // The append front (end PTS of the last appended frame). buffered_end_ms
+      // is the same value under its historical name; SAMPLE.buffered_end_ms is
+      // the element's last buffered range end, a different quantity.
+      append_front_ms: videoStruct.lastAppendedEndPTS_ms ?? null,
       buffered_end_ms: videoStruct.lastAppendedEndPTS_ms ?? null,
     });
 
