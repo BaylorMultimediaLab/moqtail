@@ -262,5 +262,69 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       expect(t.getSamplesByTrack()).toEqual({ old: 1, new: 2 });
       expect(t.getSampleCount()).toBe(3);
     });
+
+    // The fresh-grid-v2 case (native-forward-trigger, shift10s r1): after the
+    // link is restored to 6 Mbps the time-shifted client's SWMA stayed at
+    // 1.6-1.8 Mbps because the sample timed the serialised MSE append path.
+    // Objects arrive at 6 Mbps; the write handler takes 100 ms per append.
+    it('reads the 6 Mbps arrival rate however slow the appends are', () => {
+      const t = new GoodputTracker();
+      const objectBytes = 25_000; // 30 per group: a 6 Mbit GOP
+      const spacingMs = (objectBytes * 8) / 6_000; // 33.3 ms at 6 Mbps
+      const appendMs = 100; // the consumer: 3x slower than the link
+      const samples = [];
+      for (let group = 0n; group < 6n; group++) {
+        const groupStart = Number(group) * 1000;
+        for (let i = 0; i < 30; i++) {
+          vi.advanceTimersByTime(appendMs); // record time drifts further behind
+          samples.push(
+            ...t.recordObject(objectBytes, group, {
+              recvAt: groupStart + i * spacingMs,
+              track: '720p',
+              lastInGroup: i === 29,
+            }),
+          );
+        }
+      }
+      expect(samples).toHaveLength(6);
+      for (const s of samples) expect(Math.abs(s.bps - 6_000_000) / 6_000_000).toBeLessThan(0.05);
+      expect(Math.abs(t.getBandwidthBps() - 6_000_000) / 6_000_000).toBeLessThan(0.05);
+    });
+
+    it('reads the consume pace when no receive stamp is given (the old behaviour)', () => {
+      const t = new GoodputTracker();
+      for (let i = 0; i < 30; i++) {
+        vi.advanceTimersByTime(100);
+        t.recordObject(25_000, 0n, { track: '720p', lastInGroup: i === 29 });
+      }
+      // 29 x 25 kB over 2.9 s of appends = 2 Mbps, a third of the link.
+      expect(t.getBandwidthBps()).toBeCloseTo(2_000_000, -3);
+    });
+
+    it('times two tracks interleaving on arrival at their own pace', () => {
+      const t = new GoodputTracker();
+      const out = [];
+      // Old track's last group: 10 x 10 kB every 20 ms (4 Mbps); new track's
+      // first group: 10 x 5 kB every 20 ms (2 Mbps), offset by 10 ms.
+      for (let i = 0; i < 10; i++) {
+        out.push(
+          ...t.recordObject(10_000, 5n, {
+            recvAt: i * 20,
+            track: 'old',
+            lastInGroup: i === 9,
+            discarded: true,
+          }),
+        );
+        out.push(
+          ...t.recordObject(5_000, 6n, { recvAt: 10 + i * 20, track: 'new', lastInGroup: i === 9 }),
+        );
+      }
+      expect(out.map(s => [s.track, s.group, Math.round(s.bps)])).toEqual([
+        ['old', 5n, 4_000_000],
+        ['new', 6n, 2_000_000],
+      ]);
+      expect(out[0]!.discardedBytes).toBe(100_000);
+      expect(out[1]!.discardedBytes).toBe(0);
+    });
   });
 });
