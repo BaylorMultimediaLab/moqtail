@@ -55,7 +55,7 @@ function settingsWithOnlyRules(ruleNames: string[]): AbrSettings {
 
 describe('AbrRulesCollection', () => {
   describe('constructor', () => {
-    it('initialises all 8 rules from settings', () => {
+    it('initialises the rules from settings', () => {
       const collection = new AbrRulesCollection(makeSettings());
       const ruleNames = [
         'ThroughputRule',
@@ -270,6 +270,59 @@ describe('AbrRulesCollection', () => {
       const ctx = makeContext({ abrSettings: settings });
       const result = collection.getBestPossibleSwitchRequest(ctx);
       expect(result).toBeNull();
+    });
+  });
+
+  describe('tie-break and attribution', () => {
+    // At equal priority and equal index the arbiter keeps the first request in
+    // registration order (ThroughputRule, BolaRule, ProbeRule,
+    // InsufficientBufferRule, BufferDrainRateRule, LatencyTrendRule,
+    // SwitchHistoryRule, DroppedFramesRule, AbandonRequestsRule, L2ARule,
+    // LoLPRule, EmergencyBufferRule) and names the others in `tied`, so the
+    // ABR_TICK / ABR_DECISION attribution is explicit rather than implicit.
+    it('names every rule that asked for the chosen index at the chosen priority', () => {
+      // 10 Mbps, buffer 5 s (< stableBufferTime): ThroughputRule wants 1080p
+      // (DEFAULT) and InsufficientBufferRule's cap 0.7 x 10 x 5 = 35 Mbps also
+      // yields 1080p (DEFAULT) once its two warm-up calls are over.
+      const collection = new AbrRulesCollection(
+        settingsWithOnlyRules(['ThroughputRule', 'InsufficientBufferRule']),
+      );
+      const ctx = makeContext({ bufferSeconds: 5, bufferInstantSeconds: 5 });
+      collection.evaluate(ctx);
+      collection.evaluate(ctx);
+      const ev = collection.evaluate(ctx);
+      expect(ev.chosen?.representationIndex).toBe(2);
+      expect(ev.chosen?.reason).toBe('throughput'); // registered first
+      expect(ev.tied).toEqual(['InsufficientBufferRule']);
+      expect(ev.chosenBy).toBe('ThroughputRule');
+    });
+
+    it('tied is empty when one rule alone produced the choice', () => {
+      const collection = new AbrRulesCollection(settingsWithOnlyRules(['ThroughputRule']));
+      const ev = collection.evaluate(makeContext());
+      expect(ev.chosenBy).toBe('ThroughputRule');
+      expect(ev.tied).toEqual([]);
+    });
+
+    it('a request at a lower priority for the same index is not a tie', () => {
+      // EmergencyBufferRule (STRONG) and ThroughputRule (DEFAULT) both ask for
+      // rung 0; the STRONG one is chosen and ThroughputRule is not tied with it.
+      const collection = new AbrRulesCollection(
+        settingsWithOnlyRules(['ThroughputRule', 'EmergencyBufferRule']),
+      );
+      const ev = collection.evaluate(
+        makeContext({
+          activeTrackIndex: 2,
+          bandwidthBps: 600_000, // 0.9 x 600k fits 360p only
+          bufferSeconds: 0,
+          bufferInstantSeconds: 0,
+          totalFrames: 100,
+          abrSettings: settingsWithOnlyRules(['ThroughputRule', 'EmergencyBufferRule']),
+        }),
+      );
+      expect(ev.chosen?.representationIndex).toBe(0);
+      expect(ev.chosenBy).toBe('EmergencyBufferRule');
+      expect(ev.tied).toEqual([]);
     });
   });
 });

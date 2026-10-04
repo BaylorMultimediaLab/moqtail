@@ -242,3 +242,75 @@ describe('SwitchHistoryRule', () => {
     });
   });
 });
+
+describe('seam drops (controller.historyIgnoreGroupsAfterLanding, M17)', () => {
+  const veto = (ignore: number) => ({
+    ...DEFAULT_ABR_SETTINGS,
+    controller: {
+      ...DEFAULT_ABR_SETTINGS.controller,
+      switchHistoryMode: 'veto' as const,
+      historyIgnoreGroupsAfterLanding: ignore,
+    },
+  });
+  /** `drops` drops from 1080p decided `groupsSinceLanding` groups after a landing, plus `ups` climbs to it. */
+  const seamHistory = (drops: number, ups: number, groupsSinceLanding: number): SwitchEvent[] => [
+    ...makeHistory('1080p', drops, 0, '720p').map(e => ({ ...e, groupsSinceLanding })),
+    ...makeHistory('1080p', 0, ups, '720p'),
+  ];
+
+  it('drops decided within the window after a landing are not counted against the rung', () => {
+    const rule = new SwitchHistoryRule();
+    const ctx = makeContext({
+      activeTrackIndex: 1,
+      switchHistory: seamHistory(4, 4, 1),
+      abrSettings: veto(2),
+    });
+    expect(rule.getMaxIndex(ctx)).toBeNull();
+  });
+
+  it('a drop exactly at the window edge is still the seam; one group later it is the rung', () => {
+    const rule = new SwitchHistoryRule();
+    expect(
+      rule.getMaxIndex(
+        makeContext({
+          activeTrackIndex: 1,
+          switchHistory: seamHistory(4, 4, 2),
+          abrSettings: veto(2),
+        }),
+      ),
+    ).toBeNull();
+    const r = rule.getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: seamHistory(4, 4, 3),
+        abrSettings: veto(2),
+      }),
+    );
+    expect(r?.representationIndex).toBe(1);
+    expect(r?.reason).toContain('veto');
+  });
+
+  it('with the window at 0 every drop counts (grid as frozen)', () => {
+    const rule = new SwitchHistoryRule();
+    const r = rule.getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: seamHistory(4, 4, 1),
+        abrSettings: veto(0),
+      }),
+    );
+    expect(r?.representationIndex).toBe(1);
+  });
+
+  it('drops without a stamp (before the first landing) count', () => {
+    const rule = new SwitchHistoryRule();
+    const r = rule.getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: makeHistory('1080p', 4, 4, '720p'),
+        abrSettings: veto(2),
+      }),
+    );
+    expect(r?.representationIndex).toBe(1);
+  });
+});

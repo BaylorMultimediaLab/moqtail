@@ -27,10 +27,21 @@ export class SwitchHistoryRule implements AbrRule {
     this.trackStats = new Map();
     const windowS = abrSettings.controller?.switchHistoryWindowS ?? 0;
     const cutoff = windowS > 0 ? Date.now() - windowS * 1000 : -Infinity;
+    // A drop decided within ignoreGroups completed groups of a landing is the
+    // seam (the hole or the catch-up burst every mechanism produces at a
+    // switch), not evidence against the rung (M17). 0 = count every drop.
+    const ignoreGroups = abrSettings.controller?.historyIgnoreGroupsAfterLanding ?? 0;
 
     for (const event of switchHistory) {
       if (event.ts < cutoff) continue;
       if (event.reason === 'auto-downgrade' || event.reason === 'auto-emergency') {
+        if (
+          ignoreGroups > 0 &&
+          event.groupsSinceLanding !== undefined &&
+          event.groupsSinceLanding <= ignoreGroups
+        ) {
+          continue;
+        }
         // Downgrade/emergency: record a drop against the track being left
         const stats = this.trackStats.get(event.fromTrack) ?? { drops: 0, noDrops: 0 };
         stats.drops += 1;
