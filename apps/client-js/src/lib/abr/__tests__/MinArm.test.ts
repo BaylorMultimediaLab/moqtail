@@ -39,6 +39,9 @@ interface Inputs {
   latencyOlderMeanMs?: number;
   lastLatencyMs?: number;
   playbackRate?: number;
+  /** Playhead (ms) and the seam whose region it has entered (player.getMetrics, F2). */
+  playheadMs?: number;
+  latestSeamPtsMs?: number | null;
 }
 
 interface HarnessOptions {
@@ -103,6 +106,8 @@ function harness(initial: Inputs, opts: HarnessOptions = {}) {
         latencyRecentMeanMs: current.latencyRecentMeanMs,
         latencyOlderMeanMs: current.latencyOlderMeanMs,
         targetShiftMs: current.targetShiftMs,
+        playheadMs: current.playheadMs,
+        latestSeamPtsMs: current.latestSeamPtsMs,
       };
     }),
     switchTrack: vi.fn().mockResolvedValue(undefined),
@@ -335,7 +340,7 @@ describe('min arm: (b) a one-group hole right after landing', () => {
     expect(h.controller.getHistory()).toHaveLength(1);
   });
 
-  it('a seam drop within 2 groups of the landing is not a history drop: repeated seam emergencies never let the veto cap the rung', async () => {
+  it('without seam metrics (legacy player) a seam drop within 2 groups of the landing is not a history drop: repeated seam emergencies never let the veto cap the rung', async () => {
     // Each cycle: climb to 720p after the dwell, then one group after the
     // landing the seam hole empties a live-edge buffer and the emergency
     // sends the client to 360p. With the seam window (2 groups) the history
@@ -687,5 +692,74 @@ describe('min arm: (i) the live-edge sawtooth is not an emergency (F1)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('min arm: (j) the history exemption is anchored at the presented seam (F2)', () => {
+  // A seam hole reaches the playhead about one group after the landing on a
+  // live-edge client and about shift / GOP groups after it on a time-shifted
+  // one. The exemption must cover the drop the hole causes on both, and no
+  // drop anywhere else on either.
+  const cycles = async (shiftGroups: number, dropAt: 'hole' | 'elsewhere') => {
+    const h = harness({
+      activeTrack: '360p',
+      bandwidthBps: 2_000_000,
+      bufferContigSeconds: 1 + shiftGroups,
+      playheadMs: 100_000,
+      latestSeamPtsMs: null,
+    });
+    let playhead = 100_000;
+    let presentedSeam: number | null = null;
+    for (let c = 0; c < 6; c++) {
+      // Up to 720p; its seam lies one shift ahead of the playhead.
+      await h.tickAndLand({ playheadMs: playhead, latestSeamPtsMs: presentedSeam });
+      const seam = playhead + shiftGroups * 1000;
+      // The playhead plays the source media up to the seam.
+      for (let g = 0; g < shiftGroups; g++) {
+        h.complete();
+        playhead += 1000;
+      }
+      if (dropAt === 'hole') {
+        // The playhead sits at the hole in front of the seam: empty buffer.
+        presentedSeam = seam;
+        await h.tickAndLand({
+          bufferContigSeconds: 0,
+          playheadMs: seam - 20,
+          latestSeamPtsMs: presentedSeam,
+        });
+      } else {
+        // An ordinary drop, 5 s of media away from any seam.
+        await h.tickAndLand({
+          bufferContigSeconds: 0,
+          playheadMs: seam - 5_000,
+          latestSeamPtsMs: presentedSeam,
+        });
+      }
+      playhead = seam + 5_000;
+      await h.tick({ bufferContigSeconds: 1 + shiftGroups, playheadMs: playhead });
+      h.complete(3); // dwell
+    }
+    return h;
+  };
+  const ups = (h: Awaited<ReturnType<typeof cycles>>) =>
+    h.controller.getHistory().filter(e => e.reason === 'auto-upgrade').length;
+
+  it('a hole-induced drop is exempt on both client types (the veto never caps 720p)', async () => {
+    const live = await cycles(1, 'hole');
+    const shifted = await cycles(10, 'hole');
+    expect(ups(live)).toBe(6);
+    expect(ups(shifted)).toBe(6);
+    for (const h of [live, shifted]) {
+      const drops = h.controller.getHistory().filter(e => e.reason === 'auto-emergency');
+      expect(drops).toHaveLength(6);
+      for (const d of drops) expect(d.msPastSeam).toBe(-20);
+    }
+  });
+
+  it('an ordinary drop is counted on both client types (the veto caps 720p after 8 events)', async () => {
+    const live = await cycles(1, 'elsewhere');
+    const shifted = await cycles(10, 'elsewhere');
+    expect(ups(live)).toBe(4);
+    expect(ups(shifted)).toBe(4);
   });
 });

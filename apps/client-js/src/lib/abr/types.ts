@@ -31,6 +31,15 @@ export interface SwitchEvent {
    * rung's record: those are the seam, not the rung.
    */
   groupsSinceLanding?: number;
+  /**
+   * Playhead minus the PTS of the seam whose region the playhead had entered
+   * when the switch was decided (ms; negative = in the hole just before the
+   * seam), from `player.getMetrics()` `playheadMs` and `latestSeamPtsMs`.
+   * null: the player reports seams but the playhead had entered none.
+   * Absent: the player does not report seams (SwitchHistoryRule then falls
+   * back to `groupsSinceLanding`).
+   */
+  msPastSeam?: number | null;
 }
 
 export enum SwitchRequestPriority {
@@ -103,11 +112,19 @@ export interface ControllerSettings {
   upDwellGroups: number;
   /**
    * SwitchHistoryRule leaves a drop out of a rung's record when it was decided
-   * this many or fewer completed groups after a landing: that drop is the
-   * seam (a one-group hole on native, the catch-up burst elsewhere), not the
-   * rung, and must not become a 60 s ladder cap through the veto (M17). Every
-   * history entry is stamped with `groupsSinceLanding` at decision time. 0 =
-   * count every drop. Applies on every arm (part of the M17 fix).
+   * while the playhead was at a seam: inside the seam's region, which begins at
+   * the hole in front of the seam (the source's append front at landing, when
+   * that lies before the seam) and ends this many group durations
+   * (`segmentDurationS`) of media after the seam PTS. That drop is the seam
+   * (the hole every mechanism leaves, or its catch-up), not the rung, and must
+   * not become a 60 s ladder cap through the veto (M17). The window is in
+   * media time around the seam being presented, so the same hole is exempt on
+   * a live-edge client (where it reaches the playhead about one group after
+   * the landing) and on a time-shifted one (about one shift after it), and no
+   * other drop is (F2). Every history entry is stamped with `msPastSeam` at
+   * decision time. With a player that reports no seams the window is counted
+   * in completed groups since the landing instead (`groupsSinceLanding`).
+   * 0 = count every drop. Applies on every arm (part of the M17 fix).
    */
   historyIgnoreGroupsAfterLanding: number;
   /**

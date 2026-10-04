@@ -248,3 +248,43 @@ describe('SeamTracker: a switch replaced before it landed (C1, W1 preflight)', (
     expect(land(t, b, 6, 1600).superseded).toEqual([a]);
   });
 });
+
+describe('SeamTracker: the seam region the playhead is in (F2)', () => {
+  it('starts at the hole in front of the seam and names the latest seam the playhead has reached', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('low');
+    expect(t.seamRegionAt(5_000, 33)).toBeNull(); // no switch yet
+    const a = send(t, 'low', 'mid');
+    // Source append front at landing 12 000; the target begins at 12 500: a 500 ms hole.
+    land(t, a, 5, 1100);
+    t.appended({ ptsMs: 12_500, endPtsMs: 12_533, group: 5, object: 0, now: 1101 });
+    expect(t.seamRegionAt(11_000, 33)).toBeNull(); // still on the source, before the hole
+    expect(t.seamRegionAt(11_980, 33)).toBe(12_500); // a frame before the hole
+    expect(t.seamRegionAt(12_200, 33)).toBe(12_500); // in the hole
+    expect(t.seamRegionAt(30_000, 33)).toBe(12_500); // long past: the caller judges the distance
+  });
+
+  it('an overlapping seam (target restarts inside source media) starts its region at the seam', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('low');
+    const a = send(t, 'low', 'mid');
+    land(t, a, 5, 1100); // source front 12 000
+    t.appended({ ptsMs: 11_000, endPtsMs: 11_033, group: 5, object: 0, now: 1101 });
+    expect(t.seamRegionAt(10_900, 33)).toBeNull();
+    expect(t.seamRegionAt(11_000, 33)).toBe(11_000);
+  });
+
+  it('with two seams ahead (time-shifted client) the playhead is anchored to the one it reaches', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('low');
+    const a = send(t, 'low', 'mid');
+    land(t, a, 5, 1100);
+    t.appended({ ptsMs: 12_000, endPtsMs: 12_033, group: 5, object: 0, now: 1101 });
+    t.presented({ mediaMs: 12_000, frameMs: 33, now: 1200 });
+    const b = t.sent('mid', 'high', { playheadMs: 3_000, appendFrontMs: 16_000, sentAt: 1300 });
+    t.landed(b, { group: 9, object: 0, landedOnKeyframe: true, sourceEndMs: 16_000, now: 1400 });
+    t.appended({ ptsMs: 16_000, endPtsMs: 16_033, group: 9, object: 0, now: 1401 });
+    expect(t.seamRegionAt(12_010, 33)).toBe(12_000);
+    expect(t.seamRegionAt(16_010, 33)).toBe(16_000);
+  });
+});

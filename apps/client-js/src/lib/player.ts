@@ -1187,6 +1187,13 @@ export class Player {
     activeTrack: string | null;
     /** The track whose media is at the playhead: switches at the seam (M13). */
     presentedTrack: string | null;
+    /**
+     * PTS (ms) of the latest applied switch seam whose region (from the hole in
+     * front of it) the playhead has entered; null when none. With `playheadMs`
+     * it anchors SwitchHistoryRule's seam exemption at the seam being
+     * presented (F2).
+     */
+    latestSeamPtsMs: number | null;
     droppedFrames: number;
     totalFrames: number;
     playbackRate: number;
@@ -1269,6 +1276,10 @@ export class Player {
       bufferContigSeconds,
       activeTrack: videoStruct?.trackName ?? null,
       presentedTrack: this.#seams.presentedTrack(playheadMs) ?? videoStruct?.trackName ?? null,
+      latestSeamPtsMs: this.#seams.seamRegionAt(
+        playheadMs,
+        videoStruct?.lastFrameDurationMs ?? 1000 / 30,
+      ),
       droppedFrames: quality?.droppedVideoFrames ?? 0,
       totalFrames: quality?.totalVideoFrames ?? 0,
       playbackRate: el?.playbackRate ?? 1,

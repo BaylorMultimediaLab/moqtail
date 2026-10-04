@@ -92,6 +92,15 @@ export interface AbrPlayerMetrics {
   latencyOlderMeanMs?: number;
   /** The client's target shift behind live, ms: 0 live-edge, delayGroups × GOP time-shifted (C6). */
   targetShiftMs?: number;
+  /** Playhead (media time), ms. */
+  playheadMs?: number;
+  /**
+   * PTS (ms) of the latest applied switch seam whose region the playhead has
+   * entered (the region begins at the hole in front of the seam), null when
+   * it has entered none. SwitchHistoryRule's seam exemption (F2). Absent on
+   * players that do not track seams.
+   */
+  latestSeamPtsMs?: number | null;
   // Diagnostics copied into AbrMetrics for the UI / SAMPLE log.
   readyState?: number;
   paused?: boolean;
@@ -132,7 +141,18 @@ interface PendingSwitch {
   latencyTrend: number;
   /** Completed groups since the last landing when the decision was taken; null before the first landing. */
   groupsSinceLanding: number | null;
+  /** Playhead minus the seam it was at when the decision was taken (SwitchEvent.msPastSeam). */
+  msPastSeam: number | null | undefined;
   decidedTs: number;
+}
+
+/** SwitchEvent.msPastSeam from the player's metrics at decision time (F2). */
+function msPastSeamOf(
+  m: Pick<AbrPlayerMetrics, 'playheadMs' | 'latestSeamPtsMs'>,
+): number | null | undefined {
+  if (m.latestSeamPtsMs === undefined || typeof m.playheadMs !== 'number') return undefined;
+  if (m.latestSeamPtsMs === null) return null;
+  return m.playheadMs - m.latestSeamPtsMs;
 }
 
 export class AbrController {
@@ -340,6 +360,7 @@ export class AbrController {
         probe_bps: pending.probeBps,
         latency_trend: pending.latencyTrend,
         groups_since_landing: pending.groupsSinceLanding,
+        ms_past_seam: pending.msPastSeam ?? null,
         decided_ts: pending.decidedTs,
         landed_after_ms: Date.now() - pending.decidedTs,
       });
@@ -449,6 +470,7 @@ export class AbrController {
       probeBps: 0,
       latencyTrend: m.latencyTrendRatio,
       groupsSinceLanding: this.groupsSinceLanding(m),
+      msPastSeam: msPastSeamOf(m),
       decidedTs: Date.now(),
     };
     void this.#player.switchTrack(trackName);
@@ -821,6 +843,7 @@ export class AbrController {
       probeBps: context.probeBandwidthBps,
       latencyTrend: latencyTrendRatio,
       groupsSinceLanding: context.groupsSinceLanding ?? null,
+      msPastSeam: msPastSeamOf(raw),
       decidedTs: Date.now(),
     };
     void this.#player.switchTrack(targetTrack.name);
@@ -868,6 +891,7 @@ export class AbrController {
       bufferAtSwitch: p.bufferSeconds,
       emaBwAtSwitch: p.fastEmaBps,
       groupsSinceLanding: p.groupsSinceLanding ?? undefined,
+      ...(p.msPastSeam !== undefined ? { msPastSeam: p.msPastSeam } : {}),
     };
 
     this.#switchHistory.push(event);

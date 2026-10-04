@@ -243,7 +243,7 @@ describe('SwitchHistoryRule', () => {
   });
 });
 
-describe('seam drops (controller.historyIgnoreGroupsAfterLanding, M17)', () => {
+describe('seam drops without seam metrics: groups since landing (controller.historyIgnoreGroupsAfterLanding, M17)', () => {
   const veto = (ignore: number) => ({
     ...DEFAULT_ABR_SETTINGS,
     controller: {
@@ -312,5 +312,45 @@ describe('seam drops (controller.historyIgnoreGroupsAfterLanding, M17)', () => {
       }),
     );
     expect(r?.representationIndex).toBe(1);
+  });
+});
+
+describe('seam drops anchored at the presented seam (msPastSeam, F2)', () => {
+  const veto = {
+    ...DEFAULT_ABR_SETTINGS,
+    controller: {
+      ...DEFAULT_ABR_SETTINGS.controller,
+      switchHistoryMode: 'veto' as const,
+      historyIgnoreGroupsAfterLanding: 2,
+    },
+  };
+  /** 4 drops from 1080p stamped as given, plus 4 climbs to it. */
+  const history = (stamp: Partial<SwitchEvent>): SwitchEvent[] => [
+    ...makeHistory('1080p', 4, 0, '720p').map(e => ({ ...e, ...stamp })),
+    ...makeHistory('1080p', 0, 4, '720p'),
+  ];
+  const run = (stamp: Partial<SwitchEvent>, segmentDurationS = 1) =>
+    new SwitchHistoryRule().getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: history(stamp),
+        abrSettings: veto,
+        segmentDurationS,
+      }),
+    );
+
+  it('a drop in the hole before the seam or up to 2 group durations past it is exempt, whatever the groups since landing', () => {
+    expect(run({ msPastSeam: -20, groupsSinceLanding: 10 })).toBeNull();
+    expect(run({ msPastSeam: 2000, groupsSinceLanding: 10 })).toBeNull();
+  });
+
+  it('a drop elsewhere is counted even right after a landing', () => {
+    expect(run({ msPastSeam: 2001, groupsSinceLanding: 0 })?.representationIndex).toBe(1);
+    expect(run({ msPastSeam: null, groupsSinceLanding: 1 })?.representationIndex).toBe(1);
+  });
+
+  it('the window is in group durations of media (GOP from the catalog)', () => {
+    expect(run({ msPastSeam: 3500 }, 2)).toBeNull();
+    expect(run({ msPastSeam: 4500 }, 2)?.representationIndex).toBe(1);
   });
 });

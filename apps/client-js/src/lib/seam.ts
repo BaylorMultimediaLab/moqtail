@@ -86,7 +86,7 @@ export class SeamTracker {
    * target from its seam onward replaces everything buffered after it, so a
    * new seam drops every transition at or after it.
    */
-  #transitions: Array<{ seamMs: number; track: string }> = [];
+  #transitions: Array<{ seamMs: number; track: string; regionFromMs: number }> = [];
 
   /**
    * @param allocateSeq - Source of switch numbers. The player passes the
@@ -100,7 +100,9 @@ export class SeamTracker {
 
   /** The track playback starts on (before any switch). Only the first call counts. */
   setInitialTrack(track: string): void {
-    if (this.#transitions.length === 0) this.#transitions.push({ seamMs: -Infinity, track });
+    if (this.#transitions.length === 0) {
+      this.#transitions.push({ seamMs: -Infinity, track, regionFromMs: -Infinity });
+    }
   }
 
   /**
@@ -114,6 +116,26 @@ export class SeamTracker {
       track = t.track;
     }
     return track;
+  }
+
+  /**
+   * PTS (ms) of the latest applied seam whose region the playhead has entered,
+   * or null when it has entered none (F2). A seam's region begins at the hole
+   * in front of it: the source's append front at landing when that lies before
+   * the seam (a hole), else the seam itself (the target restarts inside source
+   * media). `toleranceMs` (one frame) admits a playhead that stopped a frame
+   * short of the hole. The caller judges how far past the seam the playhead
+   * is; this only says which seam it is anchored to, so the same hole anchors
+   * the same way whether it reaches the playhead one group after the landing
+   * (live edge) or one shift later (time-shifted).
+   */
+  seamRegionAt(playheadMs: number, toleranceMs: number): number | null {
+    let seam: number | null = null;
+    for (const t of this.#transitions) {
+      if (t.seamMs === -Infinity) continue;
+      if (t.regionFromMs - toleranceMs <= playheadMs) seam = t.seamMs;
+    }
+    return seam;
   }
 
   /** A number for a switch attempt that is not sent (SWITCH_SKIPPED). */
@@ -225,7 +247,11 @@ export class SeamTracker {
     rec.firstAppendedGroup = at.group;
     rec.firstAppendedObject = at.object;
     this.#transitions = this.#transitions.filter(t => t.seamMs < at.ptsMs);
-    this.#transitions.push({ seamMs: at.ptsMs, track: rec.to });
+    this.#transitions.push({
+      seamMs: at.ptsMs,
+      track: rec.to,
+      regionFromMs: Math.min(at.ptsMs, rec.sourceEndAtLandingMs ?? at.ptsMs),
+    });
     return rec;
   }
 
