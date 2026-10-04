@@ -61,7 +61,8 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
                     THROUGHPUT_SAMPLE rate of link-limited groups (bytes x 8 / 50 ms >= rate, i.e. a
                     group the publisher's ~50 ms burst cannot deliver faster than the link) lies in
                     [0.6, 1.15] x rate. When it does not, the 64 KB probe's pure transfer rate in the
-                    same window tells the cause: probe as low as video = the connection delivered
+                    same window (objects 2..N over the first-to-last object span; dt_ms on bundles
+                    without PROBE.first/last_object_ms) tells the cause: probe as low as video = the connection delivered
                     less than the link (transport / congestion control); probe near the rate while
                     video is low = client-side timing (M11)
   pf-probe-rate     lowest step <= 1.5 Mbps: probe-measured throughput p50 >= 0.8 x rate (reported;
@@ -107,12 +108,41 @@ def _median(vals: list[float]) -> float:
     return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
 
 
+PROBE_RATE_METHODS = {
+    "objects": "first-to-last object, objects 2..N",
+    "objects_unknown_n": "first-to-last object, object count unknown: all p_bytes over the span (overestimates by about 1/N)",
+    "dt_ms": "dt_ms: request to end of read, includes the request round trip and the idle wait (old bundle; a lower bound)",
+}
+
+
+def probe_transfer_rate(r: dict) -> tuple[float, str] | None:
+    """The probe's pure transfer rate in bps and how it was computed (a PROBE_RATE_METHODS key).
+
+    With ``first_object_ms`` / ``last_object_ms`` (2026-10): the bytes of objects 2..N over the
+    first-to-last arrival span, ``p_bytes x (n - 1) / n x 8 / (last - first)`` with n =
+    ``objects`` (equal-sized objects assumed; the first object's own transfer is not inside the
+    span). Without an object count all of ``p_bytes`` is put over the span. Old bundles (or a
+    span of 0, or fewer than 2 objects): ``p_bytes x 8 / dt_ms``, which includes the request
+    round trip and the idle wait after the last object, so it under-reads the link."""
+    pb = r.get("p_bytes") or 0
+    first_ms, last_ms, n = r.get("first_object_ms"), r.get("last_object_ms"), r.get("objects")
+    if first_ms is not None and last_ms is not None and last_ms > first_ms and pb > 0 and (n is None or n >= 2):
+        span_s = (last_ms - first_ms) / 1000
+        if n is not None:
+            return pb * (n - 1) / n * 8 / span_s, "objects"
+        return pb * 8 / span_s, "objects_unknown_n"
+    if r.get("dt_ms") and pb > 0:
+        return pb * 8 / (r["dt_ms"] / 1000), "dt_ms"
+    return None
+
+
 def delivery_rate(applied: list[dict], tput: list[dict], probes: list[dict] | None, client_end: float | None) -> tuple[bool | None, str]:
     """Per rate-limited step, the median THROUGHPUT_SAMPLE.bps of link-limited groups over
     [step + settle, next step) must lie in ESTIMATOR_BAND x rate. Returns (ok, detail);
     ok is None when no step had enough link-limited samples to judge. A step out of band is
-    attributed with the probe's pure transfer rate (p_bytes x 8 / dt_ms, probes >= 60 KB) in
-    the same window when probes exist: within 25 % of the video rate means the connection
+    attributed with the probe's pure transfer rate (``probe_transfer_rate``: objects 2..N over
+    the first-to-last object span, dt_ms on old bundles; probes >= 60 KB) in the same window
+    when probes exist: within 25 % of the video rate means the connection
     itself delivered that little (transport); at least 0.6 x rate means client-side timing."""
     steps = sorted((c for c in applied if c.get("rate_mbps") is not None), key=lambda c: c["ts"])
     if not steps:
@@ -138,17 +168,23 @@ def delivery_rate(applied: list[dict], tput: list[dict], probes: list[dict] | No
         bad += 0 if ok else 1
         cause = ""
         if not ok:
-            pr = [r["p_bytes"] * 8 / (r["dt_ms"] / 1000) for r in (probes or [])
-                  if r.get("src", "client") == "client" and r.get("dt_ms") and (r.get("p_bytes") or 0) >= 60_000
-                  and lo_t <= r["ts"] < end]
+            rated = [x for x in (probe_transfer_rate(r) for r in (probes or [])
+                                 if r.get("src", "client") == "client" and (r.get("p_bytes") or 0) >= 60_000
+                                 and lo_t <= r["ts"] < end) if x is not None]
+            pr = [bps for bps, _ in rated]
             if pr:
                 pmed = _median(pr)
+                methods: dict[str, int] = {}
+                for _, m in rated:
+                    methods[m] = methods.get(m, 0) + 1
+                how = "; ".join(f"{PROBE_RATE_METHODS[m]}: {k}" for m, k in sorted(methods.items()))
+                head = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes ({how})"
                 if abs(pmed - med) <= 0.25 * med:
-                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: the connection delivered this little (transport)"
+                    cause = head + ": the connection delivered this little (transport)"
                 elif pmed >= lo * rate_bps:
-                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: the link was there, client-side timing (M11)"
+                    cause = head + ": the link was there, client-side timing (M11)"
                 else:
-                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: inconclusive"
+                    cause = head + ": inconclusive"
             else:
                 cause = "; no probe in the window to attribute the cause (see CONN_STATS cwnd/rtt)"
         parts.append(f"{c['rate_mbps']} Mbps at_s={c.get('at_s')}: median {med / 1e6:.2f} Mbps over {n} link-limited groups "

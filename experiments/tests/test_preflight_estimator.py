@@ -45,6 +45,50 @@ class DeliveryRate(unittest.TestCase):
         self.assertIn("client-side timing (M11)", detail)
 
 
+def timed_probes(t_from_s: float, t_to_s: float, pure_bps: float, dt_bps: float, objects: int | None = 8, every_s: float = 2.0):
+    """PROBE records with first/last_object_ms (2026-10 contract): objects 2..N arrive at
+    `pure_bps`, while dt_ms (request to the end of the read, with the request round trip and
+    the idle wait) says `dt_bps`."""
+    out, t = [], t_from_s
+    while t < t_to_s:
+        ts = T0 + t * 1000
+        n = objects or 8
+        span_ms = 65_536 * (n - 1) / n * 8 / pure_bps * 1000
+        rec = {"ts": ts, "event": "PROBE", "src": "client", "p_bytes": 65_536, "dt_ms": 65_536 * 8 / dt_bps * 1000,
+               "first_object_ms": ts - 100 - span_ms, "last_object_ms": ts - 100}
+        if objects is not None:
+            rec["objects"] = objects
+        out.append(rec)
+        t += every_s
+    return out
+
+
+class ProbeTransferRate(unittest.TestCase):
+    """D12: the probe's 'pure transfer rate' was p_bytes x 8 / dt_ms, and dt_ms includes the
+    request round trip and the idle wait after the last object."""
+
+    def test_first_to_last_object_rate(self):
+        applied = [step(0, 6)]
+        tput = samples(0, 60, 1.5e6, 150_000)
+        ok, detail = validate.delivery_rate(applied, tput, timed_probes(0, 60, 6.0e6, 1.5e6), T0 + 60_000)
+        self.assertFalse(ok)
+        self.assertIn("client-side timing (M11)", detail)     # before: "(transport)" from dt_ms
+        self.assertIn("first-to-last object", detail)
+
+    def test_without_object_count_uses_all_bytes(self):
+        applied = [step(0, 6)]
+        ok, detail = validate.delivery_rate(applied, samples(0, 60, 1.5e6, 150_000), timed_probes(0, 60, 6.0e6, 1.5e6, objects=None),
+                                            T0 + 60_000)
+        self.assertIn("client-side timing (M11)", detail)
+        self.assertIn("object count unknown", detail)
+
+    def test_old_bundle_falls_back_to_dt_ms(self):
+        applied = [step(0, 6)]
+        ok, detail = validate.delivery_rate(applied, samples(0, 60, 1.5e6, 150_000), probes(0, 60, 1.5e6), T0 + 60_000)
+        self.assertIn("(transport)", detail)
+        self.assertIn("dt_ms", detail)
+
+
 class EstimatorFidelity(unittest.TestCase):
     def test_reads_the_link_passes(self):
         applied = [step(0, 6), step(60, 1.5), step(120, 6)]
