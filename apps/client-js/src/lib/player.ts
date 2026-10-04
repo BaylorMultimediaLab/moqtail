@@ -58,7 +58,7 @@ interface MOQStreamStruct {
   tracker: GoodputTracker;
   lastGroupId: bigint;
   pendingSwitch: PendingSwitch | null;
-  /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
+  /** End PTS (ms) of the last appended segment from the active track (the append front). Updated after a successful append only (M9). Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
   /** Frame duration (ms) of the most recently parsed object, for seam arithmetic. */
   lastFrameDurationMs?: number;
