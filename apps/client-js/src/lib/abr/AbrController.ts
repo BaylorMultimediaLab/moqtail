@@ -16,7 +16,7 @@ export interface AbrMetrics {
   fastEmaBps: number;
   slowEmaBps: number;
   bufferSeconds: number;
-  /** Contiguous buffer the rules see (= bufferSeconds when the player does not expose it). */
+  /** Contiguous buffer (= bufferSeconds when the player does not expose it); the min arm's buffer signal. */
   bufferContigSeconds: number;
   activeTrack: string | null;
   activeTrackIndex: number;
@@ -60,8 +60,9 @@ export interface AbrPlayerMetrics {
   bufferSeconds: number;
   /**
    * Contiguous buffer: end of the buffered range containing the playhead minus
-   * the playhead, 0 if none (M12). The rules' buffer signal on every arm;
-   * falls back to bufferSeconds when absent.
+   * the playhead, 0 if none (M12). The rules' buffer signal in the `min` arm
+   * (falls back to bufferSeconds when absent); `grid` and `baseline` keep
+   * bufferSeconds.
    */
   bufferContigSeconds?: number;
   activeTrack: string | null;
@@ -70,8 +71,17 @@ export interface AbrPlayerMetrics {
   playbackRate: number;
   deliveryTimeMs: number;
   lastObjectBytes: number;
-  /** Completed-group throughput samples so far (the dwell clock counts these). */
+  /** Completed-group throughput samples so far, all tracks. */
   sampleCount: number;
+  /**
+   * Completed-group throughput samples per track, keyed by the track the
+   * group belonged to (THROUGHPUT_SAMPLE.track), cumulative over the session.
+   * The dwell and the history's seam window count groups *of the landed
+   * track* since the landing from it. Without it the controller uses
+   * `sampleCount` and discounts one group per landing (see
+   * AbrController.groupsSinceLanding).
+   */
+  samplesByTrack?: Readonly<Record<string, number>>;
   /** Raw capture-to-receipt trend ratio (legacy; see RulesContext.latencyTrendRatio). */
   latencyTrendRatio: number;
   lastLatencyMs: number;
@@ -198,10 +208,11 @@ export class AbrController {
   // landing even when no decision is pending (a switch that landed after its
   // guard timed out).
   #activeTrackAtTick: string | null = null;
-  // player.getMetrics().sampleCount at the last confirmed landing, or null before
-  // the first one. Completed groups since the landing = sampleCount minus this;
-  // it is the dwell clock and is stamped on every history entry.
-  #lastLandingSampleCount: number | null = null;
+  // The last confirmed landing: the landed track and the sample counters at
+  // that moment, or null before the first one. groupsSinceLanding() derives the
+  // completed groups of the landed track since then from it; that is the
+  // min arm's dwell clock and is stamped on every history entry.
+  #landing: { track: string; sampleCount: number; trackSamples: number | null } | null = null;
 
   constructor(
     player: AbrPlayer,
@@ -293,7 +304,11 @@ export class AbrController {
       return;
     }
 
-    this.#lastLandingSampleCount = m.sampleCount;
+    this.#landing = {
+      track: landed!,
+      sampleCount: m.sampleCount,
+      trackSamples: m.samplesByTrack ? (m.samplesByTrack[landed!] ?? 0) : null,
+    };
     this.#activeTrackAtTick = landed;
     if (pending) {
       this.#recordHistory(pending);
@@ -340,11 +355,26 @@ export class AbrController {
     this.onTrackSwitched();
   }
 
-  /** Completed groups since the last confirmed landing, or null before the first landing. */
-  groupsSinceLanding(sampleCount: number): number | null {
-    return this.#lastLandingSampleCount === null
-      ? null
-      : sampleCount - this.#lastLandingSampleCount;
+  /**
+   * Completed groups of the landed track since the last confirmed landing, or
+   * null before the first landing.
+   *
+   * With `samplesByTrack` this is exact: the landed track's samples now minus
+   * at the landing. Without it, the total sample count minus one: the player
+   * calls back on the landing object *before* recording it, and recording it
+   * finalises the source's last group (the tracker closes a group when the
+   * next group's first object arrives), so the first sample after a landing is
+   * the old track's. Discounting it keeps "N groups of the new track" true on
+   * that player and errs by one group too many (never too few) on a player
+   * that finalises before calling back.
+   */
+  groupsSinceLanding(m: Pick<AbrPlayerMetrics, 'sampleCount' | 'samplesByTrack'>): number | null {
+    const landing = this.#landing;
+    if (landing === null) return null;
+    if (landing.trackSamples !== null && m.samplesByTrack) {
+      return Math.max(0, (m.samplesByTrack[landing.track] ?? 0) - landing.trackSamples);
+    }
+    return Math.max(0, m.sampleCount - landing.sampleCount - 1);
   }
 
   /** Player fires this when the first frame of the switched-to track is presented (t5). */
@@ -405,7 +435,7 @@ export class AbrController {
       slowEmaBps: m.slowEmaBps,
       probeBps: 0,
       latencyTrend: m.latencyTrendRatio,
-      groupsSinceLanding: this.groupsSinceLanding(m.sampleCount),
+      groupsSinceLanding: this.groupsSinceLanding(m),
       decidedTs: Date.now(),
     };
     void this.#player.switchTrack(trackName);
@@ -447,11 +477,15 @@ export class AbrController {
     const activeTrackIndex = activeTrack ? this.#tracks.findIndex(t => t.name === activeTrack) : -1;
 
     const mode: 'auto' | 'manual' = this.#settings.videoAutoSwitch ? 'auto' : 'manual';
+    const isMin = this.#settings.controller.arm === 'min';
 
-    // The rules see the contiguous buffer (M12); the total across holes is kept
-    // for the record. Players without the field report the total as both.
+    // The min arm's rules see the contiguous buffer (M12): a hole ahead of the
+    // playhead is not playable buffer. grid and baseline keep the total
+    // buffered-ahead they were run with. Players without the field report the
+    // total as both.
     const bufferContigSeconds =
       typeof rawContig === 'number' && Number.isFinite(rawContig) ? rawContig : bufferSeconds;
+    const bufferInstantSeconds = isMin ? bufferContigSeconds : bufferSeconds;
 
     const metrics: AbrMetrics = {
       bandwidthBps,
@@ -484,18 +518,18 @@ export class AbrController {
     this.#lastSampleCount = sampleCount;
     this.#activeTrackAtTick = activeTrack;
 
-    // Buffer level for the rules: the contiguous buffer, instantaneous or the
-    // maximum over the last group (the level after each burst landed).
+    // Buffer level for the rules: instantaneous or the maximum over the last
+    // group (the level after each burst landed).
     const envelopeMs = this.#settings.controller.bufferEnvelopeMs;
     const nowTs = Date.now();
-    this.#bufferSamples.push({ ts: nowTs, bufferSeconds: bufferContigSeconds });
+    this.#bufferSamples.push({ ts: nowTs, bufferSeconds: bufferInstantSeconds });
     while (this.#bufferSamples.length > 0 && nowTs - this.#bufferSamples[0]!.ts > envelopeMs) {
       this.#bufferSamples.shift();
     }
     const ruleBufferSeconds =
       this.#settings.controller.bufferSignal === 'envelope'
         ? bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs)
-        : bufferContigSeconds;
+        : bufferInstantSeconds;
 
     // Once the player signals the init segment landed, hold #switching until
     // a real new-track frame is decoded (totalVideoFrames moved past the
@@ -595,9 +629,9 @@ export class AbrController {
       tracks: this.#tracks,
       activeTrackIndex: currentIdx,
       bufferSeconds: ruleBufferSeconds,
-      bufferInstantSeconds: bufferContigSeconds,
+      bufferInstantSeconds,
       bufferTotalSeconds: bufferSeconds,
-      groupsSinceLanding: this.groupsSinceLanding(sampleCount),
+      groupsSinceLanding: this.groupsSinceLanding(raw),
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
@@ -705,6 +739,28 @@ export class AbrController {
       this.#upGuardArmed = false;
     }
 
+    // min arm: up-switch dwell. No up-switch until upDwellGroups completed
+    // groups of the landed track have arrived since the last landing (before
+    // the first landing: since startup). Down-switches pass.
+    if (targetIndex > currentIdx && isMin) {
+      const needed = this.#settings.controller.upDwellGroups;
+      const groups =
+        context.groupsSinceLanding ??
+        (activeTrack !== null ? raw.samplesByTrack?.[activeTrack] : undefined) ??
+        sampleCount;
+      if (groups < needed) {
+        events.emit('ABR_GATED', {
+          why: 'up-dwell',
+          from_index: currentIdx,
+          to_index: targetIndex,
+          groups_since_landing: groups,
+          min_groups: needed,
+          rule_reason: switchRequest.reason,
+        });
+        return;
+      }
+    }
+
     const targetTrack = this.#tracks[targetIndex];
     if (!targetTrack) return;
 
@@ -737,13 +793,13 @@ export class AbrController {
       reason,
       ruleReason: switchRequest.reason,
       priority: switchRequest.priority,
-      bufferSeconds: bufferContigSeconds,
+      bufferSeconds: bufferInstantSeconds,
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
       probeBps: context.probeBandwidthBps,
       latencyTrend: latencyTrendRatio,
-      groupsSinceLanding: this.groupsSinceLanding(sampleCount),
+      groupsSinceLanding: context.groupsSinceLanding ?? null,
       decidedTs: Date.now(),
     };
     void this.#player.switchTrack(targetTrack.name);

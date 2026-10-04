@@ -86,12 +86,20 @@ describe('EmergencyBufferRule', () => {
     expect(r?.representationIndex).toBe(0);
   });
 
-  it('low buffer never proposes a rung above the active one (it caps, it does not climb)', () => {
+  it('low buffer only ever lowers: it abstains when the 0.7 x SWMA rung is at or above the active one', () => {
     const rule = new EmergencyBufferRule();
-    const r = rule.getMaxIndex(
-      makeContext({ bufferInstantSeconds: 0.3, bandwidthBps: 10_000_000, activeTrackIndex: 1 }),
-    );
-    expect(r?.representationIndex).toBe(1);
+    // 0.7 x 10 Mbps fits 1080p, above the active 720p: no "stay" vote, no climb.
+    expect(
+      rule.getMaxIndex(
+        makeContext({ bufferInstantSeconds: 0.3, bandwidthBps: 10_000_000, activeTrackIndex: 1 }),
+      ),
+    ).toBeNull();
+    // 0.7 x 2.5 Mbps fits exactly the active 720p: nothing to do either.
+    expect(
+      rule.getMaxIndex(
+        makeContext({ bufferInstantSeconds: 0.3, bandwidthBps: 2_500_000, activeTrackIndex: 1 }),
+      ),
+    ).toBeNull();
   });
 
   it('judges the instantaneous contiguous buffer, not the envelope the other rules see', () => {

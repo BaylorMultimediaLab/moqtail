@@ -58,14 +58,18 @@ export interface RuleConfig {
  *   reproducible. Kept for the ablation record only.
  * - `min`: the paper controller (docs/rebuild-2026-10-04.md, "Controller
  *   min"). `resolveControllerSettings` derives the whole configuration from
- *   the arm: ThroughputRule, EmergencyBufferRule and SwitchHistoryRule (veto,
- *   60 s window) on, every other rule and the probe off, the envelope of the
- *   contiguous buffer as the buffer signal, and an up-switch dwell of
- *   `upDwellGroups` completed groups since the last landing. Its own constants
+ *   the arm: ThroughputRule (down to rung 0 when nothing fits), EmergencyBufferRule
+ *   and SwitchHistoryRule (veto, 60 s window) on, every other rule and the
+ *   probe off, the envelope of the contiguous buffer as the buffer signal, and
+ *   an up-switch dwell of `upDwellGroups` completed groups of the landed track
+ *   since the last landing (AbrController). Its own constants
  *   (`upDwellGroups`, `historyIgnoreGroupsAfterLanding`,
  *   `switchHistoryWindowS`, `bufferEnvelopeMs`, `bandwidthSafetyFactor`, the
  *   EmergencyBufferRule parameters) stay tunable; the pinned knobs are
  *   overridden whatever the caller passes.
+ *
+ * Only `min` reads the contiguous buffer (`bufferContigSeconds`); `grid` and
+ * `baseline` keep the total buffered-ahead they were run with.
  */
 export type ControllerArm = 'min' | 'grid' | 'baseline';
 
@@ -81,11 +85,14 @@ export interface ControllerSettings {
   arm: ControllerArm;
   /**
    * `min` arm: no up-switch until this many completed groups (throughput
-   * samples) of the current rung have arrived since the last confirmed
-   * landing. Down-switches are never held. Resolved onto `upGuardSamples`
-   * with `upGuardRelease = 'landed'`; inert on the other arms, which keep
-   * their explicit `upGuardSamples`. Before the first landing the slow-start
-   * gate (AbrController.MIN_STARTUP_SAMPLES) applies instead.
+   * samples) of the landed track have arrived since the last confirmed
+   * landing (`ABR_GATED why = up-dwell`). Down-switches are never held. The
+   * count uses the player's per-track sample counts
+   * (`AbrPlayerMetrics.samplesByTrack`) when present; otherwise the total
+   * sample count minus one, because the landing object itself finalises the
+   * source's last group (AbrController.groupsSinceLanding). Before the first
+   * landing the count is the startup track's samples. Inert on the other
+   * arms, which keep their explicit `upGuardSamples`.
    */
   upDwellGroups: number;
   /**
@@ -94,7 +101,7 @@ export interface ControllerSettings {
    * seam (a one-group hole on native, the catch-up burst elsewhere), not the
    * rung, and must not become a 60 s ladder cap through the veto (M17). Every
    * history entry is stamped with `groupsSinceLanding` at decision time. 0 =
-   * count every drop.
+   * count every drop. Applies on every arm (part of the M17 fix).
    */
   historyIgnoreGroupsAfterLanding: number;
   /**
@@ -240,7 +247,14 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
   maxBitrate: -1,
   controller: DEFAULT_CONTROLLER_SETTINGS,
   rules: {
-    ThroughputRule: { active: true, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
+    // downToLowest: 1 = when no rung fits bandwidth x safety factor, ask for
+    // the lowest rung instead of abstaining (set by the min arm; 0 keeps the
+    // shipped behaviour for grid and baseline).
+    ThroughputRule: {
+      active: true,
+      priority: SwitchRequestPriority.DEFAULT,
+      parameters: { downToLowest: 0 },
+    },
     BolaRule: { active: true, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     ProbeRule: {
       active: true,
@@ -328,6 +342,8 @@ export function resolveControllerSettings(settings: AbrSettings): AbrSettings {
   rules['ThroughputRule'] = {
     ...rules['ThroughputRule']!,
     priority: SwitchRequestPriority.DEFAULT,
+    // "down to the highest rung with bitrate <= 0.9 x SWMA": rung 0 when none fits.
+    parameters: { ...rules['ThroughputRule']!.parameters, downToLowest: 1 },
   };
   rules['EmergencyBufferRule'] = {
     ...rules['EmergencyBufferRule']!,
@@ -353,7 +369,10 @@ export function resolveControllerSettings(settings: AbrSettings): AbrSettings {
       // The arm is defined with a bounded memory; 0 (unbounded) is not accepted.
       switchHistoryWindowS:
         controller.switchHistoryWindowS > 0 ? controller.switchHistoryWindowS : 60,
-      upGuardSamples: Math.max(0, controller.upDwellGroups),
+      upDwellGroups: Math.max(0, controller.upDwellGroups),
+      // The dwell (upDwellGroups) is the min arm's only up-switch hold; the
+      // ablation up-guard is off.
+      upGuardSamples: 0,
       upGuardRelease: 'landed',
       latencyResetOnLanding: false,
     },

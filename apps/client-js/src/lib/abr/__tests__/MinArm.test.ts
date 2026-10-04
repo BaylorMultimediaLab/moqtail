@@ -21,12 +21,11 @@ const TRACKS: Track[] = [
   { name: '1080p', bitrate: 4_000_000 },
 ];
 
-/** What the player reports at a tick. Everything the rules may see is explicit. */
+/** What the player reports at a tick, apart from the sample counters. */
 interface Inputs {
   activeTrack: string;
   bandwidthBps: number;
   bufferContigSeconds: number;
-  sampleCount: number;
   /** Total buffered-ahead (across holes); defaults to the contiguous value. */
   bufferSeconds?: number;
   /** 0 = nothing presented yet (startup). Defaults to an advancing counter. */
@@ -40,6 +39,20 @@ interface Inputs {
   playbackRate?: number;
 }
 
+interface HarnessOptions {
+  settings?: AbrSettings;
+  /** The player exposes samplesByTrack (default true). */
+  byTrack?: boolean;
+  /**
+   * The landing object finalises the source's last group *after* the player
+   * called back (the harness player's order, default true): the first sample
+   * after a landing belongs to the old track.
+   */
+  finalizeAfterLanding?: boolean;
+  /** Groups completed on the startup track before the first tick (past slow start). */
+  startupGroups?: number;
+}
+
 function minSettings(overrides: Partial<ControllerSettings> = {}): AbrSettings {
   return {
     ...DEFAULT_ABR_SETTINGS,
@@ -48,9 +61,21 @@ function minSettings(overrides: Partial<ControllerSettings> = {}): AbrSettings {
   };
 }
 
-function harness(initial: Inputs, settings: AbrSettings = minSettings()) {
+function harness(initial: Inputs, opts: HarnessOptions = {}) {
+  const settings = opts.settings ?? minSettings();
+  const exposeByTrack = opts.byTrack ?? true;
+  const finalizeAfterLanding = opts.finalizeAfterLanding ?? true;
   let current: Inputs = initial;
   let frames = 1000;
+  let sampleCount = 0;
+  const byTrack: Record<string, number> = {};
+  /** n groups of `track` (default: the active one) complete. */
+  const complete = (n = 1, track = current.activeTrack) => {
+    sampleCount += n;
+    byTrack[track] = (byTrack[track] ?? 0) + n;
+  };
+  complete(opts.startupGroups ?? 10);
+
   const player = {
     getMetrics: vi.fn(() => {
       // Frames advance between calls so the switching guard's frame-advance
@@ -69,7 +94,8 @@ function harness(initial: Inputs, settings: AbrSettings = minSettings()) {
         playbackRate: current.playbackRate ?? 1,
         deliveryTimeMs: 50,
         lastObjectBytes: 8000,
-        sampleCount: current.sampleCount,
+        sampleCount,
+        samplesByTrack: exposeByTrack ? { ...byTrack } : undefined,
         latencyTrendRatio: current.latencyTrendRatio ?? 1,
         lastLatencyMs: current.lastLatencyMs ?? 0,
         latencyRecentMeanMs: current.latencyRecentMeanMs,
@@ -90,20 +116,26 @@ function harness(initial: Inputs, settings: AbrSettings = minSettings()) {
     set(i);
     await controller._tick();
   };
-  /** The player lands the switch: activeTrack flips, then onTrackSwitched. */
+  /**
+   * The player lands the switch: activeTrack flips, onTrackSwitched(track),
+   * then the landing object closes the source's last group.
+   */
   const land = (track: string, i: Partial<Inputs> = {}) => {
+    const source = current.activeTrack;
+    if (!finalizeAfterLanding) complete(1, source);
     set({ ...i, activeTrack: track });
     controller.onTrackSwitched(track);
+    if (finalizeAfterLanding) complete(1, source);
   };
   const switches = () => player.switchTrack.mock.calls.map(c => c[0] as string);
-  /** Tick, and if a switch was sent, land it at once (same inputs). */
+  /** Tick, and if a switch was sent, land it at once. */
   const tickAndLand = async (i: Partial<Inputs> = {}) => {
     const before = player.switchTrack.mock.calls.length;
     await tick(i);
     const calls = player.switchTrack.mock.calls;
     if (calls.length > before) land(calls[calls.length - 1]![0] as string);
   };
-  return { controller, player, collection, set, tick, land, switches, tickAndLand };
+  return { controller, player, collection, set, tick, land, complete, switches, tickAndLand };
 }
 
 describe('min arm: configuration', () => {
@@ -116,10 +148,11 @@ describe('min arm: configuration', () => {
     expect(active).toEqual([...MIN_ARM_RULES].sort());
     expect(r.rules.EmergencyBufferRule!.priority).toBe(SwitchRequestPriority.STRONG);
     expect(r.rules.ThroughputRule!.priority).toBe(SwitchRequestPriority.DEFAULT);
+    expect(r.rules.ThroughputRule!.parameters.downToLowest).toBe(1);
     expect(r.rules.SwitchHistoryRule!.priority).toBe(SwitchRequestPriority.DEFAULT);
   });
 
-  it('pins the probe off, the envelope buffer signal, the 60 s veto history and the dwell as the up-guard', () => {
+  it('pins the probe off, the envelope buffer signal and the 60 s veto history; the dwell is its own gate', () => {
     const c = resolveControllerSettings(minSettings()).controller;
     expect(c.arm).toBe('min');
     expect(c.probeMode).toBe('off');
@@ -128,10 +161,16 @@ describe('min arm: configuration', () => {
     expect(c.switchHistoryMode).toBe('veto');
     expect(c.switchHistoryWindowS).toBe(60);
     expect(c.upDwellGroups).toBe(3);
-    expect(c.upGuardSamples).toBe(3);
-    expect(c.upGuardRelease).toBe('landed');
+    expect(c.upGuardSamples).toBe(0);
     expect(c.historyIgnoreGroupsAfterLanding).toBe(2);
     expect(c.latencyResetOnLanding).toBe(false);
+    // Pinned whatever the caller passes.
+    const forced = resolveControllerSettings(
+      minSettings({ probeMode: 'on', bufferSignal: 'instant', upGuardSamples: 4 }),
+    ).controller;
+    expect(forced.probeMode).toBe('off');
+    expect(forced.bufferSignal).toBe('envelope');
+    expect(forced.upGuardSamples).toBe(0);
   });
 
   it("the min arm's own constants stay tunable", () => {
@@ -142,7 +181,7 @@ describe('min arm: configuration', () => {
         switchHistoryWindowS: 30,
       }),
     ).controller;
-    expect(c.upGuardSamples).toBe(5);
+    expect(c.upDwellGroups).toBe(5);
     expect(c.historyIgnoreGroupsAfterLanding).toBe(1);
     expect(c.switchHistoryWindowS).toBe(30);
   });
@@ -169,14 +208,8 @@ describe('min arm: configuration', () => {
   });
 
   it('never sends a probe and never engages BOLA (a 20 s buffer still climbs by throughput)', async () => {
-    const h = harness({
-      activeTrack: '360p',
-      bandwidthBps: 10_000_000,
-      bufferContigSeconds: 20,
-      sampleCount: 10,
-    });
-    h.land('360p'); // startup landing at sample 10
-    await h.tick({ sampleCount: 13 });
+    const h = harness({ activeTrack: '360p', bandwidthBps: 10_000_000, bufferContigSeconds: 20 });
+    await h.tick();
     expect(h.player.probeTrackBandwidth).not.toHaveBeenCalled();
     expect(h.switches()).toEqual(['1080p']);
   });
@@ -200,134 +233,167 @@ describe('min arm: configuration', () => {
   });
 });
 
+describe('min arm: ThroughputRule goes down to rung 0 when nothing fits', () => {
+  it('a SWMA below the lowest rung is a down-switch, not an abstention that waits for the buffer', async () => {
+    const h = harness({ activeTrack: '1080p', bandwidthBps: 300_000, bufferContigSeconds: 8 });
+    await h.tick();
+    expect(h.switches()).toEqual(['360p']);
+    h.land('360p');
+    expect(h.controller.getHistory()[0]!.reason).toBe('auto-downgrade');
+  });
+});
+
 describe('min arm: (a) up-switch dwell', () => {
-  it('no up-switch before 3 completed groups after landing', async () => {
-    const h = harness({
-      activeTrack: '360p',
-      bandwidthBps: 2_000_000,
-      bufferContigSeconds: 5,
-      sampleCount: 10,
-    });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('no up-switch before 3 completed groups of the landed track after landing', async () => {
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
     await h.tick();
     expect(h.switches()).toEqual(['720p']);
-    // Landed on 720p at sample 10; the link now reads 10 Mbps.
+    // Landed on 720p; the link now reads 10 Mbps.
     h.land('720p', { bandwidthBps: 10_000_000 });
-    for (const sampleCount of [10, 11, 12]) {
-      await h.tick({ sampleCount });
-      expect(h.switches(), `sample ${sampleCount}`).toEqual(['720p']);
+    for (let groups = 0; groups < 3; groups++) {
+      await h.tick();
+      expect(h.switches(), `${groups} groups`).toEqual(['720p']);
+      h.complete();
     }
-    await h.tick({ sampleCount: 13 });
+    await h.tick();
+    expect(h.switches()).toEqual(['720p', '1080p']);
+    const gated = emit.mock.calls
+      .filter(c => c[0] === 'ABR_GATED')
+      .map(c => c[1] as Record<string, unknown>);
+    expect(gated.map(g => g.why)).toEqual(['up-dwell', 'up-dwell', 'up-dwell']);
+    expect(gated.map(g => g.groups_since_landing)).toEqual([0, 1, 2]);
+  });
+
+  it("the source's last group, closed by the landing object, is not a group of the new rung", async () => {
+    // After the landing the total sample count has moved by 1 (the old
+    // track's group) + 2 (the new track's): three samples, two groups of 720p.
+    for (const byTrack of [true, false]) {
+      const h = harness(
+        { activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 },
+        { byTrack },
+      );
+      await h.tick();
+      h.land('720p', { bandwidthBps: 10_000_000 });
+      h.complete(2);
+      await h.tick();
+      expect(h.switches(), `byTrack=${byTrack}`).toEqual(['720p']);
+      h.complete();
+      await h.tick();
+      expect(h.switches(), `byTrack=${byTrack}`).toEqual(['720p', '1080p']);
+    }
+  });
+
+  it('without samplesByTrack, on a player that closes the source group before calling back, the dwell errs by one group too many, never too few', async () => {
+    const h = harness(
+      { activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 },
+      { byTrack: false, finalizeAfterLanding: false },
+    );
+    await h.tick();
+    h.land('720p', { bandwidthBps: 10_000_000 });
+    h.complete(3);
+    await h.tick();
+    expect(h.switches()).toEqual(['720p']);
+    h.complete();
+    await h.tick();
     expect(h.switches()).toEqual(['720p', '1080p']);
   });
 
   it('a down-switch is never held by the dwell', async () => {
-    const h = harness({
-      activeTrack: '360p',
-      bandwidthBps: 2_000_000,
-      bufferContigSeconds: 5,
-      sampleCount: 10,
-    });
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
     await h.tick();
     h.land('720p', { bandwidthBps: 700_000 });
-    await h.tick({ sampleCount: 10 });
+    await h.tick();
     expect(h.switches()).toEqual(['720p', '360p']);
   });
 });
 
 describe('min arm: (b) a one-group hole right after landing', () => {
-  it('a buffer dip that stays above 0.5 s and a missing sample produce no switch (time-shifted and live-edge shapes)', async () => {
+  it('produces no down-switch: the contiguous buffer dips but stays above 0.5 s and no sample completes (time-shifted and live-edge shapes)', async () => {
     const h = harness({
       activeTrack: '360p',
       bandwidthBps: 2_000_000,
       bufferContigSeconds: 9,
-      sampleCount: 10,
+      bufferSeconds: 9,
     });
     await h.tick();
     h.land('720p');
-    // Time-shifted: the group after the seam is missing; contiguous buffer
-    // reads 9 -> 8 -> 9 while no sample completes.
-    for (const bufferContigSeconds of [9, 8, 8, 9]) {
-      await h.tick({ bufferContigSeconds, sampleCount: 10 });
+    // Time-shifted: the group after the seam is missing; the contiguous
+    // buffer reads 9 -> 8 -> 9 while the total keeps the data behind the hole.
+    for (const bufferContigSeconds of [9, 8.5, 8, 8, 9]) {
+      await h.tick({ bufferContigSeconds, bufferSeconds: 10 });
     }
-    // Live-edge: 1.0 -> 0.75 -> 0.55 -> 1.0.
+    // Live-edge: 1.0 -> 0.75 -> 0.55 -> 1.0 with 2 s in total behind the hole.
     for (const bufferContigSeconds of [1.0, 0.75, 0.55, 1.0]) {
-      await h.tick({ bufferContigSeconds, sampleCount: 11 });
+      await h.tick({ bufferContigSeconds, bufferSeconds: 2 });
     }
     expect(h.switches()).toEqual(['720p']);
     expect(h.controller.getHistory()).toHaveLength(1);
   });
 
-  it('a seam hole that empties the live-edge buffer is a stamped emergency, not a history drop: the client climbs back after the dwell with no veto', async () => {
-    const h = harness({
-      activeTrack: '360p',
-      bandwidthBps: 2_000_000,
-      bufferContigSeconds: 1,
-      sampleCount: 10,
-    });
-    await h.tick();
-    h.land('720p');
-    // One group after landing the hole reaches the playhead.
-    await h.tick({ bufferContigSeconds: 0, sampleCount: 11 });
-    expect(h.switches()).toEqual(['720p', '360p']);
-    h.land('360p', { bufferContigSeconds: 1 });
-    const drop = h.controller.getHistory()[1]!;
-    expect(drop.reason).toBe('auto-emergency');
-    expect(drop.groupsSinceLanding).toBe(1);
-    // Dwell: 3 groups on 360p, then the throughput rule may climb again and
-    // SwitchHistoryRule does not hold 720p against the seam drop.
-    for (const sampleCount of [11, 12, 13]) {
-      await h.tick({ sampleCount });
-      expect(h.switches()).toEqual(['720p', '360p']);
-    }
-    await h.tick({ sampleCount: 14 });
-    expect(h.switches()).toEqual(['720p', '360p', '720p']);
+  it('a seam drop within 2 groups of the landing is not a history drop: repeated seam emergencies never let the veto cap the rung', async () => {
+    // Each cycle: climb to 720p after the dwell, then one group after the
+    // landing the seam hole empties a live-edge buffer and the emergency
+    // sends the client to 360p. With the seam window (2 groups) the history
+    // never holds 720p; counting those drops (window 0) the veto caps it once
+    // 8 events are on record (4 ups, 4 drops).
+    const cycles = async (historyIgnoreGroupsAfterLanding: number) => {
+      const h = harness(
+        { activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 1 },
+        { settings: minSettings({ historyIgnoreGroupsAfterLanding }) },
+      );
+      for (let c = 0; c < 6; c++) {
+        await h.tickAndLand({ bufferContigSeconds: 1 }); // up to 720p if allowed
+        h.complete();
+        await h.tickAndLand({ bufferContigSeconds: 0 }); // seam hole: emergency
+        await h.tick({ bufferContigSeconds: 1 });
+        h.complete(3); // dwell on whatever rung we are on
+      }
+      return h;
+    };
+    const ignored = await cycles(2);
+    const counted = await cycles(0);
+    const ups = (h: Awaited<ReturnType<typeof cycles>>) =>
+      h.controller.getHistory().filter(e => e.reason === 'auto-upgrade').length;
+    expect(ups(ignored)).toBe(6);
+    const drops = ignored.controller.getHistory().filter(e => e.reason === 'auto-emergency');
+    expect(drops).toHaveLength(6);
+    for (const d of drops) expect(d.groupsSinceLanding).toBe(1);
+    expect(ups(counted)).toBe(4);
   });
 });
 
 describe('min arm: (c) emergency on the instantaneous contiguous buffer', () => {
   it('buffer empty -> rung 0 at STRONG, recorded as auto-emergency', async () => {
-    const h = harness({
-      activeTrack: '1080p',
-      bandwidthBps: 10_000_000,
-      bufferContigSeconds: 0,
-      sampleCount: 10,
-    });
+    const h = harness({ activeTrack: '1080p', bandwidthBps: 10_000_000, bufferContigSeconds: 0 });
     await h.tick();
     expect(h.switches()).toEqual(['360p']);
     h.land('360p');
     expect(h.controller.getHistory()[0]!.reason).toBe('auto-emergency');
   });
 
-  it('buffer below 0.5 s -> highest rung under 0.7 x SWMA', async () => {
-    const h = harness({
-      activeTrack: '1080p',
-      bandwidthBps: 2_000_000, // 0.7 x 2 = 1.4 Mbps: only 360p fits
-      bufferContigSeconds: 0.3,
-      sampleCount: 10,
-    });
+  it('buffer below 0.5 s -> highest rung under 0.7 x SWMA, over the throughput rule', async () => {
+    // ThroughputRule: 0.9 x 2 Mbps = 1.8 -> 720p; the emergency: 0.7 x 2 =
+    // 1.4 -> 360p at STRONG.
+    const h = harness({ activeTrack: '1080p', bandwidthBps: 2_000_000, bufferContigSeconds: 0.3 });
     await h.tick();
     expect(h.switches()).toEqual(['360p']);
   });
 
-  it('buffer below 0.5 s never climbs, whatever the throughput rule wants', async () => {
-    const h = harness({
-      activeTrack: '720p',
-      bandwidthBps: 10_000_000,
-      bufferContigSeconds: 0.3,
-      sampleCount: 10,
-    });
-    h.land('720p');
-    await h.tick({ sampleCount: 20 });
-    expect(h.switches()).toEqual([]);
+  it('a low buffer is not an up-switch gate: with a healthy SWMA the throughput rule still climbs after the dwell', async () => {
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    await h.tick();
+    h.land('720p', { bandwidthBps: 10_000_000 });
+    h.complete(3);
+    // Live-edge sawtooth at its low point.
+    await h.tick({ bufferContigSeconds: 0.3 });
+    expect(h.switches()).toEqual(['720p', '1080p']);
   });
 
   it('uses the instantaneous value: an envelope of 1 s does not mask an empty buffer', async () => {
-    const h = harness({
-      activeTrack: '1080p',
-      bandwidthBps: 10_000_000,
-      bufferContigSeconds: 1.0,
-      sampleCount: 10,
-    });
+    const h = harness({ activeTrack: '1080p', bandwidthBps: 10_000_000, bufferContigSeconds: 1.0 });
     await h.tick();
     await h.tick({ bufferContigSeconds: 0 });
     expect(h.switches()).toEqual(['360p']);
@@ -339,7 +405,6 @@ describe('min arm: (c) emergency on the instantaneous contiguous buffer', () => 
       bandwidthBps: 10_000_000,
       bufferContigSeconds: 0,
       bufferSeconds: 10,
-      sampleCount: 10,
     });
     await h.tick();
     expect(h.switches()).toEqual(['360p']);
@@ -350,7 +415,6 @@ describe('min arm: (c) emergency on the instantaneous contiguous buffer', () => 
       activeTrack: '1080p',
       bandwidthBps: 10_000_000,
       bufferContigSeconds: 0,
-      sampleCount: 10,
       totalFrames: 0,
     });
     await h.tick();
@@ -362,37 +426,35 @@ describe('min arm: (d) A->B->A under an oscillating SWMA', () => {
   // The SWMA alternates per group between a value that fits 1080p and one
   // that fits only 360p. Without a dwell every group flips the rung; with the
   // dwell an up-switch needs 3 completed groups on the current rung after the
-  // last landing, so the loop runs at most once per 4 groups.
+  // last landing.
   const run = async (settings: AbrSettings) => {
     const h = harness(
-      { activeTrack: '360p', bandwidthBps: 1_000_000, bufferContigSeconds: 5, sampleCount: 10 },
-      settings,
+      { activeTrack: '360p', bandwidthBps: 1_000_000, bufferContigSeconds: 5 },
+      { settings },
     );
-    h.land('360p'); // startup landing at sample 10
     for (let g = 1; g <= 24; g++) {
-      await h.tickAndLand({ sampleCount: 10 + g, bandwidthBps: g % 2 ? 10_000_000 : 1_000_000 });
+      h.complete();
+      await h.tickAndLand({ bandwidthBps: g % 2 ? 10_000_000 : 1_000_000 });
     }
     return h;
   };
 
-  it('the dwell halves the switch rate and every up-switch is at least 3 groups after a landing', async () => {
+  it('the dwell suppresses the reversals and every up-switch is at least 3 groups after a landing', async () => {
     const withDwell = await run(minSettings());
     const noDwell = await run(minSettings({ upDwellGroups: 0 }));
     expect(noDwell.switches().length).toBeGreaterThanOrEqual(20);
     expect(withDwell.switches().length).toBeLessThanOrEqual(12);
     const ups = withDwell.controller.getHistory().filter(e => e.reason === 'auto-upgrade');
     expect(ups.length).toBeGreaterThan(0);
-    for (const up of ups) expect(up.groupsSinceLanding).toBeGreaterThanOrEqual(3);
+    for (const up of ups.slice(1)) expect(up.groupsSinceLanding).toBeGreaterThanOrEqual(3);
   });
 });
 
 describe('min arm: (e) client-type neutrality', () => {
   it('a 0.1 s and a 10 s shift client take identical decisions on identical throughput and contiguous-buffer inputs', async () => {
-    const steps: Array<Pick<Inputs, 'bandwidthBps' | 'bufferContigSeconds' | 'sampleCount'>> = [];
-    let sc = 10;
+    const steps: Array<Pick<Inputs, 'bandwidthBps' | 'bufferContigSeconds'>> = [];
     const push = (bandwidthBps: number, bufferContigSeconds: number, n: number) => {
-      for (let i = 0; i < n; i++)
-        steps.push({ bandwidthBps, bufferContigSeconds, sampleCount: ++sc });
+      for (let i = 0; i < n; i++) steps.push({ bandwidthBps, bufferContigSeconds });
     };
     push(10_000_000, 5, 5); // climb
     push(1_200_000, 5, 3); // link drops: 0.9 x 1.2 fits only 360p
@@ -425,16 +487,15 @@ describe('min arm: (e) client-type neutrality', () => {
         activeTrack: '360p',
         bandwidthBps: 1_000_000,
         bufferContigSeconds: 5,
-        sampleCount: 10,
         // A time-shifted client has more total buffer than contiguous when a
         // hole exists; the rules must not see it.
         bufferSeconds: name === 'shifted' ? 10 : undefined,
         ...client,
       });
-      h.land('360p');
       const trace: string[] = [];
       for (const [i, step] of steps.entries()) {
         const before = h.switches().length;
+        h.complete();
         await h.tickAndLand(step);
         if (h.switches().length > before) trace.push(`${i}:${h.switches().at(-1)}`);
       }
@@ -450,19 +511,42 @@ describe('min arm: (e) client-type neutrality', () => {
 describe('min arm: (f) a phantom switch is not history', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('SWITCH_SKIPPED / SWITCH_ERROR (callback with the old track) leaves history and ABR_DECISION untouched', async () => {
+  it('SWITCH_SKIPPED / SWITCH_ERROR (callback with the old track) leaves history, ABR_DECISION and the dwell clock untouched', async () => {
     const emit = vi.spyOn(events, 'emit');
-    const h = harness({
-      activeTrack: '360p',
-      bandwidthBps: 2_000_000,
-      bufferContigSeconds: 5,
-      sampleCount: 10,
-    });
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
     await h.tick();
     expect(h.switches()).toEqual(['720p']);
     h.controller.onTrackSwitched('360p');
     expect(h.controller.getHistory()).toHaveLength(0);
     expect(emit.mock.calls.filter(c => c[0] === 'ABR_DECISION')).toHaveLength(0);
     expect(emit.mock.calls.filter(c => c[0] === 'ABR_SWITCH_PHANTOM')).toHaveLength(1);
+    // Not a landing: no dwell started, the next tick may send the switch again.
+    await h.tick();
+    expect(h.switches()).toEqual(['720p', '720p']);
+  });
+});
+
+describe('grid and baseline keep the total buffer (only min reads the contiguous one)', () => {
+  it('grid: a hole ahead of the playhead with 5 s behind it is still 5 s of buffer to its rules', async () => {
+    const grid: AbrSettings = {
+      ...DEFAULT_ABR_SETTINGS,
+      controller: {
+        ...DEFAULT_ABR_SETTINGS.controller,
+        arm: 'grid',
+        latencyResetOnLanding: true,
+        bufferSignal: 'envelope',
+        switchHistoryMode: 'veto',
+        switchHistoryWindowS: 60,
+        probeMaxBytes: 65_536,
+      },
+    };
+    const h = harness(
+      { activeTrack: '1080p', bandwidthBps: 10_000_000, bufferContigSeconds: 0, bufferSeconds: 5 },
+      { settings: grid },
+    );
+    // InsufficientBufferRule's two warm-up calls, then it would read 0 as
+    // "empty" (STRONG rung 0) if it saw the contiguous buffer.
+    for (let i = 0; i < 4; i++) await h.tick();
+    expect(h.switches()).toEqual([]);
   });
 });

@@ -23,13 +23,17 @@
  * envelope the other rules see and never the total across holes:
  *
  *   buffer == 0        → rung 0                                  (STRONG)
- *   buffer < lowBufferS → highest rung with bitrate ≤ sf × SWMA,  (STRONG)
- *                         capped at the active rung
+ *   buffer < lowBufferS → highest rung with bitrate ≤ sf × SWMA   (STRONG)
+ *                         when that rung is below the active one
  *
- * with `lowBufferS = 0.5 s` and `sf = 0.7` by default. The cap means the
- * low-buffer branch never proposes an up-switch; when the cap is the active
- * rung the request reads as "stay", which vetoes DEFAULT up-votes while the
- * buffer is low.
+ * with `lowBufferS = 0.5 s` and `sf = 0.7` by default. The rule only ever
+ * lowers: when the low-buffer rung is at or above the active rung it abstains
+ * and ThroughputRule (with the dwell) decides, exactly as on a full buffer. It
+ * deliberately does not vote "stay": a STRONG stay would be an up-switch gate
+ * on the instantaneous buffer, and at the live edge that buffer is a sawtooth
+ * that crosses 0.5 s once per group while a time-shifted client never gets
+ * there, i.e. an admission policy for one client type only (the M18 objection
+ * to InsufficientBufferRule).
  *
  * Why only this: InsufficientBufferRule's admission `0.7 × SWMA × buffer`
  * binds on a live-edge client (buffer ≈ 1 s) and is no constraint on a 10 s
@@ -79,10 +83,9 @@ export class EmergencyBufferRule implements AbrRule {
     for (let i = 0; i < tracks.length; i++) {
       if ((tracks[i]!.bitrate ?? 0) <= cap) best = i;
     }
-    const active = Math.max(0, activeTrackIndex);
-    const index = Math.min(best, active);
+    if (best >= Math.max(0, activeTrackIndex)) return null;
     return {
-      representationIndex: index,
+      representationIndex: best,
       priority,
       reason: `emergency-buffer-low ${buffer.toFixed(2)}s < ${lowBufferS}s, cap ${(cap / 1e6).toFixed(2)}Mbps`,
     };
