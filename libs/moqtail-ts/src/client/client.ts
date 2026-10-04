@@ -99,6 +99,7 @@ import {
   SwitchOptions,
   EarlyDiscardPolicyConfig,
   SubscribeResult,
+  DiscardedStreamInfo,
 } from './types'
 import { SendDatagramStream } from './datagram_stream'
 import { logger, LogLevel, setLogLevel, setLogEnabledModules } from '../util/logger'
@@ -240,6 +241,12 @@ export class MOQtailClient {
   dataStreamTimeoutMs?: number
   /** Timeout (ms) for control stream read operations; undefined =\> no explicit timeout. */
   controlStreamTimeoutMs?: number
+  /**
+   * How long an incoming data stream waits for its track alias to be claimed before
+   * it is discarded as unrouted (ms). A data stream can overtake the SUBSCRIBE_OK (or
+   * PUBLISH) that names its alias, since the two travel on different streams.
+   */
+  trackAliasResolutionTimeoutMs: number = ALIAS_RESOLUTION_TIMEOUT_MS
 
   /** Flag indicating the client has been disconnected/destroyed and cannot accept further API calls. */
   #isDestroyed = false
@@ -311,6 +318,15 @@ export class MOQtailClient {
    * Informational event.
    */
   onDataSent?: (data: SubgroupObject | SubgroupHeader | FetchObject | FetchHeader) => void
+
+  /**
+   * Invoked when an incoming data stream is dropped without its objects being
+   * delivered, with the reason and the bytes it had cost (M15). Today the one reason
+   * is `unrouted`: no subscription claimed the stream's track alias. The stream is
+   * cancelled with STOP_SENDING(CANCELLED) before this fires.
+   * Accounting event: lets an application count link usage it never consumed.
+   */
+  onStreamDiscarded?: (info: DiscardedStreamInfo) => void
 
   /**
    * General-purpose error callback for surfaced exceptions not thrown to caller synchronously.
@@ -2379,7 +2395,7 @@ export class MOQtailClient {
         // alias may not have run yet. Wait briefly before treating the alias as
         // unknown, as the relay does for aliases on its side.
         if (!subscription) {
-          const deadline = Date.now() + ALIAS_RESOLUTION_TIMEOUT_MS
+          const deadline = Date.now() + this.trackAliasResolutionTimeoutMs
           while (!subscription && Date.now() < deadline) {
             await new Promise((resolve) => setTimeout(resolve, 10))
             subscription = lookupSubscription()
@@ -2457,10 +2473,27 @@ export class MOQtailClient {
           return
         }
 
-        throw new ProtocolViolationError(
+        // Unrouted (M15): nothing claimed this alias in time. Draining the stream to
+        // its end would spend link capacity on media nobody will consume and count it
+        // nowhere, so tell the peer to stop (STOP_SENDING) and report what it cost.
+        // Not a protocol violation: the relay may legitimately still be flushing
+        // streams of a subscription this side has just released.
+        await recvStream.stopSending(StreamResetCode.Cancelled)
+        reader.releaseLock()
+        const info: DiscardedStreamInfo = {
+          reason: 'unrouted',
+          trackAlias: header.trackAlias,
+          groupId: header.groupId,
+          subgroupId: header.subgroupId,
+          fullTrackName: this.aliasFullTrackNameMap.get(header.trackAlias),
+          bytes: recvStream.bytesReceived,
+        }
+        logger.warn(
           'MOQtailClient',
-          `No subscription for received track alias ${header.trackAlias} (groupId=${header.groupId})`,
+          `discarding unrouted data stream alias=${info.trackAlias} group=${info.groupId} bytes=${info.bytes}`,
         )
+        this.onStreamDiscarded?.(info)
+        return
       }
     } catch (error) {
       //this.disconnect()
@@ -3111,6 +3144,45 @@ if (import.meta.vitest) {
       expect(incoming.messages).toHaveLength(0)
       expect(streamResetCodeOf(incoming.abortReason)).toBe(StreamResetCode.InternalError)
       expect(streamResetCodeOf(incoming.cancelReason)).toBe(StreamResetCode.InternalError)
+
+      await client.disconnect()
+    })
+
+    /** Wire bytes of one subgroup stream: header plus one object with `payloadBytes` of payload. */
+    function subgroupStreamBytes(trackAlias: bigint, groupId: bigint, payloadBytes: number): Uint8Array {
+      const header = new SubgroupHeader(
+        SubgroupHeaderType.fromProperties(false, 0, false),
+        trackAlias,
+        groupId,
+        0n,
+        128,
+      )
+      const object = SubgroupObject.newWithPayload(0, null, new Uint8Array(payloadBytes))
+      const headerBytes = header.serialize().toUint8Array()
+      const objectBytes = object.serialize(undefined).toUint8Array()
+      const bytes = new Uint8Array(headerBytes.length + objectBytes.length)
+      bytes.set(headerBytes)
+      bytes.set(objectBytes, headerBytes.length)
+      return bytes
+    }
+
+    // M15: a stream whose alias has no route used to be drained off the wire and
+    // dropped silently; now it is cancelled (STOP_SENDING) and reported with the
+    // bytes it cost, so every arm counts discarded media on the same basis.
+    it('cancels a data stream for an unrouted alias with STOP_SENDING and reports its bytes (M15)', async () => {
+      const { client, transport } = await connected()
+      client.trackAliasResolutionTimeoutMs = 20
+      const discarded: DiscardedStreamInfo[] = []
+      client.onStreamDiscarded = (info) => discarded.push(info)
+
+      const bytes = subgroupStreamBytes(42n, 5n, 100)
+      transport.openIncomingUniStream(bytes)
+
+      await vi.waitFor(() => expect(discarded).toHaveLength(1))
+      expect(discarded[0]).toMatchObject({ reason: 'unrouted', trackAlias: 42n, groupId: 5n, bytes: bytes.length })
+      expect(discarded[0]!.fullTrackName).toBeUndefined()
+      await vi.waitFor(() => expect(transport.uniCancelReasons).toHaveLength(1))
+      expect(streamResetCodeOf(transport.uniCancelReasons[0])).toBe(StreamResetCode.Cancelled)
 
       await client.disconnect()
     })

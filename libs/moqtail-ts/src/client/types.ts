@@ -35,6 +35,27 @@ import { PublishRequest } from './request/publish'
 import { TrackStatusRequest } from './request/track_status'
 
 /**
+ * Why and at what cost the client dropped an incoming data stream without delivering
+ * its objects (see {@link MOQtailClient.onStreamDiscarded}).
+ *
+ * `unrouted`: the stream's track alias matched no subscription within
+ * {@link MOQtailClient.trackAliasResolutionTimeoutMs}. Typical after a track switch,
+ * when the relay still flushes streams of the old subscription after the client has
+ * released its alias. The stream is cancelled with STOP_SENDING(CANCELLED) so the
+ * relay stops writing it; `bytes` is what had been read off the wire by then,
+ * header included.
+ */
+export type DiscardedStreamInfo = {
+  reason: 'unrouted'
+  trackAlias: bigint
+  groupId: bigint
+  subgroupId: bigint | undefined
+  /** The name the alias last mapped to, if the client still remembers it. */
+  fullTrackName: FullTrackName | undefined
+  bytes: number
+}
+
+/**
  * Successful return value from {@link MOQtailClient.subscribe} (and {@link MOQtailClient.switch}).
  *
  * Carries the request id, the object stream, and the relay's `largest_location`

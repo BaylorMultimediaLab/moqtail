@@ -118,16 +118,24 @@ export class RecvStream {
   readonly #internalBuffer: ByteBuffer
   readonly #groupOrder: GroupOrder
   readonly onDataReceived?: (data: SubgroupObject | SubgroupHeader | FetchObject | FetchHeader) => void
+  /**
+   * Bytes read from the transport on this stream so far, header included. What a
+   * stream cost the link up to the moment it was dropped (see
+   * {@link MOQtailClient.onStreamDiscarded}), independent of what was parsed.
+   */
+  #bytesReceived: number
   private constructor(
     readonly header: Header,
     reader: ReadableStreamDefaultReader<Uint8Array>,
     internalBuffer: ByteBuffer,
+    bytesReceived: number,
     partialDataTimeout?: number,
     onDataReceived?: (data: SubgroupObject | SubgroupHeader | FetchObject | FetchHeader) => void,
     groupOrder: GroupOrder = GroupOrder.Original,
   ) {
     this.#reader = reader
     this.#internalBuffer = internalBuffer
+    this.#bytesReceived = bytesReceived
     this.#partialDataTimeout = partialDataTimeout
     this.#groupOrder = groupOrder
     if (onDataReceived) this.onDataReceived = onDataReceived
@@ -150,6 +158,7 @@ export class RecvStream {
   ): Promise<RecvStream> {
     const reader = readStream.getReader()
     const internalBuffer = new ByteBuffer()
+    let bytesReceived = 0
     let headerInstance: Header
     try {
       while (true) {
@@ -176,6 +185,7 @@ export class RecvStream {
         }
         if (value) {
           internalBuffer.putBytes(value)
+          bytesReceived += value.byteLength
         }
         try {
           internalBuffer.checkpoint()
@@ -202,7 +212,20 @@ export class RecvStream {
     // Resolved before the ingest loop starts: the first object may already be buffered.
     const groupOrder =
       Header.isFetch(headerInstance) && resolveGroupOrder ? resolveGroupOrder(headerInstance) : GroupOrder.Original
-    return new RecvStream(headerInstance, reader, internalBuffer, partialDataTimeout, onDataReceived, groupOrder)
+    return new RecvStream(
+      headerInstance,
+      reader,
+      internalBuffer,
+      bytesReceived,
+      partialDataTimeout,
+      onDataReceived,
+      groupOrder,
+    )
+  }
+
+  /** Bytes read from the transport on this stream so far (header included). */
+  get bytesReceived(): number {
+    return this.#bytesReceived
   }
 
   async #ingestLoop(controller: ReadableStreamDefaultController<FetchObject | SubgroupObject>) {
@@ -281,6 +304,7 @@ export class RecvStream {
         }
         if (value) {
           this.#internalBuffer.putBytes(value)
+          this.#bytesReceived += value.byteLength
         }
       }
     } catch (error) {
