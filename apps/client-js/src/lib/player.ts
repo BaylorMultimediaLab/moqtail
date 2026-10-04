@@ -35,7 +35,13 @@ import type { ProbeResult } from '@/lib/abr/ProbeManager';
 import { events } from '@/lib/events/EventLog';
 import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
 import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
-import { SeamTracker, nextPageSwitchSeq, switchAppliedFields, type SwitchRecord } from '@/lib/seam';
+import {
+  SeamTracker,
+  nextPageSwitchSeq,
+  seamBehindPlayhead,
+  switchAppliedFields,
+  type SwitchRecord,
+} from '@/lib/seam';
 
 interface PendingSwitch {
   trackName: string;
@@ -1311,8 +1317,9 @@ export class Player {
    * Recurring requestVideoFrameCallback poll.
    *
    * Every presented frame reports its `mediaTime`. The first presented frame
-   * whose media time is at or past a pending switch's seam PTS is the first
-   * frame of the new representation the viewer sees. At that frame:
+   * whose media time lies in the pending switch's appended target range
+   * [seam PTS, target append front] is the first frame of the new
+   * representation the viewer sees (SeamTracker.presented, M10). At that frame:
    *   switch_visibility_delay_ms = now - switchSentAt
    *   playback_position_jump_ms  = mediaTime - previous mediaTime - one frame
    *                                (0 when the seam is played through contiguously)
@@ -1322,6 +1329,19 @@ export class Player {
    */
   #installPerceivedPausePoll(): void {
     if (!this.#element) return;
+    // requestVideoFrameCallback reports each presented frame with its media
+    // time; where it is missing, fall back to an animation-frame poll that
+    // reads currentTime (coarser, but the seam crossing is still detected).
+    // Every record this poll emits says which one it was.
+    const el = this.#element;
+    const rvfc = (
+      el as HTMLVideoElement & {
+        requestVideoFrameCallback?: (
+          cb: (now: number, m: VideoFrameCallbackMetadata) => void,
+        ) => number;
+      }
+    ).requestVideoFrameCallback;
+    const source: 'rvfc' | 'raf' = typeof rvfc === 'function' ? 'rvfc' : 'raf';
     let prevMediaMs: number | undefined;
     let prevNowMs: number | undefined;
     const poll = (now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata) => {
@@ -1330,6 +1350,7 @@ export class Player {
       if (!this.#firstFrameSeen) {
         this.#firstFrameSeen = true;
         events.emit('STARTUP', {
+          source,
           track: this.getMetrics().activeTrack,
           playhead_ms: mediaMs,
           connect_to_first_object_ms:
@@ -1343,7 +1364,9 @@ export class Player {
       }
       const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
       const frameMs = videoStruct?.lastFrameDurationMs ?? 1000 / 30;
-      const rec = this.#seams.presented({ mediaMs, frameMs, now });
+      // When the frame was handed to the compositor (rVFC), else the callback time.
+      const presentedAt = metadata.presentationTime ?? now;
+      const rec = this.#seams.presented({ mediaMs, frameMs, now: presentedAt });
       if (rec !== null && rec.seamPtsMs !== undefined) {
         const seam = rec.seamPtsMs;
         const visibilityDelayMs = now - rec.sentAt;
@@ -1379,6 +1402,11 @@ export class Player {
           viewer_pause_ms: pauseMs,
           seam_buffer_hole_ms: bufferHoleMs,
           buffer_hole_behind_ms: bufferHoleBehindMs,
+          target_append_front_ms: rec.targetAppendFrontMs ?? null,
+          // The seam landed behind the playhead the switch was sent at; the
+          // frame above is still target media (M10), reached later.
+          seam_behind_playhead: seamBehindPlayhead(rec),
+          source,
         });
 
         this.#options.onSwitchVisible?.(rec.to);
@@ -1387,17 +1415,6 @@ export class Player {
       prevNowMs = now;
       schedule(poll);
     };
-    // requestVideoFrameCallback reports each presented frame with its media
-    // time; where it is missing, fall back to an animation-frame poll that
-    // reads currentTime (coarser, but the seam crossing is still detected).
-    const el = this.#element;
-    const rvfc = (
-      el as HTMLVideoElement & {
-        requestVideoFrameCallback?: (
-          cb: (now: number, m: VideoFrameCallbackMetadata) => void,
-        ) => number;
-      }
-    ).requestVideoFrameCallback;
     const schedule =
       typeof rvfc === 'function'
         ? (cb: (now: number, m: VideoFrameCallbackMetadata) => void) => rvfc.call(el, cb)

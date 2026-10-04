@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SeamTracker, switchAppliedFields } from './seam';
+import { SeamTracker, seamBehindPlayhead, switchAppliedFields } from './seam';
 
 const send = (t: SeamTracker, from: string, to: string, sentAt = 1000) =>
   t.sent(from, to, { playheadMs: 10_000, appendFrontMs: 12_000, sentAt });
@@ -143,5 +143,47 @@ describe('SeamTracker: the seam is the first appended target object (M9)', () =>
       since_sent_ms: 600,
       since_landed_ms: 500,
     });
+  });
+});
+
+describe('SeamTracker: first frame only for a presented target frame (M10)', () => {
+  const landAt = (t: SeamTracker, playheadMs: number) => {
+    const a = t.sent('low', 'mid', { playheadMs, appendFrontMs: 12_000, sentAt: 1000 });
+    t.landed(a, { group: 9, object: 0, landedOnKeyframe: true, sourceEndMs: 12_000, now: 1100 });
+    return a;
+  };
+
+  it('ignores source frames when the target lands behind the playhead', () => {
+    // A playhead-floor switch re-fetches from the group the viewer is in: the
+    // seam (9.0 s) is behind the playhead (10.0 s) and the next presented frame
+    // is still a source frame until the target's append front passes it.
+    const t = new SeamTracker();
+    const a = landAt(t, 10_000);
+    t.appended({ ptsMs: 9_000, endPtsMs: 9_040, group: 9, object: 0, now: 1200 });
+    t.appended({ ptsMs: 9_960, endPtsMs: 10_000, group: 9, object: 24, now: 1300 });
+    expect(t.presented({ mediaMs: 10_000, frameMs: 40, now: 1310 })).toBeNull();
+    expect(t.presented({ mediaMs: 10_040, frameMs: 40, now: 1350 })).toBeNull();
+    t.appended({ ptsMs: 10_000, endPtsMs: 10_120, group: 10, object: 0, now: 1360 });
+    expect(t.presented({ mediaMs: 10_080, frameMs: 40, now: 1390 })).toBe(a);
+    expect(seamBehindPlayhead(a)).toBe(true);
+  });
+
+  it('ignores a frame presented before the target media at its time was appended', () => {
+    const t = new SeamTracker();
+    const a = landAt(t, 10_000);
+    t.appended({ ptsMs: 12_000, endPtsMs: 12_040, group: 9, object: 0, now: 2000 });
+    t.appended({ ptsMs: 12_040, endPtsMs: 12_080, group: 9, object: 1, now: 2100 });
+    // Presented at 2050: only [12000, 12040) was in the buffer then.
+    expect(t.presented({ mediaMs: 12_040, frameMs: 40, now: 2050 })).toBeNull();
+    expect(t.presented({ mediaMs: 12_040, frameMs: 40, now: 2110 })).toBe(a);
+    expect(seamBehindPlayhead(a)).toBe(false);
+  });
+
+  it('accepts the seam frame itself within half a frame', () => {
+    const t = new SeamTracker();
+    const a = landAt(t, 10_000);
+    t.appended({ ptsMs: 12_000, endPtsMs: 12_040, group: 9, object: 0, now: 2000 });
+    expect(t.presented({ mediaMs: 11_970, frameMs: 40, now: 2010 })).toBeNull();
+    expect(t.presented({ mediaMs: 11_985, frameMs: 40, now: 2010 })).toBe(a);
   });
 });

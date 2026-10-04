@@ -72,6 +72,12 @@ export class SeamTracker {
   readonly #allocate: () => number;
   /** The landed switch whose first frame has not been presented yet. */
   #pending: SwitchRecord | null = null;
+  /**
+   * The pending switch's target append front over time: (performance.now() of
+   * the append, end PTS after it). Lets a presented frame be checked against
+   * what was in the buffer when it was presented, not when the callback ran.
+   */
+  #fronts: Array<{ at: number; frontMs: number }> = [];
 
   /**
    * @param allocateSeq - Source of switch numbers. The player passes the
@@ -131,6 +137,7 @@ export class SeamTracker {
     rec.landedOnKeyframe = at.landedOnKeyframe;
     rec.sourceEndAtLandingMs = at.sourceEndMs;
     this.#pending = rec;
+    this.#fronts = [];
     return { superseded };
   }
 
@@ -164,6 +171,10 @@ export class SeamTracker {
     const rec = this.#pending;
     if (rec === null) return null;
     rec.targetAppendFrontMs = Math.max(rec.targetAppendFrontMs ?? -Infinity, at.endPtsMs);
+    this.#fronts.push({ at: at.now, frontMs: rec.targetAppendFrontMs });
+    // Presentation times are recent; a seam that stays pending for long only
+    // needs the newest part of the history (the oldest kept entry is the base).
+    if (this.#fronts.length > 1024) this.#fronts.splice(0, 512);
     if (rec.seamPtsMs !== undefined) return null;
     rec.appliedAt = at.now;
     rec.seamPtsMs = at.ptsMs;
@@ -173,16 +184,38 @@ export class SeamTracker {
   }
 
   /**
-   * A frame with media time `mediaMs` was presented. Returns the pending switch
-   * when this is its first frame; the switch is then complete.
+   * A frame with media time `mediaMs` was presented at `now` (performance
+   * clock). Returns the pending switch when this is its first frame, which
+   * completes the switch (M10).
+   *
+   * The frame counts only if it is target media: `mediaMs` lies in
+   * [seam, target append front] as the front stood at `now`, with half a frame
+   * of tolerance for the element's rounding. A seam that lands at or behind the
+   * playhead therefore does not make the next presented source frame the
+   * "first frame"; the switch waits until the playhead reaches media the
+   * target actually delivered.
    */
   presented(at: { mediaMs: number; frameMs: number; now: number }): SwitchRecord | null {
     const rec = this.seam;
     if (rec === null || rec.seamPtsMs === undefined) return null;
-    if (at.mediaMs < rec.seamPtsMs - at.frameMs / 2) return null;
+    const half = at.frameMs / 2;
+    if (at.mediaMs < rec.seamPtsMs - half) return null;
+    const front = this.#frontAt(at.now);
+    if (front === undefined || at.mediaMs > front - half) return null;
     rec.firstFrameSeen = true;
     this.#pending = null;
+    this.#fronts = [];
     return rec;
+  }
+
+  /** The pending switch's target append front as it stood at `t`. */
+  #frontAt(t: number): number | undefined {
+    let front: number | undefined;
+    for (const f of this.#fronts) {
+      if (f.at > t) break;
+      front = f.frontMs;
+    }
+    return front;
   }
 }
 
@@ -236,4 +269,10 @@ export function switchAppliedFields(
     since_sent_ms: at.now - rec.sentAt,
     since_landed_ms: rec.landedAt !== undefined ? at.now - rec.landedAt : null,
   };
+}
+
+/** True when the switch's seam lies behind the playhead it was sent at (M10). */
+export function seamBehindPlayhead(rec: SwitchRecord): boolean | null {
+  if (rec.seamPtsMs === undefined || rec.playheadAtSendMs === undefined) return null;
+  return rec.seamPtsMs - rec.playheadAtSendMs < 0;
 }
