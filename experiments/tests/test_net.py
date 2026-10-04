@@ -792,6 +792,80 @@ class RelayFlagsAgainstSource(unittest.TestCase):
         self.assertIn("--event-log", str(cm.exception))
 
 
+# A RELAY_CONFIG record that satisfies every check for a run that is not the fixed
+# native arm (cubic, GSO off, both native-fix fields false).
+OK_CONFIG = {"congestion_controller": "cubic", "udp_gso": "off", "forward_promotion_trigger": False,
+             "native_status_before_subscribe": False}
+
+
+class NativeFixedArm(unittest.TestCase):
+    """R3-D7: `--mechanism native --mechanism-mode forward-trigger` is the corrected
+    native arm: the relay runs with --forward-promotion-trigger AND
+    --native-status-before-subscribe, and its RELAY_CONFIG must say both are on;
+    every other run must report both off (as-shipped native, and the arms whose
+    relays never promote natively)."""
+
+    FLAGS = set(rx.RELAY_PINNED) | {"--cache-size", "--congestion-controller", "--udp-gso",
+                                    "--forward-promotion-trigger", "--native-status-before-subscribe"}
+
+    def test_fixed_arm_passes_both_flags(self):
+        self.assertTrue(rx.is_native_fixed_arm("native", "forward-trigger"))
+        self.assertEqual(rx.native_fixed_relay_args(self.FLAGS, "native", "forward-trigger"),
+                         ["--forward-promotion-trigger", "--native-status-before-subscribe"])
+
+    def test_other_arms_pass_neither(self):
+        for mech, mode in (("native", None), ("pr1378", "next-group"), ("pr1378", "playhead"),
+                           ("switch-from", "hard")):
+            self.assertFalse(rx.is_native_fixed_arm(mech, mode))
+            self.assertEqual(rx.native_fixed_relay_args(self.FLAGS, mech, mode), [])
+
+    def test_fixed_arm_requires_both_flags_in_help(self):
+        for missing in ("--forward-promotion-trigger", "--native-status-before-subscribe"):
+            with self.assertRaises(SystemExit) as cm:
+                rx.native_fixed_relay_args(self.FLAGS - {missing}, "native", "forward-trigger")
+            self.assertIn(missing, str(cm.exception))
+        # an older relay without the flags is fine for every other arm
+        self.assertEqual(rx.native_fixed_relay_args(set(rx.RELAY_PINNED), "native", None), [])
+
+    def test_relay_config_must_match_the_arm(self):
+        on = dict(OK_CONFIG, forward_promotion_trigger=True, native_status_before_subscribe=True)
+        self.assertIsNone(rx.check_relay_config(on, "cubic", False, native_fixed=True))
+        self.assertIsNone(rx.check_relay_config(OK_CONFIG, "cubic", False, native_fixed=False))
+        # both directions of a mismatch, field by field; never waived by allow_missing
+        for field in ("forward_promotion_trigger", "native_status_before_subscribe"):
+            half = dict(on, **{field: False})
+            for allow in (False, True):
+                err = rx.check_relay_config(half, "cubic", allow, native_fixed=True)
+                self.assertIsNotNone(err)
+                self.assertIn(field, err)
+                err = rx.check_relay_config(dict(OK_CONFIG, **{field: True}), "cubic", allow, native_fixed=False)
+                self.assertIsNotNone(err)
+                self.assertIn(field, err)
+        # a fixed relay under another arm's name is rejected too
+        self.assertIsNotNone(rx.check_relay_config(on, "cubic", True, native_fixed=False))
+
+    def test_missing_field(self):
+        for field in ("forward_promotion_trigger", "native_status_before_subscribe"):
+            rec = {k: v for k, v in OK_CONFIG.items() if k != field}
+            self.assertIn(field, rx.check_relay_config(rec, "cubic", False))
+            # a smoke run of another arm may use a relay without the field...
+            self.assertIsNone(rx.check_relay_config(rec, "cubic", True))
+            # ...the fixed arm may not: the record is what shows it ran fixed
+            on = {k: True for k in ("forward_promotion_trigger", "native_status_before_subscribe")}
+            rec_on = {k: v for k, v in dict(OK_CONFIG, **on).items() if k != field}
+            self.assertIn(field, rx.check_relay_config(rec_on, "cubic", True, native_fixed=True))
+
+    def test_fields_under_config_are_read(self):
+        self.assertIsNone(rx.check_relay_config({"config": OK_CONFIG}, "cubic", False))
+
+    def test_relay_source_has_the_flags(self):
+        rs = REPO / "apps/relay/src/server/config.rs"
+        if not rs.exists():
+            self.skipTest("relay source not in this checkout")
+        # harness has --native-status-before-subscribe; --forward-promotion-trigger is native-ft's
+        self.assertIn("--native-status-before-subscribe", rust_long_flags(rs))
+
+
 class RelayConfigCheck(unittest.TestCase):
     def test_udp_gso_must_be_off(self):
         self.assertIn("udp_gso", rx.check_relay_config({"congestion_controller": "cubic", "udp_gso": "on"}, "cubic", False))
@@ -803,11 +877,10 @@ class RelayConfigCheck(unittest.TestCase):
         self.assertGreater(rx.STOP_WAIT_S, 10.0)  # the relay drains for 10 s after SIGTERM
 
     def test_cc_must_match(self):
-        self.assertIsNone(rx.check_relay_config({"event": "RELAY_CONFIG", "congestion_controller": "cubic", "udp_gso": "off"},
+        self.assertIsNone(rx.check_relay_config(dict(OK_CONFIG, event="RELAY_CONFIG"), "cubic", False))
+        self.assertIsNone(rx.check_relay_config(dict(OK_CONFIG, event="RELAY_CONFIG", congestion_controller="Cubic"),
                                                 "cubic", False))
-        self.assertIsNone(rx.check_relay_config({"event": "RELAY_CONFIG", "congestion_controller": "Cubic", "udp_gso": "off"},
-                                                "cubic", False))
-        self.assertIsNone(rx.check_relay_config({"config": {"congestion_controller": "bbr", "udp_gso": "off"}}, "bbr", False))
+        self.assertIsNone(rx.check_relay_config({"config": dict(OK_CONFIG, congestion_controller="bbr")}, "bbr", False))
         self.assertIn("runner asked for 'cubic'",
                       rx.check_relay_config({"congestion_controller": "bbr"}, "cubic", False))
         # also enforced in smoke mode: a relay that reports a different cc is never accepted
