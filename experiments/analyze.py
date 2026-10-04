@@ -166,18 +166,45 @@ RULE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z \-]*?(?=\s*[\d≥>=<(]|$)")
 
 
 def seam_hole(fframe: dict | None, tol_ms: float = 100.0) -> float | None:
-    """Buffer hole attributable to this seam: the reported hole when the first presented frame
-    after the seam lies more than `tol_ms` past the seam PTS, else 0 (the hole behind the
-    presented range is then an older one that playback already crossed or will cross later)."""
+    """Buffer hole attributable to this seam. One rule, the player's: since 2026-10-02 the
+    client reports ``seam_buffer_hole_ms`` as the hole behind the presented frame's range only
+    when that range begins at the seam (else 0), and the raw hole as ``buffer_hole_behind_ms``;
+    such records (``buffer_hole_behind_ms`` present; 2026-10 records also carry
+    ``seam_behind_playhead``) are used as is. Older clients reported the raw hole as
+    ``seam_buffer_hole_ms``; for them only, the fallback attributes it to the seam when the
+    first presented frame lies more than ``tol_ms`` past the seam PTS (something at the seam
+    was skipped), else 0. Applying that rule on top of the player's would zero exactly the
+    holes the player attributes (the range begins at the seam, so the first presented frame
+    is the seam frame)."""
     if not fframe:
         return None
     hole = fframe.get("seam_buffer_hole_ms")
     if hole is None:
         return None
+    if seam_hole_rule(fframe) == "player":
+        return hole
     seam, presented = fframe.get("seam_pts_ms"), fframe.get("presented_pts_ms")
     if seam is None or presented is None:
         return hole
     return hole if presented - seam > tol_ms else 0
+
+
+def seam_hole_rule(fframe: dict | None) -> str | None:
+    """``player`` (records with ``buffer_hole_behind_ms`` or ``seam_behind_playhead``: the client
+    attributed the hole itself) or ``analyzer-100ms`` (older records)."""
+    if not fframe:
+        return None
+    return "player" if ("buffer_hole_behind_ms" in fframe or "seam_behind_playhead" in fframe) else "analyzer-100ms"
+
+
+def hole_behind(fframe: dict | None) -> float | None:
+    """The raw hole behind the presented frame's range: the record's own
+    ``buffer_hole_behind_ms``; old clients reported it as ``seam_buffer_hole_ms``."""
+    if not fframe:
+        return None
+    if "buffer_hole_behind_ms" in fframe:
+        return fframe["buffer_hole_behind_ms"]
+    return fframe.get("seam_buffer_hole_ms")
 
 
 def _clip_episodes(episodes: list[dict], end_ts: float | None) -> list[dict]:
@@ -929,12 +956,12 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "playback_position_jump_ms": fframe.get("playback_position_jump_ms") if presented else None,
             # Wall-clock pause at the seam beyond one frame period.
             "viewer_pause_ms": fframe.get("viewer_pause_ms") if presented else None,
-            # Hole in the element's buffered ranges at the seam (what a range-jump seek crosses).
-            # The client reports the hole just behind the presented frame's range, which can be
-            # an older hole still in the buffer; attribute it to this seam only when the first
-            # presented frame is later than the seam itself (something at the seam was skipped).
+            # Hole in the element's buffered ranges at the seam (what a gap seek crosses): the
+            # player's attribution on 2026-10 records, the 100 ms rule on older ones (seam_hole).
             "seam_buffer_hole_ms": seam_hole(fframe) if presented else None,
-            "buffer_hole_behind_ms": fframe.get("seam_buffer_hole_ms") if presented else None,
+            "seam_hole_rule": seam_hole_rule(fframe) if presented else None,
+            # The raw hole behind the presented frame's range (may be an older hole).
+            "buffer_hole_behind_ms": hole_behind(fframe) if presented else None,
             # Whether the target began on object 0 of its group (its keyframe).
             "landed_on_group_start": applied.get("landed_on_group_start") if applied else None,
             # Whether the landing object's moof carries the sync-sample flag (a real keyframe).

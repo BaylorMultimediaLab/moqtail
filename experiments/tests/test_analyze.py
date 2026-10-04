@@ -251,6 +251,39 @@ class SkippedAttempts(TmpRun):
         self.assertEqual((sw["skipped_not_sent"], sw["skipped_attempts"]), (2, 2))
 
 
+class SeamHole(TmpRun):
+    """D8: buffer_hole_behind_ms was filled from seam_buffer_hole_ms, and the analyzer's 100 ms
+    rule overrode the player's own seam attribution on new bundles."""
+
+    def run_with(self, ff_fields: dict) -> dict:
+        A, B = R[0], R[4]
+        client = startup(A) + switch(1, T0 + 1000, A, B, with_seq=True)
+        ff = first_frame(T0 + 3000, A, B, vis_ms=2000.0, seq=1)
+        ff.update(ff_fields)
+        client.append(ff)
+        client += samples(T0, T0 + 6000, lambda t: A)
+        return analyze.analyze(write_run(self.dir, client))["switches"]["list"][0]
+
+    def test_new_bundle_uses_the_players_attribution(self):
+        x = self.run_with({"seam_buffer_hole_ms": 250, "buffer_hole_behind_ms": 600, "seam_pts_ms": 1000,
+                           "presented_pts_ms": 1040, "seam_behind_playhead": False})
+        self.assertEqual(x["seam_buffer_hole_ms"], 250)     # before: 0 (presented within 100 ms of the seam)
+        self.assertEqual(x["buffer_hole_behind_ms"], 600)   # before: 250 (copied from seam_buffer_hole_ms)
+        self.assertEqual(x["seam_hole_rule"], "player")
+
+    def test_player_attribution_without_seam_behind_playhead(self):
+        # Clients from 2026-10-02 (fresh-grid-v2) already attributed the hole and reported the raw
+        # one as buffer_hole_behind_ms, before seam_behind_playhead existed.
+        x = self.run_with({"seam_buffer_hole_ms": 250, "buffer_hole_behind_ms": 250, "seam_pts_ms": 1000, "presented_pts_ms": 1000})
+        self.assertEqual((x["seam_buffer_hole_ms"], x["seam_hole_rule"]), (250, "player"))   # before: 0
+
+    def test_old_bundle_keeps_the_100_ms_rule(self):
+        x = self.run_with({"seam_buffer_hole_ms": 250, "seam_pts_ms": 1000, "presented_pts_ms": 1040})
+        self.assertEqual(x["seam_buffer_hole_ms"], 0)
+        self.assertEqual(x["buffer_hole_behind_ms"], 250)   # old clients reported the raw hole as seam_buffer_hole_ms
+        self.assertEqual(x["seam_hole_rule"], "analyzer-100ms")
+
+
 class Censoring(unittest.TestCase):
     """M19: censored metrics summarised by the median of the runs where the event happened."""
 
