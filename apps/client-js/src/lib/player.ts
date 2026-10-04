@@ -34,7 +34,7 @@ import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
 import { events } from '@/lib/events/EventLog';
 import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
-import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
+import { DEFAULT_LIVE_EDGE_DELAY, contiguousBufferAheadS } from '@/lib/buffer';
 import {
   SeamTracker,
   nextPageSwitchSeq,
@@ -1183,14 +1183,22 @@ export class Player {
     bandwidthBps: number;
     fastEmaBps: number;
     slowEmaBps: number;
+    /** Last buffered range end minus playhead (counts across holes), s. */
     bufferSeconds: number;
+    /** End of the buffered range containing the playhead minus playhead, 0 if none (M12), s. */
+    bufferContigSeconds: number;
+    /** The track subscribed to: switches at the landing. */
     activeTrack: string | null;
+    /** The track whose media is at the playhead: switches at the seam (M13). */
+    presentedTrack: string | null;
     droppedFrames: number;
     totalFrames: number;
     playbackRate: number;
     deliveryTimeMs: number;
     lastObjectBytes: number;
     sampleCount: number;
+    /** Closed THROUGHPUT_SAMPLE groups per track (the group's own track). */
+    samplesByTrack: Record<string, number>;
     readyState: number;
     paused: boolean;
     ended: boolean;
@@ -1202,6 +1210,11 @@ export class Player {
     videoErrorCode: number;
     latencyTrendRatio: number;
     lastLatencyMs: number;
+    /** Means of the older / recent half of the latency window; undefined until it is full. */
+    latencyOlderMeanMs: number | undefined;
+    latencyRecentMeanMs: number | undefined;
+    /** Target shift behind live: 0 live-edge, delay_groups x GOP time-shifted, ms. */
+    targetShiftMs: number;
     playheadMs: number;
     bufferedEndMs: number;
     liveEdgeDistanceMs: number;
@@ -1215,24 +1228,26 @@ export class Player {
       buffered && buffered.length > 0 && el
         ? Math.max(0, buffered.end(buffered.length - 1) - el.currentTime)
         : 0;
+    const bufferContigSeconds =
+      buffered && el ? contiguousBufferAheadS(buffered, el.currentTime) : 0;
     const playheadMs = (el?.currentTime ?? 0) * 1000;
+    const shift = targetShiftMs({
+      clientMode: this.#options.clientMode,
+      timeShiftSeconds: this.#options.timeShiftSeconds,
+      gopDurationMs: this.#timeMap?.gopDurationMs ?? 0,
+      liveEdgeDelaySeconds: DEFAULT_LIVE_EDGE_DELAY,
+    }).targetShiftMs;
+    const latencyMeans = this.#latencyTracker.getHalfMeans();
     const bufferedEndMs =
       buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) * 1000 : 0;
     let liveEdgeDistanceMs = Number.NaN;
     let timeShiftErrorMs = Number.NaN;
     if (this.#prftAnchor && el) {
-      const gopDurationMs = this.#timeMap?.gopDurationMs ?? 0;
-      const target = targetShiftMs({
-        clientMode: this.#options.clientMode,
-        timeShiftSeconds: this.#options.timeShiftSeconds,
-        gopDurationMs,
-        liveEdgeDelaySeconds: DEFAULT_LIVE_EDGE_DELAY,
-      });
       const est = estimateLiveEdge({
         anchor: this.#prftAnchor,
         nowMs: Date.now(),
         playheadMs,
-        targetShiftMs: target.targetShiftMs,
+        targetShiftMs: shift,
       });
       liveEdgeDistanceMs = est.liveEdgeDistanceMs;
       timeShiftErrorMs = est.timeShiftErrorMs;
@@ -1255,13 +1270,16 @@ export class Player {
       fastEmaBps: videoStruct?.tracker.getFastEmaBps() ?? 0,
       slowEmaBps: videoStruct?.tracker.getSlowEmaBps() ?? 0,
       bufferSeconds,
+      bufferContigSeconds,
       activeTrack: videoStruct?.trackName ?? null,
+      presentedTrack: this.#seams.presentedTrack(playheadMs) ?? videoStruct?.trackName ?? null,
       droppedFrames: quality?.droppedVideoFrames ?? 0,
       totalFrames: quality?.totalVideoFrames ?? 0,
       playbackRate: el?.playbackRate ?? 1,
       deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
       lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
       sampleCount: videoStruct?.tracker.getSampleCount() ?? 0,
+      samplesByTrack: videoStruct?.tracker.getSamplesByTrack() ?? {},
       readyState: el?.readyState ?? 0,
       paused: el?.paused ?? true,
       ended: el?.ended ?? false,
@@ -1273,6 +1291,9 @@ export class Player {
       videoErrorCode: el?.error?.code ?? 0,
       latencyTrendRatio: this.#latencyTracker.getTrendRatio(),
       lastLatencyMs: this.#latencyTracker.getLastLatencyMs(),
+      latencyOlderMeanMs: latencyMeans?.olderMs,
+      latencyRecentMeanMs: latencyMeans?.recentMs,
+      targetShiftMs: shift,
       playheadMs,
       bufferedEndMs,
       liveEdgeDistanceMs,
@@ -1335,7 +1356,8 @@ export class Player {
     events.emit('STALL_START', {
       cause,
       playhead_ms: playheadMs,
-      track: this.getMetrics().activeTrack,
+      // The track the viewer is looking at, not the one being received (M13).
+      track: this.getMetrics().presentedTrack,
     });
   }
 
@@ -1958,6 +1980,11 @@ export class Player {
       pendingSwitch: null,
       lastAppendedEndPTS_ms: undefined,
     };
+
+    // The startup video track is what is presented until the first seam.
+    if (params.trackName !== 'catalog' && this.catalog?.getRole(params.trackName) === 'video') {
+      this.#seams.setInitialTrack(params.trackName);
+    }
 
     // Add the stream to the pool
     this.#streams.push(struct);

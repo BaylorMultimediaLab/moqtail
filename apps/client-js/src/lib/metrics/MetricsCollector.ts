@@ -51,6 +51,7 @@ export class MetricsCollector {
     const sample: MetricsSample = {
       ts: Date.now(),
       bufferSeconds: m.bufferSeconds,
+      bufferContigSeconds: m.bufferContigSeconds,
       bitrateKbps: m.activeTrack !== null ? (this.#bitrateMap[m.activeTrack] ?? 0) : 0,
       bandwidthBps: m.bandwidthBps,
       fastEmaBps: m.fastEmaBps,
@@ -65,11 +66,13 @@ export class MetricsCollector {
       timeShiftErrorMs: m.timeShiftErrorMs,
       lastLatencyMs: m.lastLatencyMs,
       activeTrack: m.activeTrack,
+      presentedTrack: m.presentedTrack,
       activeGroup: m.activeGroup,
     };
 
     events.emit('SAMPLE', {
       buffer_s: sample.bufferSeconds,
+      buffer_contig_s: sample.bufferContigSeconds,
       bitrate_kbps: sample.bitrateKbps,
       bandwidth_bps: sample.bandwidthBps,
       fast_ema_bps: sample.fastEmaBps,
@@ -88,6 +91,7 @@ export class MetricsCollector {
         : null,
       last_latency_ms: sample.lastLatencyMs,
       track: sample.activeTrack,
+      presented_track: sample.presentedTrack,
       group: sample.activeGroup,
       ready_state: m.readyState,
       paused: m.paused,

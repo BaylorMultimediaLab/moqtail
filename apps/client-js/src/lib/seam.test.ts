@@ -187,3 +187,40 @@ describe('SeamTracker: first frame only for a presented target frame (M10)', () 
     expect(t.presented({ mediaMs: 11_985, frameMs: 40, now: 2010 })).toBe(a);
   });
 });
+
+describe('SeamTracker: presented track from (seam, track) transitions (M13)', () => {
+  const apply = (t: SeamTracker, from: string, to: string, seamMs: number) => {
+    const r = t.sent(from, to, { playheadMs: 0, appendFrontMs: 0, sentAt: 0 });
+    t.landed(r, { group: 0, object: 0, landedOnKeyframe: true, sourceEndMs: 0, now: 0 });
+    t.appended({ ptsMs: seamMs, endPtsMs: seamMs + 40, group: 0, object: 0, now: 0 });
+    return r;
+  };
+
+  it('is the startup track until the playhead reaches the first seam', () => {
+    const t = new SeamTracker();
+    expect(t.presentedTrack(5_000)).toBeNull();
+    t.setInitialTrack('low');
+    apply(t, 'low', 'mid', 20_000);
+    expect(t.presentedTrack(5_000)).toBe('low');
+    expect(t.presentedTrack(19_990)).toBe('low');
+    expect(t.presentedTrack(20_000)).toBe('mid');
+  });
+
+  it('keeps a superseded seam that is still in the buffer ahead of a later one', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('low');
+    apply(t, 'low', 'mid', 20_000);
+    apply(t, 'mid', 'high', 21_000); // supersedes the first, whose media 20-21 s stays
+    expect(t.presentedTrack(20_500)).toBe('mid');
+    expect(t.presentedTrack(21_500)).toBe('high');
+  });
+
+  it('drops transitions the new target overwrote (a seam behind an earlier one)', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('low');
+    apply(t, 'low', 'mid', 20_000);
+    apply(t, 'mid', 'high', 18_000); // re-fetched from earlier: replaces 18 s onward
+    expect(t.presentedTrack(17_000)).toBe('low');
+    expect(t.presentedTrack(20_500)).toBe('high');
+  });
+});

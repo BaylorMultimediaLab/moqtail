@@ -118,6 +118,8 @@ export class GoodputTracker {
   #lastGroupBps = 0;
   #lastGroupBytes = 0;
   #sampleCount = 0;
+  // Closed samples per track (the sample's own track).
+  #samplesByTrack: Record<string, number> = {};
   // Monotonic counter of all bytes ever recorded (dropped objects included:
   // they shared the link). Used by the active probe (Kuo Algorithm 1) to
   // compute v = video-track bytes received during the probe window.
@@ -235,6 +237,11 @@ export class GoodputTracker {
     return this.#sampleCount;
   }
 
+  /** Closed group samples per track, keyed by the group's own track. */
+  getSamplesByTrack(): Record<string, number> {
+    return { ...this.#samplesByTrack };
+  }
+
   /** Throughput (bps) of the most recently finalised group sample. */
   getLastSampleBps(): number {
     return this.#lastGroupBps;
@@ -282,6 +289,7 @@ export class GoodputTracker {
     this.#lastGroupBps = 0;
     this.#lastGroupBytes = 0;
     this.#sampleCount = 0;
+    this.#samplesByTrack = {};
     this.#emaFast = 0;
     this.#emaSlow = 0;
     this.#hasEmaData = false;
@@ -308,6 +316,7 @@ export class GoodputTracker {
     this.#lastGroupBps = groupBps;
     this.#lastGroupBytes = bytes;
     this.#sampleCount++;
+    this.#samplesByTrack[g.track] = (this.#samplesByTrack[g.track] ?? 0) + 1;
 
     this.#updateEma(groupBps, dtMs);
     return {

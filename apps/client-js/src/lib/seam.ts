@@ -78,6 +78,13 @@ export class SeamTracker {
    * what was in the buffer when it was presented, not when the callback ran.
    */
   #fronts: Array<{ at: number; frontMs: number }> = [];
+  /**
+   * Which track's media begins where in the buffer (M13): the startup track
+   * from -infinity, then one entry per applied switch at its seam. Appending a
+   * target from its seam onward replaces everything buffered after it, so a
+   * new seam drops every transition at or after it.
+   */
+  #transitions: Array<{ seamMs: number; track: string }> = [];
 
   /**
    * @param allocateSeq - Source of switch numbers. The player passes the
@@ -87,6 +94,24 @@ export class SeamTracker {
   constructor(allocateSeq?: () => number) {
     let n = 0;
     this.#allocate = allocateSeq ?? (() => ++n);
+  }
+
+  /** The track playback starts on (before any switch). Only the first call counts. */
+  setInitialTrack(track: string): void {
+    if (this.#transitions.length === 0) this.#transitions.push({ seamMs: -Infinity, track });
+  }
+
+  /**
+   * The track whose media sits at `playheadMs` in the buffer, i.e. the track
+   * being presented (M13); null before the initial track is known.
+   */
+  presentedTrack(playheadMs: number): string | null {
+    let track: string | null = null;
+    for (const t of this.#transitions) {
+      if (t.seamMs > playheadMs) break;
+      track = t.track;
+    }
+    return track;
   }
 
   /** A number for a switch attempt that is not sent (SWITCH_SKIPPED). */
@@ -180,6 +205,8 @@ export class SeamTracker {
     rec.seamPtsMs = at.ptsMs;
     rec.firstAppendedGroup = at.group;
     rec.firstAppendedObject = at.object;
+    this.#transitions = this.#transitions.filter(t => t.seamMs < at.ptsMs);
+    this.#transitions.push({ seamMs: at.ptsMs, track: rec.to });
     return rec;
   }
 

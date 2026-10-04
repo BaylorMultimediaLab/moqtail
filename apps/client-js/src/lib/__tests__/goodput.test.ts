@@ -250,5 +250,17 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       const out = t.recordObject(1_000, 6n, { recvAt: 2_100, track: 'new', lastInGroup: false });
       expect(out.map(s => [s.track, s.group])).toEqual([['old', 5n]]);
     });
+
+    it('counts closed samples per track (the min arm dwell reads the landed track)', () => {
+      const t = new GoodputTracker();
+      t.recordObject(1_000, 5n, { recvAt: 0, track: 'old', lastInGroup: false });
+      t.recordObject(1_000, 5n, { recvAt: 4, track: 'old', lastInGroup: true });
+      t.recordObject(1_000, 6n, { recvAt: 10, track: 'new', lastInGroup: false });
+      t.recordObject(1_000, 6n, { recvAt: 14, track: 'new', lastInGroup: true });
+      t.recordObject(1_000, 7n, { recvAt: 20, track: 'new', lastInGroup: false });
+      t.recordObject(1_000, 7n, { recvAt: 24, track: 'new', lastInGroup: true });
+      expect(t.getSamplesByTrack()).toEqual({ old: 1, new: 2 });
+      expect(t.getSampleCount()).toBe(3);
+    });
   });
 });

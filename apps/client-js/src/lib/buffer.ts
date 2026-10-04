@@ -44,6 +44,25 @@ export function computeLiveEdgeDelay(
   return DEFAULT_LIVE_EDGE_DELAY;
 }
 
+/**
+ * Buffer the playhead can play without crossing a hole (M12): end of the
+ * buffered range containing `currentTimeS` minus `currentTimeS`, 0 when the
+ * playhead is in no range. A playhead up to 1 ms before a range start counts
+ * as inside it (seeks land on rounded times). `buffer_s` (last range end minus
+ * playhead) counts across holes and stays the total.
+ */
+export function contiguousBufferAheadS(
+  buffered: { length: number; start(i: number): number; end(i: number): number },
+  currentTimeS: number,
+): number {
+  for (let i = 0; i < buffered.length; i++) {
+    if (currentTimeS >= buffered.start(i) - 0.001 && currentTimeS <= buffered.end(i)) {
+      return Math.max(0, buffered.end(i) - currentTimeS);
+    }
+  }
+  return 0;
+}
+
 /** Where new media is landing in the buffer right now (from the player's append path). */
 export interface GapFillState {
   /** End PTS (s) of the most recently appended frame; undefined before the first append. */
