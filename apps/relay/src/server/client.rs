@@ -336,13 +336,14 @@ impl MOQTClient {
       let mut send_streams = send_stream_map.write().await;
       match send_streams.entry(stream_id.get_stream_id().to_string()) {
         std::collections::hash_map::Entry::Vacant(entry) => {
+          // The priority is in place before the first byte (the WebTransport stream
+          // header included), so the stream is never queued at quinn's default 0
+          // (R3-D6).
           let send_stream = self
             .connection
-            .open_uni()
+            .open_uni_with_priority(priority)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open send stream: {:?}", e))?;
-
-          send_stream.set_priority(priority);
           let s = Arc::new(Mutex::new(send_stream));
           entry.insert(s.clone());
           info!(
@@ -933,6 +934,19 @@ mod tests_write_stream_object {
       client.get_stream(&stream_id).await.is_none(),
       "a stopped stream is dropped from the send-stream map"
     );
+  }
+
+  /// R3-D6: a data stream carries its priority from the moment it is opened.
+  #[tokio::test]
+  async fn a_data_stream_is_opened_at_its_priority() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+    let stream_id = StreamId::new_subgroup(1, 0, Some(0));
+    let stream = client
+      .open_stream(&stream_id, header(), 123_456)
+      .await
+      .unwrap();
+    assert_eq!(stream.lock().await.priority(), Some(123_456));
   }
 
   /// The whole connection going away is reported too (ConnectionLost).
