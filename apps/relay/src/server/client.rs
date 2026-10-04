@@ -504,12 +504,12 @@ impl MOQTClient {
             let mut send_streams = stream_map.write().await;
             send_streams.remove(stream_id.get_stream_id().as_str());
           }
-          Err(anyhow::anyhow!(
-            "write to stream {} failed for connection_id {}: {}",
-            stream_id,
-            self.connection_id,
-            e
-          ))
+          // The transport error is kept as the source, so a caller can tell a
+          // stream the peer stopped (ClosedOrStopped) from other failures.
+          Err(anyhow::Error::new(e).context(format!(
+            "write to stream {} failed for connection_id {}",
+            stream_id, self.connection_id
+          )))
         }
       }
     } else {

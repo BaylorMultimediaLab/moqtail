@@ -43,7 +43,7 @@ use moqtail::model::error::StreamResetCode;
 use moqtail::model::parameter::message_parameter::{
   MessageParameter, apply_message_parameter_update,
 };
-use moqtail::transport::connection::TransportSendStream;
+use moqtail::transport::connection::{TransportSendStream, TransportWriteError};
 use moqtail::transport::data_stream_handler::HeaderInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -350,6 +350,8 @@ pub(crate) struct SubscriptionCounters {
   pub write_failures: AtomicU64,
   /// Live objects dropped because the cache replay had already delivered them.
   pub live_duplicates_dropped: AtomicU64,
+  /// Objects dropped because the subscriber had stopped (STOP_SENDING) their stream.
+  pub stopped_stream_objects_dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +364,11 @@ pub struct Subscription {
   subscriber: Arc<MOQTClient>,
   event_rx: Arc<Mutex<Option<UnboundedReceiver<TrackEvent>>>>,
   send_stream_last_object_ids: Arc<RwLock<HashMap<StreamId, Option<u64>>>>,
+  /// Data streams the subscriber stopped (STOP_SENDING, seen as a write that failed
+  /// with ClosedOrStopped). The rest of such a subgroup is dropped rather than sent
+  /// on a reopened stream (R3-D3). An entry is retired when the publisher's stream
+  /// for it closes, after which nothing more of that subgroup can be queued.
+  stopped_streams: Arc<RwLock<std::collections::HashSet<StreamId>>>,
   /// Monotonic count of data streams opened for this subscription, including
   /// empty subgroups. Reported as PUBLISH_DONE Stream Count.
   opened_stream_count: Arc<AtomicU64>,
@@ -411,6 +418,7 @@ impl Subscription {
       subscriber,
       event_rx,
       send_stream_last_object_ids: Arc::new(RwLock::new(HashMap::new())),
+      stopped_streams: Arc::new(RwLock::new(std::collections::HashSet::new())),
       opened_stream_count: Arc::new(AtomicU64::new(0)),
       finished: Arc::new(AtomicBool::new(false)),
       cache,
@@ -1230,6 +1238,20 @@ impl Subscription {
           pending.take();
         }
 
+        // The subscriber stopped this subgroup's stream: the rest of the subgroup is
+        // not wanted, and must not go out on a reopened stream (R3-D3).
+        if self.stopped_streams.read().await.contains(&stream_id) {
+          self
+            .counters
+            .stopped_stream_objects_dropped
+            .fetch_add(1, Ordering::Relaxed);
+          debug!(
+            "Dropping object of a stream the subscriber stopped: subscriber={} stream_id={} relay_track_id={} location: {:?}",
+            self.client_connection_id, stream_id, self.relay_track_id, object.location
+          );
+          return;
+        }
+
         // Handle header info if this is the first object
         let send_stream = if let Some(header) = header_info {
           if let HeaderInfo::Subgroup { header: _ } = header {
@@ -1286,11 +1308,20 @@ impl Subscription {
                   "mid-subgroup join: opening stream from cached header for subscriber={} relay_track_id={} stream_id={}",
                   self.client_connection_id, self.relay_track_id, stream_id
                 );
-                self
-                  .handle_header(h)
-                  .await
-                  .ok()
-                  .map(|(_, send_stream)| send_stream)
+                // A new stream: its first object is encoded from scratch, not as a
+                // delta from whatever an earlier stream for this id last carried
+                // (R3-D3).
+                match self.handle_header(h).await {
+                  Ok((opened_id, send_stream)) => {
+                    self
+                      .send_stream_last_object_ids
+                      .write()
+                      .await
+                      .insert(opened_id, None);
+                    Some(send_stream)
+                  }
+                  Err(_) => None,
+                }
               } else {
                 None
               }
@@ -1329,6 +1360,25 @@ impl Subscription {
             )
             .await;
           let send_status = write_result.is_ok();
+          if let Err(e) = &write_result
+            && e
+              .downcast_ref::<TransportWriteError>()
+              .is_some_and(|e| matches!(e, TransportWriteError::ClosedOrStopped))
+          {
+            // The subscriber stopped this stream (the client already dropped it
+            // from its send-stream map). Remember it so the rest of the subgroup is
+            // dropped instead of reopening the stream (R3-D3).
+            info!(
+              "Subscriber stopped stream: subscriber={} stream_id={} relay_track_id={}; dropping the rest of the subgroup",
+              self.client_connection_id, stream_id, self.relay_track_id
+            );
+            self.stopped_streams.write().await.insert(stream_id.clone());
+            self
+              .send_stream_last_object_ids
+              .write()
+              .await
+              .remove(&stream_id);
+          }
           if send_status {
             self
               .counters
@@ -1621,6 +1671,9 @@ impl Subscription {
   async fn handle_stream_closed(&self, stream_id: &StreamId) -> Result<()> {
     // Handle the stream closed event
     debug!("Stream closed: {}", stream_id.get_stream_id());
+
+    // The publisher's subgroup is over: nothing more of it can arrive.
+    self.stopped_streams.write().await.remove(stream_id);
 
     // remove the stream id from send_stream_last_object_ids immediately
     let mut send_stream_last_object_ids = self.send_stream_last_object_ids.write().await;
@@ -2284,5 +2337,132 @@ mod tests_native_switch {
     .await;
     assert!(res.is_err());
     assert_eq!(ctx.snapshot().await, before);
+  }
+}
+
+/// R3-D3: a subscriber's STOP_SENDING on a data stream. The relay used to reopen the
+/// stream for the next object (mid-subgroup join) and encode that object's id as a
+/// delta from the last id written on the stopped stream, so the subscriber read
+/// 5/2..5/4 as 5/1..5/3.
+#[cfg(test)]
+mod tests_stop_sending {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, publish, quic_pair, relay_client, subscribe, test_track,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::transport::connection::{TransportConnection, TransportRecvStream};
+  use moqtail::transport::data_stream_handler::RecvDataStream;
+  use std::time::Duration;
+
+  const TRACK: u64 = 1;
+
+  fn latest() -> Subscribe {
+    Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    )
+  }
+
+  /// (group, object) of every object on `recv`, as the subscriber parses them, until
+  /// nothing arrives for 500 ms.
+  async fn objects_on(recv: TransportRecvStream) -> Vec<(u64, u64)> {
+    let data = RecvDataStream::new(
+      recv,
+      Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+    );
+    let mut ids = vec![];
+    while let Ok((_, Some(o))) =
+      tokio::time::timeout(Duration::from_millis(500), data.next_object()).await
+    {
+      ids.push((o.location.group, o.location.object));
+    }
+    ids
+  }
+
+  async fn next_stream(peer: &TransportConnection, wait: Duration) -> Option<TransportRecvStream> {
+    tokio::time::timeout(wait, peer.accept_uni())
+      .await
+      .ok()
+      .and_then(|r| r.ok())
+  }
+
+  /// The reviewer's scenario: the subscriber stops the group-5 stream after 5/0;
+  /// 5/1..5/4 follow. The rest of the subgroup is dropped (the subscriber asked for
+  /// that), no stream is reopened for it, and group 6 arrives on its own stream with
+  /// its own ids.
+  #[tokio::test]
+  async fn a_stopped_stream_is_not_reopened_and_later_groups_keep_their_ids() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(88, server);
+    let track = test_track(TRACK, "video-720p");
+    let sub = subscribe(&track, &client, latest(), false).await;
+    let counters = sub.read().await.counters.clone();
+    sub.read().await.mark_alias_announced();
+
+    publish(&track, 5, 0).await;
+    let first = peer.accept_uni().await.unwrap();
+    first.stop(0x10);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for o in 1..5 {
+      publish(&track, 5, o).await;
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Some(reopened) = next_stream(&peer, Duration::from_secs(1)).await {
+      panic!(
+        "group 5 was reopened after STOP_SENDING, carrying {:?} (published 5/1..5/4)",
+        objects_on(reopened).await
+      );
+    }
+
+    track
+      .stream_closed(&StreamId::new_subgroup(TRACK, 5, Some(0)))
+      .await
+      .unwrap();
+    for o in 0..3 {
+      publish(&track, 6, o).await;
+    }
+    let next = next_stream(&peer, Duration::from_secs(3))
+      .await
+      .expect("group 6 is delivered");
+    assert_eq!(objects_on(next).await, vec![(6, 0), (6, 1), (6, 2)]);
+    assert!(
+      counters
+        .stopped_stream_objects_dropped
+        .load(Ordering::Relaxed)
+        >= 3,
+      "the rest of group 5 is dropped"
+    );
+  }
+
+  /// Should a stream ever be reopened (here: it vanished from the send-stream map
+  /// without the subscriber stopping it), the first object on the new stream is
+  /// encoded from scratch, not as a delta from the old stream's last id.
+  #[tokio::test]
+  async fn a_reopened_stream_starts_its_object_ids_afresh() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(89, server);
+    let track = test_track(TRACK, "video-720p");
+    let sub = subscribe(&track, &client, latest(), false).await;
+    sub.read().await.mark_alias_announced();
+
+    publish(&track, 5, 0).await;
+    publish(&track, 5, 1).await;
+    let first = peer.accept_uni().await.unwrap();
+    let first_objects = tokio::spawn(objects_on(first));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let gone = client
+      .remove_stream_by_stream_id(&StreamId::new_subgroup(TRACK, 5, Some(0)))
+      .await;
+    assert!(gone.is_some());
+    publish(&track, 5, 3).await;
+    publish(&track, 5, 4).await;
+    let reopened = next_stream(&peer, Duration::from_secs(3))
+      .await
+      .expect("the stream is reopened from the cached header");
+    assert_eq!(objects_on(reopened).await, vec![(5, 3), (5, 4)]);
+    assert_eq!(first_objects.await.unwrap(), vec![(5, 0), (5, 1)]);
   }
 }
