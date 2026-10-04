@@ -560,8 +560,11 @@ def main() -> int:
                     help="switching mechanism under test; must match the checked-out branch")
     ap.add_argument("--mechanism-mode", default=None,
                     help="mechanism-specific mode: pr1378 next-group|playhead, switch-from hard|soft; none for native")
-    ap.add_argument("--repeat", type=int, default=1, help="independent repetitions of this condition")
+    ap.add_argument("--repeat", type=int, default=1, help="independent repetitions of this condition (arm-major)")
     ap.add_argument("--repeat-start", type=int, default=0, help="first repeat_index (to extend a series)")
+    ap.add_argument("--repeat-index", type=int, default=None,
+                    help="run exactly this one repetition, with a stable run id (no timestamp) so an external "
+                         "repetition-major loop can run every arm once per rep; excludes --repeat/--repeat-start")
     ap.add_argument("--client-mode", choices=["live-edge", "time-shifted"], default="live-edge")
     ap.add_argument("--time-shift", type=float, default=10.0, help="seconds behind live for time-shifted clients")
     ap.add_argument("--profile", type=Path, required=True)
@@ -640,24 +643,44 @@ def main() -> int:
     if branch != expected_branch:
         ap.error(f"--mechanism {args.mechanism} runs on branch {expected_branch}, but HEAD is {branch}")
 
-    for repeat_index in range(args.repeat_start, args.repeat_start + args.repeat):
+    if args.repeat_index is not None:
+        if args.repeat != 1 or args.repeat_start != 0:
+            ap.error("--repeat-index excludes --repeat and --repeat-start")
+        reps = [args.repeat_index]
+    else:
+        reps = list(range(args.repeat_start, args.repeat_start + args.repeat))
+
+    for repeat_index in reps:
         code = run_once(args, repeat_index)
         if code != 0:
             return code
     return 0
 
 
-def run_once(args, repeat_index: int) -> int:
-    profile = load_profile(args.profile)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+def run_id_for(args, profile_name: str, repeat_index: int, stamp: str | None) -> str:
+    """`<stamp>_<mech[-mode]>_<client>_<profile>_bg<N>_r<rep>[_ctl-<arm>][_<label>]`.
+    With --repeat-index the stamp is omitted so an external repetition-major
+    loop (README, "Run ordering") gets a stable id per (condition, rep)."""
     mode = "live-edge" if args.client_mode == "live-edge" else f"shift{args.time_shift:g}s"
     mech = args.mechanism + (f"-{args.mechanism_mode}" if args.mechanism_mode else "")
-    run_id = f"{stamp}_{mech}_{mode}_{profile['name']}_bg{args.bg_flows}_r{repeat_index}"
+    run_id = f"{mech}_{mode}_{profile_name}_bg{args.bg_flows}_r{repeat_index}"
+    if stamp:
+        run_id = f"{stamp}_{run_id}"
     if args.controller != "baseline":
         run_id += f"_ctl-{args.controller}"
     if args.label:
         run_id += f"_{args.label}"
+    return run_id
+
+
+def run_once(args, repeat_index: int) -> int:
+    profile = load_profile(args.profile)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = run_id_for(args, profile["name"], repeat_index, None if args.repeat_index is not None else stamp)
     out = args.results / run_id
+    if out.exists():
+        raise SystemExit(f"{out} exists: this (condition, repeat_index) was already run; delete it, use another "
+                         "--repeat-index, or add --label")
     out.mkdir(parents=True, exist_ok=False)
     print(f"[run] run_id={run_id}\n[run] out={out}")
 

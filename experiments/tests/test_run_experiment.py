@@ -157,6 +157,26 @@ class Controller(unittest.TestCase):
             rx.controller_params(self._args("min", ["novalue"]))
 
 
+class RunIds(unittest.TestCase):
+    def _args(self, **kw):
+        import argparse
+        base = dict(mechanism="pr1378", mechanism_mode="next-group", client_mode="time-shifted", time_shift=10.0,
+                    bg_flows=0, controller="min", label="")
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_stable_id_without_stamp(self):
+        rid = rx.run_id_for(self._args(), "step_down_up", 3, None)
+        self.assertEqual(rid, "pr1378-next-group_shift10s_step_down_up_bg0_r3_ctl-min")
+        # same inputs -> same id, so an external loop can resume by (condition, rep)
+        self.assertEqual(rid, rx.run_id_for(self._args(), "step_down_up", 3, None))
+
+    def test_stamped_id_and_baseline_suffix(self):
+        rid = rx.run_id_for(self._args(mechanism="native", mechanism_mode=None, client_mode="live-edge",
+                                       controller="baseline", label="x"), "stable_3mbps", 0, "20261004T120000Z")
+        self.assertEqual(rid, "20261004T120000Z_native_live-edge_stable_3mbps_bg0_r0_x")
+
+
 class Records(unittest.TestCase):
     def test_find_record_and_cache_meta(self):
         with tempfile.TemporaryDirectory() as d:
