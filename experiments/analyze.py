@@ -649,6 +649,24 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         p["cpu"].append(r.get("cpu_pct", 0.0))
     out["process"] = {k: {"max_rss_bytes": max(v["rss"]), "mean_cpu_pct": statistics.fmean(v["cpu"])}
                       for k, v in procs.items() if v["rss"]}
+    # QUIC path statistics of the client's connection (relay CONN_STATS, once per
+    # second, cumulative counters): the connection the client's session used is the
+    # one with the most bytes sent (the publisher's upstream connection is the other).
+    conn_stats: dict[int, list[dict]] = {}
+    for r in by("CONN_STATS"):
+        conn_stats.setdefault(r.get("conn"), []).append(r)
+    client_conn = max(conn_stats.values(), key=lambda v: v[-1].get("udp_tx_bytes") or 0, default=[])
+    cwnd = [r["cwnd"] for r in client_conn if r.get("cwnd") is not None]
+    out["conn"] = {
+        "samples": len(client_conn),
+        "rtt_ms": stats([r["rtt_ms"] for r in client_conn if r.get("rtt_ms") is not None]),
+        "cwnd_bytes": stats(cwnd),
+        "lost_packets": (client_conn[-1].get("lost_packets") or 0) if client_conn else None,
+        "lost_bytes": (client_conn[-1].get("lost_bytes") or 0) if client_conn else None,
+        "sent_packets": (client_conn[-1].get("sent_packets") or 0) if client_conn else None,
+        "congestion_events": (client_conn[-1].get("congestion_events") or 0) if client_conn else None,
+        "loss_rate": ((client_conn[-1].get("lost_packets") or 0) / (client_conn[-1].get("sent_packets") or 1)) if client_conn else None,
+    }
     out["relay"] = {
         "subscribes": len(by("SUBSCRIBE_RECV")), "holds": len(by("SUBSCRIBE_HOLD")),
         "clamped": sum(1 for r in by("SUBSCRIBE_RECV") if r.get("decision") == "clamped"),
@@ -769,8 +787,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                 break
     lat = [r["ts"] - sent_ts[(r.get("track"), r.get("group"), r.get("object"))] for r in by("OBJECT_RECV")
            if (r.get("track"), r.get("group"), r.get("object")) in sent_ts]
+    # Probe-measured throughput: each probe's bytes / wall time is a sample of what the
+    # connection actually delivered at top QUIC priority, i.e. the connection's usable
+    # capacity at that moment (a congestion-collapsed connection shows here as probes
+    # well below the shaped rate while the link itself is idle).
+    probe_bps = [r["bps"] for r in probes if r.get("src") == "client" and r.get("bps")]
     out["link"] = {"probe_bytes": probe_bytes, "probe_mbps": (probe_bytes * 8 / span_s / 1e6) if span_s else None,
                    "probes": sum(1 for r in probes if r.get("src") == "client"),
+                   "probe_measured_mbps": {k: (v / 1e6 if v is not None else None) for k, v in stats(probe_bps).items()},
                    "send_recv_latency_ms": stats(lat)}
     out["client_errors"] = [r.get("message") for r in by("ERROR")]
     # Fatal media element errors (MEDIA_ERR_DECODE = 3 etc.): after one, every append fails.
@@ -894,7 +918,8 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
                   "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
                   "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
-                  "probe_mbps", "send_recv_latency_p50_ms", "down_t2_ms", "down_t4_ms", "up_t2_ms", "down_reliable", "up_reliable",
+                  "probe_mbps", "probe_measured_min_mbps", "probe_measured_p50_mbps", "conn_loss_rate", "conn_cwnd_min_bytes",
+                  "conn_congestion_events", "send_recv_latency_p50_ms", "down_t2_ms", "down_t4_ms", "up_t2_ms", "down_reliable", "up_reliable",
                   "retained_live_edge_ms", "min_live_edge_ms",
                   "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
                   "cache_max_bytes", "relay_max_rss_mb"]
@@ -958,6 +983,11 @@ def agg_row(s: dict) -> dict:
         "discarded_objects": s["discarded"]["objects"],
         "discarded_mb": s["discarded"]["bytes"] / 1e6,
         "probe_mbps": s["link"]["probe_mbps"],
+        "probe_measured_min_mbps": s["link"].get("probe_measured_mbps", {}).get("min"),
+        "conn_loss_rate": s.get("conn", {}).get("loss_rate"),
+        "conn_cwnd_min_bytes": s.get("conn", {}).get("cwnd_bytes", {}).get("min"),
+        "conn_congestion_events": s.get("conn", {}).get("congestion_events"),
+        "probe_measured_p50_mbps": s["link"].get("probe_measured_mbps", {}).get("p50"),
         "down_t2_ms": s["reaction"]["down_t2_ms"], "down_t4_ms": s["reaction"]["down_t4_ms"], "up_t2_ms": s["reaction"]["up_t2_ms"],
         "down_reliable": s["reaction"]["down_reliable"], "up_reliable": s["reaction"]["up_reliable"],
         "retained_live_edge_ms": s["time_shift"].get("retained_live_edge_ms"),
