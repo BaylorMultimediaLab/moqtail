@@ -30,7 +30,6 @@ built (``cargo build --release --workspace``) and the GOP cache prepared
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import shutil
@@ -45,7 +44,10 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
-from net import BackgroundFlows, Shape, make_backend  # noqa: E402
+from net import (  # noqa: E402
+    DEFAULT_OFFLOADS, BackgroundFlows, load_profile, make_backend, profile_shapes, profile_topology,
+    step_record, tc_version,
+)
 
 # Mechanism label -> the modes it accepts (empty = takes none), the branch it
 # runs on, and the player URL parameter that selects the mode.
@@ -185,27 +187,6 @@ def git(*args: str) -> str:
         return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
     except Exception:
         return ""
-
-
-def load_profile(path: Path) -> dict:
-    prof = json.loads(path.read_text())
-    if "trace" in prof:
-        trace_path = (path.parent / prof["trace"]).resolve()
-        steps = []
-        with trace_path.open() as f:
-            for row in csv.DictReader(f):
-                steps.append({
-                    "at_s": float(row["t_s"]),
-                    "rate_mbps": float(row["rate_mbps"]),
-                    "delay_ms": prof.get("delay_ms", 0),
-                    "loss_pct": prof.get("loss_pct", 0),
-                })
-        prof["steps"] = steps
-        prof["trace_file"] = str(trace_path)
-    prof.setdefault("queue", "tail-drop")
-    prof.setdefault("queue_pkts", 100)
-    prof["steps"] = sorted(prof["steps"], key=lambda s: s["at_s"])
-    return prof
 
 
 def spawn(cmd: list[str], log: Path, cwd: Path = ROOT, env: dict | None = None,
@@ -404,6 +385,9 @@ def main() -> int:
     ap.add_argument("--profile", type=Path, required=True)
     ap.add_argument("--duration", type=float, default=180.0, help="seconds of playback to record")
     ap.add_argument("--net", choices=["none", "netns"], default="none")
+    ap.add_argument("--offloads", default=",".join(DEFAULT_OFFLOADS),
+                    help="ethtool -K features turned off on both veth ends before any qdisc is added (netns only); "
+                         "the read-back `ethtool -k` state is recorded on every NET_CHANGE")
     ap.add_argument("--bg-flows", type=int, default=0, help="number of competing iperf3 TCP flows")
     ap.add_argument("--bg-pattern", choices=["steady", "bursty"], default="steady")
     ap.add_argument("--bg-cc", default=None, help="TCP congestion control for iperf3 (cubic, bbr)")
@@ -488,7 +472,9 @@ def run_once(args, repeat_index: int) -> int:
 
     rlog = RunnerLog(out / "runner-events.jsonl")
     backend = make_backend(args.net)
-    backend.setup()
+    topo = profile_topology(profile, offloads=tuple(f for f in args.offloads.split(",") if f))
+    shapes = profile_shapes(profile)
+    backend.setup(topo)
 
     procs: dict[str, subprocess.Popen] = {}
     browser: str | None = None
@@ -553,15 +539,17 @@ def run_once(args, repeat_index: int) -> int:
 
         # Initial network state, then background flows -----------------------
         steps = profile["steps"]
-        def apply_step(step: dict) -> None:
-            shape = Shape(rate_mbps=step.get("rate_mbps"), delay_ms=step.get("delay_ms", 0),
-                          loss_pct=step.get("loss_pct", 0), jitter_ms=step.get("jitter_ms", 0))
-            backend.apply(shape, profile["queue"], profile["queue_pkts"])
-            rlog.emit("NET_CHANGE", {"rate_mbps": shape.rate_mbps, "delay_ms": shape.delay_ms,
-                                     "loss_pct": shape.loss_pct, "jitter_ms": shape.jitter_ms,
-                                     "queue": profile["queue"], "queue_pkts": profile["queue_pkts"],
-                                     "at_s": step["at_s"], "applied": backend.name != "none"})
-        apply_step(steps[0])
+
+        def apply_step(idx: int) -> None:
+            """Apply profile step `idx` (the first call builds and verifies the
+            tree, later ones change it in place) and record the resolved
+            commands, the leaf's `tc -s` counters and the offload state (C5, M1)."""
+            shape = shapes[idx]
+            res = backend.apply(shape)
+            rlog.emit("NET_CHANGE", {**step_record(shape, topo), "at_s": steps[idx]["at_s"], "step_index": idx,
+                                     "applied": bool(res.get("applied")), "tc": res.get("tc", []),
+                                     "qdisc_stats": backend.stats(), "offloads": backend.offloads or None})
+        apply_step(0)
         bg.start(args.duration + 30)
 
         # Browser ------------------------------------------------------------
@@ -608,7 +596,7 @@ def run_once(args, repeat_index: int) -> int:
         while time.time() - t0 < args.duration:
             elapsed = time.time() - t0
             if step_idx < len(steps) and elapsed >= steps[step_idx]["at_s"]:
-                apply_step(steps[step_idx])
+                apply_step(step_idx)
                 step_idx += 1
             bg.tick()
             if time.time() - last_stats >= 1.0:
@@ -625,7 +613,7 @@ def run_once(args, repeat_index: int) -> int:
                     if p.poll() is not None:
                         raise SystemExit(f"{name} exited early with {p.returncode}; see {out / (name + '.log')}")
             time.sleep(0.2)
-        rlog.emit("RUN_END", {"elapsed_s": time.time() - t0})
+        rlog.emit("RUN_END", {"elapsed_s": time.time() - t0, "qdisc_stats": backend.stats()})
     except BaseException as e:  # noqa: BLE001 - always tear down
         exit_code = 1 if not isinstance(e, KeyboardInterrupt) else 130
         print(f"[run] aborting: {e!r}")
@@ -638,10 +626,8 @@ def run_once(args, repeat_index: int) -> int:
         bg.stop()
         for name in ("publisher", "relay", "vite"):
             stop(procs.get(name), name)
-        try:
-            backend.apply(Shape(rate_mbps=None), profile["queue"], profile["queue_pkts"]) if backend.name != "none" else None
-        except Exception:
-            pass
+        # The namespace and veth go away with everything queued; the tree is
+        # never modified after the run's last step (M1).
         backend.teardown()
         rlog.close()
         src = ROOT / "logs" / run_id / "client-events.jsonl"
@@ -684,6 +670,8 @@ def run_once(args, repeat_index: int) -> int:
             "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             "profile": profile, "host": os.uname().nodename, "platform": sys.platform,
             "net_backend": backend.name,
+            "net": {"topology": {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(topo).items()},
+                    "offloads": backend.offloads or None, "kernel": os.uname().release, "tc_version": tc_version()},
             # kept for older readers
             "run_id": run_id, "git_branch": identity["branch"], "git_sha": identity["git_sha"], "started": stamp,
         }

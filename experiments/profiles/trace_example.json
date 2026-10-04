@@ -5,5 +5,5 @@
   "queue_pkts": 100,
   "delay_ms": 40,
   "loss_pct": 0,
-  "trace": "traces/example_4g.csv"
+  "trace": "../traces/example_4g.csv"
 }
