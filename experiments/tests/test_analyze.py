@@ -487,6 +487,21 @@ class StallsAndSeeks(TmpRun):
         self.assertEqual(ep["duration_ms"], 2500)
         self.assertEqual(s["starvation"]["total_ms"], 300)   # [9500, 9800) overlaps the starvation episode; before: 0
 
+    def test_reopened_frozen_stall_is_not_counted_twice(self):
+        # D5 follow-up (fresh-grid-v2 pr1378 shift10s r0): `playing` closed a frozen stall while
+        # the watchdog still counted frozen ticks, which reopened it backdated to the original
+        # freeze start. The two episodes overlap; the stalled time is their union (7.0 s, not 13.5 s).
+        client = startup()
+        client.append(ev("STALL_START", T0 + 10_000, cause="frozen", playhead_ms=9000, track=R[0]))
+        client.append(ev("STALL_END", T0 + 16_000, cause="frozen", playhead_ms=9000, duration_ms=6500))
+        client.append(ev("STALL_START", T0 + 16_050, cause="frozen", playhead_ms=9000, track=R[0]))
+        client.append(ev("STALL_END", T0 + 16_500, cause="frozen", playhead_ms=9000, duration_ms=7000))
+        client += samples(T0, T0 + 20_000, lambda t: R[0])
+        s = analyze.analyze(write_run(self.dir, client))
+        st = s["stalls"]
+        self.assertEqual((st["count"], st["total_ms"], st["max_ms"]), (1, 7000, 7000))
+        self.assertEqual(st["overlapping_merged"], 1)
+
     def test_client_records_after_run_end_are_clipped(self):
         # D6: the browser keeps logging after the runner's RUN_END (teardown); those records
         # were counted in samples, the presented/subscribed weighting, playback and stalls.

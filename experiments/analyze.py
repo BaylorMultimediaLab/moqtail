@@ -239,6 +239,26 @@ def client_connection_id(recs: list[dict], ladder: list[dict]) -> tuple[int | No
     return (last, "relay_records") if last is not None else (None, None)
 
 
+def _merge_overlapping(episodes: list[dict]) -> tuple[list[dict], int]:
+    """Stall episodes as the union of their intervals: an episode starting before the previous
+    one ended is merged into it (the end is the later of the two). Returns (episodes, merged)."""
+    out: list[dict] = []
+    merged = 0
+    for e in sorted(episodes, key=lambda x: x["ts"]):
+        if out and out[-1].get("duration_ms") is not None and e.get("duration_ms") is not None \
+                and e["ts"] < out[-1]["ts"] + out[-1]["duration_ms"]:
+            prev = out[-1]
+            end = max(prev["ts"] + prev["duration_ms"], e["ts"] + e["duration_ms"])
+            out[-1] = dict(prev, duration_ms=end - prev["ts"], merged=prev.get("merged", 0) + 1,
+                           open_at_end=prev.get("open_at_end") or e.get("open_at_end"))
+            if not out[-1]["open_at_end"]:
+                out[-1].pop("open_at_end")
+            merged += 1
+            continue
+        out.append(e)
+    return out, merged
+
+
 def landing_keyframe(first_object: dict | None, applied: dict | None) -> bool | None:
     """landed_on_keyframe of the landing object: SWITCH_FIRST_OBJECT's flag (2026-10), else
     SWITCH_APPLIED's (older bundles carry it there only); None when neither says."""
@@ -843,6 +863,9 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                          "playhead_ms": open_start.get("playhead_ms"), "track": open_start.get("track"), "open_at_end": True})
     # Clip to RUN_END: an episode starting after it is not part of the run, one spanning it ends there.
     episodes = _clip_episodes(episodes, clip_end)
+    # Overlapping episodes are one stall: a frozen stall that `playing` closed while the
+    # watchdog still counted frozen ticks is reopened backdated to the original freeze start.
+    episodes, merged_overlaps = _merge_overlapping(episodes)
     # Only episodes after the first presented frame count; the client already excludes
     # pre-startup `waiting`, this is the analyzer's own guarantee.
     episodes = [e for e in episodes if st is None or e["ts"] >= st["ts"]]
@@ -864,6 +887,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "min_episode_ms": STALL_MIN_EPISODE_MS,
         "blips": len(blips), "blips_ms": sum(e["duration_ms"] or 0 for e in blips),
         "all_count": len(episodes),
+        # Episodes that overlapped an earlier one (reopened backdated) and were merged into it.
+        "overlapping_merged": merged_overlaps,
         "episodes": episodes,
         # Normalised seek vocabulary (gap = gap | range-jump | unwedge), all seeks of the session.
         "seeks": {k: sum(1 for s in seeks if s["_kind"] == k) for k in ("startup", "gap", "wedge", "visibility")},
