@@ -398,14 +398,13 @@ export function App() {
   }, [blurSettings]);
 
   useEffect(() => {
-    // Preserve fields populated outside React (e.g. firstReceivedGroupId,
-    // switchDiscontinuities — written from player.ts as media objects arrive).
+    // Preserve fields populated outside React (firstReceivedGroupId is written
+    // from player.ts as media objects arrive).
     const prev = window.__moqtailMetrics;
     window.__moqtailMetrics = {
       abr: abrMetrics,
       samples: metricsSnapshot,
       firstReceivedGroupId: prev?.firstReceivedGroupId,
-      switchDiscontinuities: prev?.switchDiscontinuities,
       catalogTracks: catalogTracks ?? prev?.catalogTracks,
     };
   }, [abrMetrics, metricsSnapshot, catalogTracks]);

@@ -37,45 +37,6 @@ import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/li
 import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
 import { SeamTracker, nextPageSwitchSeq, type SwitchRecord } from '@/lib/seam';
 
-/**
- * One record per track-switch (or, in C4, per time-shifted connect).
- * Pushed to window.__moqtailMetrics.switchDiscontinuities for offline analysis.
- */
-export interface DiscontinuityRecord {
-  eventType: 'connect' | 'switch';
-  switchSentAt: number;
-  switchAppliedAt: number;
-  fromTrack?: string;
-  toTrack: string;
-
-  // PTS-domain (headline)
-  oldEndPTS_ms?: number;
-  newStartPTS_ms: number;
-  /** Media seam gap: newStartPTS_ms - oldEndPTS_ms. Buffered-region continuity at
-   *  the seam (0 = contiguous), not a viewer-visible discontinuity. */
-  mediaSeamGapMs: number;
-  /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
-  playheadPTS_ms?: number;
-  /** Seam distance ahead of the playhead: newStartPTS_ms - playheadPTS_ms, i.e. how
-   *  much media the viewer still plays before seeing the new representation.
-   *  Undefined for `connect` records. */
-  seamAheadOfPlayheadMs?: number;
-
-  // wall-clock context
-  wallClockMs: number;
-  /** Wall-clock pause at the seam crossing beyond one frame period (ms). */
-  viewerPauseMs?: number;
-
-  // connect-time clamp signal (Task C4)
-  expectedStartGroup?: number;
-  actualStartGroup?: number;
-  clampedByRelay?: boolean;
-
-  // mode context (every record)
-  clientMode: 'time-shifted' | 'live-edge';
-  timeShiftSeconds: number;
-}
-
 interface PendingSwitch {
   trackName: string;
   initData: ArrayBuffer;
@@ -263,8 +224,7 @@ export class Player {
   // `LatencyTrendRule` reads `getTrendRatio()` for downswitch decisions.
   #latencyTracker = new LatencyTracker();
   // Connect-time state (Task C4) for time-shifted-mode clamp detection.
-  // Captured in subscribe(); consumed once on the first received object.
-  #connectSentAt: number | undefined;
+  // Captured in subscribe(); reported on FIRST_OBJECT.
   #expectedStartGroupId: number | undefined;
   // PTS <-> group lookup populated from incoming object decode times.
   // Measurement only: maps the playhead to the group it is showing.
@@ -930,45 +890,6 @@ export class Player {
                 events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
               }
 
-              if (newStartPTS_ms !== undefined) {
-                const mediaSeamGapMs =
-                  sourceEndAtApplyPTS_ms !== undefined
-                    ? newStartPTS_ms - sourceEndAtApplyPTS_ms
-                    : 0;
-                const seamAheadOfPlayheadMs =
-                  playheadPTS_ms !== undefined ? newStartPTS_ms - playheadPTS_ms : undefined;
-                const wallClockMs = performance.now() - switchSentAt;
-                const disc: DiscontinuityRecord = {
-                  eventType: 'switch',
-                  switchSentAt,
-                  switchAppliedAt: performance.now(),
-                  fromTrack,
-                  toTrack: newTrackName,
-                  oldEndPTS_ms,
-                  newStartPTS_ms,
-                  mediaSeamGapMs,
-                  playheadPTS_ms,
-                  seamAheadOfPlayheadMs,
-                  wallClockMs,
-                  clientMode: this.#options.clientMode,
-                  timeShiftSeconds: this.#options.timeShiftSeconds,
-                };
-                if (typeof window !== 'undefined') {
-                  const w = window as Window & {
-                    __moqtailMetrics?: {
-                      switchDiscontinuities?: DiscontinuityRecord[];
-                      [k: string]: unknown;
-                    };
-                  };
-                  w.__moqtailMetrics ??= {} as Window['__moqtailMetrics'] & object;
-                  const metrics = w.__moqtailMetrics as Window['__moqtailMetrics'] & {
-                    switchDiscontinuities?: DiscontinuityRecord[];
-                  };
-                  metrics.switchDiscontinuities ??= [];
-                  metrics.switchDiscontinuities.push(disc);
-                }
-              }
-
               // NOW release the ABR switching guard — the relay has completed the
               // transition and delivered data on the new track. Safe to switch again.
               this.#options.onTrackSwitched?.(newTrackName);
@@ -1156,57 +1077,6 @@ export class Player {
                       ? this.#tFirstObject - this.#tConnectStart
                       : null,
                 });
-
-                // Connect-time discontinuity record (Task C4): emit only if we
-                // were in time-shifted mode AND we have a known expected start
-                // group (i.e. the relay sent a SubscribeOk with largestLocation
-                // and delay_groups was non-zero).
-                if (
-                  this.#options.clientMode === 'time-shifted' &&
-                  this.#expectedStartGroupId !== undefined &&
-                  this.#connectSentAt !== undefined
-                ) {
-                  const expected = this.#expectedStartGroupId;
-                  const actual = Number(object.location.group);
-                  // Relay clamps when our requested target was older than the
-                  // oldest cached group: it returns a more-recent group instead.
-                  const clampedByRelay = actual > expected;
-
-                  const connectTimescale = this.catalog?.getTimescale(struct.trackName);
-                  const newStartPTS_ms =
-                    connectTimescale && connectTimescale > 0
-                      ? parseMoofBaseMediaDecodeTime(
-                          new Uint8Array(
-                            object.payload.buffer,
-                            object.payload.byteOffset,
-                            object.payload.byteLength,
-                          ),
-                          connectTimescale,
-                        )
-                      : undefined;
-
-                  const connectGopDurationMs =
-                    this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
-                  const mediaSeamGapMs = (actual - expected) * connectGopDurationMs;
-                  const wallClockMs = performance.now() - this.#connectSentAt;
-
-                  const record: DiscontinuityRecord = {
-                    eventType: 'connect',
-                    switchSentAt: this.#connectSentAt,
-                    switchAppliedAt: performance.now(),
-                    toTrack: struct.trackName,
-                    newStartPTS_ms: newStartPTS_ms ?? 0,
-                    mediaSeamGapMs,
-                    wallClockMs,
-                    expectedStartGroup: expected,
-                    actualStartGroup: actual,
-                    clampedByRelay,
-                    clientMode: this.#options.clientMode,
-                    timeShiftSeconds: this.#options.timeShiftSeconds,
-                  };
-                  window.__moqtailMetrics.switchDiscontinuities ??= [];
-                  window.__moqtailMetrics.switchDiscontinuities.push(record);
-                }
               }
             }
 
@@ -1525,18 +1395,6 @@ export class Player {
           buffer_hole_behind_ms: bufferHoleBehindMs,
         });
 
-        if (typeof window !== 'undefined' && window.__moqtailMetrics) {
-          const records = window.__moqtailMetrics.switchDiscontinuities;
-          if (records) {
-            for (let i = records.length - 1; i >= 0; i--) {
-              const r = records[i];
-              if (r && r.eventType === 'switch' && r.toTrack === rec.to) {
-                r.viewerPauseMs = pauseMs ?? undefined;
-                break;
-              }
-            }
-          }
-        }
         this.#options.onSwitchVisible?.(rec.to);
       }
       prevMediaMs = mediaMs;
@@ -1702,21 +1560,6 @@ export class Player {
   /** Controller knob: reset the per-frame latency window when a switch lands. */
   setResetLatencyOnLanding(enabled: boolean): void {
     this.#resetLatencyOnLanding = enabled;
-  }
-
-  /**
-   * Abort an in-flight track switch. Called by AbrController when its
-   * switching-guard timeout fires — meaning the chosen target track is
-   * unfulfillable (typically: upswitch fired right before a regime change
-   * dropped the link below the target's source rate). Clearing
-   * `pendingSwitch` ensures any stale data arriving later on the abandoned
-   * track is dropped by the write handler's `objectTrackName !==
-   * struct.pendingSwitch?.trackName` filter rather than belatedly applied.
-   */
-  abortPendingSwitch(): void {
-    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    if (!videoStruct) return;
-    videoStruct.pendingSwitch = null;
   }
 
   /**
@@ -2018,15 +1861,14 @@ export class Player {
       throw new Error(`Error occured during subscription: ${result.reasonPhrase.phrase}`);
     }
 
-    // Capture connect-time state for media tracks (not catalog) so C4 can emit
-    // a connect-time discontinuity record on the first arriving object. We only
+    // Capture connect-time state for media tracks (not catalog) so FIRST_OBJECT
+    // can report whether the relay clamped the start group. We only
     // populate #expectedStartGroupId for time-shifted mode with a non-zero
     // delay_groups; otherwise the relay does not clamp and we have nothing to
     // detect against.
     if (params.trackName !== 'catalog' && this.catalog) {
       const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
       const largest = result.largestLocation;
-      this.#connectSentAt = performance.now();
       if (this.#options.clientMode === 'time-shifted' && largest !== undefined) {
         const delayGroups = Math.round((this.#options.timeShiftSeconds * 1000) / gopDurationMs);
         if (delayGroups > 0) {
