@@ -94,9 +94,33 @@ pub struct SubscriptionState {
   pub last_sent_max_location: Option<Location>,
   pub last_received_object_location: Option<Location>,
   pub is_joining: bool,
+  /// Highest object id the cache replay wrote on each data stream (keyed by the
+  /// relay-side StreamId: track, group, subgroup). An object of the newest group
+  /// that arrived between this subscription's registration and the replay's read
+  /// of that group is both in the cache and in the live queue; the live copy is
+  /// dropped when it is at or below this mark. Per stream rather than one
+  /// watermark, so a late object of an earlier group (streams are ingested
+  /// concurrently) is not mistaken for a duplicate.
+  pub replayed_through: HashMap<StreamId, u64>,
 }
 
 impl SubscriptionState {
+  /// Whether `object_id` on `stream_id` was already delivered by the cache replay.
+  pub fn covered_by_replay(&self, stream_id: &StreamId, object_id: u64) -> bool {
+    self
+      .replayed_through
+      .get(stream_id)
+      .is_some_and(|max| object_id <= *max)
+  }
+
+  fn record_replayed(&mut self, stream_id: StreamId, object_id: u64) {
+    self
+      .replayed_through
+      .entry(stream_id)
+      .and_modify(|max| *max = (*max).max(object_id))
+      .or_insert(object_id);
+  }
+
   pub fn update_last_sent_max_location(&mut self, location: Location) {
     match &self.last_sent_max_location {
       Some(current_max) => {
@@ -198,6 +222,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           // live objects flow. The replay path below is gated on `is_joining`;
           // without it those cached objects are silently dropped.
           is_joining,
+          replayed_through: HashMap::new(),
         }
       }
       SubscriptionOrigin::Publish(publish) => {
@@ -265,6 +290,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           last_sent_max_location: None,
           last_received_object_location: None,
           is_joining: false,
+          replayed_through: HashMap::new(),
         }
       }
     }
@@ -277,7 +303,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
 /// Within each band, group_id determines relative position according to group_order:
 ///   Ascending / Original – lower group_id = higher priority (counts down from band_max)
 ///   Descending            – higher group_id = higher priority (counts up from band_min)
-fn compute_stream_priority(
+pub(crate) fn compute_stream_priority(
   sub_prio: u8,
   pub_prio: u8,
   group_order: GroupOrder,
@@ -293,12 +319,38 @@ fn compute_stream_priority(
   }
 }
 
+/// QUIC stream priority of the relay's synthetic `.probe:` streams (M3).
+///
+/// The lowest slot the formula above can produce: subscriber and publisher priority
+/// 255 (the lowest band) and the last group slot of that band. A literal 0 sat in the
+/// middle of the i32 range, which is above every video stream of a subscriber whose
+/// priority is 128 (the default the promoted subscription fell back to) and below
+/// those of a priority-0 subscriber, so whether the probe starved video depended on
+/// which SUBSCRIBE created the subscription. This value is below every video stream
+/// for any subscriber priority other than the (255, 255) corner, where it ties.
+pub(crate) fn probe_stream_priority() -> i32 {
+  compute_stream_priority(255, 255, GroupOrder::Ascending, u64::MAX)
+}
+
+/// Per-subscription counters of what the forwarding path did, for tests and
+/// diagnostics. Not reset.
+#[derive(Debug, Default)]
+pub(crate) struct SubscriptionCounters {
+  /// Objects QUIC accepted (OBJECT_SENT.sent = true), replayed or live.
+  pub objects_written: AtomicU64,
+  /// Objects whose serialize or write failed (OBJECT_SENT.sent = false).
+  pub write_failures: AtomicU64,
+  /// Live objects dropped because the cache replay had already delivered them.
+  pub live_duplicates_dropped: AtomicU64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Subscription {
   pub request_id: u64,
   relay_track_id: u64,
   pub full_track_name: FullTrackName,
   pub subscription_state: Arc<RwLock<SubscriptionState>>,
+  pub(crate) counters: Arc<SubscriptionCounters>,
   subscriber: Arc<MOQTClient>,
   event_rx: Arc<Mutex<Option<UnboundedReceiver<TrackEvent>>>>,
   send_stream_last_object_ids: Arc<RwLock<HashMap<StreamId, Option<u64>>>>,
@@ -347,6 +399,7 @@ impl Subscription {
       full_track_name,
       request_id,
       subscription_state: Arc::new(RwLock::new(origin_message.into())),
+      counters: Arc::new(SubscriptionCounters::default()),
       subscriber,
       event_rx,
       send_stream_last_object_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -526,6 +579,8 @@ impl Subscription {
                           (None, last_stream_id.clone())
                         };
 
+                        let replay_stream_id = stream_id.clone().unwrap();
+                        let replayed_object_id = object.object_id;
                         let the_object = Object::try_from_fetch(object, relay_track_id).unwrap();
 
                         let track_event = TrackEvent::SubgroupObject {
@@ -538,6 +593,13 @@ impl Subscription {
                           instance.client_connection_id, relay_track_id, track_event
                         );
                         instance.handle_track_event(track_event).await;
+                        // Whatever the write did, the live copy of this object (if one
+                        // is queued) must not be written on the same stream again.
+                        instance
+                          .subscription_state
+                          .write()
+                          .await
+                          .record_replayed(replay_stream_id, replayed_object_id);
                       }
                       CacheConsumeEvent::EndLocation => {}
                     },
@@ -548,9 +610,8 @@ impl Subscription {
                   }
                 }
               }
-              // Record what was replayed up to so the live-forward path knows where
-              // to resume; live objects in [start_location, end] that arrive after
-              // the snapshot would otherwise be duplicates.
+              // The live path's duplicate filter is `replayed_through` (per stream,
+              // recorded above as each object is replayed), not this location.
               let mut state = instance.subscription_state.write().await;
               state.last_received_object_location = Some(end);
               drop(state);
@@ -805,8 +866,10 @@ impl Subscription {
         // if so, set this track as current
         let mut switch_at_next_group = false;
         let mut new_start_location = None;
+        let current_track_name = self.subscriber.switch_context.get_current().await;
+        let mut old_last_sent_max: Option<Location> = None;
 
-        if let Some(current_track_name) = self.subscriber.switch_context.get_current().await {
+        if let Some(current_track_name) = current_track_name.clone() {
           let current_subscription_opt = self
             .subscriber
             .subscriptions
@@ -819,6 +882,7 @@ impl Subscription {
             let current_subscription = current_subscription.read().await;
             let current_state = current_subscription.subscription_state.read().await;
             let last_sent_max_location = current_state.last_sent_max_location.clone();
+            old_last_sent_max = last_sent_max_location.clone();
 
             if let Some(loc) = last_sent_max_location {
               switch_at_next_group = object_location.group >= loc.group;
@@ -868,6 +932,10 @@ impl Subscription {
 
           state.end_group = 0; // remove end group limit
 
+          // old_track / old_last_sent_group: the track this one replaces and the
+          // group its last accepted write belonged to (the seam's anchor: start_group
+          // is that + 1). trigger_forwarded: as shipped the trigger is never forwarded
+          // (this branch returns false below).
           events::emit(
             "SWITCH_PROMOTED",
             serde_json::json!({
@@ -877,6 +945,9 @@ impl Subscription {
               "trigger_group": object_location.group,
               "trigger_object": object_location.object,
               "start_group": state.start_location.as_ref().map(|l| l.group),
+              "old_track": current_track_name.as_ref().map(events::track_name_string),
+              "old_last_sent_group": old_last_sent_max.as_ref().map(|l| l.group),
+              "trigger_forwarded": false,
             }),
           );
 
@@ -912,6 +983,22 @@ impl Subscription {
           let mut state = self.subscription_state.write().await;
           state.forward = false;
           state.end_group = object_location.group;
+          // The moment this (demoted) track stops forwarding: last_group is the group
+          // of its last accepted write, i.e. the old side of the seam; stop_group is
+          // the group whose first object found it demoted (not forwarded). Its open
+          // streams are FIN'd as the publisher's close, not reset.
+          events::emit(
+            "SWITCH_DEMOTED",
+            serde_json::json!({
+              "conn": self.client_connection_id,
+              "relay_track_id": self.relay_track_id,
+              "old_track": events::track_name_string(&self.full_track_name),
+              "last_group": state.last_sent_max_location.as_ref().map(|l| l.group),
+              "last_object": state.last_sent_max_location.as_ref().map(|l| l.object),
+              "stop_group": object_location.group,
+              "stop_object": object_location.object,
+            }),
+          );
         }
 
         false
@@ -960,6 +1047,9 @@ impl Subscription {
     match recv_result {
       Some(event) if !self.finished.load(Ordering::Relaxed) => {
         drop(event_rx_guard);
+        if self.live_event_covered_by_replay(&event).await {
+          return;
+        }
         self.handle_track_event(event).await;
       }
       Some(_) => {
@@ -974,6 +1064,52 @@ impl Subscription {
         event_rx_guard.take();
         drop(event_rx_guard);
       }
+    }
+  }
+
+  /// Live path only: whether this queued event repeats an object the cache replay
+  /// already handed to the serializer, in which case it is dropped and counted.
+  ///
+  /// An object that arrived between this subscription's registration (from when the
+  /// track fans live objects into its queue) and the replay's read of its group is in
+  /// both. Written again it would follow itself on the same stream, and the object-id
+  /// delta cannot encode that ("Error in serializing object", OBJECT_SENT.sent =
+  /// false); if it carries the subgroup header it would open a second stream for the
+  /// group and deliver the replayed objects twice. Per (group, subgroup) stream, at or
+  /// below the highest object id the replay wrote there.
+  ///
+  /// A StreamClosed for a replayed stream retires its mark: the publisher's stream has
+  /// ended, so nothing more of it can be queued.
+  async fn live_event_covered_by_replay(&self, event: &TrackEvent) -> bool {
+    match event {
+      TrackEvent::SubgroupObject {
+        stream_id, object, ..
+      } => {
+        let covered = self
+          .subscription_state
+          .read()
+          .await
+          .covered_by_replay(stream_id, object.location.object);
+        if covered {
+          self
+            .counters
+            .live_duplicates_dropped
+            .fetch_add(1, Ordering::Relaxed);
+          debug!(
+            "Dropping live copy of replayed object for subscriber={} relay_track_id={} stream_id={} location: {:?}",
+            self.client_connection_id, self.relay_track_id, stream_id, object.location
+          );
+        }
+        covered
+      }
+      TrackEvent::StreamClosed { stream_id } => {
+        let mut state = self.subscription_state.write().await;
+        if !state.replayed_through.is_empty() {
+          state.replayed_through.remove(stream_id);
+        }
+        false
+      }
+      _ => false,
     }
   }
 
@@ -1185,6 +1321,14 @@ impl Subscription {
             )
             .await;
           let send_status = write_result.is_ok();
+          if send_status {
+            self
+              .counters
+              .objects_written
+              .fetch_add(1, Ordering::Relaxed);
+          } else {
+            self.counters.write_failures.fetch_add(1, Ordering::Relaxed);
+          }
 
           // Update the last object ID for this stream if successful
           if send_status {
@@ -1654,6 +1798,50 @@ mod tests {
     assert!(high > low, "lower pub_prio number = higher priority");
   }
 
+  /// M3: the probe must never outrank video, whatever subscriber priority the
+  /// SUBSCRIBE (or a promoted SWITCH subscription) ended up with. Checked for the
+  /// two priorities that occur in the harness (0 from the player, 128 the relay
+  /// default) across every publisher priority, both group orders and the group
+  /// slots at the band edges.
+  #[test]
+  fn probe_priority_is_below_every_video_band_for_subscriber_priorities_0_and_128() {
+    let probe = probe_stream_priority();
+    assert_eq!(
+      probe,
+      i32::MIN,
+      "probe takes the lowest slot of the lowest band"
+    );
+    for sub in [0u8, 128] {
+      for pub_ in 0u8..=255 {
+        for &order in &[
+          GroupOrder::Ascending,
+          GroupOrder::Original,
+          GroupOrder::Descending,
+        ] {
+          for group in [0u64, 1, 1000, 65534, 65535, 65536, u64::MAX] {
+            let video = compute_stream_priority(sub, pub_, order, group);
+            assert!(
+              video > probe,
+              "video (sub={sub} pub={pub_} order={order:?} group={group}) = {video} must outrank probe {probe}"
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /// A literal 0 (the previous probe priority) is NOT below video for a
+  /// priority-128 subscriber: this is the defect the derived value fixes.
+  #[test]
+  fn literal_zero_would_outrank_default_priority_video() {
+    let video_default_sub = compute_stream_priority(128, 128, GroupOrder::Ascending, 0);
+    assert!(
+      video_default_sub < 0,
+      "literal 0 sits above a 128/128 video stream"
+    );
+    assert!(probe_stream_priority() < video_default_sub);
+  }
+
   #[test]
   fn test_all_values_within_i32_range() {
     for sub in [0u8, 128, 255] {
@@ -1718,5 +1906,341 @@ mod tests_from_subscribe_is_joining {
     let state = SubscriptionState::from(SubscriptionOrigin::from(sub));
     assert_eq!(state.start_location, None);
     assert!(!state.is_joining);
+  }
+}
+
+/// Replay/live overlap (Report 5, Major): a joining subscription replays the cache
+/// while live objects queue behind it; an object of the newest group that arrived in
+/// between is in both.
+#[cfg(test)]
+mod tests_replay_live_overlap {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, collect_streams, publish, quic_pair, relay_client, subscribe, test_track,
+    wait_until,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use std::time::Duration;
+
+  const TRACK: u64 = 1;
+
+  /// The mark is per stream: a late object of an earlier group the replay did not
+  /// reach is not mistaken for a duplicate, as one watermark location would.
+  #[test]
+  fn replay_marks_are_per_stream() {
+    let sub = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![],
+    );
+    let mut state = SubscriptionState::from(SubscriptionOrigin::from(sub));
+    let g11 = StreamId::new_subgroup(TRACK, 11, Some(0));
+    let g12 = StreamId::new_subgroup(TRACK, 12, Some(0));
+    state.record_replayed(g11.clone(), 3);
+    state.record_replayed(g12.clone(), 0);
+    state.record_replayed(g12.clone(), 4);
+    assert!(state.covered_by_replay(&g11, 3));
+    assert!(!state.covered_by_replay(&g11, 4), "late object of group 11");
+    assert!(state.covered_by_replay(&g12, 0));
+    assert!(state.covered_by_replay(&g12, 4));
+    assert!(!state.covered_by_replay(&g12, 5));
+    let g13 = StreamId::new_subgroup(TRACK, 13, Some(0));
+    assert!(!state.covered_by_replay(&g13, 0), "never replayed");
+  }
+
+  #[tokio::test]
+  async fn a_joining_replay_and_the_live_queue_deliver_each_object_once() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(7, server);
+    let received = collect_streams(peer);
+    let track = test_track(TRACK, "video-720p");
+
+    // Before the SUBSCRIBE: groups 10 and 11 whole, group 12 objects 0..3. Cache only.
+    for g in 10..=11 {
+      for o in 0..6 {
+        publish(&track, g, o).await;
+      }
+    }
+    for o in 0..3 {
+      publish(&track, 12, o).await;
+    }
+
+    let subscription = subscribe(
+      &track,
+      &client,
+      Subscribe::new_absolute_start(
+        1,
+        Tuple::from_utf8_path(TEST_NAMESPACE),
+        TupleField::from_utf8("video-720p"),
+        Location::new(10, 0),
+        vec![],
+      ),
+      false,
+    )
+    .await;
+
+    // Registered but not yet forwarding: these are queued AND cached, so the replay
+    // (which reads the cache once forwarding is released) delivers them as well.
+    for o in 3..6 {
+      publish(&track, 12, o).await;
+    }
+    for o in 0..3 {
+      publish(&track, 13, o).await;
+    }
+
+    let (counters, sub) = {
+      let s = subscription.read().await;
+      (s.counters.clone(), s.clone())
+    };
+    sub.mark_alias_announced();
+
+    // 10, 11, 12 whole and 13/0..3, each once.
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let received = received.clone();
+        async move { received.objects(TRACK).len() >= 21 }
+      })
+      .await,
+      "replay + live delivered {:?}",
+      received.objects(TRACK)
+    );
+
+    // Purely live from here.
+    for o in 3..6 {
+      publish(&track, 13, o).await;
+    }
+    for o in 0..6 {
+      publish(&track, 14, o).await;
+    }
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let received = received.clone();
+        async move { received.objects(TRACK).len() >= 30 }
+      })
+      .await,
+      "live delivered {:?}",
+      received.objects(TRACK)
+    );
+    // Anything still in flight would show up as an extra object.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let counts = received.counts(TRACK);
+    let duplicated: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(duplicated.is_empty(), "delivered twice: {duplicated:?}");
+    let expected: Vec<(u64, u64)> = (10..=14)
+      .flat_map(|g| (0..6).map(move |o| (g, o)))
+      .collect();
+    assert_eq!(counts.keys().copied().collect::<Vec<_>>(), expected);
+    for g in 10..=14 {
+      assert_eq!(received.streams_for(TRACK, g), 1, "group {g} on one stream");
+    }
+    assert_eq!(counters.write_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(counters.objects_written.load(Ordering::Relaxed), 30);
+    assert_eq!(
+      counters.live_duplicates_dropped.load(Ordering::Relaxed),
+      6,
+      "12/3..6 and 13/0..3 were replayed and queued"
+    );
+  }
+}
+
+/// Native SWITCH on harness: the switched (target) subscription is gated by
+/// `check_switch_context`; the source keeps forwarding until its next group.
+#[cfg(test)]
+mod tests_native_switch {
+  use super::*;
+  use crate::server::message_handlers::subscribe_handler::with_native_switch_statuses;
+  use crate::server::test_support::{
+    Received, TEST_NAMESPACE, collect_streams, publish, quic_pair, relay_client, subscribe,
+    test_track, wait_until,
+  };
+  use crate::server::track::Track;
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::model::error::TerminationCode;
+  use std::time::Duration;
+
+  const OLD: u64 = 1;
+  const NEW: u64 = 2;
+
+  fn latest(request_id: u64, track: &str) -> Subscribe {
+    Subscribe::new_latest_object(
+      request_id,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8(track),
+      vec![MessageParameter::new_forward(true)],
+    )
+  }
+
+  async fn wait_for(received: &Received, alias: u64, loc: (u64, u64)) -> bool {
+    wait_until(Duration::from_secs(5), || {
+      let received = received.clone();
+      async move { received.objects(alias).contains(&loc) }
+    })
+    .await
+  }
+
+  /// A client subscribed to the old track, which has delivered group 5 objects
+  /// 0..5, and a new track that has published group 5 objects 0..3.
+  struct Fixture {
+    client: Arc<MOQTClient>,
+    received: Received,
+    old: Track,
+    new: Track,
+  }
+
+  /// `conn` must be unique per test: captured events are filtered by it.
+  async fn fixture(conn: usize) -> Fixture {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(conn, server);
+    let received = collect_streams(peer);
+    let old = test_track(OLD, "video-360p");
+    let new = test_track(NEW, "video-720p");
+    let old_sub = subscribe(&old, &client, latest(1, "video-360p"), false).await;
+    old_sub.read().await.mark_alias_announced();
+    for o in 0..5 {
+      publish(&old, 5, o).await;
+    }
+    assert!(wait_for(&received, OLD, (5, 4)).await);
+    for o in 0..3 {
+      publish(&new, 5, o).await;
+    }
+    Fixture {
+      client,
+      received,
+      old,
+      new,
+    }
+  }
+
+  /// What the handler's SUBSCRIBE does for the switch, as far as forwarding goes:
+  /// create the target subscription (is_switch arms the one-shot check) and release
+  /// its forwarding (SUBSCRIBE_OK sent).
+  async fn switched_subscribe(f: &Fixture) -> Arc<RwLock<Subscription>> {
+    let sub = subscribe(&f.new, &f.client, latest(3, "video-720p"), true).await;
+    sub.read().await.mark_alias_announced();
+    sub
+  }
+
+  /// The defect, reproduced with the old ordering (statuses set after the SUBSCRIBE
+  /// was handled): an object the target dequeues in between is forwarded ungated,
+  /// mid-group, and the source is not demoted for it.
+  #[tokio::test]
+  async fn statuses_set_after_the_subscribe_let_a_mid_group_object_through() {
+    let f = fixture(21).await;
+    let _new_sub = switched_subscribe(&f).await;
+    publish(&f.new, 5, 3).await;
+    assert!(
+      wait_for(&f.received, NEW, (5, 3)).await,
+      "the window forwards (5, 3) of the target: {:?}",
+      f.received.objects(NEW)
+    );
+    assert_eq!(f.client.switch_context.get_current().await, None);
+  }
+
+  /// The fix: the statuses are in place before the target can forward, so the same
+  /// object meets the Next branch: the target is promoted to start at the group after
+  /// the source's last sent one, and nothing of group 5 is forwarded from it.
+  #[tokio::test]
+  async fn statuses_set_before_the_subscribe_gate_the_first_object() {
+    let f = fixture(22).await;
+    let new_name = f.new.full_track_name.clone();
+    let old_name = f.old.full_track_name.clone();
+    with_native_switch_statuses(
+      &f.client.switch_context,
+      new_name.clone(),
+      old_name,
+      async {
+        switched_subscribe(&f).await;
+        Ok(())
+      },
+    )
+    .await
+    .unwrap();
+    publish(&f.new, 5, 3).await;
+    publish(&f.new, 5, 4).await;
+    for o in 0..3 {
+      publish(&f.old, 6, o).await;
+      publish(&f.new, 6, o).await;
+    }
+    assert!(wait_for(&f.received, NEW, (6, 2)).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+      f.received.objects(NEW),
+      vec![(6, 0), (6, 1), (6, 2)],
+      "the target starts at the next group"
+    );
+    assert!(
+      f.received.objects(OLD).iter().all(|(g, _)| *g == 5),
+      "the source stops at its next group: {:?}",
+      f.received.objects(OLD)
+    );
+    assert_eq!(f.client.switch_context.get_current().await, Some(new_name));
+
+    // The relay's account of the same seam.
+    let promoted = crate::server::events::test_capture::records("SWITCH_PROMOTED", 22);
+    assert_eq!(promoted.len(), 1, "{promoted:?}");
+    let p = &promoted[0];
+    assert_eq!(p["track"], "moqtail/video-720p");
+    assert_eq!(p["trigger_group"], 5);
+    assert_eq!(p["trigger_object"], 3);
+    assert_eq!(p["start_group"], 6);
+    assert_eq!(p["old_track"], "moqtail/video-360p");
+    assert_eq!(p["old_last_sent_group"], 5);
+    assert_eq!(p["trigger_forwarded"], false);
+    let demoted = crate::server::events::test_capture::records("SWITCH_DEMOTED", 22);
+    assert_eq!(demoted.len(), 1, "{demoted:?}");
+    let d = &demoted[0];
+    assert_eq!(d["old_track"], "moqtail/video-360p");
+    assert_eq!(d["relay_track_id"], OLD);
+    assert_eq!(d["last_group"], 5);
+    assert_eq!(d["last_object"], 4);
+    assert_eq!(d["stop_group"], 6);
+    assert_eq!(d["stop_object"], 0);
+  }
+
+  /// The ordering itself: when the SUBSCRIBE runs (and with it SUBSCRIBE_OK and the
+  /// release of forwarding), target = Next and source = Current are already set.
+  #[tokio::test]
+  async fn the_subscribe_runs_with_the_statuses_already_set() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let seen = Arc::new(Mutex::new(None));
+    let seen_in = seen.clone();
+    let ctx_in = ctx.clone();
+    let (t, s) = (target.clone(), source.clone());
+    with_native_switch_statuses(&ctx, target.clone(), source.clone(), async move {
+      *seen_in.lock().await = Some((
+        ctx_in.get_switch_status(&t).await,
+        ctx_in.get_switch_status(&s).await,
+      ));
+      Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+      *seen.lock().await,
+      Some((Some(SwitchStatus::Next), Some(SwitchStatus::Current)))
+    );
+  }
+
+  /// A SUBSCRIBE that fails leaves the switch context as it was.
+  #[tokio::test]
+  async fn a_failed_subscribe_restores_the_statuses() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let pending = crate::server::test_support::full_track_name("video-1080p");
+    ctx
+      .add_or_update_switch_item(pending.clone(), SwitchStatus::Next)
+      .await;
+    let before = ctx.snapshot().await;
+    let res = with_native_switch_statuses(&ctx, target, source, async {
+      Err(TerminationCode::InternalError)
+    })
+    .await;
+    assert!(res.is_err());
+    assert_eq!(ctx.snapshot().await, before);
   }
 }

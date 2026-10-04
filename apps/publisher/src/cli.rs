@@ -60,8 +60,17 @@ pub struct Cli {
   #[arg(long, default_value_t = false)]
   pub no_loop: bool,
 
-  /// Project-local experiment event log (JSON lines): RUN_META once, then
-  /// one GROUP_EMIT per group per variant. Empty disables it.
+  /// Project-local experiment event log (JSON lines): RUN_META and
+  /// PUBLISHER_CONFIG once, then one GROUP_EMIT per group per variant. Empty
+  /// disables it.
   #[arg(long, default_value = "")]
   pub event_log: String,
+
+  /// MoQ Publisher Priority carried in every video variant's subgroup headers
+  /// (0 = highest, 255 = lowest). One value for all variants: the relay's QUIC
+  /// scheduler orders streams by (subscriber priority, publisher priority) band
+  /// before group recency, so per-variant priorities made the seam order depend
+  /// on ladder position rather than on the mechanism under test (M3).
+  #[arg(long, default_value_t = 128)]
+  pub variant_priority: u8,
 }

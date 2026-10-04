@@ -57,6 +57,17 @@ impl From<wtransport::error::ConnectionError> for TransportConnectionError {
   }
 }
 
+/// See [`TransportConnection::congestion_metrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CongestionMetrics {
+  /// Congestion window in bytes.
+  pub window: u64,
+  /// Slow start threshold in bytes, where the controller has one.
+  pub ssthresh: Option<u64>,
+  /// The controller's model pacing rate in bits/s, where it has one (BBR).
+  pub model_pacing_rate_bps: Option<u64>,
+}
+
 impl From<quinn::ConnectionError> for TransportConnectionError {
   fn from(e: quinn::ConnectionError) -> Self {
     match e {
@@ -277,6 +288,23 @@ impl TransportConnection {
     match self {
       Self::WebTransport(c) => c.quic_connection().stats(),
       Self::Quic(c) => c.stats(),
+    }
+  }
+
+  /// The congestion controller's own view, for diagnostics: its window, its slow
+  /// start threshold (CUBIC/NewReno; `None` for BBR) and its model pacing rate in
+  /// bits/s (BBR; `None` otherwise). quinn's connection pacer does not use the
+  /// latter: it paces at 1.25 x window / smoothed RTT for every controller.
+  pub fn congestion_metrics(&self) -> CongestionMetrics {
+    let controller = match self {
+      Self::WebTransport(c) => c.quic_connection().congestion_state(),
+      Self::Quic(c) => c.congestion_state(),
+    };
+    let metrics = controller.metrics();
+    CongestionMetrics {
+      window: metrics.congestion_window,
+      ssthresh: metrics.ssthresh,
+      model_pacing_rate_bps: metrics.pacing_rate,
     }
   }
 

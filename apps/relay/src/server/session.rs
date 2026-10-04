@@ -1149,6 +1149,7 @@ impl Session {
       context.connection_id,
       Arc::new(context.connection.clone()),
       Arc::new(client_setup),
+      context.server_config.write_kbps_limit,
     );
     let client = Arc::new(client);
     context.client_manager.add(client.clone()).await;
