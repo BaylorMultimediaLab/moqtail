@@ -54,18 +54,22 @@ impl CongestionController {
     }
   }
 
-  /// Initial congestion window in bytes of quinn-proto 0.11.16's default config
-  /// for this controller. Recorded, not configurable: the relay keeps quinn's
+  /// Initial congestion window in bytes of quinn's default config for this
+  /// controller, read from a controller built the way a connection builds it (at
+  /// quinn's 1200-byte initial MTU) rather than restated, so RELAY_CONFIG stays true
+  /// across a quinn upgrade. Recorded, not configurable: the relay keeps quinn's
   /// defaults for everything but the controller choice.
   pub fn default_initial_window_bytes(&self) -> u64 {
-    const BASE_DATAGRAM_SIZE: u64 = 1200;
+    use wtransport::quinn::congestion::ControllerFactory;
+    const INITIAL_MTU: u16 = 1200;
+    let now = std::time::Instant::now();
     match self {
-      // `14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE)`
-      CongestionController::Cubic => {
-        14720u64.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE)
-      }
-      // `K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE`
-      CongestionController::Bbr => 200 * BASE_DATAGRAM_SIZE,
+      CongestionController::Cubic => Arc::new(CubicConfig::default())
+        .build(now, INITIAL_MTU)
+        .initial_window(),
+      CongestionController::Bbr => Arc::new(BbrConfig::default())
+        .build(now, INITIAL_MTU)
+        .initial_window(),
     }
   }
 }
