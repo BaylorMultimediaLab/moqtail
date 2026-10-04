@@ -586,6 +586,41 @@ class DecisionJoin(TmpRun):
         self.assertEqual(d["t3_ms"], 1010)
 
 
+def landed_off_keyframe_then_superseded(seq: int, ts: float, frm: str, to: str, by: int) -> list[dict]:
+    """A switch whose landing object is not a keyframe and that a newer switch supersedes
+    before the keyframe gate let anything in: SWITCH_FIRST_OBJECT, no SWITCH_APPLIED."""
+    return switch(seq, ts, frm, to, land_after_ms=None, with_seq=True) + [
+        ev("SWITCH_FIRST_OBJECT", ts + 300, **{"from": frm, "to": to, "group": 40, "object": 7, "since_sent_ms": 300,
+                                               "landed_on_keyframe": False}, switch_seq=seq),
+        ev("SWITCH_SUPERSEDED", ts + 900, switch_seq=seq, by_switch_seq=by, playhead_ms=ts - T0, landed=True)]
+
+
+class KeyframeLandings(TmpRun):
+    """D3: landed_on_keyframe was read from SWITCH_APPLIED only, so a switch that landed on a
+    non-keyframe and was superseded before any append left the denominator."""
+
+    def test_landing_flag_from_first_object(self):
+        A, B = R[0], R[4]
+        client = startup(A) + landed_off_keyframe_then_superseded(1, T0 + 1000, A, B, by=2)
+        client += switch(2, T0 + 1500, A, R[2], with_seq=True)
+        client.append(first_frame(T0 + 4000, A, R[2], vis_ms=2500.0, seq=2))
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switches"]
+        self.assertEqual([x["landed_on_keyframe"] for x in sw["list"]], [False, True])
+        self.assertEqual((sw["landed_on_keyframe"], sw["landed_on_keyframe_known"]), (1, 2))   # before: 1 of 1
+
+    def test_applied_flag_is_the_fallback(self):
+        A, B = R[0], R[4]
+        client = startup(A) + switch(1, T0 + 1000, A, B)
+        for r in client:
+            if r["event"] == "SWITCH_FIRST_OBJECT":
+                del r["landed_on_keyframe"]          # bundles before 2026-10: the flag is on SWITCH_APPLIED only
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        self.assertEqual((s["switches"]["landed_on_keyframe"], s["switches"]["landed_on_keyframe_known"]), (1, 1))
+
+
 class Starvation(TmpRun):
     """M19: starvation is reported as a subset of stall time."""
 
@@ -611,7 +646,8 @@ class ValidateScript(TmpRun):
 
     def complete_run(self, *, run_end: bool = True, applied: bool = True, promoted: bool = True, with_seq: bool = False,
                      superseded_record: bool = True, validation: dict | None = None, mechanism_mode: str | None = None,
-                     rates: tuple = (6, 1.5), net_fields: dict | None = None, meta_extra: dict | None = None) -> Path:
+                     rates: tuple = (6, 1.5), net_fields: dict | None = None, meta_extra: dict | None = None,
+                     extra_client: list[dict] | None = None) -> Path:
         A, B = R[0], R[4]
         client = startup(A) + [ev("CLOCK_MAP", T0 - 1100, user_agent="Mozilla/5.0 Firefox/157.0")]
         client += switch(1, T0 + 1000, A, B, with_seq=with_seq) + switch(2, T0 + 2000, B, A, with_seq=with_seq)
@@ -619,6 +655,7 @@ class ValidateScript(TmpRun):
         if with_seq and superseded_record:
             client.append(ev("SWITCH_SUPERSEDED", T0 + 2500, switch_seq=1, by_switch_seq=2, playhead_ms=2500))
         client += samples(T0, T0 + 60_000, lambda t: A)
+        client += extra_client or []
         runner_recs = [runner("NET_CHANGE", T0 - 5000, rate_mbps=rates[0], at_s=0, applied=True, **(net_fields or {})),
                        runner("NET_CHANGE", T0 + 30_000, rate_mbps=rates[1], at_s=30, applied=applied, **(net_fields or {}))]
         if run_end:
@@ -728,6 +765,12 @@ class ValidateScript(TmpRun):
         self.assertEqual(st["pf-relay-gso"], "FAIL")
         _, st = self.validate(self.complete_run(), "--preflight")
         self.assertEqual(st["pf-relay-gso"], "SKIP")
+
+    def test_preflight_keyframe_counts_landings_superseded_before_append(self):
+        # D3: the off-keyframe landing has no SWITCH_APPLIED; pf-keyframe passed (2 of 2) before the fix.
+        extra = landed_off_keyframe_then_superseded(3, T0 + 5000, R[0], R[4], by=4) + switch(4, T0 + 5500, R[0], R[2], with_seq=True)
+        _, st = self.validate(self.complete_run(with_seq=True, mechanism_mode="forward-trigger", extra_client=extra), "--preflight")
+        self.assertEqual(st["pf-keyframe"], "FAIL")
 
     def test_preflight_requires_superseded_records_with_switch_seq(self):
         _, st = self.validate(self.complete_run(with_seq=True), "--preflight")

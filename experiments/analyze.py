@@ -177,6 +177,15 @@ def seam_hole(fframe: dict | None, tol_ms: float = 100.0) -> float | None:
     return hole if presented - seam > tol_ms else 0
 
 
+def landing_keyframe(first_object: dict | None, applied: dict | None) -> bool | None:
+    """landed_on_keyframe of the landing object: SWITCH_FIRST_OBJECT's flag (2026-10), else
+    SWITCH_APPLIED's (older bundles carry it there only); None when neither says."""
+    for r in (first_object, applied):
+        if r is not None and r.get("landed_on_keyframe") is not None:
+            return r["landed_on_keyframe"]
+    return None
+
+
 def playable_data_ahead(sample: dict, min_buffer_s: float = 0.5, min_later_range_s: float = 0.1) -> bool:
     """True when the SAMPLE shows data the player could have played: at least
     `min_buffer_s` buffered ahead of the playhead, or a buffered range beginning
@@ -894,7 +903,10 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             # Whether the target began on object 0 of its group (its keyframe).
             "landed_on_group_start": applied.get("landed_on_group_start") if applied else None,
             # Whether the landing object's moof carries the sync-sample flag (a real keyframe).
-            "landed_on_keyframe": applied.get("landed_on_keyframe") if applied else None,
+            # From SWITCH_FIRST_OBJECT (2026-10: the landing object), so a switch that landed
+            # off a keyframe and was superseded before the keyframe gate appended anything
+            # (no SWITCH_APPLIED) stays in the denominator; SWITCH_APPLIED for older bundles.
+            "landed_on_keyframe": landing_keyframe(fobj, applied),
             # Source-track objects that arrived after the target landed and were discarded
             # (the relay kept delivering the source's in-progress group).
             "seam_dropped_source_frames": sum(
