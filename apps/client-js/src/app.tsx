@@ -20,13 +20,18 @@ import { Player } from '@/lib/player';
 import { cn } from '@/lib/utils';
 import { Tuple, type CMSF } from 'moqtail';
 import MSEBuffer, { computeLiveEdgeDelay } from '@/lib/buffer';
-import { AbrController, AbrRulesCollection, DEFAULT_ABR_SETTINGS } from '@/lib/abr';
+import {
+  AbrController,
+  AbrRulesCollection,
+  DEFAULT_ABR_SETTINGS,
+  describeController,
+} from '@/lib/abr';
 import type { AbrMetrics, AbrSettings } from '@/lib/abr';
 import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
 import { events } from '@/lib/events/EventLog';
 import { targetShiftMs } from '@/lib/events/liveEdge';
 import type { MetricsSnapshot } from '@/lib/metrics/types';
-import { controllerArmParam, type ControllerArmParam } from '@/lib/runParams';
+import { controllerArmParam } from '@/lib/runParams';
 import { SettingsPanel } from '@/components/SettingsPanel';
 import { MetricsPanel } from '@/components/MetricsPanel';
 
@@ -332,10 +337,9 @@ export function App() {
     if (Number.isFinite(envMs) && envMs > 0) controller.bufferEnvelopeMs = envMs;
     const probe = params.get('probeMode');
     if (probe === 'on' || probe === 'off') controller.probeMode = probe;
-    // The controller arm (W5's AbrSettings.controller.arm). Typed loosely so this
-    // compiles on a base whose ControllerSettings has no `arm` yet.
+    // The controller arm; resolveControllerSettings derives the rest from it.
     const arm = controllerArmParam(params.get('controllerArm'));
-    if (arm !== null) (controller as typeof controller & { arm?: ControllerArmParam }).arm = arm;
+    if (arm !== null) controller.arm = arm;
     const rules = { ...DEFAULT_ABR_SETTINGS.rules };
     if (controller.switchHistoryMode === 'off') {
       rules.SwitchHistoryRule = { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false };
@@ -534,15 +538,16 @@ export function App() {
         const startupBitrate = videoTracks.find(t => t.name === videoTrack)?.bitrate ?? 0;
         player.seedThroughputEstimate(startupBitrate);
 
-        // ── Controller integration point (W5) ─────────────────────────────
+        // ── Controller integration point ──────────────────────────────────
         // The one place where the controller's settings become final, the
         // controller is built and wired, and RUN_META records them. Nothing
-        // overrides the settings afterwards (the __abrSettingsOverride hook
-        // is gone), so RUN_META is what runs. At integration: set
-        // controller.segmentDurationS = gopDurationMs / 1000, log
-        // describeController(effective settings) as RUN_META.controller, and
-        // wire onTrackSwitched(trackName).
-        const controllerSettings = abrSettings;
+        // overrides the settings afterwards, so RUN_META is what runs: the
+        // controller resolves its arm (resolveControllerSettings) and
+        // RUN_META logs exactly abr.settings and describeController of it.
+        const controllerSettings: AbrSettings = {
+          ...abrSettings,
+          controller: { ...abrSettings.controller, segmentDurationS: gopDurationMs / 1000 },
+        };
         const rulesCollection = new AbrRulesCollection(controllerSettings);
         const abr = new AbrController(
           player,
@@ -570,9 +575,9 @@ export function App() {
           gop_duration_ms: gopDurationMs,
           initial_bandwidth_bps: initialBw,
           startup_track: videoTrack,
-          abr_settings: controllerSettings,
-          controller: controllerSettings.controller,
-          controller_arm: runParams.controllerArm,
+          abr_settings: abr.settings,
+          controller: describeController(abr.settings),
+          controller_arm: abr.settings.controller.arm,
           ladder: videoTracks.map(t => ({
             track: t.name,
             bitrate: t.bitrate,
@@ -583,11 +588,11 @@ export function App() {
         rulesRef.current = rulesCollection;
         abrRef.current = abr;
         player.setOnTrackSwitched(trackName => {
-          abrRef.current?.releaseSwitchingGuard();
+          abrRef.current?.onTrackSwitched(trackName);
           setSelectedVideo(trackName);
         });
         player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());
-        player.setResetLatencyOnLanding(controllerSettings.controller.latencyResetOnLanding);
+        player.setResetLatencyOnLanding(abr.settings.controller.latencyResetOnLanding);
         // ── end of the controller integration point ───────────────────────
 
         await player.startMedia();
