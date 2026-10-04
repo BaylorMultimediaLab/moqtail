@@ -226,6 +226,31 @@ class SwitchIdentity(TmpRun):
         self.assertEqual(s["switches"]["superseded_frac"], 2 / 4)
 
 
+class SkippedAttempts(TmpRun):
+    """D7: SWITCH_SKIPPED is emitted WITHOUT a SWITCH_SENT and with its own switch_seq (an
+    attempt, not a switch); there is no `skipped` terminal."""
+
+    def test_skipped_is_an_attempt_not_a_terminal(self):
+        A, B = R[0], R[4]
+        self.assertNotIn("skipped", analyze.TERMINALS)
+        client = startup(A) + switch(1, T0 + 1000, A, B, with_seq=True)
+        client.append(first_frame(T0 + 3000, A, B, vis_ms=2000.0, seq=1))
+        client.append(ev("SWITCH_SKIPPED", T0 + 1200, switch_seq=2, **{"from": A, "to": R[2]}, reason="previous switch not landed",
+                         pending_request_id=2))
+        # A SKIPPED record that reuses a sent switch's seq (contract violation) still ends nothing.
+        client += switch(3, T0 + 4000, B, A, with_seq=True)
+        client.append(ev("SWITCH_SKIPPED", T0 + 4100, switch_seq=3, **{"from": B, "to": A}, reason="previous switch not landed",
+                         pending_request_id=6))
+        client.append(first_frame(T0 + 6000, B, A, vis_ms=2000.0, seq=3))
+        client += samples(T0, T0 + 8000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switches"]
+        self.assertEqual(sw["count"], 2)
+        self.assertEqual([x["terminal"] for x in sw["list"]], ["first_frame", "first_frame"])   # before: #3 was `skipped`
+        self.assertEqual(set(sw["terminals"]), set(analyze.TERMINALS))
+        self.assertEqual((sw["skipped_not_sent"], sw["skipped_attempts"]), (2, 2))
+
+
 class Censoring(unittest.TestCase):
     """M19: censored metrics summarised by the median of the runs where the event happened."""
 

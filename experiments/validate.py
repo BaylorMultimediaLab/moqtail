@@ -327,7 +327,7 @@ def main() -> int:
     client_end = max((r["ts"] for r in recs if r.get("src") == "client"), default=None)
     mech = identity.get("mechanism") or summary.get("mechanism")
     if mech in PROMOTING_MECHANISMS and switches:
-        due = [sw for sw in switches if sw["terminal"] not in ("error", "skipped")
+        due = [sw for sw in switches if sw["terminal"] != "error"
                and (client_end is None or sw["ts"] <= client_end - END_GRACE_MS)]
         missing_stamps = [sw for sw in due if sw.get("relay_promoted_ms") is None]
         rep.add("relay-stamps", not missing_stamps,

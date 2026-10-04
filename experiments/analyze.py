@@ -15,7 +15,8 @@ definitions"). In short, per run and over the last client session:
                          with ts <= record.ts and matching from AND to; every other
                          unresolved switch it overwrote is superseded). Every switch
                          ends in exactly one ``terminal``: first_frame, superseded,
-                         error, skipped or open (run ended first). Seam statistics
+                         error or open (run ended first); SWITCH_SKIPPED is an attempt
+                         that was never sent, not a switch. Seam statistics
                          (visibility, viewer pause, hole, jump) are computed only
                          over switches with their own SWITCH_FIRST_FRAME.
 * presented rung         time-weighted over SAMPLE intervals in which the playhead
@@ -51,7 +52,9 @@ import re
 import statistics
 from pathlib import Path
 
-TERMINALS = ("first_frame", "superseded", "error", "skipped", "open")
+# Terminal states of a switch (one SWITCH_SENT). SWITCH_SKIPPED is not one: the player emits it
+# instead of a SWITCH_SENT, with its own switch_seq (an attempt; switches.skipped_not_sent).
+TERMINALS = ("first_frame", "superseded", "error", "open")
 STALL_MIN_EPISODE_MS = 250.0
 FIT_SAFETY = 0.9
 SHARE_SETTLE_S = 5.0
@@ -235,7 +238,7 @@ def rule_name(rule_reason) -> str:
 _SWITCH_SLOTS = {"SWITCH_OK": "ok", "SWITCH_ERROR": "error", "SWITCH_SKIPPED": "skipped",
                  "SWITCH_FIRST_OBJECT": "first_object", "SWITCH_APPLIED": "applied",
                  "SWITCH_FIRST_FRAME": "first_frame", "SWITCH_SUPERSEDED": "superseded_rec", "SWITCH_FLOOR": "floor"}
-_SWITCH_RECORD_FIELDS = ("ok", "error", "skipped", "first_object", "applied", "first_frame", "superseded_rec", "floor")
+_SWITCH_RECORD_FIELDS = ("ok", "error", "first_object", "applied", "first_frame", "superseded_rec", "floor")
 
 
 def _fallback_join(joined: list[dict], r: dict, slot: str, diag: dict) -> dict | None:
@@ -255,13 +258,12 @@ def _fallback_join(joined: list[dict], r: dict, slot: str, diag: dict) -> dict |
       target (responses come back in order).
     * SWITCH_FLOOR (pr1378) precedes its SWITCH_SENT by at most a few ms and joins the
       next SWITCH_SENT.
-    * SWITCH_SKIPPED and SWITCH_SUPERSEDED need ``switch_seq``: old clients emitted
-      SWITCH_SKIPPED instead of a SWITCH_SENT (it is not a switch) and never emitted
-      SWITCH_SUPERSEDED.
+    * SWITCH_SUPERSEDED needs ``switch_seq`` (old clients never emitted it). SWITCH_SKIPPED
+      never joins (see ``join_switches``).
     Every unresolved switch that is not given a first frame here is classified later by
     ``join_switches`` (superseded when a later switch overwrote its seam, else open)."""
     ts = r.get("ts", 0)
-    if slot in ("skipped", "superseded_rec"):
+    if slot == "superseded_rec":
         return None
     if slot == "floor":
         return next((j for j in joined if j["floor"] is None and ts - 50 <= j["sent"]["ts"] <= ts + 2000), None)
@@ -288,8 +290,12 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
     terminal state. Join key: ``switch_seq`` when the records carry it, else the
     documented fallback (see ``_fallback_join``).
 
+    SWITCH_SKIPPED is never joined: the player emits it INSTEAD of a SWITCH_SENT, with a
+    switch_seq of its own, so it is an attempt that was not sent, not a switch; every
+    SWITCH_SKIPPED is counted in ``diag["unjoined"]["SWITCH_SKIPPED"]`` (switches.skipped_not_sent).
+
     Terminal (exactly one per switch, in this precedence): ``error`` (SWITCH_ERROR),
-    ``skipped`` (SWITCH_SKIPPED), ``first_frame`` (its own SWITCH_FIRST_FRAME),
+    ``first_frame`` (its own SWITCH_FIRST_FRAME),
     ``superseded`` (a SWITCH_SUPERSEDED record, or inferred when there is none: a later
     switch overwrote this one's pending state before its first frame, i.e. a later switch
     landed after this one landed, or a later switch was acknowledged (SWITCH_OK, which
@@ -311,7 +317,10 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         if slot is None:
             continue
         seq = r.get("switch_seq")
-        target = by_seq.get(seq) if seq is not None else _fallback_join(joined, r, slot, diag)
+        if slot == "skipped":
+            target = None
+        else:
+            target = by_seq.get(seq) if seq is not None else _fallback_join(joined, r, slot, diag)
         if target is None:
             diag["unjoined"][r["event"]] = diag["unjoined"].get(r["event"], 0) + 1
             continue
@@ -327,8 +336,6 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         j["superseded_by"], j["terminal_source"] = None, "record"
         if j["error"] is not None:
             j["terminal"] = "error"
-        elif j["skipped"] is not None:
-            j["terminal"] = "skipped"
         elif j["first_frame"] is not None:
             j["terminal"] = "first_frame"
             if j["superseded_rec"] is not None:
@@ -339,7 +346,7 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         else:
             later = None
             for k in joined[idx + 1:]:
-                if k["error"] is not None or k["skipped"] is not None:
+                if k["error"] is not None:
                     continue
                 if k["landed"] or k["first_frame"] is not None or (not j["landed"] and k["ok"] is not None):
                     later = k
@@ -901,7 +908,6 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "decided_ts": decision["ts"] if decision else None,
             "t2_decision_ms": (sent["ts"] - decision["ts"]) if decision else None,
             "t3_ok_ms": d(ok), "error": err.get("reason") if err else None,
-            "skipped_reason": j["skipped"].get("reason") if j["skipped"] else None,
             "relay_recv_ms": d(rrecv), "relay_promoted_ms": d(rprom),
             "relay_start_group": rprom.get("start_group") if rprom else None,
             # pr1378: the Minimum Switching Group the client asked for.
@@ -964,7 +970,6 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "up": sum(1 for s in switches if s["direction"] == "up"),
         "down": sum(1 for s in switches if s["direction"] == "down"),
         "failed": terminals["error"],
-        "skipped": terminals["skipped"],
         "landed": sum(1 for s in switches if s["landed"]),
         # Delivery-side stamps over every landed switch (mechanism metrics).
         "switch_delivery_latency_ms": stats([s["switch_delivery_latency_ms"] for s in switches]),
@@ -989,9 +994,10 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "decision_join": decision_diag,
         "guard_timeouts": len(by("ABR_GUARD_TIMEOUT")),
         "gated_slow_start": len(by("ABR_GATED")),
-        # SWITCH_SKIPPED records that belong to no SWITCH_SENT (clients before 2026-10-04
-        # skipped the request before sending it).
+        # SWITCH_SKIPPED: a switch attempt the player did not send (the previous switch had
+        # no alias yet). Emitted instead of a SWITCH_SENT, so never a switch (diagnostic).
         "skipped_not_sent": join_diag["unjoined"].get("SWITCH_SKIPPED", 0),
+        "skipped_attempts": len(by("SWITCH_SKIPPED")),
         "session_destroyed": any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR")),
     }
     out["switches"]["skipped_not_landed"] = out["switches"]["skipped_not_sent"]  # legacy name
@@ -1500,7 +1506,7 @@ def to_markdown(s: dict) -> str:
          "| metric | value |", "|---|---|",
          f"| run duration s (first frame to RUN_END); switches; switches/min | {fmt(s.get('run_duration_s'))}; {sw['count']}; {fmt(s['switching']['switches_per_minute'])} |",
          f"| A->B->A reversals (direction reversals) | {s['switching']['aba_reversals']} ({s['switching']['direction_reversals']}) |",
-         f"| switch terminals: first_frame / superseded / error / skipped / open | {sw['terminals']['first_frame']} / {sw['terminals']['superseded']} / {sw['terminals']['error']} / {sw['terminals']['skipped']} / {sw['terminals']['open']} (superseded frac {fmt(sw['superseded_frac'])}; join by {'switch_seq' if sw['join'].get('seq_join') else 'fallback'}) |",
+         f"| switch terminals: first_frame / superseded / error / open | {sw['terminals']['first_frame']} / {sw['terminals']['superseded']} / {sw['terminals']['error']} / {sw['terminals']['open']} (superseded frac {fmt(sw['superseded_frac'])}; join by {'switch_seq' if sw['join'].get('seq_join') else 'fallback'}) |",
          f"| presented rung mean / presented kbps (advancing time, source {br.get('presented_source')}) | {fmt(br.get('presented_rung_mean'))} / {fmt(br.get('presented_kbps'))} |",
          f"| subscribed rung mean / kbps (diagnostic, wall time) | {fmt(br.get('subscribed_rung_mean'))} / {fmt(br.get('subscribed_kbps'))} |",
          f"| fit share in the low window (fit rung {sh.get('fit_rung')}, rung at drop {sh.get('rung_at_drop')}) | {fmt(sh.get('fit_share_low'))} over {fmt(sh.get('low_window_advancing_s'))} s advancing |",
@@ -1525,7 +1531,7 @@ def to_markdown(s: dict) -> str:
          f"| probe load: probes / MB / mean Mbps; relay->client object latency ms p50 / p95 | {s['link']['probes']} / {s['link']['probe_bytes'] / 1e6:.1f} / {fmt(s['link']['probe_mbps'])}; {fmt(s['link']['send_recv_latency_ms'].get('p50'))} / {fmt(s['link']['send_recv_latency_ms'].get('p95'))} |",
          f"| discarded by the client (stale objects / groups / MB; pre-keyframe; unrouted bytes) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f}; {s['discarded']['pre_keyframe']}; {s['discarded'].get('unrouted_bytes')} |",
          f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
-         f"| switches (up / down / failed / skipped / landed) | {sw['count']} ({sw['up']} / {sw['down']} / {sw['failed']} / {sw['skipped']} / {sw['landed']}) |",
+         f"| switches (up / down / failed / landed); attempts skipped without a SWITCH_SENT | {sw['count']} ({sw['up']} / {sw['down']} / {sw['failed']} / {sw['landed']}); {sw['skipped_attempts']} |",
          f"| switch delivery latency ms, t4 (median / p95) | {fmt(sw['switch_delivery_latency_ms'].get('p50'))} / {fmt(sw['switch_delivery_latency_ms'].get('p95'))} |",
          f"| relay promoted ms (median / n of {sw['count']}) | {fmt(sw['relay_promoted_ms'].get('p50'))} / {sw['relay_promoted_ms'].get('n')} |",
          f"| media seam gap ms (median / max) | {fmt(sw['media_seam_gap_ms'].get('p50'))} / {fmt(sw['media_seam_gap_ms'].get('max'))} |",
@@ -1533,7 +1539,7 @@ def to_markdown(s: dict) -> str:
          f"| playback position jump ms (median / abs p95) | {fmt(sw['playback_position_jump_ms'].get('p50'))} / {fmt(sw['abs_playback_position_jump_ms'].get('p95'))} |",
          f"| seam buffer hole ms (median / max) | {fmt(sw['seam_buffer_hole_ms'].get('p50'))} / {fmt(sw['seam_buffer_hole_ms'].get('max'))} |",
          f"| seam dropped source frames (median / max); landed on object 0 | {fmt(sw['seam_dropped_source_frames'].get('p50'))} / {fmt(sw['seam_dropped_source_frames'].get('max'))}; {sw['landed_on_group_start']} of {sw['count']} |",
-         f"| join diagnostics: unjoined / duplicates / conflicting terminals; SKIPPED without SENT | {sw['join'].get('unjoined')} / {sw['join'].get('duplicates')} / {sw['join'].get('conflicting_terminals')}; {sw['skipped_not_sent']} |",
+         f"| join diagnostics: unjoined / duplicates / conflicting terminals; SWITCH_SKIPPED (not sent) | {sw['join'].get('unjoined')} / {sw['join'].get('duplicates')} / {sw['join'].get('conflicting_terminals')}; {sw['skipped_not_sent']} |",
          f"| playback advancing fraction / longest no-progress s / longest frozen with playable data s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} / {fmt((s['playback'].get('longest_frozen_with_data_ms') or 0) / 1000)} |",
          f"| detection attributable (per change: quiet before t0) | {s['detection_reliable']}; down t2/t4 {fmt(rx['down_t2_ms'])}/{fmt(rx['down_t4_ms'])} ms, up t2 {fmt(rx['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
          f"| inter-switch interval ms (median / min); switch span s | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])}; {fmt(s['switching']['switch_span_s'])} |",
