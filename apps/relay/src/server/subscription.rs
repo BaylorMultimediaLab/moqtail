@@ -1103,6 +1103,10 @@ impl Subscription {
               "old_track": current_track_name.as_ref().map(events::track_name_string),
               "old_last_sent_group": old_last_sent_max.as_ref().map(|l| l.group),
               "trigger_forwarded": false,
+              // When the promotion was decided (epoch ms). On the fixed native arm a
+              // held-back trigger's record is emitted after the joining replay, so its
+              // `ts` trails the decision; consumers use promoted_ts for the timeline.
+              "promoted_ts": events::now_ms(),
           });
           if forward_trigger || stash_trigger {
             *self.pending_promotion.lock().unwrap() = Some(record);
@@ -3068,6 +3072,17 @@ mod tests_forward_promotion_trigger {
     f.received.counts(NEW)
   }
 
+  /// The record carries the decision time, which never trails the emission
+  /// (`ts`); for a held-back trigger the emission follows the replay.
+  fn assert_promoted_ts_precedes_emission(p: &serde_json::Value) {
+    let decided = p["promoted_ts"].as_f64().expect("promoted_ts present");
+    let emitted = p["ts"].as_f64().expect("ts present");
+    assert!(
+      decided <= emitted,
+      "promoted_ts {decided} after ts {emitted}"
+    );
+  }
+
   fn promoted(conn: usize) -> serde_json::Value {
     let records = crate::server::events::test_capture::records("SWITCH_PROMOTED", conn);
     assert_eq!(records.len(), 1, "{records:?}");
@@ -3206,6 +3221,7 @@ mod tests_forward_promotion_trigger {
     assert_eq!(p["trigger_object"], 5);
     assert_eq!(p["start_group"], GS + 1, "the start is never moved");
     assert_eq!(p["trigger_forwarded"], true);
+    assert_promoted_ts_precedes_emission(&p);
   }
 
   /// R3-D1 case D-mid: trigger (g_s+3, 3), two groups past the start. Groups g_s+1
@@ -3230,6 +3246,7 @@ mod tests_forward_promotion_trigger {
     assert_eq!(arrival[0], (GS + 1, 0));
     assert_eq!(p["start_group"], GS + 1);
     assert_eq!(p["trigger_forwarded"], true);
+    assert_promoted_ts_precedes_emission(&p);
   }
 
   /// Flag off, the same two scenarios: the as-shipped outcome, pinned. The trigger
