@@ -336,9 +336,13 @@ export class Player {
         pending: vs?.pendingSwitch?.trackName ?? null,
       });
       events.emit('DROP_STALE', fields);
-      if (vs && typeof fields.track === 'string') {
-        vs.tracker.recordDiscardedBytes(info.bytes, info.groupId, fields.track);
-      }
+      // Attributed to its group if that group is open, else reported with the
+      // stream's next THROUGHPUT_SAMPLE as unrouted_bytes (F6).
+      vs?.tracker.recordDiscardedBytes(
+        info.bytes,
+        info.groupId,
+        typeof fields.track === 'string' ? fields.track : null,
+      );
     };
 
     // Debug-only escape hatch: lets the network test harness force a SWITCH
@@ -1183,7 +1187,13 @@ export class Player {
         bytes: sample.bytes,
         duration_ms: sample.durationMs,
         bps: sample.bps,
+        // Bytes of this group dropped by the player, plus library (unrouted)
+        // discards of this group while it was open.
         discarded_bytes: sample.discardedBytes,
+        // Library (unrouted) discards no open group could take (already
+        // sampled, never routed, or unknown track), any track, since this
+        // stream's previous sample; every such byte is reported once (F6).
+        unrouted_bytes: sample.unroutedBytes,
         objects: sample.objects,
         swma_bps: struct.tracker.getBandwidthBps(),
         fast_ema_bps: struct.tracker.getFastEmaBps(),

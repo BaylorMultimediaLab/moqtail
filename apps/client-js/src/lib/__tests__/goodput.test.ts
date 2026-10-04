@@ -394,4 +394,44 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       expect(out.filter(x => x.group === 5n)).toHaveLength(1);
     });
   });
+
+  describe('library-discarded (unrouted) bytes reach a sample (F6)', () => {
+    const group = (t: GoodputTracker, g: bigint, track: string, at: number) => {
+      const out = [];
+      for (let o = 0; o < 30; o++) {
+        out.push(...t.recordObject(1000, g, { recvAt: at + o, track, lastInGroup: o >= 29 }));
+      }
+      return out;
+    };
+
+    it("bytes of an open group are that group's discarded_bytes", () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      t.recordObject(1000, 4n, { recvAt: 1000, track: 'A', lastInGroup: false });
+      t.recordDiscardedBytes(5000, 4n, 'A');
+      const out = [];
+      for (let o = 1; o < 30; o++) {
+        out.push(
+          ...t.recordObject(1000, 4n, { recvAt: 1000 + o, track: 'A', lastInGroup: o >= 29 }),
+        );
+      }
+      expect(out).toHaveLength(1);
+      expect(out[0]!.discardedBytes).toBe(5000);
+      expect(out[0]!.unroutedBytes).toBe(0);
+    });
+
+    it('bytes of a group with no open accumulator (closed, or never routed) go out with the next sample of the stream, once', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      expect(group(t, 4n, 'A', 1000)).toHaveLength(1);
+      // The old track's trailing stream arrives after its alias was dropped:
+      // group 4 has already been sampled, group 5 never reached the player.
+      t.recordDiscardedBytes(7000, 4n, 'A');
+      t.recordDiscardedBytes(9000, 5n, 'A');
+      const next = group(t, 20n, 'B', 2000);
+      expect(next).toHaveLength(1);
+      expect(next[0]!.track).toBe('B');
+      expect(next[0]!.discardedBytes).toBe(0);
+      expect(next[0]!.unroutedBytes).toBe(16_000);
+      expect(group(t, 21n, 'B', 3000)[0]!.unroutedBytes).toBe(0);
+    });
+  });
 });

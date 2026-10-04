@@ -76,8 +76,21 @@ export interface GroupSample {
   /** recvAt(last) − recvAt(first), ms. */
   durationMs: number;
   bps: number;
-  /** Bytes of this group dropped by the player or the library (any object). */
+  /**
+   * Bytes of this group dropped by the player (objects that were received,
+   * hence also in `bytes`/`objects` when timed), plus bytes of this (track,
+   * group) the library discarded (unrouted streams) while this group's
+   * accumulator was open.
+   */
   discardedBytes: number;
+  /**
+   * Library-discarded (unrouted) bytes that no open group could take: the
+   * group had already produced its sample, never reached the player, or the
+   * library no longer knew its track. Accumulated over the whole stream
+   * (any track, any group) since the previous sample and reported once, with
+   * the next sample of this stream (F6). They never enter the timed span.
+   */
+  unroutedBytes: number;
   objects: number;
 }
 
@@ -124,6 +137,8 @@ export class GoodputTracker {
   // objects and bytes folded into them (F5).
   #closed = new Map<string, { objects: number; bytes: number }>();
   #lateObjects = 0;
+  // Unrouted bytes with no open group to take them, until the next sample (F6).
+  #unroutedPending = 0;
   /** A group with no object for this long is finalised whatever else happens (ms). */
   #abandonMs: number;
 
@@ -224,13 +239,18 @@ export class GoodputTracker {
   }
 
   /**
-   * Bytes of `groupId` on `track` that were discarded without being delivered
-   * as objects (the library cancelled an unrouted stream). Added to the
-   * group's `discardedBytes` if that group is still open; not timed.
+   * Bytes of `groupId` on `track` that the library discarded without
+   * delivering them as objects (it cancelled a stream whose alias had no
+   * route; `track` null when it no longer knew the alias). Never timed. If
+   * that (track, group) is open they become its `discardedBytes`; otherwise
+   * (already sampled, never routed, or unknown track) they are reported as
+   * `unroutedBytes` with the next sample of this stream, whatever its track,
+   * so every byte reaches exactly one THROUGHPUT_SAMPLE (F6).
    */
-  recordDiscardedBytes(bytes: number, groupId: bigint, track: string): void {
-    const g = this.#open.get(`${track}\u0000${groupId}`);
+  recordDiscardedBytes(bytes: number, groupId: bigint, track: string | null): void {
+    const g = track !== null ? this.#open.get(`${track}\u0000${groupId}`) : undefined;
     if (g !== undefined) g.discardedBytes += bytes;
+    else this.#unroutedPending += bytes;
   }
 
   /** Conservative bandwidth: average of the SWMA window. 0 until first group completes. */
@@ -314,6 +334,7 @@ export class GoodputTracker {
     this.#open.clear();
     this.#closed.clear();
     this.#lateObjects = 0;
+    this.#unroutedPending = 0;
     this.#lastObjectBytes = 0;
     this.#lastGroupDurationMs = 0;
     this.#lastGroupBps = 0;
@@ -355,6 +376,8 @@ export class GoodputTracker {
     }
 
     this.#updateEma(groupBps, dtMs);
+    const unroutedBytes = this.#unroutedPending;
+    this.#unroutedPending = 0;
     return {
       track: g.track,
       group: g.group,
@@ -362,6 +385,7 @@ export class GoodputTracker {
       durationMs: dtMs,
       bps: groupBps,
       discardedBytes: g.discardedBytes,
+      unroutedBytes,
       objects: g.objects,
     };
   }
