@@ -148,17 +148,20 @@ pub(crate) struct MOQTClient {
 }
 
 impl MOQTClient {
+  /// `write_kbps_limit` is the configured per-connection write cap (0 = none); the
+  /// session passes `AppConfig::write_kbps_limit`.
   pub(crate) fn new(
     connection_id: usize,
     connection: Arc<TransportConnection>,
     client_setup: Arc<Setup>,
+    write_kbps_limit: u64,
   ) -> Self {
     let mut send_streams = Vec::with_capacity(SEND_STREAM_PARTITION_COUNT);
     for _ in 0..SEND_STREAM_PARTITION_COUNT {
       send_streams.push(Arc::new(RwLock::new(HashMap::new())));
     }
 
-    let kbps = crate::server::config::AppConfig::load().write_kbps_limit;
+    let kbps = write_kbps_limit;
     let rate_limiter = if kbps > 0 {
       Some(Arc::new(Mutex::new(TokenBucket::new(kbps))))
     } else {
@@ -480,10 +483,14 @@ impl MOQTClient {
       rl.lock().await.consume(object.len()).await;
     }
 
+    // M21: a failed write is an error to the caller. It used to be swallowed, so
+    // OBJECT_SENT.sent read true and last_sent_max_location advanced for objects
+    // that were never handed to QUIC, and the next switch's start group was then
+    // computed from them.
     if let Some(s) = send_stream {
       let mut stream = s.lock().await;
       match stream.write_all(&object).await {
-        Ok(..) => {}
+        Ok(..) => Ok(()),
         Err(e) => {
           if let TransportWriteError::ClosedOrStopped = &e {
             warn!(
@@ -496,17 +503,24 @@ impl MOQTClient {
             let mut send_streams = stream_map.write().await;
             send_streams.remove(stream_id.get_stream_id().as_str());
           }
+          Err(anyhow::anyhow!(
+            "write to stream {} failed for connection_id {}: {}",
+            stream_id,
+            self.connection_id,
+            e
+          ))
         }
-      };
-      Ok(())
+      }
     } else {
       warn!(
         "write_stream_object | Send stream not found for {} connection_id: {}",
         stream_id, self.connection_id
       );
-      // This is not an error. The stream already started, wait for the next group...
-      // Err(anyhow::anyhow!("Send stream not found ({})", stream_id))
-      Ok(())
+      Err(anyhow::anyhow!(
+        "send stream not found ({}) for connection_id {}",
+        stream_id,
+        self.connection_id
+      ))
     }
   }
 
@@ -839,5 +853,111 @@ mod tests {
         "Multiple calls should produce same partition for same stream_id"
       );
     }
+  }
+}
+
+/// M21: `write_stream_object` reports what QUIC accepted. Over a real loopback
+/// connection, so the failures are the ones the relay meets in a run.
+#[cfg(test)]
+mod tests_write_stream_object {
+  use super::*;
+  use crate::server::test_support::{quic_pair, relay_client, wait_until};
+
+  fn header() -> Bytes {
+    Bytes::from_static(b"hdr")
+  }
+
+  #[tokio::test]
+  async fn write_to_an_open_stream_succeeds() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+    let stream_id = StreamId::new_subgroup(1, 0, Some(0));
+    let stream = client.open_stream(&stream_id, header(), 0).await.unwrap();
+    client
+      .write_stream_object(&stream_id, 0, Bytes::from_static(b"obj0"), Some(stream))
+      .await
+      .expect("a write to an open stream is accepted");
+  }
+
+  /// There was a comment saying a missing stream "is not an error"; it is one, or
+  /// OBJECT_SENT.sent reads true for an object that went nowhere.
+  #[tokio::test]
+  async fn write_to_an_unknown_stream_is_an_error() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+    let stream_id = StreamId::new_subgroup(1, 42, Some(0));
+    let res = client
+      .write_stream_object(&stream_id, 0, Bytes::from_static(b"obj0"), None)
+      .await;
+    assert!(res.is_err(), "no stream was opened for this id");
+  }
+
+  /// The peer's STOP_SENDING used to be logged and reported as Ok.
+  #[tokio::test]
+  async fn write_after_the_peer_stops_the_stream_is_an_error_and_drops_the_stream() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+    let stream_id = StreamId::new_subgroup(1, 0, Some(0));
+    let stream = client.open_stream(&stream_id, header(), 0).await.unwrap();
+    client
+      .write_stream_object(
+        &stream_id,
+        0,
+        Bytes::from_static(b"obj0"),
+        Some(stream.clone()),
+      )
+      .await
+      .unwrap();
+
+    let recv = peer.accept_uni().await.expect("peer sees the stream");
+    recv.stop(0x10);
+
+    // STOP_SENDING takes a round trip to land; until then writes are buffered.
+    let failed = wait_until(Duration::from_secs(5), || {
+      let client = client.clone();
+      let stream = stream.clone();
+      let stream_id = stream_id.clone();
+      async move {
+        client
+          .write_stream_object(&stream_id, 1, Bytes::from_static(b"obj1"), Some(stream))
+          .await
+          .is_err()
+      }
+    })
+    .await;
+    assert!(
+      failed,
+      "a write after STOP_SENDING must be reported as an error"
+    );
+    assert!(
+      client.get_stream(&stream_id).await.is_none(),
+      "a stopped stream is dropped from the send-stream map"
+    );
+  }
+
+  /// The whole connection going away is reported too (ConnectionLost).
+  #[tokio::test]
+  async fn write_after_the_connection_closed_is_an_error() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+    let stream_id = StreamId::new_subgroup(1, 0, Some(0));
+    let stream = client.open_stream(&stream_id, header(), 0).await.unwrap();
+    peer.close(0, b"bye");
+    let failed = wait_until(Duration::from_secs(5), || {
+      let client = client.clone();
+      let stream = stream.clone();
+      let stream_id = stream_id.clone();
+      async move {
+        client
+          .write_stream_object(&stream_id, 1, Bytes::from_static(b"obj1"), Some(stream))
+          .await
+          .is_err()
+      }
+    })
+    .await;
+    assert!(
+      failed,
+      "a write after the connection closed must be an error"
+    );
   }
 }
