@@ -115,13 +115,22 @@ export interface AbrPlayerMetrics {
 /** What the controller needs from the player. `Player` satisfies it structurally. */
 export interface AbrPlayer {
   getMetrics(): AbrPlayerMetrics;
-  switchTrack(trackName: string): Promise<void>;
+  /** Sends a switch; resolves to its `switch_seq` when the player numbers switches. */
+  switchTrack(trackName: string): Promise<unknown>;
+  /**
+   * `switch_seq` the last switchTrack call allocated, readable synchronously
+   * right after the call (Player sets it before its first await); null or
+   * absent when the player does not number switches (F14).
+   */
+  readonly lastSwitchSeq?: number | null;
   setEmaHalfLives(fastHalfLifeSeconds: number, slowHalfLifeSeconds: number): void;
   probeTrackBandwidth(trackName: string, durationMs: number): Promise<number | ProbeResult>;
 }
 
 /** A switch that has been sent and not yet confirmed by the player (see onTrackSwitched). */
 interface PendingSwitch {
+  /** The player's `switch_seq` for this switch (null when it does not number switches). */
+  switchSeq: number | null;
   fromTrack: string;
   toTrack: string;
   fromIndex: number;
@@ -308,12 +317,15 @@ export class AbrController {
    *
    * Without an argument (legacy wiring) the landed track is read from
    * `player.getMetrics().activeTrack`, which the player updates before it calls
-   * back.
+   * back. `switchSeq` (the player's `switch_seq` of the switch the callback is
+   * about) picks the pending record exactly; ABR_DECISION and
+   * ABR_SWITCH_PHANTOM carry it as `switch_seq` (F14).
    */
-  onTrackSwitched(landedTrack?: string): void {
+  onTrackSwitched(landedTrack?: string, switchSeq?: number): void {
     const m = this.#player.getMetrics();
     const landed = landedTrack ?? m.activeTrack ?? null;
-    const pending = this.#resolvePending(landed);
+    const pending = this.#resolvePending(landed, switchSeq);
+    const seq = pending?.switchSeq ?? switchSeq ?? null;
     this.#lastSampleCount = m.sampleCount;
     // Defer actually clearing #switching until totalVideoFrames advances past
     // the snapshot — that's when MSE has decoded an actual frame from the new
@@ -326,12 +338,14 @@ export class AbrController {
     if (!isLanding) {
       if (pending) {
         events.emit('ABR_SWITCH_PHANTOM', {
+          switch_seq: seq,
           from: pending.fromTrack,
           to: pending.toTrack,
           landed,
           reason: pending.reason,
           rule_reason: pending.ruleReason,
           decided_ms_ago: Date.now() - pending.decidedTs,
+          decided_ts: pending.decidedTs,
         });
       }
       return;
@@ -346,6 +360,7 @@ export class AbrController {
     if (pending) {
       this.#recordHistory(pending);
       events.emit('ABR_DECISION', {
+        switch_seq: seq,
         from: pending.fromTrack,
         to: pending.toTrack,
         from_index: pending.fromIndex,
@@ -387,14 +402,27 @@ export class AbrController {
   }
 
   /**
-   * The unresolved decision a callback with `landed` resolves, removed from
-   * the pending list: the newest one whose target is `landed` (a landing; it
-   * and every older record are done, since an older switch can no longer land
-   * once a newer one has), else the newest one (a refusal of the latest
-   * switch, ABR_SWITCH_PHANTOM). Null when nothing is pending.
+   * The unresolved decision a callback resolves, removed from the pending
+   * list. With the player's `switchSeq` it is the record of that switch (F14);
+   * a seq no record carries is a switch the controller did not decide (null),
+   * unless some records were never numbered, which are then matched by track.
+   * By track: the newest record whose target is `landed` (a landing), else the
+   * newest one (a refusal of the latest switch, ABR_SWITCH_PHANTOM). A landing
+   * also resolves every older record: an older switch can no longer land once
+   * a newer one has. Null when nothing matches.
    */
-  #resolvePending(landed: string | null): PendingSwitch | null {
+  #resolvePending(landed: string | null, switchSeq?: number): PendingSwitch | null {
     const list = this.#pendingSwitches;
+    if (switchSeq !== undefined) {
+      const i = list.findIndex(p => p.switchSeq === switchSeq);
+      if (i >= 0) {
+        const rec = list[i]!;
+        if (rec.toTrack === landed) list.splice(0, i + 1);
+        else list.splice(i, 1);
+        return rec;
+      }
+      if (!list.some(p => p.switchSeq === null)) return null;
+    }
     for (let i = list.length - 1; i >= 0; i--) {
       if (list[i]!.toTrack === landed) {
         const rec = list[i]!;
@@ -405,10 +433,24 @@ export class AbrController {
     return list.pop() ?? null;
   }
 
-  /** A switch was sent: its record waits for its callback (bounded; the oldest is forgotten). */
-  #addPending(rec: PendingSwitch): void {
+  /**
+   * Sends the switch of `rec` and keeps the record for its callback (bounded;
+   * the oldest is forgotten). The record takes the player's `switch_seq`:
+   * read synchronously (the player may call back before its promise
+   * resolves), else from the resolved value.
+   */
+  #send(rec: PendingSwitch): void {
     this.#pendingSwitches.push(rec);
     if (this.#pendingSwitches.length > MAX_PENDING_SWITCHES) this.#pendingSwitches.shift();
+    const sent = this.#player.switchTrack(rec.toTrack);
+    const seq = this.#player.lastSwitchSeq;
+    if (typeof seq === 'number') rec.switchSeq = seq;
+    void Promise.resolve(sent).then(
+      v => {
+        if (rec.switchSeq === null && typeof v === 'number') rec.switchSeq = v;
+      },
+      () => {},
+    );
   }
 
   /** @deprecated Use onTrackSwitched(trackName); kept for the existing app.tsx wiring. */
@@ -480,7 +522,8 @@ export class AbrController {
     const fromTrack = m.activeTrack ?? '';
     const fromIndex = this.#tracks.findIndex(t => t.name === fromTrack);
     const toIndex = this.#tracks.findIndex(t => t.name === trackName);
-    this.#addPending({
+    this.#send({
+      switchSeq: null,
       fromTrack,
       toTrack: trackName,
       fromIndex,
@@ -502,7 +545,6 @@ export class AbrController {
       msPastSeam: msPastSeamOf(m),
       decidedTs: Date.now(),
     });
-    void this.#player.switchTrack(trackName);
   }
 
   getHistory(): SwitchEvent[] {
@@ -853,7 +895,8 @@ export class AbrController {
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
-    this.#addPending({
+    this.#send({
+      switchSeq: null,
       fromTrack: activeTrack ?? '',
       toTrack: targetTrack.name,
       fromIndex: currentIdx,
@@ -875,7 +918,6 @@ export class AbrController {
       msPastSeam: msPastSeamOf(raw),
       decidedTs: Date.now(),
     });
-    void this.#player.switchTrack(targetTrack.name);
   }
 
   #updateDynamicStrategy(bufferLevel: number): void {

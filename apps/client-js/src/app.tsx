@@ -585,8 +585,8 @@ export function App() {
         });
         rulesRef.current = rulesCollection;
         abrRef.current = abr;
-        player.setOnTrackSwitched(trackName => {
-          abrRef.current?.onTrackSwitched(trackName);
+        player.setOnTrackSwitched((trackName, switchSeq) => {
+          abrRef.current?.onTrackSwitched(trackName, switchSeq);
           setSelectedVideo(trackName);
         });
         player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());

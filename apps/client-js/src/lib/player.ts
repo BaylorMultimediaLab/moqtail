@@ -104,8 +104,13 @@ export interface PlayerOptions {
   receiveCatalogViaSubscribe?: boolean;
   /** Catalog location (default: group 0, object 1) */
   catalogLocation?: [Location, Location];
-  /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
-  onTrackSwitched?: (trackName: string) => void;
+  /**
+   * Called when a switchTrack() completes (success or failure) with the track
+   * the player is now on and the switch's `switch_seq` (undefined only when
+   * the switch failed before a number was allocated). Releases the ABR
+   * switching guard.
+   */
+  onTrackSwitched?: (trackName: string, switchSeq?: number) => void;
   /** Called when the first frame of a switched-to track is presented (the seam became visible). */
   onSwitchVisible?: (trackName: string) => void;
   /** Pre-connect: 'time-shifted' clients subscribe behind live by `timeShiftSeconds`; 'live-edge' is today's behavior. */
@@ -129,7 +134,7 @@ const DefaultOptions = {
   namespace: Tuple.fromUtf8Path('/moqtail'),
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
-  onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
+  onTrackSwitched: undefined as ((trackName: string, switchSeq?: number) => void) | undefined,
   onSwitchVisible: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'live-edge' as 'time-shifted' | 'live-edge',
   timeShiftSeconds: 0,
@@ -304,6 +309,8 @@ export class Player {
   // Video appends that landed inside a gap (buffered media after them): the
   // fills the gap-crossing policy waits for (F4).
   #gapFills = new GapFillLog();
+  // switch_seq allocated by the latest switchTrack call (F14).
+  #lastSwitchSeq: number | null = null;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -351,8 +358,9 @@ export class Player {
     // for production use — direct switchTrack() calls bypass the ABR
     // switching guard's bookkeeping.
     if (typeof window !== 'undefined') {
-      (window as Window & { __forceSwitch?: (trackName: string) => Promise<void> }).__forceSwitch =
-        (trackName: string) => this.switchTrack(trackName);
+      (
+        window as Window & { __forceSwitch?: (trackName: string) => Promise<number | null> }
+      ).__forceSwitch = (trackName: string) => this.switchTrack(trackName);
     }
 
     // Fetch the catalog
@@ -847,7 +855,7 @@ export class Player {
                 // Keep the pipeline alive: retry the init before the next object
                 // append and drop this object (it cannot be decoded without it).
                 struct.pendingInit = { mimeType, initData, attempts: 1 };
-                this.#options.onTrackSwitched?.(newTrackName);
+                this.#options.onTrackSwitched?.(newTrackName, record.seq);
                 this.#seams.discarded();
                 this.#dropStale(struct, object, objectTrackName, {
                   track: objectTrackName,
@@ -863,7 +871,7 @@ export class Player {
 
               // NOW release the ABR switching guard — the relay has completed the
               // transition and delivered data on the new track. Safe to switch again.
-              this.#options.onTrackSwitched?.(newTrackName);
+              this.#options.onTrackSwitched?.(newTrackName, record.seq);
             }
 
             // Publisher emits one moof+mdat per access unit (see apps/publisher/src/cmaf.rs),
@@ -1681,7 +1689,7 @@ export class Player {
    * Called by app.tsx after creating the Player and AbrController,
    * to wire the ABR switching guard release without a circular dependency.
    */
-  setOnTrackSwitched(cb: (trackName: string) => void): void {
+  setOnTrackSwitched(cb: (trackName: string, switchSeq?: number) => void): void {
     this.#options.onTrackSwitched = cb;
   }
 
@@ -1704,12 +1712,15 @@ export class Player {
    * Fire-and-forget from AbrController: do NOT await this externally.
    * The #switching guard in AbrController is released via onTrackSwitched callback.
    */
-  async switchTrack(trackName: string): Promise<void> {
-    if (!this.client) return;
-    if (!this.catalog) return;
+  async switchTrack(trackName: string): Promise<number | null> {
+    // Set synchronously below once a number is allocated, so the caller can
+    // read it right after the call returns its promise (F14).
+    this.#lastSwitchSeq = null;
+    if (!this.client) return null;
+    if (!this.catalog) return null;
 
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    if (!videoStruct) return;
+    if (!videoStruct) return null;
 
     const fullTrackName = getFullTrackName(this.#options.namespace, trackName);
     const initData = this.catalog.getInitData(trackName);
@@ -1719,7 +1730,7 @@ export class Player {
     if (!initData || !role || !codec) {
       logger.error('media', `switchTrack: missing catalog data for track ${trackName}`);
       this.#options.onTrackSwitched?.(videoStruct.trackName);
-      return;
+      return null;
     }
 
     const mimeType = `${role}/mp4; codecs="${codec}"`;
@@ -1752,16 +1763,18 @@ export class Player {
         'media',
         `switchTrack: previous switch has not landed; skipping switch to ${trackName}`,
       );
+      // Not sent, so no SWITCH_SENT; the attempt still gets its own number.
+      const skippedSeq = this.#seams.allocateSeq();
+      this.#lastSwitchSeq = skippedSeq;
       events.emit('SWITCH_SKIPPED', {
-        // Not sent, so no SWITCH_SENT; the attempt still gets its own number.
-        switch_seq: this.#seams.allocateSeq(),
+        switch_seq: skippedSeq,
         from: videoStruct.trackName,
         to: trackName,
         reason: 'previous switch not landed',
         pending_request_id: subscriptionRequestId,
       });
-      this.#options.onTrackSwitched?.(videoStruct.trackName);
-      return;
+      this.#options.onTrackSwitched?.(videoStruct.trackName, skippedSeq);
+      return skippedSeq;
     }
     const newRequestId = this.client.allocateNextRequestId();
     videoStruct.requestId = newRequestId;
@@ -1771,6 +1784,7 @@ export class Player {
       appendFrontMs: videoStruct.lastAppendedEndPTS_ms,
       sentAt: switchSentAt,
     });
+    this.#lastSwitchSeq = record.seq;
     events.emit('SWITCH_SENT', {
       switch_seq: record.seq,
       from: videoStruct.trackName,
@@ -1814,8 +1828,8 @@ export class Player {
         // Roll back the optimistic id update so the next switchTrack attempt
         // references the still-active subscription rather than the failed one.
         videoStruct.requestId = subscriptionRequestId;
-        this.#options.onTrackSwitched?.(videoStruct.trackName);
-        return;
+        this.#options.onTrackSwitched?.(videoStruct.trackName, record.seq);
+        return record.seq;
       }
 
       // Arm the write handler for init segment re-injection at the next group
@@ -1849,8 +1863,19 @@ export class Player {
       });
       // Roll back the optimistic id update on unexpected failure too.
       videoStruct.requestId = subscriptionRequestId;
-      this.#options.onTrackSwitched?.(videoStruct.trackName);
+      this.#options.onTrackSwitched?.(videoStruct.trackName, record.seq);
     }
+    return record.seq;
+  }
+
+  /**
+   * `switch_seq` of the most recent switchTrack call, set synchronously during
+   * the call (null when it returned before allocating one). The controller
+   * stores it on its pending record so ABR_DECISION / ABR_SWITCH_PHANTOM name
+   * the switch they decided (F14).
+   */
+  get lastSwitchSeq(): number | null {
+    return this.#lastSwitchSeq;
   }
 
   /**

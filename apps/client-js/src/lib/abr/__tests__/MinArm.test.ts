@@ -797,3 +797,70 @@ describe('min arm: (k) a switch that lands after its guard timed out (F7)', () =
     expect(phantoms.map(c => (c[1] as Record<string, unknown>).to)).toEqual(['1080p']);
   });
 });
+
+describe('min arm: (l) ABR_DECISION and ABR_SWITCH_PHANTOM carry the switch_seq (F14)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  /** A player that numbers its switches like Player.switchTrack (lastSwitchSeq, resolved seq). */
+  const numbered = (h: ReturnType<typeof harness>, first = 41) => {
+    let n = first;
+    const p = h.player as unknown as { lastSwitchSeq: number | null };
+    p.lastSwitchSeq = null;
+    h.player.switchTrack.mockImplementation(async () => {
+      p.lastSwitchSeq = ++n;
+      return n;
+    });
+  };
+
+  it('the landing decision and the phantom name the seq of the switch they decided', async () => {
+    vi.useFakeTimers();
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    numbered(h);
+    await h.tick(); // seq 42: 360p -> 720p
+    vi.advanceTimersByTime(3_100);
+    await h.tick(); // guard timeout
+    vi.advanceTimersByTime(5_100);
+    await h.tick({ bandwidthBps: 10_000_000 }); // seq 43: 360p -> 1080p
+    expect(h.switches()).toEqual(['720p', '1080p']);
+    // The player resolves each callback with the switch's seq.
+    h.controller.onTrackSwitched('360p', 43);
+    h.set({ activeTrack: '720p' });
+    h.controller.onTrackSwitched('720p', 42);
+    const phantom = emit.mock.calls.find(c => c[0] === 'ABR_SWITCH_PHANTOM')![1];
+    const decision = emit.mock.calls.find(c => c[0] === 'ABR_DECISION')![1];
+    expect(phantom).toMatchObject({ switch_seq: 43, to: '1080p' });
+    expect(typeof (phantom as Record<string, unknown>).decided_ts).toBe('number');
+    expect(decision).toMatchObject({ switch_seq: 42, to: '720p' });
+    expect(typeof (decision as Record<string, unknown>).decided_ts).toBe('number');
+  });
+
+  it('matches by seq, not by track: a callback for an older switch to the same target resolves that one', async () => {
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    numbered(h);
+    await h.tick(); // seq 42 -> 720p
+    h.controller.onTrackSwitched('360p', 42); // refused
+    await h.tick(); // seq 43 -> 720p again
+    h.set({ activeTrack: '720p' });
+    h.controller.onTrackSwitched('720p', 43);
+    const seqs = (name: string) =>
+      emit.mock.calls
+        .filter(c => c[0] === name)
+        .map(c => (c[1] as Record<string, unknown>).switch_seq);
+    expect(seqs('ABR_SWITCH_PHANTOM')).toEqual([42]);
+    expect(seqs('ABR_DECISION')).toEqual([43]);
+  });
+
+  it('without a numbering player the fields are null', async () => {
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    await h.tick();
+    h.land('720p');
+    const decision = emit.mock.calls.find(c => c[0] === 'ABR_DECISION')![1];
+    expect(decision).toMatchObject({ switch_seq: null });
+  });
+});
