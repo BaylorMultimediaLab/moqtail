@@ -1,5 +1,5 @@
 import type { AbrRule, AbrSettings, RulesContext, SwitchRequest } from './types';
-import { SwitchRequestPriority } from './types';
+import { SwitchRequestPriority, resolveControllerSettings } from './types';
 import { ThroughputRule } from './rules/ThroughputRule';
 import { BolaRule } from './rules/BolaRule';
 import { ProbeRule } from './rules/ProbeRule';
@@ -11,6 +11,7 @@ import { DroppedFramesRule } from './rules/DroppedFramesRule';
 import { AbandonRequestsRule } from './rules/AbandonRequestsRule';
 import { L2ARule } from './rules/L2ARule';
 import { LoLpRule } from './rules/LoLpRule';
+import { EmergencyBufferRule } from './rules/EmergencyBufferRule';
 
 interface RuleEntry {
   rule: AbrRule;
@@ -21,7 +22,13 @@ export class AbrRulesCollection {
   readonly #rules: Map<string, RuleEntry>;
   #shouldUseBolaRule: boolean;
 
-  constructor(settings: AbrSettings) {
+  constructor(rawSettings: AbrSettings) {
+    // The arm decides the active set (types.ts resolveControllerSettings); the
+    // caller passes the same raw settings it gives AbrController.
+    const settings = resolveControllerSettings(rawSettings);
+    // Registration order is also the tie-break order of the arbiter (see
+    // getMinSwitchRequest): earlier rules win attribution at equal index and
+    // priority. New rules go last so the record of the earlier arms is stable.
     const allRules: AbrRule[] = [
       new ThroughputRule(),
       new BolaRule(),
@@ -34,6 +41,7 @@ export class AbrRulesCollection {
       new AbandonRequestsRule(),
       new L2ARule(),
       new LoLpRule(),
+      new EmergencyBufferRule(),
     ];
 
     this.#rules = new Map();

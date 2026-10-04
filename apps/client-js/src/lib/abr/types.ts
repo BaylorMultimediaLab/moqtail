@@ -46,6 +46,30 @@ export interface RuleConfig {
 }
 
 /**
+ * Which rule set the controller runs (`AbrSettings.controller.arm`;
+ * `?controllerArm=` in the player URL, `--controller` in the runner).
+ *
+ * - `baseline`: the controller as shipped; every stabilisation knob below at
+ *   its default.
+ * - `grid`: the frozen ablation controller (docs/abr-controller.md 9.7, 9.9).
+ *   The arm itself changes nothing: its knobs (`latencyResetOnLanding`,
+ *   `bufferSignal`, `switchHistoryMode`, `switchHistoryWindowS`,
+ *   `probeMaxBytes`) are passed explicitly, so the earlier ablation arms stay
+ *   reproducible. Kept for the ablation record only.
+ * - `min`: the paper controller (docs/rebuild-2026-10-04.md, "Controller
+ *   min"). `resolveControllerSettings` derives the whole configuration from
+ *   the arm: ThroughputRule, EmergencyBufferRule and SwitchHistoryRule (veto,
+ *   60 s window) on, every other rule and the probe off, the envelope of the
+ *   contiguous buffer as the buffer signal, and an up-switch dwell of
+ *   `upDwellGroups` completed groups since the last landing. Its own constants
+ *   (`upDwellGroups`, `historyIgnoreGroupsAfterLanding`,
+ *   `switchHistoryWindowS`, `bufferEnvelopeMs`, `bandwidthSafetyFactor`, the
+ *   EmergencyBufferRule parameters) stay tunable; the pinned knobs are
+ *   overridden whatever the caller passes.
+ */
+export type ControllerArm = 'min' | 'grid' | 'baseline';
+
+/**
  * Controller stabilisation parameters. Every one of them is off in the
  * defaults (the baseline controller); the experiment runner turns them on per
  * ablation arm and records them in RUN_META. They are deliberately separate
@@ -53,6 +77,26 @@ export interface RuleConfig {
  * post-switch up-guard addresses control-loop frequency.
  */
 export interface ControllerSettings {
+  /** The rule set (see ControllerArm). The controller selects everything else from it when `min`. */
+  arm: ControllerArm;
+  /**
+   * `min` arm: no up-switch until this many completed groups (throughput
+   * samples) of the current rung have arrived since the last confirmed
+   * landing. Down-switches are never held. Resolved onto `upGuardSamples`
+   * with `upGuardRelease = 'landed'`; inert on the other arms, which keep
+   * their explicit `upGuardSamples`. Before the first landing the slow-start
+   * gate (AbrController.MIN_STARTUP_SAMPLES) applies instead.
+   */
+  upDwellGroups: number;
+  /**
+   * SwitchHistoryRule leaves a drop out of a rung's record when it was decided
+   * this many or fewer completed groups after a landing: that drop is the
+   * seam (a one-group hole on native, the catch-up burst elsewhere), not the
+   * rung, and must not become a 60 s ladder cap through the veto (M17). Every
+   * history entry is stamped with `groupsSinceLanding` at decision time. 0 =
+   * count every drop.
+   */
+  historyIgnoreGroupsAfterLanding: number;
   /**
    * Floor on the active probe payload in bytes (0 = the Algorithm 1 size
    * alone). A probe sized only from a small rung gap is a few tens of KB and
@@ -148,6 +192,9 @@ export function bufferEnvelope(
 }
 
 export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
+  arm: 'baseline',
+  upDwellGroups: 3,
+  historyIgnoreGroupsAfterLanding: 2,
   probeMinBytes: 0,
   probeMinDurationMs: 0,
   upGuardSamples: 0,
@@ -245,16 +292,92 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
     },
     L2ARule: { active: false, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     LoLPRule: { active: false, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
+    // The min arm's emergency (rules/EmergencyBufferRule.ts): instantaneous
+    // contiguous buffer == 0 -> rung 0; < lowBufferS -> highest rung under
+    // throughputSafetyFactor x SWMA. Off in baseline and grid.
+    EmergencyBufferRule: {
+      active: false,
+      priority: SwitchRequestPriority.STRONG,
+      parameters: { lowBufferS: 0.5, throughputSafetyFactor: 0.7 },
+    },
   },
 };
+
+/** The rules the `min` arm runs; every other rule is inactive in it. */
+export const MIN_ARM_RULES = [
+  'ThroughputRule',
+  'EmergencyBufferRule',
+  'SwitchHistoryRule',
+] as const;
+
+/**
+ * The settings the controller and the rules collection actually run. Fills in
+ * controller defaults for every arm; for `min` it derives the rule set and the
+ * pinned knobs from the arm (see ControllerArm), so app.tsx only has to set
+ * `controller.arm`. Idempotent.
+ */
+export function resolveControllerSettings(settings: AbrSettings): AbrSettings {
+  const controller: ControllerSettings = { ...DEFAULT_CONTROLLER_SETTINGS, ...settings.controller };
+  if (controller.arm !== 'min') return { ...settings, controller };
+
+  const minRules = new Set<string>(MIN_ARM_RULES);
+  const rules: Record<string, RuleConfig> = {};
+  for (const [name, cfg] of Object.entries({ ...DEFAULT_ABR_SETTINGS.rules, ...settings.rules })) {
+    rules[name] = { ...cfg, active: minRules.has(name) };
+  }
+  rules['ThroughputRule'] = {
+    ...rules['ThroughputRule']!,
+    priority: SwitchRequestPriority.DEFAULT,
+  };
+  rules['EmergencyBufferRule'] = {
+    ...rules['EmergencyBufferRule']!,
+    priority: SwitchRequestPriority.STRONG,
+  };
+  rules['SwitchHistoryRule'] = {
+    ...rules['SwitchHistoryRule']!,
+    priority: SwitchRequestPriority.DEFAULT,
+  };
+
+  return {
+    ...settings,
+    rules,
+    controller: {
+      ...controller,
+      // Pinned by the arm.
+      probeMode: 'off',
+      probeMinBytes: 0,
+      probeMinDurationMs: 0,
+      probeMaxBytes: 0,
+      bufferSignal: 'envelope',
+      switchHistoryMode: 'veto',
+      // The arm is defined with a bounded memory; 0 (unbounded) is not accepted.
+      switchHistoryWindowS:
+        controller.switchHistoryWindowS > 0 ? controller.switchHistoryWindowS : 60,
+      upGuardSamples: Math.max(0, controller.upDwellGroups),
+      upGuardRelease: 'landed',
+      latencyResetOnLanding: false,
+    },
+  };
+}
 
 export interface RulesContext {
   tracks: Track[];
   activeTrackIndex: number;
-  /** Buffer level the rules reason about (instantaneous, or the group envelope; ControllerSettings.bufferSignal). */
+  /**
+   * Buffer level the rules reason about: the *contiguous* buffer ahead of the
+   * playhead (`player.getMetrics().bufferContigSeconds`, falling back to the
+   * total `bufferSeconds` on players that do not expose it), either
+   * instantaneous or its envelope over the last group
+   * (ControllerSettings.bufferSignal). A hole ahead of the playhead is not
+   * playable buffer (M12).
+   */
   bufferSeconds: number;
-  /** Instantaneous buffered-ahead at this tick, for the empty-buffer emergency. Defaults to bufferSeconds. */
+  /** Instantaneous contiguous buffer at this tick, for the emergency rules. Defaults to bufferSeconds. */
   bufferInstantSeconds?: number;
+  /** Total buffered-ahead across holes (last range end minus playhead), for the record only. */
+  bufferTotalSeconds?: number;
+  /** Completed groups since the last confirmed landing; null before the first landing. */
+  groupsSinceLanding?: number | null;
   bandwidthBps: number;
   fastEmaBps: number;
   slowEmaBps: number;

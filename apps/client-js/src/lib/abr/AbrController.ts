@@ -8,6 +8,7 @@ import {
   type SwitchReason,
   type Track,
   bufferEnvelope,
+  resolveControllerSettings,
 } from './types';
 
 export interface AbrMetrics {
@@ -15,6 +16,8 @@ export interface AbrMetrics {
   fastEmaBps: number;
   slowEmaBps: number;
   bufferSeconds: number;
+  /** Contiguous buffer the rules see (= bufferSeconds when the player does not expose it). */
+  bufferContigSeconds: number;
   activeTrack: string | null;
   activeTrackIndex: number;
   droppedFrames: number;
@@ -55,6 +58,12 @@ export interface AbrPlayerMetrics {
   slowEmaBps: number;
   /** Total buffered-ahead: last buffered range end minus playhead, s. */
   bufferSeconds: number;
+  /**
+   * Contiguous buffer: end of the buffered range containing the playhead minus
+   * the playhead, 0 if none (M12). The rules' buffer signal on every arm;
+   * falls back to bufferSeconds when absent.
+   */
+  bufferContigSeconds?: number;
   activeTrack: string | null;
   droppedFrames: number;
   totalFrames: number;
@@ -205,15 +214,21 @@ export class AbrController {
     this.#rulesCollection = rulesCollection;
     // Sort ascending by bitrate — index 0 = lowest quality, last = highest
     this.#tracks = [...tracks].sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
-    this.#settings = settings;
+    // The arm decides the effective settings (types.ts resolveControllerSettings).
+    this.#settings = resolveControllerSettings(settings);
     this.#onMetricsUpdate = onMetricsUpdate;
     this.#probeManager = new ProbeManager(this.#player, {
-      minDurationMs: settings.controller?.probeMinDurationMs ?? 0,
+      minDurationMs: this.#settings.controller.probeMinDurationMs,
     });
     this.#player.setEmaHalfLives(
       settings.ewma.throughputFastHalfLifeSeconds,
       settings.ewma.throughputSlowHalfLifeSeconds,
     );
+  }
+
+  /** The settings the controller runs (arm resolved). */
+  get settings(): AbrSettings {
+    return this.#settings;
   }
 
   start(): void {
@@ -229,8 +244,8 @@ export class AbrController {
   }
 
   updateSettings(settings: AbrSettings): void {
-    this.#settings = settings;
-    this.#probeManager.setMinDurationMs(settings.controller?.probeMinDurationMs ?? 0);
+    this.#settings = resolveControllerSettings(settings);
+    this.#probeManager.setMinDurationMs(this.#settings.controller.probeMinDurationMs);
     this.#player.setEmaHalfLives(
       settings.ewma.throughputFastHalfLifeSeconds,
       settings.ewma.throughputSlowHalfLifeSeconds,
@@ -407,6 +422,7 @@ export class AbrController {
       fastEmaBps,
       slowEmaBps,
       bufferSeconds,
+      bufferContigSeconds: rawContig,
       activeTrack,
       droppedFrames,
       totalFrames,
@@ -432,11 +448,17 @@ export class AbrController {
 
     const mode: 'auto' | 'manual' = this.#settings.videoAutoSwitch ? 'auto' : 'manual';
 
+    // The rules see the contiguous buffer (M12); the total across holes is kept
+    // for the record. Players without the field report the total as both.
+    const bufferContigSeconds =
+      typeof rawContig === 'number' && Number.isFinite(rawContig) ? rawContig : bufferSeconds;
+
     const metrics: AbrMetrics = {
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
       bufferSeconds,
+      bufferContigSeconds,
       activeTrack,
       activeTrackIndex,
       droppedFrames,
@@ -462,18 +484,18 @@ export class AbrController {
     this.#lastSampleCount = sampleCount;
     this.#activeTrackAtTick = activeTrack;
 
-    // Buffer level for the rules: instantaneous, or the maximum over the last
-    // group (the level after each burst landed).
-    const envelopeMs = this.#settings.controller?.bufferEnvelopeMs ?? 1250;
+    // Buffer level for the rules: the contiguous buffer, instantaneous or the
+    // maximum over the last group (the level after each burst landed).
+    const envelopeMs = this.#settings.controller.bufferEnvelopeMs;
     const nowTs = Date.now();
-    this.#bufferSamples.push({ ts: nowTs, bufferSeconds });
+    this.#bufferSamples.push({ ts: nowTs, bufferSeconds: bufferContigSeconds });
     while (this.#bufferSamples.length > 0 && nowTs - this.#bufferSamples[0]!.ts > envelopeMs) {
       this.#bufferSamples.shift();
     }
     const ruleBufferSeconds =
-      this.#settings.controller?.bufferSignal === 'envelope'
+      this.#settings.controller.bufferSignal === 'envelope'
         ? bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs)
-        : bufferSeconds;
+        : bufferContigSeconds;
 
     // Once the player signals the init segment landed, hold #switching until
     // a real new-track frame is decoded (totalVideoFrames moved past the
@@ -573,7 +595,9 @@ export class AbrController {
       tracks: this.#tracks,
       activeTrackIndex: currentIdx,
       bufferSeconds: ruleBufferSeconds,
-      bufferInstantSeconds: bufferSeconds,
+      bufferInstantSeconds: bufferContigSeconds,
+      bufferTotalSeconds: bufferSeconds,
+      groupsSinceLanding: this.groupsSinceLanding(sampleCount),
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
@@ -605,10 +629,13 @@ export class AbrController {
             : { index: req.representationIndex, priority: req.priority, reason: req.reason };
       }
       events.emit('ABR_TICK', {
+        arm: this.#settings.controller.arm,
         track: activeTrack,
         active_index: currentIdx,
         buffer_s: bufferSeconds,
+        buffer_contig_s: bufferContigSeconds,
         buffer_rule_s: ruleBufferSeconds,
+        groups_since_landing: context.groupsSinceLanding,
         bandwidth_bps: bandwidthBps,
         fast_ema_bps: fastEmaBps,
         slow_ema_bps: slowEmaBps,
@@ -710,7 +737,7 @@ export class AbrController {
       reason,
       ruleReason: switchRequest.reason,
       priority: switchRequest.priority,
-      bufferSeconds,
+      bufferSeconds: bufferContigSeconds,
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
@@ -728,6 +755,16 @@ export class AbrController {
       this.#rulesCollection.isRuleActive('L2ARule') ||
       this.#rulesCollection.isRuleActive('LoLPRule')
     ) {
+      return;
+    }
+    // No BOLA, no DYNAMIC toggle: with BolaRule inactive (the min arm) the
+    // toggle would only silence ThroughputRule above bufferTimeDefault.
+    if (!this.#rulesCollection.isRuleActive('BolaRule')) {
+      if (this.#usingBolaRule) {
+        this.#usingBolaRule = false;
+        events.emit('ABR_STRATEGY', { using_bola: false, buffer_s: bufferLevel });
+      }
+      this.#rulesCollection.setShouldUseBolaRule(false);
       return;
     }
 

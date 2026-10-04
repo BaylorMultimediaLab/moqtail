@@ -1,5 +1,5 @@
 export { AbrController } from './AbrController';
-export type { AbrMetrics } from './AbrController';
+export type { AbrMetrics, AbrPlayer, AbrPlayerMetrics } from './AbrController';
 export { AbrRulesCollection } from './AbrRulesCollection';
 export {
   type AbrRule,
@@ -9,10 +9,13 @@ export {
   type SwitchEvent,
   type SwitchReason,
   type RuleConfig,
+  type ControllerArm,
   type ControllerSettings,
   type Track,
   SwitchRequestPriority,
   DEFAULT_ABR_SETTINGS,
   DEFAULT_CONTROLLER_SETTINGS,
+  MIN_ARM_RULES,
   bufferEnvelope,
+  resolveControllerSettings,
 } from './types';

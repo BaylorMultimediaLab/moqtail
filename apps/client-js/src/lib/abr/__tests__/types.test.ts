@@ -2,9 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { bufferEnvelope, DEFAULT_ABR_SETTINGS, SwitchRequestPriority } from '../types';
 
 describe('DEFAULT_ABR_SETTINGS', () => {
-  it('has all 11 rules defined', () => {
+  it('has all 12 rules defined', () => {
     const ruleNames = Object.keys(DEFAULT_ABR_SETTINGS.rules);
-    expect(ruleNames).toHaveLength(11);
+    expect(ruleNames).toHaveLength(12);
+    expect(ruleNames).toContain('EmergencyBufferRule');
     expect(ruleNames).toContain('ThroughputRule');
     expect(ruleNames).toContain('BolaRule');
     expect(ruleNames).toContain('ProbeRule');
@@ -18,8 +19,9 @@ describe('DEFAULT_ABR_SETTINGS', () => {
     expect(ruleNames).toContain('LoLPRule');
   });
 
-  it('DroppedFramesRule, L2ARule, LoLPRule are inactive by default', () => {
+  it('DroppedFramesRule, L2ARule, LoLPRule, EmergencyBufferRule are inactive by default', () => {
     expect(DEFAULT_ABR_SETTINGS.rules.DroppedFramesRule!.active).toBe(false);
+    expect(DEFAULT_ABR_SETTINGS.rules.EmergencyBufferRule!.active).toBe(false);
     expect(DEFAULT_ABR_SETTINGS.rules.L2ARule!.active).toBe(false);
     expect(DEFAULT_ABR_SETTINGS.rules.LoLPRule!.active).toBe(false);
   });
@@ -27,7 +29,7 @@ describe('DEFAULT_ABR_SETTINGS', () => {
   it('STRONG-priority rules preempt DEFAULT-tier upswitches', () => {
     // LatencyTrendRule (Kuo Algorithm 1 lines 14-16) and BufferDrainRateRule
     // are both downswitch safety nets that must beat DEFAULT-tier upswitches.
-    const strongRules = new Set(['LatencyTrendRule', 'BufferDrainRateRule']);
+    const strongRules = new Set(['LatencyTrendRule', 'BufferDrainRateRule', 'EmergencyBufferRule']);
     for (const [name, rule] of Object.entries(DEFAULT_ABR_SETTINGS.rules)) {
       if (strongRules.has(name)) {
         expect(rule.priority).toBe(SwitchRequestPriority.STRONG);
@@ -39,6 +41,12 @@ describe('DEFAULT_ABR_SETTINGS', () => {
 
   it('bufferTimeDefault is 18', () => {
     expect(DEFAULT_ABR_SETTINGS.bufferTimeDefault).toBe(18);
+  });
+
+  it("the shipped controller is the baseline arm; the min arm's constants are 3 groups dwell and 2 groups seam window", () => {
+    expect(DEFAULT_ABR_SETTINGS.controller.arm).toBe('baseline');
+    expect(DEFAULT_ABR_SETTINGS.controller.upDwellGroups).toBe(3);
+    expect(DEFAULT_ABR_SETTINGS.controller.historyIgnoreGroupsAfterLanding).toBe(2);
   });
 });
 
