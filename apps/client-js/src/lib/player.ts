@@ -945,9 +945,13 @@ export class Player {
 
             // Append the data
             let maxRetries = 5;
+            // When the successful appendBuffer call was made: the seam's target
+            // append front is dated here, not at updateend (F9).
+            let appendCalledAt = performance.now();
             while (maxRetries--) {
               try {
                 // Append the data
+                appendCalledAt = performance.now();
                 sourceBuffer.appendBuffer(object.payload.buffer);
 
                 // Wait for the source buffer to be consumed
@@ -1029,6 +1033,7 @@ export class Player {
                         group: Number(object.location.group),
                         object: Number(object.location.object),
                         now: nowPerf,
+                        appendStartedAt: appendCalledAt,
                       })
                     : null;
                 if (applied !== null) {

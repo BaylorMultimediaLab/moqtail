@@ -241,6 +241,14 @@ export class SeamTracker {
   /**
    * A target frame [ptsMs, endPtsMs) was appended. The first one applies the
    * pending switch (returned); later ones only move its target append front.
+   *
+   * `now` is when the append completed (updateend's continuation);
+   * `appendStartedAt` when appendBuffer was called. The front history is dated
+   * at the call (F9): the element can present the frame between the call and
+   * the continuation, and the rVFC callback that reports it runs after the
+   * continuation with an earlier presentationTime, which must not be read as
+   * "before the frame was in the buffer" (that credited the first frame one
+   * frame late).
    */
   appended(at: {
     ptsMs: number;
@@ -248,11 +256,17 @@ export class SeamTracker {
     group: number;
     object: number;
     now: number;
+    appendStartedAt?: number;
   }): SwitchRecord | null {
     const rec = this.#pending;
     if (rec === null) return null;
     rec.targetAppendFrontMs = Math.max(rec.targetAppendFrontMs ?? -Infinity, at.endPtsMs);
-    this.#fronts.push({ at: at.now, frontMs: rec.targetAppendFrontMs });
+    // Keep the history ordered by time even if call times interleave.
+    const dated = Math.max(
+      at.appendStartedAt ?? at.now,
+      this.#fronts.length > 0 ? this.#fronts[this.#fronts.length - 1]!.at : -Infinity,
+    );
+    this.#fronts.push({ at: dated, frontMs: rec.targetAppendFrontMs });
     // Presentation times are recent; a seam that stays pending for long only
     // needs the newest part of the history (the oldest kept entry is the base).
     if (this.#fronts.length > 1024) this.#fronts.splice(0, 512);

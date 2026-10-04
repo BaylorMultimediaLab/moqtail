@@ -328,3 +328,34 @@ describe('SeamTracker: presented track before the first frame (F8)', () => {
     expect(t.presentedTrack(9000)).toBe('B');
   });
 });
+
+describe('SeamTracker: the append front is dated at the appendBuffer call (F9)', () => {
+  it('a frame presented before the appended() continuation ran is the first frame', () => {
+    const t = new SeamTracker();
+    t.setInitialTrack('A');
+    const r = t.sent('A', 'B', { playheadMs: 9000, appendFrontMs: 10_000, sentAt: 0 });
+    t.armed(r);
+    t.landed(r, { group: 10, object: 0, landedOnKeyframe: true, sourceEndMs: 10_000, now: 1 });
+    // appendBuffer was called at 90; updateend's continuation recorded it at 100.
+    t.appended({
+      ptsMs: 10_000,
+      endPtsMs: 10_033,
+      group: 10,
+      object: 0,
+      now: 100,
+      appendStartedAt: 90,
+    });
+    // The stalled playhead presented that frame at 99 (rVFC presentationTime).
+    const rec = t.presented({ mediaMs: 10_000, frameMs: 33.3, now: 99 });
+    expect(rec).toBe(r);
+    expect(r.seamPtsMs).toBe(10_000);
+  });
+
+  it('without a call time the append is dated by `now` (the old behaviour)', () => {
+    const t = new SeamTracker();
+    const r = t.sent('A', 'B', { playheadMs: 9000, appendFrontMs: 10_000, sentAt: 0 });
+    t.landed(r, { group: 10, object: 0, landedOnKeyframe: true, sourceEndMs: 10_000, now: 1 });
+    t.appended({ ptsMs: 10_000, endPtsMs: 10_033, group: 10, object: 0, now: 100 });
+    expect(t.presented({ mediaMs: 10_000, frameMs: 33.3, now: 99 })).toBeNull();
+  });
+});
