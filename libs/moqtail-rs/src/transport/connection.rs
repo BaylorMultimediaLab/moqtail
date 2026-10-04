@@ -25,6 +25,12 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use wtransport::quinn;
 
+/// QUIC send priority of every control and request stream (the control stream, and
+/// each bidirectional request stream opened or accepted): above every data stream,
+/// so a response such as SUBSCRIBE_OK or a PUBLISH is never queued behind media
+/// that depends on it. Data-stream priorities stay strictly below it.
+pub const CONTROL_STREAM_PRIORITY: i32 = i32::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
   WebTransport,
@@ -166,13 +172,22 @@ impl From<quinn::ReadError> for TransportReadError {
 pub enum TransportSendStream {
   WebTransport(wtransport::SendStream),
   Quic(quinn::SendStream),
+  /// A WebTransport stream opened on the session's QUIC connection with its
+  /// priority set before the WebTransport header was written
+  /// ([`TransportConnection::open_uni_with_priority`]). wtransport's `SendStream`
+  /// cannot be built from a quinn stream, so this holds the quinn stream itself; on
+  /// the wire it is the same (wtransport passes error codes through unchanged), and
+  /// `finish` keeps wtransport's semantics (completes once the peer has everything).
+  WebTransportPrioritised(quinn::SendStream),
 }
 
 impl TransportSendStream {
   pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportWriteError> {
     match self {
       Self::WebTransport(s) => s.write_all(buf).await.map_err(Into::into),
-      Self::Quic(s) => s.write_all(buf).await.map_err(Into::into),
+      Self::Quic(s) | Self::WebTransportPrioritised(s) => {
+        s.write_all(buf).await.map_err(Into::into)
+      }
     }
   }
 
@@ -180,13 +195,23 @@ impl TransportSendStream {
     match self {
       Self::WebTransport(s) => s.finish().await.map_err(Into::into),
       Self::Quic(s) => s.finish().map_err(Into::into),
+      // As wtransport's finish: FIN, then wait until the peer has acknowledged
+      // everything (Ok) or stopped the stream (Err).
+      Self::WebTransportPrioritised(s) => {
+        let _ = s.finish();
+        match s.stopped().await {
+          Ok(None) => Ok(()),
+          Ok(Some(_)) => Err(TransportWriteError::ClosedOrStopped),
+          Err(e) => Err(TransportWriteError::Other(format!("{e:?}"))),
+        }
+      }
     }
   }
 
   pub async fn flush(&mut self) -> Result<(), TransportWriteError> {
     let result = match self {
       Self::WebTransport(s) => s.flush().await,
-      Self::Quic(s) => s.flush().await,
+      Self::Quic(s) | Self::WebTransportPrioritised(s) => s.flush().await,
     };
     result.map_err(|e| TransportWriteError::Other(e.to_string()))
   }
@@ -195,9 +220,17 @@ impl TransportSendStream {
   pub fn set_priority(&self, priority: i32) {
     match self {
       Self::WebTransport(s) => s.set_priority(priority),
-      Self::Quic(s) => {
+      Self::Quic(s) | Self::WebTransportPrioritised(s) => {
         let _ = s.set_priority(priority);
       }
+    }
+  }
+
+  /// The stream's current priority; `None` once it is closed.
+  pub fn priority(&self) -> Option<i32> {
+    match self {
+      Self::WebTransport(s) => s.quic_stream().priority().ok(),
+      Self::Quic(s) | Self::WebTransportPrioritised(s) => s.priority().ok(),
     }
   }
 
@@ -212,7 +245,7 @@ impl TransportSendStream {
         s.reset(vi)
           .map_err(|_| TransportWriteError::ClosedOrStopped)
       }
-      Self::Quic(s) => {
+      Self::Quic(s) | Self::WebTransportPrioritised(s) => {
         let vi = quinn::VarInt::from_u64(code)
           .map_err(|_| TransportWriteError::Other("reset code exceeds VarInt max".to_string()))?;
         s.reset(vi).map_err(Into::into)
@@ -366,6 +399,108 @@ impl TransportConnection {
           TransportSendStream::Quic(send),
           TransportRecvStream::Quic(recv),
         ))
+      }
+    }
+  }
+
+  /// Opens a bidirectional stream whose send half is scheduled at `priority` from
+  /// its first byte.
+  ///
+  /// quinn files a stream into its send queue at the priority the stream has when
+  /// data is first written to it, and `set_priority` does not move a stream that is
+  /// already queued: the new value applies only once that data has been sent. A
+  /// WebTransport stream's header is written by wtransport's open itself, so
+  /// `open_bi()` followed by `set_priority` leaves the header, and everything written
+  /// behind it before the stream is next scheduled, at priority 0 (R3-D6). Here the
+  /// QUIC stream is opened directly, given its priority, and only then is the
+  /// WebTransport header written, exactly as wtransport writes it.
+  pub async fn open_bi_with_priority(
+    &self,
+    priority: i32,
+  ) -> Result<(TransportSendStream, TransportRecvStream), TransportConnectionError> {
+    match self {
+      Self::WebTransport(c) => {
+        let (mut send, recv) = c.quic_connection().open_bi().await?;
+        let _ = send.set_priority(priority);
+        let mut header = Vec::new();
+        wtransport::proto::frame::Frame::new_webtransport(c.session_id())
+          .write(&mut header)
+          .map_err(|e| TransportConnectionError::Other(format!("{e:?}")))?;
+        send
+          .write_all(&header)
+          .await
+          .map_err(|e| TransportConnectionError::Other(format!("{e:?}")))?;
+        Ok((
+          TransportSendStream::WebTransportPrioritised(send),
+          TransportRecvStream::Quic(recv),
+        ))
+      }
+      Self::Quic(c) => {
+        let (send, recv) = c.open_bi().await?;
+        let _ = send.set_priority(priority);
+        Ok((
+          TransportSendStream::Quic(send),
+          TransportRecvStream::Quic(recv),
+        ))
+      }
+    }
+  }
+
+  /// Accepts a bidirectional stream and sets its send half's priority before
+  /// anything is written on it.
+  pub async fn accept_bi_with_priority(
+    &self,
+    priority: i32,
+  ) -> Result<(TransportSendStream, TransportRecvStream), TransportConnectionError> {
+    let (send, recv) = self.accept_bi().await?;
+    send.set_priority(priority);
+    Ok((send, recv))
+  }
+
+  /// Opens the session's control stream (uni) at [`CONTROL_STREAM_PRIORITY`].
+  pub async fn open_control_stream(&self) -> Result<TransportSendStream, TransportConnectionError> {
+    self.open_uni_with_priority(CONTROL_STREAM_PRIORITY).await
+  }
+
+  /// Opens a request stream (bidi) at [`CONTROL_STREAM_PRIORITY`].
+  pub async fn open_request_stream(
+    &self,
+  ) -> Result<(TransportSendStream, TransportRecvStream), TransportConnectionError> {
+    self.open_bi_with_priority(CONTROL_STREAM_PRIORITY).await
+  }
+
+  /// Accepts a request stream (bidi) the peer opened; its responses go out at
+  /// [`CONTROL_STREAM_PRIORITY`].
+  pub async fn accept_request_stream(
+    &self,
+  ) -> Result<(TransportSendStream, TransportRecvStream), TransportConnectionError> {
+    self.accept_bi_with_priority(CONTROL_STREAM_PRIORITY).await
+  }
+
+  /// Opens a unidirectional stream scheduled at `priority` from its first byte (the
+  /// WebTransport stream header included); see [`Self::open_bi_with_priority`].
+  pub async fn open_uni_with_priority(
+    &self,
+    priority: i32,
+  ) -> Result<TransportSendStream, TransportConnectionError> {
+    match self {
+      Self::WebTransport(c) => {
+        let mut send = c.quic_connection().open_uni().await?;
+        let _ = send.set_priority(priority);
+        let mut header = Vec::new();
+        wtransport::proto::stream_header::StreamHeader::new_webtransport(c.session_id())
+          .write(&mut header)
+          .map_err(|e| TransportConnectionError::Other(format!("{e:?}")))?;
+        send
+          .write_all(&header)
+          .await
+          .map_err(|e| TransportConnectionError::Other(format!("{e:?}")))?;
+        Ok(TransportSendStream::WebTransportPrioritised(send))
+      }
+      Self::Quic(c) => {
+        let send = c.open_uni().await?;
+        let _ = send.set_priority(priority);
+        Ok(TransportSendStream::Quic(send))
       }
     }
   }
@@ -566,6 +701,180 @@ mod tests {
         Err(e) => panic!("unexpected read error: {e:?}"),
       }
     }
+  }
+
+  /// R3-D6: streams opened with a priority carry it before their first byte, and on
+  /// WebTransport the header written by hand is the one the peer expects: the peer
+  /// accepts the stream as part of the session and reads the payload intact, both
+  /// directions of a bidirectional one included, and a uni stream's finish completes.
+  async fn prioritised_open_roundtrip(client: TransportConnection, server: TransportConnection) {
+    let mut uni = server
+      .open_uni_with_priority(i32::MAX)
+      .await
+      .expect("open uni");
+    assert_eq!(uni.priority(), Some(i32::MAX));
+    uni.write_all(b"uni-payload").await.expect("write uni");
+    let reader = tokio::spawn(async move {
+      let mut recv = client.accept_uni().await.expect("accept uni");
+      let mut got = Vec::new();
+      let mut buf = [0u8; 64];
+      while let Ok(Some(n)) = recv.read(&mut buf).await {
+        got.extend_from_slice(&buf[..n]);
+      }
+      (client, got)
+    });
+    uni.finish().await.expect("finish uni");
+    let (client, got) = reader.await.unwrap();
+    assert_eq!(got, b"uni-payload");
+
+    let (mut send, mut recv) = server
+      .open_bi_with_priority(i32::MAX)
+      .await
+      .expect("open bi");
+    assert_eq!(send.priority(), Some(i32::MAX));
+    send.write_all(b"request").await.expect("write bi");
+    let (mut peer_send, mut peer_recv) = client.accept_bi().await.expect("accept bi");
+    let mut buf = [0u8; 7];
+    let mut read = 0;
+    while read < buf.len() {
+      read += peer_recv.read(&mut buf[read..]).await.unwrap().unwrap();
+    }
+    assert_eq!(&buf, b"request");
+    peer_send.write_all(b"reply").await.expect("reply");
+    let mut buf = [0u8; 5];
+    let mut read = 0;
+    while read < buf.len() {
+      read += recv.read(&mut buf[read..]).await.unwrap().unwrap();
+    }
+    assert_eq!(&buf, b"reply");
+  }
+
+  #[tokio::test]
+  async fn webtransport_prioritised_streams_roundtrip() {
+    let (client, server) = webtransport_pair().await.expect("webtransport_pair");
+    prioritised_open_roundtrip(client, server).await;
+  }
+
+  #[tokio::test]
+  async fn quic_prioritised_streams_roundtrip() {
+    let (client, server) = quic_pair().await.expect("quic_pair");
+    prioritised_open_roundtrip(client, server).await;
+  }
+
+  /// R3-D2: control and request streams, opened or accepted, sit above every data
+  /// stream.
+  #[tokio::test]
+  async fn control_and_request_streams_take_the_control_priority() {
+    for (client, server) in [
+      webtransport_pair().await.expect("webtransport_pair"),
+      quic_pair().await.expect("quic_pair"),
+    ] {
+      let control = server.open_control_stream().await.expect("control");
+      assert_eq!(control.priority(), Some(CONTROL_STREAM_PRIORITY));
+      let (opened, _) = server.open_request_stream().await.expect("open request");
+      assert_eq!(opened.priority(), Some(CONTROL_STREAM_PRIORITY));
+      let (mut send, _recv) = client.open_bi().await.expect("peer open");
+      send.write_all(b"x").await.unwrap();
+      let (accepted, _) = server
+        .accept_request_stream()
+        .await
+        .expect("accept request");
+      assert_eq!(accepted.priority(), Some(CONTROL_STREAM_PRIORITY));
+    }
+  }
+
+  /// An accepted request stream gets its priority before the first response byte.
+  #[tokio::test]
+  async fn accepted_bidi_stream_takes_the_priority() {
+    let (client, server) = webtransport_pair().await.expect("webtransport_pair");
+    let (mut send, _recv) = client.open_bi().await.expect("open");
+    send.write_all(b"x").await.unwrap();
+    let (accepted, _) = server
+      .accept_bi_with_priority(i32::MAX)
+      .await
+      .expect("accept");
+    assert_eq!(accepted.priority(), Some(i32::MAX));
+  }
+
+  /// Bytes of the low-priority stream the peer had read when the first bytes of a
+  /// later, higher-priority stream reached it. `prioritised` opens the later stream
+  /// with its priority in place before anything is written on it; otherwise the
+  /// stream is opened and only then given its priority, as the relay did (R3-D6).
+  ///
+  /// quinn files a stream into its send queue at the priority it has when data is
+  /// first written to it, and does not re-sort it on `set_priority`. A WebTransport
+  /// uni stream's header is written by the open itself, so a priority set afterwards
+  /// leaves the stream queued at 0 until everything above 0 has been sent.
+  async fn low_priority_bytes_read_before_high_priority_stream(prioritised: bool) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const LOW: i32 = 50;
+    const HIGH: i32 = 100;
+    const LOW_BYTES: usize = 1024 * 1024;
+    let (client, server) = webtransport_pair().await.expect("webtransport_pair");
+
+    // Everything below happens without yielding, so both streams are queued before
+    // the connection sends its first packet of either.
+    let mut low = server.open_uni_with_priority(LOW).await.expect("low");
+    low
+      .write_all(&vec![1u8; LOW_BYTES])
+      .await
+      .expect("low write");
+    let mut high = if prioritised {
+      server.open_uni_with_priority(HIGH).await.expect("high")
+    } else {
+      let s = server.open_uni().await.expect("high");
+      s.set_priority(HIGH);
+      s
+    };
+    high.write_all(&[2u8; 1024]).await.expect("high write");
+
+    let low_read = std::sync::Arc::new(AtomicUsize::new(0));
+    let at_high = std::sync::Arc::new(AtomicUsize::new(usize::MAX));
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+      let mut recv = client.accept_uni().await.expect("accept");
+      let (low_read, at_high) = (low_read.clone(), at_high.clone());
+      readers.push(tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(Some(n)) = recv.read(&mut buf).await {
+          if buf[0] == 1 {
+            if low_read.fetch_add(n, Ordering::SeqCst) + n >= LOW_BYTES {
+              break;
+            }
+          } else {
+            at_high.store(low_read.load(Ordering::SeqCst), Ordering::SeqCst);
+            break;
+          }
+        }
+      }));
+    }
+    for r in readers {
+      let _ = tokio::time::timeout(std::time::Duration::from_secs(10), r).await;
+    }
+    drop((low, high));
+    at_high.load(Ordering::SeqCst)
+  }
+
+  /// R3-D6: a WebTransport stream opened with its priority is scheduled at that
+  /// priority from its first byte. Opened and then prioritised (the old way), it
+  /// waits behind the whole lower-priority backlog.
+  #[tokio::test]
+  async fn webtransport_stream_is_scheduled_at_its_priority_from_the_first_byte() {
+    let read = low_priority_bytes_read_before_high_priority_stream(true).await;
+    assert!(
+      read < 256 * 1024,
+      "the high-priority stream's first bytes arrived after {read} B of the low one"
+    );
+  }
+
+  /// The defect the above fixes, kept as a regression witness of quinn's behaviour.
+  #[tokio::test]
+  async fn priority_set_after_the_webtransport_header_does_not_apply_to_queued_data() {
+    let read = low_priority_bytes_read_before_high_priority_stream(false).await;
+    assert!(
+      read >= 512 * 1024,
+      "expected the late priority to be ignored, got {read} B first"
+    );
   }
 
   #[tokio::test]

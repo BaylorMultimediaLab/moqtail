@@ -59,6 +59,12 @@ MECHANISM_MODES = {"native": {"forward-trigger"}, "pr1378": {"next-group", "play
 # object even when it is object 0 of the start group, so the client lands on object 1.
 MECHANISM_MODE_OPTIONAL = {"native"}
 MECHANISM_BRANCH = {"native": "switch/native", "pr1378": "switch/pr1378", "switch-from": "switch/pr1674"}
+# The corrected ("fixed") native arm, `--mechanism native --mechanism-mode
+# forward-trigger`, runs the relay with both explicitly flagged corrections; every
+# other run (as-shipped native included) with neither. RELAY_CONFIG must confirm it
+# (R3-D7): the field names are the flags' with underscores.
+NATIVE_FIXED_FLAGS = ("--forward-promotion-trigger", "--native-status-before-subscribe")
+NATIVE_FIXED_FIELDS = ("forward_promotion_trigger", "native_status_before_subscribe")
 MECHANISM_URL_PARAM = {"native": None, "pr1378": "switchFloor", "switch-from": "switchFromMode"}
 
 # Controller arm -> player URL parameters (apps/client-js/src/app.tsx reads them into
@@ -375,9 +381,38 @@ def relay_reported_cc(rec: dict | None) -> str | None:
     return str(cc).lower() if cc is not None else None
 
 
-def check_relay_config(rec: dict | None, cc: str, allow_missing: bool) -> str | None:
+def is_native_fixed_arm(mechanism: str | None, mode: str | None) -> bool:
+    """`--mechanism native --mechanism-mode forward-trigger`: the corrected native arm."""
+    return mechanism == "native" and mode == "forward-trigger"
+
+
+def native_fixed_relay_args(flags: set[str], mechanism: str | None, mode: str | None) -> list[str]:
+    """The relay flags of the corrected native arm, both required in `relay --help`
+    for that arm (never waived: without them the run is the as-shipped arm under the
+    wrong name); none for any other run."""
+    if not is_native_fixed_arm(mechanism, mode):
+        return []
+    missing = [f for f in NATIVE_FIXED_FLAGS if f not in flags]
+    if missing:
+        raise SystemExit(f"this relay has no {', '.join(missing)} (checked `relay --help`); the native "
+                         "forward-trigger arm needs both. Build it from rebuild/native-ft")
+    return list(NATIVE_FIXED_FLAGS)
+
+
+def _relay_config_field(rec: dict, field: str):
+    value = rec.get(field)
+    if value is None and isinstance(rec.get("config"), dict):
+        value = rec["config"].get(field)
+    return value
+
+
+def check_relay_config(rec: dict | None, cc: str, allow_missing: bool, native_fixed: bool = False) -> str | None:
     """Error text unless the relay's own RELAY_CONFIG confirms the requested
-    congestion controller (smoke tests may run a relay without the record)."""
+    congestion controller, UDP GSO off, and the native-fix flags matching the arm:
+    `forward_promotion_trigger` and `native_status_before_subscribe` both true for
+    the fixed native arm (`native_fixed`), both false otherwise. Smoke tests may run
+    a relay without the record or a field; a value that disagrees is never accepted,
+    and the fixed arm always needs both fields."""
     if rec is None:
         return None if allow_missing else (
             "relay emitted no RELAY_CONFIG within 5 s of start; this relay predates the contract "
@@ -394,6 +429,15 @@ def check_relay_config(rec: dict | None, cc: str, allow_missing: bool) -> str | 
         return None if allow_missing else "relay RELAY_CONFIG has no udp_gso field"
     if str(gso).lower() != RELAY_UDP_GSO:
         return f"relay reports udp_gso={gso!r}, runner requires {RELAY_UDP_GSO!r}"
+    arm = "native forward-trigger" if native_fixed else "this arm"
+    for field in NATIVE_FIXED_FIELDS:
+        value = _relay_config_field(rec, field)
+        if value is None:
+            if allow_missing and not native_fixed:
+                continue
+            return f"relay RELAY_CONFIG has no {field} field ({arm} requires {native_fixed})"
+        if value is not native_fixed:
+            return f"relay reports {field}={value!r}, {arm} requires {native_fixed}"
     return None
 
 
@@ -961,9 +1005,9 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         publisher_flags = binary_flags(publisher_bin)
         publisher_pin_argv, publisher_pins = pinned_publisher_args(publisher_flags, args.allow_missing_relay_flags)
         check_base_flags("publisher", publisher_flags, PUBLISHER_BASE_FLAGS)
-        if args.mechanism == "native" and args.mechanism_mode == "forward-trigger" \
-                and "--forward-promotion-trigger" not in relay_flags:
-            raise SystemExit("this relay has no --forward-promotion-trigger; build it from switch/native")
+        native_fixed = is_native_fixed_arm(args.mechanism, args.mechanism_mode)
+        native_fixed_argv = native_fixed_relay_args(relay_flags, args.mechanism, args.mechanism_mode)
+        relay_pins["native_fixed"] = native_fixed_argv
         procs["relay"] = spawn([
             str(relay_bin), "--port", str(args.relay_port), "--host", backend.relay_host,
             "--cert-file", str(args.cert_dir / "cert.pem"),
@@ -974,10 +1018,11 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             # --log-objects: the relay logs OBJECT_SENT per object handed to a subscriber
             # (and its per-subscription object files under relay-logs/).
             *(["--enable-object-logging"] if args.log_objects else []),
-            # native/forward-trigger: relay forwards the promotion-triggering object when it
-            # is at or after the start location (switch/native only; other relays lack the flag).
-            *(["--forward-promotion-trigger"]
-              if args.mechanism == "native" and args.mechanism_mode == "forward-trigger" else []),
+            # native/forward-trigger (the fixed native arm): the relay forwards the
+            # promotion-triggering object in order after the replay of [start, trigger)
+            # and sets the SWITCH statuses before the SUBSCRIBE runs (rebuild/native-ft).
+            # No other run passes either flag.
+            *native_fixed_argv,
         ], out / "relay.log")
         if not wait_log_line(out / "relay.log", RELAY_LISTENING_NEEDLE, RELAY_READY_TIMEOUT_S, procs["relay"], "relay"):
             raise SystemExit(f"relay did not log its listening line ({RELAY_LISTENING_NEEDLE!r}) within "
@@ -985,7 +1030,7 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         # The relay's own view of its configuration (RELAY_CONFIG, W4) is the
         # record of what actually ran; kept in run_meta as `relay_config`.
         relay_config = wait_record(out / "relay-events.jsonl", "RELAY_CONFIG", 5.0, procs["relay"], "relay")
-        err = check_relay_config(relay_config, args.cc, args.allow_missing_relay_flags)
+        err = check_relay_config(relay_config, args.cc, args.allow_missing_relay_flags, native_fixed)
         if err:
             raise SystemExit(err)
 

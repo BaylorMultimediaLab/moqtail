@@ -470,6 +470,7 @@ mod tests_group_bounds {
       downstream_alias_timeout: Duration::from_millis(3000),
       publish_done_stream_timeout: Duration::from_millis(2000),
       dedup_retained_groups: 30,
+      native_status_before_subscribe: false,
       event_log: String::new(),
     }
   }

@@ -16,6 +16,7 @@ use crate::server::client::MOQTClient;
 use crate::server::message_handlers::parameters;
 use crate::server::session_context::{PendingRequest, SessionContext, UpstreamFetchEvent};
 use crate::server::stream_id::StreamId;
+use crate::server::subscription::compute_stream_priority;
 use crate::server::utils::build_stream_id;
 use core::result::Result::{Err, Ok};
 use moqtail::model::common::location::Location;
@@ -23,10 +24,12 @@ use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::fetch::Fetch;
 use moqtail::model::control::fetch_ok::FetchOk;
 use moqtail::model::control::request_error::RequestError;
+use moqtail::model::data::constant::DEFAULT_PUBLISHER_PRIORITY;
 use moqtail::model::data::fetch_header::FetchHeader;
 use moqtail::model::error::RequestErrorCode;
 use moqtail::model::error::StreamResetCode;
 use moqtail::model::error::TerminationCode;
+use moqtail::model::parameter::message_parameter::MessageParameter;
 use moqtail::model::{common::reason_phrase::ReasonPhrase, control::constant::FetchType};
 use moqtail::transport::control_stream_handler::ControlStreamHandler;
 use moqtail::transport::data_stream_handler::{FetchRequest, HeaderInfo};
@@ -457,9 +460,10 @@ pub async fn handle(
 
         let stream_id = build_stream_id(track_read.relay_track_id, &header_info);
 
+        let priority = fetch_stream_priority(&fetch, start_location.group);
         let stream_fn = async move |client: Arc<MOQTClient>, stream_id: &StreamId| {
           let stream_result = client
-            .open_stream(stream_id, fetch_header.serialize().unwrap(), 0)
+            .open_stream(stream_id, fetch_header.serialize().unwrap(), priority)
             .await;
 
           match stream_result {
@@ -914,7 +918,7 @@ async fn send_upstream_fetch_for_range(
 
   // FETCH is Request, First: it opens its own bidirectional stream. Open it before
   // registering the request so a failure here leaves no state behind.
-  let (send, recv) = match publisher.connection.open_bi().await {
+  let (send, recv) = match publisher.connection.open_request_stream().await {
     Ok(streams) => streams,
     Err(e) => {
       warn!(
@@ -1062,6 +1066,83 @@ async fn send_request_error(
     .write()
     .await
     .remove(&request_id);
+}
+
+/// QUIC priority of a FETCH response's data stream: the formula subscription data
+/// streams use, with the FETCH's SubscriberPriority (128 when absent) and GroupOrder,
+/// the default publisher priority (a FETCH response mixes the publisher's objects)
+/// and the first group served. It used to be a literal 0, mid-range in i32: below
+/// every video stream of a priority-0 subscriber and above every one of a
+/// priority-128 subscriber, so whether a catch-up FETCH competed with live video
+/// depended on the subscriber priority by accident (R3-D2).
+pub(crate) fn fetch_stream_priority(fetch: &Fetch, first_group: u64) -> i32 {
+  let subscriber_priority = fetch
+    .parameters
+    .iter()
+    .find_map(|p| match p {
+      MessageParameter::SubscriberPriority { priority } => Some(*priority),
+      _ => None,
+    })
+    .unwrap_or(128);
+  compute_stream_priority(
+    subscriber_priority,
+    DEFAULT_PUBLISHER_PRIORITY,
+    fetch.group_order(),
+    first_group,
+  )
+}
+
+#[cfg(test)]
+mod tests_fetch_stream_priority {
+  use super::*;
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::model::control::constant::GroupOrder;
+  use moqtail::transport::connection::CONTROL_STREAM_PRIORITY;
+
+  fn fetch(parameters: Vec<MessageParameter>) -> Fetch {
+    Fetch::new_standalone(
+      9,
+      moqtail::model::control::fetch::StandaloneFetchProps {
+        track_namespace: Tuple::from_utf8_path("/moqtail"),
+        track_name: TupleField::from_utf8("video-720p"),
+        start_location: Location::new(10, 0),
+        end_location: Location::new(12, 0),
+      },
+      parameters,
+    )
+  }
+
+  /// R3-D2: the response stream sits in the band the request asked for, below
+  /// control streams, not at a literal 0.
+  #[test]
+  fn a_fetch_response_stream_takes_the_requests_priority_and_order() {
+    let f = fetch(vec![
+      MessageParameter::new_subscriber_priority(0),
+      MessageParameter::new_group_order(GroupOrder::Descending),
+    ]);
+    let p = fetch_stream_priority(&f, 10);
+    assert_eq!(
+      p,
+      compute_stream_priority(0, DEFAULT_PUBLISHER_PRIORITY, GroupOrder::Descending, 10)
+    );
+    assert!(p > 2_000_000_000 && p < CONTROL_STREAM_PRIORITY, "{p}");
+    // Live video of the same subscriber at an older group outranks it (ascending).
+    let f = fetch(vec![MessageParameter::new_subscriber_priority(0)]);
+    assert!(
+      compute_stream_priority(0, DEFAULT_PUBLISHER_PRIORITY, GroupOrder::Ascending, 9)
+        > fetch_stream_priority(&f, 10)
+    );
+  }
+
+  #[test]
+  fn a_fetch_without_parameters_uses_the_relay_defaults() {
+    let p = fetch_stream_priority(&fetch(vec![]), 10);
+    assert_eq!(
+      p,
+      compute_stream_priority(128, DEFAULT_PUBLISHER_PRIORITY, GroupOrder::Ascending, 10)
+    );
+    assert_ne!(p, 0);
+  }
 }
 
 #[cfg(test)]

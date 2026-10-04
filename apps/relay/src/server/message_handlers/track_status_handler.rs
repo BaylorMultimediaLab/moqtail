@@ -110,7 +110,7 @@ async fn forward_track_status_upstream(
   new_req: TrackStatus,
   _context: Arc<SessionContext>,
 ) {
-  let (send, recv) = match publisher.connection.open_bi().await {
+  let (send, recv) = match publisher.connection.open_request_stream().await {
     Ok(streams) => streams,
     Err(e) => {
       error!("Failed to open upstream track-status stream: {:?}", e);
