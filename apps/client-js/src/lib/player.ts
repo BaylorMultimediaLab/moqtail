@@ -24,7 +24,7 @@ import {
   RequestError,
   Tuple,
 } from 'moqtail';
-import { MOQtailClient } from 'moqtail/client';
+import { MOQtailClient, type DiscardedStreamInfo } from 'moqtail/client';
 import { CMSFCatalog, MessageParameters, type MessageParameter } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
@@ -155,6 +155,32 @@ export function buildSubscribeParameters(opts: {
 }
 
 /**
+ * DROP_STALE fields for a data stream the library discarded without delivering
+ * it (M15): no subscription claimed its track alias in time, so the library
+ * cancelled it with STOP_SENDING and reported what it had read. `track` is the
+ * name the alias last mapped to (null once the library has forgotten it).
+ * Same record as the player's own drops, so every arm counts discarded media
+ * on the same basis whether the library or the player dropped it.
+ *
+ * Exported for unit testing.
+ */
+export function unroutedDropFields(
+  info: DiscardedStreamInfo,
+  state: { current: string | null; pending: string | null },
+): Record<string, unknown> {
+  return {
+    reason: info.reason,
+    track: info.fullTrackName ? new TextDecoder().decode(info.fullTrackName.name) : null,
+    current: state.current,
+    pending: state.pending,
+    group: Number(info.groupId),
+    subgroup: info.subgroupId !== undefined ? Number(info.subgroupId) : null,
+    track_alias: Number(info.trackAlias),
+    bytes: info.bytes,
+  };
+}
+
+/**
  * Compute the seek target for playback startup. Live-edge clients seek
  * 1.0s behind the live edge so MSE has buffer runway; time-shifted clients
  * are already `timeShiftSeconds` behind live and don't need the extra
@@ -269,6 +295,19 @@ export class Player {
       throw error;
     }
     events.emit('CONNECTED', { connect_ms: performance.now() - this.#tConnectStart });
+    // Streams the library cancels for want of a route (M15) are counted here,
+    // on the same basis as the write handler's own drops.
+    this.client.onStreamDiscarded = info => {
+      const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+      const fields = unroutedDropFields(info, {
+        current: vs?.trackName ?? null,
+        pending: vs?.pendingSwitch?.trackName ?? null,
+      });
+      events.emit('DROP_STALE', fields);
+      if (vs && typeof fields.track === 'string') {
+        vs.tracker.recordDiscardedBytes(info.bytes, info.groupId, fields.track);
+      }
+    };
 
     // Debug-only escape hatch: lets the network test harness force a SWITCH
     // without going through the AbrController. Used by Slice C/Phase B E2Es

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { buildSubscribeParameters, computeStartupTarget } from './player';
+import { FullTrackName, Tuple } from 'moqtail';
+import { buildSubscribeParameters, computeStartupTarget, unroutedDropFields } from './player';
 
 describe('buildSubscribeParameters', () => {
   it('returns undefined for live-edge mode', () => {
@@ -132,5 +133,54 @@ describe('computeStartupTarget', () => {
         timeShiftSeconds: 5,
       }),
     ).toBeCloseTo(9);
+  });
+});
+
+// M15: a data stream the library cancelled because no subscription claimed its
+// alias becomes DROP_STALE{reason:'unrouted'} with the bytes it cost.
+describe('unroutedDropFields', () => {
+  it('names the track the alias last mapped to, the group and the bytes', () => {
+    const ftn = FullTrackName.tryNew(
+      Tuple.fromUtf8Path('/moqtail'),
+      new TextEncoder().encode('720p'),
+    );
+    expect(
+      unroutedDropFields(
+        {
+          reason: 'unrouted',
+          trackAlias: 7n,
+          groupId: 42n,
+          subgroupId: 0n,
+          fullTrackName: ftn,
+          bytes: 1234,
+        },
+        { current: '480p', pending: null },
+      ),
+    ).toEqual({
+      reason: 'unrouted',
+      track: '720p',
+      current: '480p',
+      pending: null,
+      group: 42,
+      subgroup: 0,
+      track_alias: 7,
+      bytes: 1234,
+    });
+  });
+
+  it('reports a null track when the alias is no longer known', () => {
+    expect(
+      unroutedDropFields(
+        {
+          reason: 'unrouted',
+          trackAlias: 9n,
+          groupId: 1n,
+          subgroupId: undefined,
+          fullTrackName: undefined,
+          bytes: 10,
+        },
+        { current: '480p', pending: '720p' },
+      ),
+    ).toMatchObject({ track: null, subgroup: null, pending: '720p', bytes: 10 });
   });
 });
