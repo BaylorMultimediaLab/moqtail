@@ -463,6 +463,41 @@ def warm_vite(base: str) -> None:
     print("[run] WARNING: vite entry did not stabilise; a mid-run reload is possible")
 
 
+class Vite:
+    """The Vite dev server: serves the player and receives client events
+    (POST /__events -> logs/<run_id>/client-events.jsonl). Per run by
+    default; with --keep-vite one instance serves every repetition of the
+    same arm (it is mechanism-agnostic within a branch) and `warm_vite` runs
+    once, saving the dependency-optimisation reload per run. When shared it
+    binds 0.0.0.0 so the listener survives the veth being recreated between
+    repetitions; the page URL still uses the namespace-facing address."""
+
+    def __init__(self, page_host: str, port: int, log: Path, shared: bool) -> None:
+        self.page_host, self.port, self.log, self.shared = page_host, port, log, shared
+        self.proc: subprocess.Popen | None = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.page_host}:{self.port}"
+
+    def start(self) -> None:
+        bind = "0.0.0.0" if self.shared and self.page_host != "localhost" else self.page_host
+        self.proc = spawn([
+            "npm", "run", "--prefix", str(ROOT / "apps/client-js"), "dev", "--",
+            "--host", bind, "--port", str(self.port), "--strictPort",
+        ], self.log, env=dict(os.environ))
+        probe_host = "127.0.0.1" if self.page_host == "localhost" else self.page_host
+        if not wait_port(probe_host, self.port, 60):
+            raise SystemExit(f"vite did not come up; see {self.log}")
+        warm_vite(self.base_url)
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self) -> None:
+        stop(self.proc, "vite")
+
+
 def find_browser(explicit: str | None) -> str | None:
     """Explicit path, else Firefox, else a Chromium. Firefox first because it
     decodes HEVC in software everywhere; Chrome on Linux needs a working VA-API
@@ -592,6 +627,9 @@ def main() -> int:
                          "(--congestion-controller, timeouts, --variant-priority); refused with --final")
     ap.add_argument("--relay-port", type=int, default=4433)
     ap.add_argument("--vite-port", type=int, default=5173)
+    ap.add_argument("--keep-vite", action="store_true",
+                    help="start the Vite dev server once and keep it across the repetitions of this invocation "
+                         "(skips the vite warm-up after the first rep); its log goes to <results>/vite_<stamp>.log")
     ap.add_argument("--browser", default=None, help="path to a Firefox or Chromium binary (default: Firefox if found, else Chromium)")
     ap.add_argument("--cert-dir", type=Path, default=ROOT / "apps/relay/cert",
                     help="directory with the relay's cert.pem/key.pem; if hash.txt is there (scripts/gen-dev-cert.sh) the player pins it")
@@ -650,10 +688,21 @@ def main() -> int:
     else:
         reps = list(range(args.repeat_start, args.repeat_start + args.repeat))
 
-    for repeat_index in reps:
-        code = run_once(args, repeat_index)
-        if code != 0:
-            return code
+    shared_vite: Vite | None = None
+    if args.keep_vite:
+        page_host = make_backend(args.net).vite_host
+        args.results.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        shared_vite = Vite(page_host, args.vite_port, args.results / f"vite_{stamp}.log", shared=True)
+        shared_vite.start()
+    try:
+        for repeat_index in reps:
+            code = run_once(args, repeat_index, shared_vite)
+            if code != 0:
+                return code
+    finally:
+        if shared_vite is not None:
+            shared_vite.stop()
     return 0
 
 
@@ -673,7 +722,7 @@ def run_id_for(args, profile_name: str, repeat_index: int, stamp: str | None) ->
     return run_id
 
 
-def run_once(args, repeat_index: int) -> int:
+def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
     profile = load_profile(args.profile)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = run_id_for(args, profile["name"], repeat_index, None if args.repeat_index is not None else stamp)
@@ -771,14 +820,15 @@ def run_once(args, repeat_index: int) -> int:
         ], out / "publisher.log")
 
         # Vite dev server (serves the player and receives client events) -----
-        vite_env = dict(os.environ)
-        procs["vite"] = spawn([
-            "npm", "run", "--prefix", str(ROOT / "apps/client-js"), "dev", "--",
-            "--host", backend.vite_host, "--port", str(args.vite_port), "--strictPort",
-        ], out / "vite.log", env=vite_env)
-        if not wait_port(backend.vite_host if backend.vite_host != "localhost" else "127.0.0.1", args.vite_port, 60):
-            raise SystemExit("vite did not come up")
-        warm_vite(f"http://{backend.vite_host}:{args.vite_port}")
+        if shared_vite is not None:
+            if not shared_vite.alive():
+                raise SystemExit(f"the shared vite exited; see {shared_vite.log}")
+            vite = shared_vite
+            (out / "vite.log").write_text(f"shared vite (--keep-vite); log: {shared_vite.log}\n")
+        else:
+            vite = Vite(backend.vite_host, args.vite_port, out / "vite.log", shared=False)
+            vite.start()
+        procs["vite"] = vite.proc
 
         # Browser start is gated on the publisher's first GROUP_EMIT plus a fixed
         # warm-up, the same for both client types, so the media second at which
@@ -895,7 +945,7 @@ def run_once(args, repeat_index: int) -> int:
         stop(procs.get("browser"), "browser", browser_pattern if backend.detaches_itself else None)
         time.sleep(1.0)
         bg.stop()
-        for name in ("publisher", "relay", "vite"):
+        for name in ("publisher", "relay") + (() if shared_vite is not None else ("vite",)):
             stop(procs.get(name), name)
         # The namespace and veth go away with everything queued; the tree is
         # never modified after the run's last step (M1).
