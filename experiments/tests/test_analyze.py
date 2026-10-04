@@ -345,6 +345,21 @@ class StallsAndSeeks(TmpRun):
         self.assertEqual(st["all_count"], 3)   # the pre-startup episode is excluded
         self.assertEqual(s["starvation"]["subset_of"], "stalls.total_ms")
 
+    def test_frozen_stall_starts_at_end_minus_duration(self):
+        # D5: the player backdates a `frozen` stall to the first frozen watchdog tick, so its
+        # STALL_START is logged ~0.5-1 s after the stall began; STALL_END.duration_ms is exact.
+        client = startup()
+        client.append(ev("DATA_STARVED", T0 + 9000, since_last_append_ms=4000, track=R[0]))
+        client.append(ev("DATA_RESUMED", T0 + 9800, starved_ms=4800))
+        client.append(ev("STALL_START", T0 + 10_000, cause="frozen", playhead_ms=9500, track=R[0]))
+        client.append(ev("STALL_END", T0 + 12_000, cause="frozen", playhead_ms=9500, duration_ms=2500))
+        client += samples(T0, T0 + 20_000, lambda t: R[0])
+        s = analyze.analyze(write_run(self.dir, client))
+        ep = s["stalls"]["episodes"][0]
+        self.assertEqual(ep["ts"], T0 + 9500)            # before: T0 + 10_000 (STALL_START.ts)
+        self.assertEqual(ep["duration_ms"], 2500)
+        self.assertEqual(s["starvation"]["total_ms"], 300)   # [9500, 9800) overlaps the starvation episode; before: 0
+
     def test_switches_per_minute_over_run_duration(self):
         A, B = R[0], R[4]
         client = startup(A) + switch(1, T0 + 10_000, A, B) + switch(2, T0 + 11_000, B, A)

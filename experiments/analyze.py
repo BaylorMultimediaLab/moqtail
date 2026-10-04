@@ -741,7 +741,12 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         if r.get("event") == "STALL_START":
             open_start = r
         elif r.get("event") == "STALL_END" and open_start is not None:
-            episodes.append({"ts": open_start["ts"], "cause": r.get("cause"), "duration_ms": r.get("duration_ms"),
+            # The episode starts at STALL_END.ts - duration_ms: the player backdates a
+            # `frozen` stall to its first frozen watchdog tick (STALL_START is logged 0.5-1 s
+            # later), and duration_ms is measured from that start on the monotonic clock.
+            dur = r.get("duration_ms")
+            start_ts = (r["ts"] - dur) if dur is not None else open_start["ts"]
+            episodes.append({"ts": start_ts, "start_logged_ts": open_start["ts"], "cause": r.get("cause"), "duration_ms": dur,
                              "playhead_ms": r.get("playhead_ms"), "track": open_start.get("track")})
             open_start = None
     # A stall still open when the run ended is a stall to the end of the run.
