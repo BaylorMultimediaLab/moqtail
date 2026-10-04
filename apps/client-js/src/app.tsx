@@ -26,6 +26,7 @@ import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
 import { events } from '@/lib/events/EventLog';
 import { targetShiftMs } from '@/lib/events/liveEdge';
 import type { MetricsSnapshot } from '@/lib/metrics/types';
+import { controllerArmParam, type ControllerArmParam } from '@/lib/runParams';
 import { SettingsPanel } from '@/components/SettingsPanel';
 import { MetricsPanel } from '@/components/MetricsPanel';
 
@@ -236,6 +237,7 @@ function TrackGroup({
  *   ?autoConnect=1   connect and start playback without a click (headless runs)
  *   ?logObjects=1    one OBJECT_RECV record per received frame
  *   ?relay=<url> ?namespace=<ns>  connection defaults
+ *   ?controllerArm=min|grid|baseline  the ABR controller arm (abrSettings.controller.arm)
  * Together with ?clientMode, ?timeShift and the ABR overrides below.
  */
 const truthyParam = (v: string | null) => v === '1' || v === 'true';
@@ -249,6 +251,7 @@ function readRunParams() {
     logObjects: truthy(params.get('logObjects')),
     relay: params.get('relay'),
     namespace: params.get('namespace'),
+    controllerArm: controllerArmParam(params.get('controllerArm')),
   };
 }
 
@@ -329,6 +332,10 @@ export function App() {
     if (Number.isFinite(envMs) && envMs > 0) controller.bufferEnvelopeMs = envMs;
     const probe = params.get('probeMode');
     if (probe === 'on' || probe === 'off') controller.probeMode = probe;
+    // The controller arm (W5's AbrSettings.controller.arm). Typed loosely so this
+    // compiles on a base whose ControllerSettings has no `arm` yet.
+    const arm = controllerArmParam(params.get('controllerArm'));
+    if (arm !== null) (controller as typeof controller & { arm?: ControllerArmParam }).arm = arm;
     const rules = { ...DEFAULT_ABR_SETTINGS.rules };
     if (controller.switchHistoryMode === 'off') {
       rules.SwitchHistoryRule = { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false };
@@ -565,6 +572,7 @@ export function App() {
           startup_track: videoTrack,
           abr_settings: controllerSettings,
           controller: controllerSettings.controller,
+          controller_arm: runParams.controllerArm,
           ladder: videoTracks.map(t => ({
             track: t.name,
             bitrate: t.bitrate,
