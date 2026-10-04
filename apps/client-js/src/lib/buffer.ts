@@ -103,8 +103,18 @@ interface MSEBufferConfig {
   liveEdgeTolerance: number;
   /** Interval for checking buffered regions in milliseconds (default: 250) */
   bufferCheckInterval: number;
-  /** Threshold for detecting stalls in seconds (default: 0.5) */
+  /**
+   * Most buffered media (s) the policy throws away to cross a gap when the
+   * playhead is stuck (the element fired `waiting`, or the playhead has not
+   * moved for this long): the element cannot play what is left. Default 0.5.
+   */
   stallThreshold: number;
+  /**
+   * Frame duration (ms) of the media being appended, from the player; a
+   * playing playhead crosses a gap only once at most this much is left in its
+   * range. Default 1000 / 30 when the probe is absent or has no value.
+   */
+  frameDurationProbe?: () => number | undefined;
   /** Playback rate for catching up to live edge (default: 1.05 = 5% faster) */
   catchupPlaybackRate: number;
   /** Reports where new media is being appended, so a range-jump does not cross a gap being filled. */
@@ -131,6 +141,8 @@ interface MSEBufferConfig {
  * What the one gap-crossing policy (M14) does at a playhead position.
  * - `gap`: the playhead is at the end of its range (or in a hole) and a later
  *   range exists; cross to its start, subject to the fill deferral.
+ *   `skippedS` is the buffered media between the playhead and the end of its
+ *   range that the crossing throws away (0 from a hole), `gapS` the hole.
  * - `short-target`: the only later range is a sliver still being filled; wait.
  * - `wedge`: frozen inside a range for `wedgeFrozenMs` with data ahead and no
  *   gap to cross; seek to the next group boundary.
@@ -139,18 +151,29 @@ interface MSEBufferConfig {
 export type GapPlan =
   | { kind: 'none' }
   | { kind: 'short-target'; rangeEndS: number; nextStartS: number; nextEndS: number }
-  | { kind: 'gap'; toS: number; gapS: number; rangeEndS: number }
+  | { kind: 'gap'; toS: number; gapS: number; rangeEndS: number; skippedS: number }
   | { kind: 'wedge'; toS: number };
 
 /**
  * The geometry of the gap-crossing policy (M14); the deferral is applied by
  * MSEBuffer on top of a `gap` plan. Ranges are [start, end] seconds in order.
+ *
+ * A playing playhead crosses only once at most one frame (`frameS`) is left
+ * in its range (F3): every buffered frame before the hole is played. It used
+ * to cross with up to `stallThresholdS` (0.5 s) left, throwing that media
+ * away on every crossing (0.45 s before a 40 ms hole). A `stuck` playhead (the
+ * element fired `waiting`, or has not moved for `stallThresholdS`) cannot play
+ * what is left and crosses with up to `stallThresholdS` buffered.
  */
 export function planGapCrossing(args: {
   ranges: Array<[number, number]>;
   currentTimeS: number;
   frozenMs: number;
   stallThresholdS: number;
+  /** One frame, s (default 1/30). */
+  frameS?: number;
+  /** The element cannot play on: `waiting` fired or the playhead is frozen. */
+  stuck?: boolean;
   minJumpTargetS: number;
   gopS: number;
   wedgeFrozenMs: number;
@@ -160,10 +183,13 @@ export function planGapCrossing(args: {
   if (ranges.length === 0) return { kind: 'none' };
   const i = ranges.findIndex(([start, end]) => t >= start - 0.001 && t <= end);
   let rangeEndS: number;
+  let skippedS = 0;
   if (i >= 0) {
     const end = ranges[i]![1];
     const ahead = end - t;
-    if (ahead > args.stallThresholdS) {
+    // 1 ms of slack for the element's rounding of currentTime.
+    const crossWithin = args.stuck ? args.stallThresholdS : (args.frameS ?? 1 / 30) + 0.001;
+    if (ahead > crossWithin) {
       if (args.frozenMs >= args.wedgeFrozenMs && ahead > args.wedgeMinAheadS) {
         const nextBoundary = (Math.floor(t / args.gopS) + 1) * args.gopS + 0.001;
         return { kind: 'wedge', toS: Math.min(end - 0.5, nextBoundary) };
@@ -171,6 +197,7 @@ export function planGapCrossing(args: {
       return { kind: 'none' };
     }
     rangeEndS = end;
+    skippedS = Math.max(0, ahead);
   } else {
     // In a hole: the hole starts at the playhead.
     rangeEndS = t;
@@ -183,7 +210,7 @@ export function planGapCrossing(args: {
   if (j === ranges.length - 1 && nextEndS - nextStartS < args.minJumpTargetS) {
     return { kind: 'short-target', rangeEndS, nextStartS, nextEndS };
   }
-  return { kind: 'gap', toS: nextStartS, gapS: nextStartS - rangeEndS, rangeEndS };
+  return { kind: 'gap', toS: nextStartS, gapS: nextStartS - rangeEndS, rangeEndS, skippedS };
 }
 
 class MSEBuffer {
@@ -278,7 +305,7 @@ class MSEBuffer {
 
   private handleWaiting = () => {
     logger.info('buffer', '[mseBuffer] Video is waiting for data');
-    this.checkBufferedRegions();
+    this.checkBufferedRegions(true, true);
   };
 
   private handleStalled = () => {
@@ -315,9 +342,12 @@ class MSEBuffer {
    * - `wedge`: frozen for `wedgeFrozenMs` inside a range with data ahead and
    *   no gap to cross; seek to the next group boundary.
    * Nothing is crossed before playback has started (paused element): the
-   * player's startup seek places the playhead.
+   * player's startup seek places the playhead. A playing playhead crosses a
+   * gap only within one frame of its range end; `waiting` (or a playhead that
+   * has not moved for `stallThreshold`) lets it cross with up to
+   * `stallThreshold` still buffered (F3).
    */
-  private checkBufferedRegions(logDetails: boolean = true) {
+  private checkBufferedRegions(logDetails: boolean = true, waiting: boolean = false) {
     const buffered = this.video.buffered;
     const currentTime = this.video.currentTime;
     const now = performance.now();
@@ -342,11 +372,14 @@ class MSEBuffer {
     }
 
     const frozenMs = now - this.progressAt;
+    const frameMs = this.config.frameDurationProbe?.();
     const plan = planGapCrossing({
       ranges,
       currentTimeS: currentTime,
       frozenMs,
       stallThresholdS: this.config.stallThreshold,
+      frameS: frameMs !== undefined && frameMs > 0 ? frameMs / 1000 : undefined,
+      stuck: waiting || frozenMs >= this.config.stallThreshold * 1000,
       minJumpTargetS: this.config.minJumpTargetS,
       gopS: this.config.gopDurationMs / 1000,
       wedgeFrozenMs: this.config.wedgeFrozenMs,
@@ -361,7 +394,12 @@ class MSEBuffer {
           'buffer',
           `[mseBuffer] crossing a ${plan.gapS.toFixed(3)}s gap to ${plan.toS.toFixed(2)}s`,
         );
-        this.seek(plan.toS, 'gap', { gap_ms: plan.gapS * 1000, deferred_ms: deferredMs });
+        this.seek(plan.toS, 'gap', {
+          gap_ms: plan.gapS * 1000,
+          // Buffered media between the playhead and the hole, jumped over.
+          skipped_buffered_ms: plan.skippedS * 1000,
+          deferred_ms: deferredMs,
+        });
         return;
       }
       case 'wedge': {
@@ -375,6 +413,7 @@ class MSEBuffer {
         );
         this.seek(plan.toS, 'wedge', {
           gap_ms: 0,
+          skipped_buffered_ms: (plan.toS - currentTime) * 1000,
           deferred_ms: 0,
           frozen_ms: frozenMs,
           ready_state: this.video.readyState,

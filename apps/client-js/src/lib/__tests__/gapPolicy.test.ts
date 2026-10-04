@@ -21,11 +21,17 @@ function fakeVideo(ranges: Range[], currentTime: number) {
     duration: Infinity,
     playbackRate: 1,
     ranges,
+    listeners: {} as Record<string, Array<() => void>>,
+    fire(type: string) {
+      for (const cb of v.listeners[type] ?? []) cb();
+    },
     get buffered() {
       const r = v.ranges;
       return { length: r.length, start: (i: number) => r[i]![0], end: (i: number) => r[i]![1] };
     },
-    addEventListener: () => {},
+    addEventListener: (type: string, cb: () => void) => {
+      (v.listeners[type] ??= []).push(cb);
+    },
     removeEventListener: () => {},
     play: () => Promise.resolve(),
   };
@@ -153,5 +159,77 @@ describe('gap-crossing policy (M14)', () => {
     start(video, { s: 29.9 });
     vi.advanceTimersByTime(1_000);
     for (const s of seeks) expect(['startup', 'gap', 'wedge']).toContain(s.reason);
+  });
+
+  it('G1: plays the current range to its end before crossing a gap (no buffered media thrown away)', () => {
+    // 0.45 s of playable media before a 40 ms hole.
+    const video = fakeVideo(
+      [
+        [0, 16.2],
+        [16.24, 30],
+      ],
+      15.75,
+    );
+    start(video, { s: 29.9 });
+    vi.advanceTimersByTime(250);
+    expect(seeks).toEqual([]);
+    video.currentTime = 15.95; // still playing
+    vi.advanceTimersByTime(250);
+    expect(seeks).toEqual([]);
+    video.currentTime = 16.2; // at the end of the range
+    vi.advanceTimersByTime(250);
+    expect(seeks).toHaveLength(1);
+    expect(seeks[0]).toMatchObject({ reason: 'gap', from_ms: 16_200 });
+    expect(seeks[0]!.to_ms as number).toBeCloseTo(16_240);
+    expect(seeks[0]!.gap_ms as number).toBeCloseTo(40);
+    expect(seeks[0]!.skipped_buffered_ms as number).toBeCloseTo(0);
+  });
+
+  it('crosses within one frame of the range end, and reports what it skipped separately from the gap', () => {
+    const video = fakeVideo(
+      [
+        [0, 16.2],
+        [16.24, 30],
+      ],
+      16.18,
+    );
+    start(video, { s: 29.9 });
+    vi.advanceTimersByTime(250);
+    expect(seeks).toHaveLength(1);
+    expect(seeks[0]!.skipped_buffered_ms as number).toBeCloseTo(20);
+    expect(seeks[0]!.gap_ms as number).toBeCloseTo(40);
+  });
+
+  it('on `waiting` (the element cannot play what is left) crosses with up to 0.5 s still buffered', () => {
+    const video = fakeVideo(
+      [
+        [0, 16.2],
+        [16.24, 30],
+      ],
+      15.9,
+    );
+    start(video, { s: 29.9 });
+    vi.advanceTimersByTime(100);
+    expect(seeks).toEqual([]);
+    video.fire('waiting');
+    expect(seeks).toHaveLength(1);
+    expect(seeks[0]!.skipped_buffered_ms as number).toBeCloseTo(300);
+    expect(seeks[0]!.gap_ms as number).toBeCloseTo(40);
+  });
+
+  it('a playhead frozen short of the range end for 0.5 s is stuck too (no `waiting` needed)', () => {
+    const video = fakeVideo(
+      [
+        [0, 16.2],
+        [16.24, 30],
+      ],
+      15.9,
+    );
+    start(video, { s: 29.9 });
+    vi.advanceTimersByTime(500);
+    expect(seeks).toEqual([]);
+    vi.advanceTimersByTime(250);
+    expect(seeks).toHaveLength(1);
+    expect(seeks[0]!.skipped_buffered_ms as number).toBeCloseTo(300);
   });
 });

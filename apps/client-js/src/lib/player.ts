@@ -1348,6 +1348,12 @@ export class Player {
       ?.lastAppendedEndPTS_ms;
   }
 
+  /** Duration (ms) of the most recently parsed video frame; undefined before the first one. */
+  getFrameDurationMs(): number | undefined {
+    return this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')
+      ?.lastFrameDurationMs;
+  }
+
   /** True between SWITCH_OK and the target's first object (the switch has not landed). */
   hasSwitchInFlight(): boolean {
     return (

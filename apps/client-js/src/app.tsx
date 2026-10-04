@@ -528,6 +528,7 @@ export function App() {
             const front = player.getAppendFrontMs();
             return { appendFrontS: front !== undefined ? front / 1000 : undefined };
           },
+          frameDurationProbe: () => player.getFrameDurationMs(),
           gopDurationMs,
         });
         if (videoTrack) await player.addMediaTrack(videoTrack);
