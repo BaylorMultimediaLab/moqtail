@@ -448,6 +448,7 @@ mod tests_group_bounds {
       key_file: String::new(),
       max_idle_timeout: 60,
       keep_alive_interval: 30,
+      congestion_controller: crate::server::config::CongestionController::Cubic,
       cache_size: 100,
       log_folder: String::new(),
       cache_expiration_type: CacheExpirationType::Ttl,

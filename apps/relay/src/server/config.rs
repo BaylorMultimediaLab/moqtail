@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{error, info, warn};
 use wtransport::Identity;
-use wtransport::quinn::congestion::BbrConfig;
+use wtransport::quinn::congestion::{BbrConfig, CubicConfig};
 use wtransport::quinn::{self, TransportConfig};
 
 /// Cache expiration strategy
@@ -31,6 +31,43 @@ pub enum CacheExpirationType {
   Ttl,
   /// Time-to-idle: entries expire after a period of inactivity
   Tti,
+}
+
+/// QUIC congestion controller for every connection the relay accepts (M4).
+///
+/// CUBIC is the primary controller: it is what browsers run, so relay → client
+/// behaviour under a shaped link is comparable with the client's own stack, and
+/// its initial window (12 000 B, quinn-proto 0.11.16 `CubicConfig::default`) does
+/// not overshoot a shallow tail-drop queue. BBR is kept as a sensitivity factor;
+/// its initial window is 200 × 1200 B (`K_MAX_INITIAL_CONGESTION_WINDOW`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CongestionController {
+  Cubic,
+  Bbr,
+}
+
+impl CongestionController {
+  pub fn as_str(&self) -> &'static str {
+    match self {
+      CongestionController::Cubic => "cubic",
+      CongestionController::Bbr => "bbr",
+    }
+  }
+
+  /// Initial congestion window in bytes of quinn-proto 0.11.16's default config
+  /// for this controller. Recorded, not configurable: the relay keeps quinn's
+  /// defaults for everything but the controller choice.
+  pub fn default_initial_window_bytes(&self) -> u64 {
+    const BASE_DATAGRAM_SIZE: u64 = 1200;
+    match self {
+      // `14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE)`
+      CongestionController::Cubic => {
+        14720u64.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE)
+      }
+      // `K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE`
+      CongestionController::Bbr => 200 * BASE_DATAGRAM_SIZE,
+    }
+  }
 }
 
 /// Upper bound on `--io-sockets`. Past the core count extra sockets only add
@@ -56,14 +93,20 @@ pub struct Cli {
   /// Private key PEM file
   #[arg(long, default_value = "apps/relay/cert/key.pem")]
   pub key_file: String,
-  /// Number of cached subgroups/fetches per track
+  /// Groups cached per track (moka `max_capacity`, one entry per group).
   #[arg(long, default_value_t = 1000)]
   pub cache_size: u16,
-  /// Cache grow ratio before evicting - allows cache to grow to this multiple of cache_size before evicting
+  /// QUIC max idle timeout in seconds. A connection with no packets in either
+  /// direction for this long is torn down; keep-alives reset it.
   #[arg(long, default_value_t = 7)]
   pub max_idle_timeout: u64,
+  /// QUIC keep-alive interval in seconds (PING frames while idle).
   #[arg(long, default_value_t = 3)]
   pub keep_alive_interval: u64,
+  /// QUIC congestion controller for accepted connections: `cubic` (default) or `bbr`.
+  /// Recorded in RELAY_CONFIG; every other quinn transport default is kept.
+  #[arg(long, value_enum, default_value = "cubic")]
+  pub congestion_controller: CongestionController,
   #[arg(long, default_value = "/tmp")]
   pub log_folder: String,
   /// Project-local experiment event log (JSON lines). Empty disables it.
@@ -161,8 +204,11 @@ pub struct AppConfig {
   pub host: String,
   pub cert_file: String,
   pub key_file: String,
+  /// Seconds (see `Cli::max_idle_timeout`).
   pub max_idle_timeout: u64,
+  /// Seconds (see `Cli::keep_alive_interval`).
   pub keep_alive_interval: u64,
+  pub congestion_controller: CongestionController,
   pub cache_size: u16,
   pub log_folder: String,
   /// Path of the experiment event log; empty = disabled.
@@ -216,6 +262,7 @@ impl AppConfig {
       key_file: cli.key_file,
       max_idle_timeout: cli.max_idle_timeout,
       keep_alive_interval: cli.keep_alive_interval,
+      congestion_controller: cli.congestion_controller,
       cache_size: cli.cache_size,
       log_folder: cli.log_folder,
       event_log: cli.event_log,
@@ -272,14 +319,15 @@ impl AppConfig {
 
     let quic_crypto_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?;
 
-    // set up BBR congestion control
-    let mut transport_config = TransportConfig::default();
-    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(self.keep_alive_interval)));
-    transport_config.max_idle_timeout(Some(Duration::from_secs(self.max_idle_timeout).try_into()?));
-    // Request flow control: bound the number of concurrent request streams a peer
-    // may open.
-    transport_config.max_concurrent_bidi_streams(self.max_request_stream_limit());
+    let transport_config = self.transport_config()?;
+    info!(
+      "QUIC transport: congestion_controller={} (initial window {} B), keep_alive={}s, idle_timeout={}s; {:?}",
+      self.congestion_controller.as_str(),
+      self.congestion_controller.default_initial_window_bytes(),
+      self.keep_alive_interval,
+      self.max_idle_timeout,
+      transport_config
+    );
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto_config));
     server_config.transport_config(Arc::new(transport_config));
@@ -302,6 +350,74 @@ impl AppConfig {
     }
 
     Ok(endpoints)
+  }
+
+  /// The quinn transport configuration every accepted connection runs on. Only the
+  /// congestion controller, keep-alive, idle timeout and the request-stream limit are
+  /// set; everything else is quinn's default (recorded in RELAY_CONFIG through
+  /// `TransportConfig`'s Debug output: stream_receive_window 1.25 MB, receive_window
+  /// unlimited, send_window 10 MB, max_concurrent_uni_streams 100, initial_mtu 1200
+  /// with MTU discovery on, initial_rtt 333 ms, GSO on).
+  pub fn transport_config(&self) -> Result<TransportConfig> {
+    let mut transport_config = TransportConfig::default();
+    match self.congestion_controller {
+      CongestionController::Cubic => {
+        transport_config.congestion_controller_factory(Arc::new(CubicConfig::default()));
+      }
+      CongestionController::Bbr => {
+        transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+      }
+    }
+    transport_config.keep_alive_interval(Some(Duration::from_secs(self.keep_alive_interval)));
+    transport_config.max_idle_timeout(Some(Duration::from_secs(self.max_idle_timeout).try_into()?));
+    // Request flow control: bound the number of concurrent request streams a peer
+    // may open.
+    transport_config.max_concurrent_bidi_streams(self.max_request_stream_limit());
+    Ok(transport_config)
+  }
+
+  /// Every resolved setting, for the RELAY_CONFIG event emitted once at startup so a
+  /// run's identity records what the relay actually ran with. Durations are in the
+  /// unit the flag takes (`*_ms` millisecond flags, `*_secs`/plain seconds), plus the
+  /// quinn transport defaults as `quinn_transport`.
+  pub fn event_record(&self) -> serde_json::Value {
+    let quinn_transport = self
+      .transport_config()
+      .map(|t| format!("{t:?}"))
+      .unwrap_or_else(|e| format!("error: {e}"));
+    serde_json::json!({
+      "port": self.port,
+      "host": self.host,
+      "cert_file": self.cert_file,
+      "key_file": self.key_file,
+      "congestion_controller": self.congestion_controller.as_str(),
+      "cc_initial_window_bytes": self.congestion_controller.default_initial_window_bytes(),
+      "keep_alive_interval_s": self.keep_alive_interval,
+      "max_idle_timeout_s": self.max_idle_timeout,
+      "cache_size": self.cache_size,
+      "cache_expiration_type": format!("{:?}", self.cache_expiration_type).to_lowercase(),
+      "cache_expiration_minutes": self.cache_expiration_minutes,
+      "log_folder": self.log_folder,
+      "event_log": self.event_log,
+      "enable_object_logging": self.enable_object_logging,
+      "enable_token_logging": self.enable_token_logging,
+      "token_log_path": self.token_log_path,
+      "io_sockets": self.io_sockets,
+      "max_request_streams": self.max_request_streams,
+      "max_active_requests": self.max_active_requests,
+      "max_subscriber_lag": self.max_subscriber_lag,
+      "max_publish_streams": self.max_publish_streams,
+      "write_kbps_limit": self.write_kbps_limit,
+      "redirect_uri": self.redirect_uri,
+      "max_upstream_fetch_gaps": self.max_upstream_fetch_gaps,
+      "upstream_fetch_timeout_secs": self.upstream_fetch_timeout.as_secs(),
+      "upstream_subscribe_timeout_secs": self.upstream_subscribe_timeout.as_secs(),
+      "track_alias_resolution_timeout_ms": self.track_alias_resolution_timeout.as_millis() as u64,
+      "downstream_alias_timeout_ms": self.downstream_alias_timeout.as_millis() as u64,
+      "publish_done_stream_timeout_ms": self.publish_done_stream_timeout.as_millis() as u64,
+      "dedup_retained_groups": self.dedup_retained_groups,
+      "quinn_transport": quinn_transport,
+    })
   }
 
   /// How many UDP sockets to bind. Only Linux spreads connections across sockets
@@ -375,6 +491,7 @@ mod tests {
       key_file: "apps/relay/cert/key.pem".to_string(),
       max_idle_timeout: 7,
       keep_alive_interval: 3,
+      congestion_controller: CongestionController::Cubic,
       cache_size: 1000,
       log_folder: "/tmp".to_string(),
       cache_expiration_type: CacheExpirationType::Ttl,
@@ -443,5 +560,113 @@ mod tests {
     // A value above the QUIC VarInt maximum is clamped rather than rejected.
     let clamped = test_config(u64::MAX);
     assert_eq!(clamped.max_request_stream_limit(), quinn::VarInt::MAX);
+  }
+
+  /// M4: CUBIC is the primary controller; BBR stays selectable for the sensitivity
+  /// batch. The runner passes the flag explicitly, so the spelling is pinned here.
+  #[test]
+  fn congestion_controller_defaults_to_cubic_and_bbr_is_selectable() {
+    let cli = Cli::parse_from(["relay"]);
+    assert_eq!(cli.congestion_controller, CongestionController::Cubic);
+    let cli = Cli::parse_from(["relay", "--congestion-controller", "bbr"]);
+    assert_eq!(cli.congestion_controller, CongestionController::Bbr);
+    let cli = Cli::parse_from(["relay", "--congestion-controller", "cubic"]);
+    assert_eq!(cli.congestion_controller, CongestionController::Cubic);
+    assert!(Cli::try_parse_from(["relay", "--congestion-controller", "reno"]).is_err());
+  }
+
+  /// The transport flags the runner pins on every branch, with their current
+  /// defaults (seconds for keep-alive / idle timeout, milliseconds for the alias
+  /// timeouts, groups for the cache).
+  #[test]
+  fn transport_flags_keep_their_defaults() {
+    let cli = Cli::parse_from(["relay"]);
+    assert_eq!(cli.keep_alive_interval, 3);
+    assert_eq!(cli.max_idle_timeout, 7);
+    assert_eq!(cli.track_alias_resolution_timeout_ms, 500);
+    assert_eq!(cli.downstream_alias_timeout_ms, 3000);
+    assert_eq!(cli.publish_done_stream_timeout_ms, 2000);
+    assert_eq!(cli.cache_size, 1000);
+    let cli = Cli::parse_from([
+      "relay",
+      "--keep-alive-interval",
+      "5",
+      "--max-idle-timeout",
+      "20",
+      "--track-alias-resolution-timeout-ms",
+      "2000",
+      "--downstream-alias-timeout-ms",
+      "4000",
+      "--cache-size",
+      "200",
+    ]);
+    let config = AppConfig::from_cli(cli);
+    assert_eq!(config.keep_alive_interval, 5);
+    assert_eq!(config.max_idle_timeout, 20);
+    assert_eq!(
+      config.track_alias_resolution_timeout,
+      Duration::from_millis(2000)
+    );
+    assert_eq!(config.downstream_alias_timeout, Duration::from_millis(4000));
+    assert_eq!(config.cache_size, 200);
+  }
+
+  /// The transport config applies the chosen controller and the explicit timeouts
+  /// and leaves the rest of quinn's defaults alone (Debug output is what RELAY_CONFIG
+  /// records).
+  #[test]
+  fn transport_config_applies_timeouts_and_keeps_quinn_defaults() {
+    let config = test_config(10);
+    let dbg = format!("{:?}", config.transport_config().unwrap());
+    assert!(dbg.contains("keep_alive_interval: Some(3s)"), "{dbg}");
+    assert!(dbg.contains("max_idle_timeout: Some(7000)"), "{dbg}");
+    assert!(dbg.contains("max_concurrent_bidi_streams: 10"), "{dbg}");
+    // quinn-proto 0.11 defaults, untouched
+    assert!(dbg.contains("stream_receive_window: 1250000"), "{dbg}");
+    assert!(dbg.contains("send_window: 10000000"), "{dbg}");
+    assert!(dbg.contains("max_concurrent_uni_streams: 100"), "{dbg}");
+    assert!(dbg.contains("initial_mtu: 1200"), "{dbg}");
+  }
+
+  /// RELAY_CONFIG carries every resolved field, named as the flags are.
+  #[test]
+  fn event_record_lists_every_resolved_field() {
+    let mut config = test_config(10);
+    config.congestion_controller = CongestionController::Bbr;
+    let record = config.event_record();
+    for key in [
+      "port",
+      "host",
+      "congestion_controller",
+      "cc_initial_window_bytes",
+      "keep_alive_interval_s",
+      "max_idle_timeout_s",
+      "cache_size",
+      "cache_expiration_type",
+      "cache_expiration_minutes",
+      "track_alias_resolution_timeout_ms",
+      "downstream_alias_timeout_ms",
+      "publish_done_stream_timeout_ms",
+      "upstream_fetch_timeout_secs",
+      "upstream_subscribe_timeout_secs",
+      "max_request_streams",
+      "max_subscriber_lag",
+      "write_kbps_limit",
+      "dedup_retained_groups",
+      "event_log",
+      "quinn_transport",
+    ] {
+      assert!(record.get(key).is_some(), "RELAY_CONFIG lacks {key}");
+    }
+    assert_eq!(record["congestion_controller"], "bbr");
+    assert_eq!(record["cc_initial_window_bytes"], 240_000);
+    assert_eq!(record["keep_alive_interval_s"], 3);
+    assert_eq!(record["max_idle_timeout_s"], 7);
+    assert_eq!(record["track_alias_resolution_timeout_ms"], 500);
+    assert_eq!(record["cache_expiration_type"], "ttl");
+    assert_eq!(
+      CongestionController::Cubic.default_initial_window_bytes(),
+      12_000
+    );
   }
 }

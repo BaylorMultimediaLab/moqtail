@@ -174,6 +174,9 @@ impl Server {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     if events::enabled() {
+      // Once per run: the resolved configuration (congestion controller, timeouts,
+      // cache size, quinn defaults), so a bundle's identity is what the relay ran with.
+      events::emit("RELAY_CONFIG", self.app_config.event_record());
       self.spawn_cache_stats_task(shutdown_rx.clone());
     }
     // Only used to correlate log lines, so any unique value will do.
