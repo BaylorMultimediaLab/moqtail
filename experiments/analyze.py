@@ -7,28 +7,38 @@
 Per run it writes ``summary.json`` and ``summary.md`` next to the logs. With
 several runs it also writes one aggregate CSV row per run.
 
-Metric definitions (see docs/measurement-schema.md):
+Metric definitions are normative in docs/measurement-schema.md ("Metric
+definitions"). In short, per run and over the last client session:
 
-* startup_delay_ms        CONNECT_START -> first rendered frame (STARTUP)
-* stalls                  STALL_START/STALL_END episodes after the first frame;
-                          wedge/range-jump SEEKs are listed separately since
-                          they hide stalls the element never reports
-* switches                SWITCH_SENT count, up/down split, and per switch the
-                          detection timeline t2..t5 plus the relay-side
-                          SWITCH_RECV / SWITCH_PROMOTED stamps
-* detection               for every NET_CHANGE: t0 (change), t1 (first
-                          THROUGHPUT_SAMPLE within --t1-tolerance of the new
-                          rate), t2 (first ABR_DECISION in the right
-                          direction), t3 SWITCH_SENT, t4 SWITCH_FIRST_OBJECT,
-                          t5 SWITCH_FIRST_FRAME
-* time_shift              SAMPLE.time_shift_error_ms (signed, absolute) and
-                          live_edge_distance_ms statistics
-* recovery                after an up-step: quality recovery (track index back
-                          to the pre-drop index) and offset recovery
-                          (|time_shift_error| within --offset-tolerance for
-                          --offset-hold seconds)
-* bitrate                 time-weighted mean played bitrate and per-track share
-* cache / process         relay CACHE_STATS and runner PROC_STATS extremes
+* switches               one entry per SWITCH_SENT, joined to its later records by
+                         ``switch_seq`` (fallback for old bundles: last SWITCH_SENT
+                         with ts <= record.ts and matching from AND to; every other
+                         unresolved switch it overwrote is superseded). Every switch
+                         ends in exactly one ``terminal``: first_frame, superseded,
+                         error, skipped or open (run ended first). Seam statistics
+                         (visibility, viewer pause, hole, jump) are computed only
+                         over switches with their own SWITCH_FIRST_FRAME.
+* presented rung         time-weighted over SAMPLE intervals in which the playhead
+                         advanced, using SAMPLE.presented_track when present and
+                         otherwise the track visible between consecutive own first
+                         frames. The subscribed rung (SAMPLE.track) is kept as a
+                         diagnostic.
+* shares                 fit_share_low: share of advancing time in
+                         [t_drop + 5 s, t_restore) at a rung whose bitrate fits
+                         0.9 x the low rate; pre_drop_share_after_restore: share of
+                         advancing time in [t_restore + 5 s, end) at or above the
+                         pre-drop rung (median presented rung, 20 s before the drop).
+* reaction               down_reaction_ms / up_recovery_ms and the t1..t5
+                         attribution are computed only when the presented rung at
+                         the drop is above the fitting rung, and reported only from
+                         the detect_step profile; otherwise null with
+                         ``reaction_na_reason``.
+* stalls                 STALL episodes >= 250 ms after the first frame; shorter
+                         ones are ``blips``. Starvation = the stall time inside
+                         DATA_STARVED episodes, a subset of stall time.
+* media_skipped_ms       sum of to - from over gap seeks (``gap``; old reasons
+                         ``range-jump`` / ``unwedge``) after the initial window.
+* switches_per_minute    SWITCH_SENT count over ((RUN_END or last SAMPLE) - STARTUP).
 """
 
 from __future__ import annotations
@@ -51,6 +61,7 @@ SEEK_REASON_NORMAL = {"startup": "startup", "gap": "gap", "range-jump": "gap", "
                       "visibility": "visibility"}
 # Mechanisms whose relay emits SWITCH_PROMOTED for every switch (validate.py requires the stamp).
 PROMOTING_MECHANISMS = {"native", "pr1378"}
+DEFAULT_CONGESTION_CONTROLLER = "bbr"  # every run before the 2026-10 rebuild used BBR (relay hard-coded)
 
 
 def load(run: Path) -> list[dict]:
@@ -523,7 +534,11 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     index_of = {t["track"]: i for i, t in enumerate(ladder)}
     bitrate_of = {t["track"]: (t.get("bitrate") or 0) for t in ladder}
 
-    identity = meta.get("identity") or {}
+    identity = dict(meta.get("identity") or {})
+    # Condition key: the relay's congestion controller. Runs before the rebuild did not
+    # record it and all used BBR (hard-coded in the relay).
+    cc_recorded = identity.get("congestion_controller") is not None
+    identity.setdefault("congestion_controller", DEFAULT_CONGESTION_CONTROLLER)
     clock = first(recs, "CLOCK_MAP")
     ua = (clock or {}).get("user_agent") or ""
     browser_version = next((ua[ua.index(k) + len(k):].split()[0] for k in ("Firefox/", "Chrome/") if k in ua), None)
@@ -531,6 +546,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     out: dict = {
         "run_id": meta.get("run_id", run.name),
         "identity": identity,
+        "congestion_controller": identity["congestion_controller"],
+        "congestion_controller_source": "identity" if cc_recorded else "default",
         "browser_version": browser_version,
         "mechanism": identity.get("mechanism") or meta.get("args", {}).get("mechanism"),
         "mechanism_mode": identity.get("mechanism_mode"),
@@ -540,6 +557,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "delay_groups": client_meta.get("delay_groups"),
         "target_shift_ms": client_meta.get("target_shift_ms"),
         "profile": meta.get("profile", {}).get("name"),
+        "qdisc": identity.get("qdisc") or meta.get("profile", {}).get("queue"),
         "bg_flows": meta.get("args", {}).get("bg_flows"),
         "duration_s": identity.get("duration_s") or meta.get("args", {}).get("duration"),
         "net_backend": meta.get("net_backend"),
@@ -1287,90 +1305,117 @@ def fmt(v) -> str:
 
 
 def to_markdown(s: dict) -> str:
+    sw, stl, ts_, br, sh, rx = s["switches"], s["stalls"], s["time_shift"], s["bitrate"], s["shares"], s["reaction"]
     L = [f"# {s['run_id']}", "",
-         f"mechanism={s['mechanism']} client={s['client_mode']} shift={s['time_shift_s']}s "
-         f"(delay_groups={s['delay_groups']}, target={s['target_shift_ms']} ms) profile={s['profile']} bg={s['bg_flows']}", "",
+         f"mechanism={s['mechanism']} mode={s['mechanism_mode']} client={s['client_mode']} shift={s['time_shift_s']}s "
+         f"(delay_groups={s['delay_groups']}, target={s['target_shift_ms']} ms) profile={s['profile']} qdisc={s.get('qdisc')} "
+         f"cc={s.get('congestion_controller')} bg={s['bg_flows']} controller={(s.get('identity') or {}).get('controller') or 'baseline'}", "",
+         "## Headline", "",
          "| metric | value |", "|---|---|",
+         f"| run duration s (first frame to RUN_END); switches; switches/min | {fmt(s.get('run_duration_s'))}; {sw['count']}; {fmt(s['switching']['switches_per_minute'])} |",
+         f"| A->B->A reversals (direction reversals) | {s['switching']['aba_reversals']} ({s['switching']['direction_reversals']}) |",
+         f"| switch terminals: first_frame / superseded / error / skipped / open | {sw['terminals']['first_frame']} / {sw['terminals']['superseded']} / {sw['terminals']['error']} / {sw['terminals']['skipped']} / {sw['terminals']['open']} (superseded frac {fmt(sw['superseded_frac'])}; join by {'switch_seq' if sw['join'].get('seq_join') else 'fallback'}) |",
+         f"| presented rung mean / presented kbps (advancing time, source {br.get('presented_source')}) | {fmt(br.get('presented_rung_mean'))} / {fmt(br.get('presented_kbps'))} |",
+         f"| subscribed rung mean / kbps (diagnostic, wall time) | {fmt(br.get('subscribed_rung_mean'))} / {fmt(br.get('subscribed_kbps'))} |",
+         f"| fit share in the low window (fit rung {sh.get('fit_rung')}, rung at drop {sh.get('rung_at_drop')}) | {fmt(sh.get('fit_share_low'))} over {fmt(sh.get('low_window_advancing_s'))} s advancing |",
+         f"| share at >= pre-drop rung after restore (pre-drop rung {sh.get('pre_drop_rung')}) | {fmt(sh.get('pre_drop_share_after_restore'))} over {fmt(sh.get('after_window_advancing_s'))} s advancing |",
+         f"| stalls >= {stl['min_episode_ms']:g} ms: count / total ms / max ms; blips (count / ms) | {stl['count']} / {fmt(stl['total_ms'])} / {fmt(stl['max_ms'])}; {stl['blips']} ({fmt(stl['blips_ms'])}) |",
+         f"| media skipped by gap seeks after the initial window: s (seeks); wedge seeks s (seeks) | {fmt(stl['media_skipped_ms'] / 1000)} ({stl['gap_seeks']}); {fmt(stl['wedge_skipped_ms'] / 1000)} ({stl['wedge_seeks']}) |",
+         f"| starvation: stall s inside starvation episodes (subset of stall s); episodes / raw s from the last append | {fmt(s['starvation']['total_ms'] / 1000)}; {s['starvation']['count']} / {fmt(s['starvation']['raw_total_ms'] / 1000)}{' (open at end)' if s['starvation']['open_at_end'] else ''} |",
+         f"| viewer pause at seam ms p50 / p95 (own first frame, n) | {fmt(sw['viewer_pause_ms'].get('p50'))} / {fmt(sw['viewer_pause_ms'].get('p95'))} (n={sw['viewer_pause_ms'].get('n')}) |",
+         f"| switch visibility delay ms t5 p50 / p95 (own first frame, n) | {fmt(sw['switch_visibility_delay_ms'].get('p50'))} / {fmt(sw['switch_visibility_delay_ms'].get('p95'))} (n={sw['switch_visibility_delay_ms'].get('n')}) |",
          f"| startup delay (ms) | {fmt(s['startup']['startup_delay_ms'])} |",
+         f"| shift retained in the last 60 s (mean live-edge distance ms) / half shift lost / time to half shift s | {fmt(ts_.get('retained_live_edge_ms'))} / {ts_.get('half_shift_lost')} / {fmt((ts_['time_to_half_shift_ms'] or 0) / 1000) if ts_['time_to_half_shift_ms'] else '-'} |",
+         f"| live-edge distance ms mean after the initial window / p95 | {fmt(ts_['live_edge_after_window_ms'].get('mean'))} / {fmt(ts_['live_edge_after_window_ms'].get('p95'))} |",
+         f"| landed on a keyframe (sync flag) | {sw['landed_on_keyframe']} of {sw['landed_on_keyframe_known']} known |",
+         f"| down-reaction / up-recovery s (presented rung held {rx['sustain_s']:g} s) | {fmt((rx['down_reaction_ms'] or 0) / 1000) if rx['down_reaction_ms'] is not None else '-'} / {fmt((rx['up_recovery_ms'] or 0) / 1000) if rx['up_recovery_ms'] is not None else '-'}{(' (N/A: ' + rx['reaction_na_reason'] + ')') if rx.get('reaction_na_reason') else ''} |",
+         "", "## Diagnostics", "",
+         "| metric | value |", "|---|---|",
          f"| first group / expected / clamped | {s['startup']['first_group']} / {s['startup']['expected_start_group']} / {s['startup']['clamped_by_relay']} |",
-         f"| stalls (count / total ms / max ms) | {s['stalls']['count']} / {fmt(s['stalls']['total_ms'])} / {fmt(s['stalls']['max_ms'])} |",
-         f"| seeks (all): startup / gap / wedge / visibility; deferred gaps | {s['stalls']['seeks']['startup']} / {s['stalls']['seeks']['gap']} / {s['stalls']['seeks']['wedge']} / {s['stalls']['seeks']['visibility']}; {s['stalls']['range_jumps_deferred']} |",
-         f"| data starvation episodes / total s | {s['starvation']['count']} / {fmt(s['starvation']['total_ms'] / 1000)}{' (open at end)' if s['starvation']['open_at_end'] else ''} |",
-         f"| down-reaction / up-recovery s (played rung held {s['reaction']['sustain_s']:g} s) | {fmt((s['reaction']['down_reaction_ms'] or 0) / 1000) if s['reaction']['down_reaction_ms'] is not None else '-'} / {fmt((s['reaction']['up_recovery_ms'] or 0) / 1000) if s['reaction']['up_recovery_ms'] is not None else '-'} |",
+         f"| seeks (all): startup / gap / wedge / visibility; deferred gaps | {stl['seeks']['startup']} / {stl['seeks']['gap']} / {stl['seeks']['wedge']} / {stl['seeks']['visibility']}; {stl['range_jumps_deferred']} |",
          f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
-         f"| delivery (needs --log-objects): groups / objects per group p50,min / short (received < half) / truncated on the wire (arrived < half) | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
+         f"| delivery (needs --log-objects): groups / objects per group p50,min / short / truncated on the wire | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
          f"| of the wire-cut groups (relay OBJECT_SENT): cut at the relay / lost after send | {s['delivery']['cut_at_relay']} / {s['delivery']['lost_after_send']} |",
-         f"| probe load: probes / MB / mean Mbps; relay->client object latency ms p50 / p95 (needs --log-objects) | {s['link']['probes']} / {s['link']['probe_bytes'] / 1e6:.1f} / {fmt(s['link']['probe_mbps'])}; {fmt(s['link']['send_recv_latency_ms'].get('p50'))} / {fmt(s['link']['send_recv_latency_ms'].get('p95'))} |",
-         f"| discarded by the client (stale-track objects / groups / MB; of which pre-keyframe) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f}; {s['discarded']['pre_keyframe']} |",
+         f"| probe load: probes / MB / mean Mbps; relay->client object latency ms p50 / p95 | {s['link']['probes']} / {s['link']['probe_bytes'] / 1e6:.1f} / {fmt(s['link']['probe_mbps'])}; {fmt(s['link']['send_recv_latency_ms'].get('p50'))} / {fmt(s['link']['send_recv_latency_ms'].get('p95'))} |",
+         f"| discarded by the client (stale objects / groups / MB; pre-keyframe; unrouted bytes) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f}; {s['discarded']['pre_keyframe']}; {s['discarded'].get('unrouted_bytes')} |",
          f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
-         f"| switches (up / down / failed) | {s['switches']['count']} ({s['switches']['up']} / {s['switches']['down']} / {s['switches']['failed']}) |",
-         f"| switch delivery latency ms, t4 (median / p95) | {fmt(s['switches']['switch_delivery_latency_ms'].get('p50'))} / {fmt(s['switches']['switch_delivery_latency_ms'].get('p95'))} |",
-         f"| switch visibility delay ms, t5 (median / p95) | {fmt(s['switches']['switch_visibility_delay_ms'].get('p50'))} / {fmt(s['switches']['switch_visibility_delay_ms'].get('p95'))} |",
-         f"| media seam gap ms (median / abs max) | {fmt(s['switches']['media_seam_gap_ms'].get('p50'))} / {fmt(s['switches']['media_seam_gap_ms'].get('max'))} |",
-         f"| seam ahead of playhead ms (median / p95) | {fmt(s['switches']['seam_ahead_of_playhead_ms'].get('p50'))} / {fmt(s['switches']['abs_seam_ahead_of_playhead_ms'].get('p95'))} |",
-         f"| playback position jump ms (median / abs p95) | {fmt(s['switches']['playback_position_jump_ms'].get('p50'))} / {fmt(s['switches']['abs_playback_position_jump_ms'].get('p95'))} |",
-         f"| viewer pause at seam ms (median / p95) | {fmt(s['switches']['viewer_pause_ms'].get('p50'))} / {fmt(s['switches']['viewer_pause_ms'].get('p95'))} |",
-         f"| seam buffer hole ms (median / max) | {fmt(s['switches']['seam_buffer_hole_ms'].get('p50'))} / {fmt(s['switches']['seam_buffer_hole_ms'].get('max'))} |",
-         f"| switches superseded before visible; skipped (previous not landed) | {s['switches']['superseded']} of {s['switches']['count']}; {s['switches']['skipped_not_landed']} |",
+         f"| switches (up / down / failed / skipped / landed) | {sw['count']} ({sw['up']} / {sw['down']} / {sw['failed']} / {sw['skipped']} / {sw['landed']}) |",
+         f"| switch delivery latency ms, t4 (median / p95) | {fmt(sw['switch_delivery_latency_ms'].get('p50'))} / {fmt(sw['switch_delivery_latency_ms'].get('p95'))} |",
+         f"| relay promoted ms (median / n of {sw['count']}) | {fmt(sw['relay_promoted_ms'].get('p50'))} / {sw['relay_promoted_ms'].get('n')} |",
+         f"| media seam gap ms (median / max) | {fmt(sw['media_seam_gap_ms'].get('p50'))} / {fmt(sw['media_seam_gap_ms'].get('max'))} |",
+         f"| seam ahead of playhead ms (median / abs p95); landed behind playhead | {fmt(sw['seam_ahead_of_playhead_ms'].get('p50'))} / {fmt(sw['abs_seam_ahead_of_playhead_ms'].get('p95'))}; {sw['landed_behind_playhead']} |",
+         f"| playback position jump ms (median / abs p95) | {fmt(sw['playback_position_jump_ms'].get('p50'))} / {fmt(sw['abs_playback_position_jump_ms'].get('p95'))} |",
+         f"| seam buffer hole ms (median / max) | {fmt(sw['seam_buffer_hole_ms'].get('p50'))} / {fmt(sw['seam_buffer_hole_ms'].get('max'))} |",
+         f"| seam dropped source frames (median / max); landed on object 0 | {fmt(sw['seam_dropped_source_frames'].get('p50'))} / {fmt(sw['seam_dropped_source_frames'].get('max'))}; {sw['landed_on_group_start']} of {sw['count']} |",
+         f"| join diagnostics: unjoined / duplicates / conflicting terminals; SKIPPED without SENT | {sw['join'].get('unjoined')} / {sw['join'].get('duplicates')} / {sw['join'].get('conflicting_terminals')}; {sw['skipped_not_sent']} |",
          f"| playback advancing fraction / longest no-progress s / longest frozen with playable data s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} / {fmt((s['playback'].get('longest_frozen_with_data_ms') or 0) / 1000)} |",
-         f"| time to half shift (s) | {fmt((s['time_shift']['time_to_half_shift_ms'] or 0) / 1000) if s['time_shift']['time_to_half_shift_ms'] else '-'} |",
-         f"| detection attributable (per change: quiet before t0 and t1 <= t2) | {s['detection_reliable']}; down t2/t4 {fmt(s['reaction']['down_t2_ms'])}/{fmt(s['reaction']['down_t4_ms'])} ms, up t2 {fmt(s['reaction']['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
-         f"| seam dropped source frames (median / max); landed on object 0; landed on a keyframe (sync flag) | {fmt(s['switches']['seam_dropped_source_frames'].get('p50'))} / {fmt(s['switches']['seam_dropped_source_frames'].get('max'))}; {s['switches']['landed_on_group_start']} of {s['switches']['count']}; {s['switches']['landed_on_keyframe']} of {s['switches']['landed_on_keyframe_known']} known |",
-         f"| switches/min; reversals (A->B->A) | {fmt(s['switching']['switches_per_minute'])}; {s['switching']['direction_reversals']} ({s['switching']['aba_reversals']}) |",
-         f"| inter-switch interval ms (median / min) | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])} |",
+         f"| detection attributable (per change: quiet before t0) | {s['detection_reliable']}; down t2/t4 {fmt(rx['down_t2_ms'])}/{fmt(rx['down_t4_ms'])} ms, up t2 {fmt(rx['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
+         f"| inter-switch interval ms (median / min); switch span s | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])}; {fmt(s['switching']['switch_span_s'])} |",
          f"| switches by rule | {s['switching']['switches_by_rule']} |",
          f"| switches followed within {s['feedback']['window_s']:g} s (by latency trend) | {s['feedback']['summary']['followed_within_window']} ({s['feedback']['summary']['followed_within_window_by_latency_trend']}) of {s['feedback']['summary']['switches']} |",
-         f"| initial-window live-edge distance ms (mean, n) | {fmt(s['time_shift']['initial_window']['live_edge_distance_ms'].get('mean'))} (n={s['time_shift']['initial_window']['live_edge_distance_ms'].get('n')}), target {s['time_shift']['initial_window']['target_shift_ms']} |",
-         f"| time-shift error ms signed mean / abs p95 | {fmt(s['time_shift']['signed_error_ms'].get('mean'))} / {fmt(s['time_shift']['abs_error_ms'].get('p95'))} |",
-         f"| shift retained in the last 60 s (mean live-edge distance ms) / closest to live ms | {fmt(s['time_shift'].get('retained_live_edge_ms'))} / {fmt(s['time_shift'].get('min_live_edge_ms'))} |",
-         f"| live-edge distance ms mean / p95 | {fmt(s['time_shift']['live_edge_distance_ms'].get('mean'))} / {fmt(s['time_shift']['live_edge_distance_ms'].get('p95'))} |",
-         f"| buffer s mean / p50 | {fmt(s['time_shift']['buffer_s'].get('mean'))} / {fmt(s['time_shift']['buffer_s'].get('p50'))} |",
-         f"| played bitrate kbps (time-weighted); mean rung index; share per rung | {fmt(s['bitrate'].get('time_weighted_mean_kbps'))}; {fmt(s['bitrate'].get('mean_rung_index'))}; {({k: round(v, 2) for k, v in (s['bitrate'].get('rung_share') or {}).items()})} |",
+         f"| initial-window live-edge distance ms (mean, n) | {fmt(ts_['initial_window']['live_edge_distance_ms'].get('mean'))} (n={ts_['initial_window']['live_edge_distance_ms'].get('n')}), target {ts_['initial_window']['target_shift_ms']} |",
+         f"| time-shift error ms signed mean / abs p95; closest to live ms | {fmt(ts_['signed_error_ms'].get('mean'))} / {fmt(ts_['abs_error_ms'].get('p95'))}; {fmt(ts_.get('min_live_edge_ms'))} |",
+         f"| live-edge distance ms mean / p95 (whole run) | {fmt(ts_['live_edge_distance_ms'].get('mean'))} / {fmt(ts_['live_edge_distance_ms'].get('p95'))} |",
+         f"| buffer s mean / p50; contiguous buffer s mean | {fmt(ts_['buffer_s'].get('mean'))} / {fmt(ts_['buffer_s'].get('p50'))}; {fmt(ts_['buffer_contig_s'].get('mean'))} |",
+         f"| presented rung share; subscribed rung share | {({k: round(v, 2) for k, v in (br.get('presented_rung_share') or {}).items()})}; {({k: round(v, 2) for k, v in (br.get('subscribed_rung_share') or {}).items()})} |",
          f"| relay cache total max bytes / evictions | {s['cache']['total_max_bytes']} / {s['cache']['evictions']} |",
+         f"| QUIC (client connection): rtt p50 ms / cwnd min KB / loss rate / congestion events | {fmt(s['conn']['rtt_ms'].get('p50'))} / {fmt((s['conn']['cwnd_bytes'].get('min') or 0) / 1000 or None)} / {fmt(s['conn'].get('loss_rate'))} / {s['conn'].get('congestion_events')} |",
+         f"| NET_CHANGE: changes / applied / with qdisc_stats; RUN_END present (elapsed s) | {s['net']['changes']} / {s['net']['applied']} / {s['net']['with_qdisc_stats']}; {s['run_end']['present']} ({fmt(s['run_end']['elapsed_s'])}) |",
          ]
     for name, p in s["process"].items():
         L.append(f"| {name} max RSS MB / mean CPU % | {p['max_rss_bytes'] / 1e6:.1f} / {p['mean_cpu_pct']:.1f} |")
     if s["detection"]:
-        L += ["", "## Detection timelines (ms after the capacity change)", "",
-              "| change | attributable (quiet / t1<=t2) | t1 sample | t2 decision (rule) | t3 sent | t4 first obj | t5 first frame | quality rec. | offset rec. | sustained reaction/recovery |",
-              "|---|---|---|---|---|---|---|---|---|---|"]
+        L += ["", "## Detection timelines (ms after the capacity change; diagnostics for every profile)", "",
+              "| change | attributable (quiet before) | precondition (rung at drop / fit; pre-drop rung) | t1 sample | t2 decision (rule) | t3 sent | t4 first obj | t5 first frame | quality rec. | offset rec. | sustained reaction/recovery |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
         for d in s["detection"]:
-            L.append(f"| {d['from_mbps']}->{d['to_mbps']} Mbps | {d['reliable']} ({d['quiet_before']} / {d['sample_before_decision']}) | {fmt(d['t1_ms'])} | {fmt(d['t2_ms'])} ({d['t2_rule']}) | "
+            pre = f"{d.get('precondition')} ({d.get('rung_at_drop')} / {d.get('fit_index')}; {d.get('pre_drop_index')})"
+            L.append(f"| {d['from_mbps']}->{d['to_mbps']} Mbps | {d['reliable']} | {pre} | {fmt(d['t1_ms'])} | {fmt(d['t2_ms'])} ({d['t2_rule']}) | "
                      f"{fmt(d['t3_ms'])} | {fmt(d['t4_ms'])} | {fmt(d['t5_ms'])} | "
                      f"{fmt(d.get('quality_recovery_ms'))} | {fmt(d.get('offset_recovery_ms'))} | "
-                     f"{fmt(d.get('down_reaction_ms', d.get('up_recovery_ms')))} |")
-    if s["switches"]["list"]:
-        L += ["", "## Switches", "", "| t (s) | from -> to | rule | relay recv | promoted (start grp) | t4 delivery | landed obj0 | seam ahead | t5 visible | hole | jump | dropped src frames |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
-        t0 = s["switches"]["list"][0]["ts"]
-        for sw in s["switches"]["list"]:
-            L.append(f"| {(sw['ts'] - t0) / 1000:.1f} | {sw['from']} -> {sw['to']} | {rule_name(sw['rule_reason'])} | {fmt(sw['relay_recv_ms'])} | "
-                     f"{fmt(sw['relay_promoted_ms'])} ({sw['relay_start_group']}) | {fmt(sw['switch_delivery_latency_ms'])} | "
-                     f"{sw['landed_on_group_start']} | {fmt(sw['seam_ahead_of_playhead_ms'])} | {fmt(sw['switch_visibility_delay_ms'])} | "
-                     f"{fmt(sw['seam_buffer_hole_ms'])} | {fmt(sw['playback_position_jump_ms'])} | {sw['seam_dropped_source_frames']} |")
+                     f"{fmt(d.get('down_reaction_ms', d.get('up_recovery_ms')))}{(' (' + d['na_reason'] + ')') if d.get('na_reason') else ''} |")
+    if sw["list"]:
+        L += ["", "## Switches", "", "| t (s) | seq | from -> to | rule | terminal | relay recv | promoted (start grp) | t4 delivery | keyframe | seam ahead | t5 visible | pause | hole | jump | dropped src frames |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        t0 = sw["list"][0]["ts"]
+        for x in sw["list"]:
+            term = x["terminal"] + (f"(by {x['superseded_by']})" if x["superseded_by"] is not None else "")
+            L.append(f"| {(x['ts'] - t0) / 1000:.1f} | {x['switch_seq']} | {x['from']} -> {x['to']} | {rule_name(x['rule_reason'])} | {term} | {fmt(x['relay_recv_ms'])} | "
+                     f"{fmt(x['relay_promoted_ms'])} ({x['relay_start_group']}) | {fmt(x['switch_delivery_latency_ms'])} | "
+                     f"{x['landed_on_keyframe']} | {fmt(x['seam_ahead_of_playhead_ms'])} | {fmt(x['switch_visibility_delay_ms'])} | "
+                     f"{fmt(x['viewer_pause_ms'])} | {fmt(x['seam_buffer_hole_ms'])} | {fmt(x['playback_position_jump_ms'])} | {x['seam_dropped_source_frames']} |")
     return "\n".join(L) + "\n"
 
 
 IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups",
                     "browser_version",
-                    "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "background_flows",
+                    "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "congestion_controller", "background_flows",
                     "repeat_index", "timestamp_start"]
-METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_count", "switch_up", "switch_down",
+METRIC_COLUMNS = ["startup_delay_ms", "run_duration_s", "stall_count", "stall_total_ms", "stall_blips", "media_skipped_ms", "wedge_skipped_ms",
+                  "switch_count", "switch_up", "switch_down",
                   "switches_per_minute", "direction_reversals", "aba_reversals", "median_inter_switch_ms",
-                  "cooldown_activations", "switch_delivery_latency_p50_ms", "switch_visibility_delay_p50_ms",
+                  "cooldown_activations", "switch_delivery_latency_p50_ms", "switch_visibility_delay_p50_ms", "switch_visibility_delay_p95_ms",
                   "media_seam_gap_p50_ms", "seam_ahead_p50_ms", "seam_buffer_hole_p50_ms", "seam_dropped_frames_p50",
-                  "landed_on_group_start", "landed_on_keyframe", "superseded", "landed_behind_playhead", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
+                  "landed_on_group_start", "landed_on_keyframe", "landed_on_keyframe_known", "presented_switches", "superseded", "superseded_frac",
+                  "open_switches", "failed_switches", "landed_behind_playhead", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
-                  "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
-                  "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
+                  "time_to_half_shift_ms", "half_shift_lost", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
+                  "detection_reliable", "down_reaction_ms", "up_recovery_ms", "reaction_na_reason", "data_starved_ms", "data_starved_raw_ms",
                   "gap_seeks", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
-                  "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
+                  "presented_rung_mean", "presented_kbps", "subscribed_rung_mean", "subscribed_kbps",
+                  "fit_share_low", "pre_drop_share_after_restore", "pre_drop_rung", "rung_at_drop", "fit_rung",
+                  "truncated_groups", "discarded_objects", "discarded_mb",
                   "probe_mbps", "probe_measured_min_mbps", "probe_measured_p50_mbps", "conn_loss_rate", "conn_cwnd_min_bytes",
                   "conn_congestion_events", "send_recv_latency_p50_ms", "down_t2_ms", "down_t4_ms", "up_t2_ms", "down_reliable", "up_reliable",
                   "retained_live_edge_ms", "min_live_edge_ms",
-                  "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "buffer_mean_s", "bitrate_kbps",
+                  "shift_err_mean_ms", "shift_abs_err_p95_ms", "live_edge_mean_ms", "live_edge_after_window_ms", "buffer_mean_s",
                   "cache_max_bytes", "relay_max_rss_mb"]
 AGG_COLUMNS = IDENTITY_COLUMNS + METRIC_COLUMNS
+# Right-censored metrics: None = the event never happened in that run (per-condition
+# summaries report the fraction with the event and the median with never = inf).
+CENSORED_COLUMNS = ("time_to_half_shift_ms", "down_reaction_ms", "up_recovery_ms")
+# Bernoulli metrics: per-condition summaries report the fraction, never a median.
+FRACTION_COLUMNS = ("half_shift_lost", "detection_reliable", "down_reliable", "up_reliable", "session_destroyed")
 
 
 def agg_row(s: dict) -> dict:
@@ -1383,49 +1428,64 @@ def agg_row(s: dict) -> dict:
     ident.setdefault("delay_groups", s["delay_groups"])
     ident.setdefault("network_profile", s["profile"])
     ident.setdefault("background_flows", s["bg_flows"])
+    ident.setdefault("qdisc", s.get("qdisc"))
+    ident.setdefault("congestion_controller", s.get("congestion_controller") or DEFAULT_CONGESTION_CONTROLLER)
     row = {k: ident.get(k) for k in IDENTITY_COLUMNS}
     row["controller_params"] = json.dumps(ident.get("controller_params") or {}, sort_keys=True)
     # The browser build changed between batches once (Firefox 156 -> 157); keep it per run.
     row["browser_version"] = s.get("browser_version")
+    sw, stl, ts_, br, sh, rx = s["switches"], s["stalls"], s["time_shift"], s["bitrate"], s["shares"], s["reaction"]
     row.update({
-        "startup_delay_ms": s["startup"]["startup_delay_ms"], "stall_count": s["stalls"]["count"],
-        "stall_total_ms": s["stalls"]["total_ms"], "switch_count": s["switches"]["count"],
-        "switch_up": s["switches"]["up"], "switch_down": s["switches"]["down"],
+        "startup_delay_ms": s["startup"]["startup_delay_ms"], "run_duration_s": s.get("run_duration_s"),
+        "stall_count": stl["count"], "stall_total_ms": stl["total_ms"], "stall_blips": stl["blips"],
+        "media_skipped_ms": stl["media_skipped_ms"], "wedge_skipped_ms": stl["wedge_skipped_ms"],
+        "switch_count": sw["count"],
+        "switch_up": sw["up"], "switch_down": sw["down"],
         "switches_per_minute": s["switching"]["switches_per_minute"],
         "direction_reversals": s["switching"]["direction_reversals"],
         "aba_reversals": s["switching"]["aba_reversals"],
         "median_inter_switch_ms": s["switching"]["median_inter_switch_interval_ms"],
         "cooldown_activations": s["switching"]["cooldown_activations"],
-        "switch_delivery_latency_p50_ms": s["switches"]["switch_delivery_latency_ms"].get("p50"),
-        "switch_visibility_delay_p50_ms": s["switches"]["switch_visibility_delay_ms"].get("p50"),
-        "media_seam_gap_p50_ms": s["switches"]["media_seam_gap_ms"].get("p50"),
-        "seam_ahead_p50_ms": s["switches"]["seam_ahead_of_playhead_ms"].get("p50"),
-        "seam_buffer_hole_p50_ms": s["switches"]["seam_buffer_hole_ms"].get("p50"),
-        "seam_dropped_frames_p50": s["switches"]["seam_dropped_source_frames"].get("p50"),
-        "landed_on_group_start": s["switches"]["landed_on_group_start"],
-        "landed_on_keyframe": s["switches"]["landed_on_keyframe"],
-        "landed_behind_playhead": s["switches"].get("landed_behind_playhead"),
-        "superseded": s["switches"]["superseded"],
-        "abs_playback_jump_p95_ms": s["switches"]["abs_playback_position_jump_ms"].get("p95"),
-        "viewer_pause_p95_ms": s["switches"]["viewer_pause_ms"].get("p95"),
+        "switch_delivery_latency_p50_ms": sw["switch_delivery_latency_ms"].get("p50"),
+        "switch_visibility_delay_p50_ms": sw["switch_visibility_delay_ms"].get("p50"),
+        "switch_visibility_delay_p95_ms": sw["switch_visibility_delay_ms"].get("p95"),
+        "media_seam_gap_p50_ms": sw["media_seam_gap_ms"].get("p50"),
+        "seam_ahead_p50_ms": sw["seam_ahead_of_playhead_ms"].get("p50"),
+        "seam_buffer_hole_p50_ms": sw["seam_buffer_hole_ms"].get("p50"),
+        "seam_dropped_frames_p50": sw["seam_dropped_source_frames"].get("p50"),
+        "landed_on_group_start": sw["landed_on_group_start"],
+        "landed_on_keyframe": sw["landed_on_keyframe"],
+        "landed_on_keyframe_known": sw["landed_on_keyframe_known"],
+        "presented_switches": sw["presented"],
+        "landed_behind_playhead": sw.get("landed_behind_playhead"),
+        "superseded": sw["superseded"], "superseded_frac": sw["superseded_frac"],
+        "open_switches": sw["open"], "failed_switches": sw["failed"],
+        "abs_playback_jump_p95_ms": sw["abs_playback_position_jump_ms"].get("p95"),
+        "viewer_pause_p95_ms": sw["viewer_pause_ms"].get("p95"),
         "followed_within_window": s["feedback"]["summary"]["followed_within_window"],
         "followed_by_latency_trend": s["feedback"]["summary"]["followed_within_window_by_latency_trend"],
-        "initial_live_edge_mean_ms": s["time_shift"]["initial_window"]["live_edge_distance_ms"].get("mean"),
-        "time_to_half_shift_ms": s["time_shift"]["time_to_half_shift_ms"],
+        "initial_live_edge_mean_ms": ts_["initial_window"]["live_edge_distance_ms"].get("mean"),
+        "time_to_half_shift_ms": ts_["time_to_half_shift_ms"],
+        "half_shift_lost": ts_.get("half_shift_lost"),
         "advancing_fraction": s["playback"]["advancing_fraction"],
         "longest_no_progress_ms": s["playback"]["longest_no_progress_ms"],
         "longest_frozen_with_data_ms": s["playback"].get("longest_frozen_with_data_ms"),
-        "session_destroyed": s["switches"]["session_destroyed"],
+        "session_destroyed": sw["session_destroyed"],
         "detection_reliable": s["detection_reliable"],
-        "down_reaction_ms": s["reaction"]["down_reaction_ms"],
-        "up_recovery_ms": s["reaction"]["up_recovery_ms"],
+        "down_reaction_ms": rx["down_reaction_ms"],
+        "up_recovery_ms": rx["up_recovery_ms"],
+        "reaction_na_reason": rx.get("reaction_na_reason"),
         "data_starved_ms": s["starvation"]["total_ms"],
-        "gap_seeks": s["stalls"]["gap_seeks"],
-        "range_jumps_deferred": s["stalls"]["range_jumps_deferred"],
+        "data_starved_raw_ms": s["starvation"].get("raw_total_ms"),
+        "gap_seeks": stl["gap_seeks"],
+        "range_jumps_deferred": stl["range_jumps_deferred"],
         "up_guard_vetoes": s["switching"]["up_guard_vetoes"],
         "probes_discarded": s["switching"]["probes_discarded"],
         "media_errors": len(s["media_errors"]),
-        "mean_rung_index": s["bitrate"].get("mean_rung_index"),
+        "presented_rung_mean": br.get("presented_rung_mean"), "presented_kbps": br.get("presented_kbps"),
+        "subscribed_rung_mean": br.get("subscribed_rung_mean"), "subscribed_kbps": br.get("subscribed_kbps"),
+        "fit_share_low": sh.get("fit_share_low"), "pre_drop_share_after_restore": sh.get("pre_drop_share_after_restore"),
+        "pre_drop_rung": sh.get("pre_drop_rung"), "rung_at_drop": sh.get("rung_at_drop"), "fit_rung": sh.get("fit_rung"),
         "truncated_groups": s["delivery"]["truncated_groups"],
         "discarded_objects": s["discarded"]["objects"],
         "discarded_mb": s["discarded"]["bytes"] / 1e6,
@@ -1435,26 +1495,28 @@ def agg_row(s: dict) -> dict:
         "conn_cwnd_min_bytes": s.get("conn", {}).get("cwnd_bytes", {}).get("min"),
         "conn_congestion_events": s.get("conn", {}).get("congestion_events"),
         "probe_measured_p50_mbps": s["link"].get("probe_measured_mbps", {}).get("p50"),
-        "down_t2_ms": s["reaction"]["down_t2_ms"], "down_t4_ms": s["reaction"]["down_t4_ms"], "up_t2_ms": s["reaction"]["up_t2_ms"],
-        "down_reliable": s["reaction"]["down_reliable"], "up_reliable": s["reaction"]["up_reliable"],
-        "retained_live_edge_ms": s["time_shift"].get("retained_live_edge_ms"),
-        "min_live_edge_ms": s["time_shift"].get("min_live_edge_ms"),
+        "down_t2_ms": rx["down_t2_ms"], "down_t4_ms": rx["down_t4_ms"], "up_t2_ms": rx["up_t2_ms"],
+        "down_reliable": rx["down_reliable"], "up_reliable": rx["up_reliable"],
+        "retained_live_edge_ms": ts_.get("retained_live_edge_ms"),
+        "min_live_edge_ms": ts_.get("min_live_edge_ms"),
         "send_recv_latency_p50_ms": s["link"]["send_recv_latency_ms"].get("p50"),
-        "shift_err_mean_ms": s["time_shift"]["signed_error_ms"].get("mean"),
-        "shift_abs_err_p95_ms": s["time_shift"]["abs_error_ms"].get("p95"),
-        "live_edge_mean_ms": s["time_shift"]["live_edge_distance_ms"].get("mean"),
-        "buffer_mean_s": s["time_shift"]["buffer_s"].get("mean"),
-        "bitrate_kbps": s["bitrate"].get("time_weighted_mean_kbps"),
+        "shift_err_mean_ms": ts_["signed_error_ms"].get("mean"),
+        "shift_abs_err_p95_ms": ts_["abs_error_ms"].get("p95"),
+        "live_edge_mean_ms": ts_["live_edge_distance_ms"].get("mean"),
+        "live_edge_after_window_ms": ts_["live_edge_after_window_ms"].get("mean"),
+        "buffer_mean_s": ts_["buffer_s"].get("mean"),
         "cache_max_bytes": s["cache"]["total_max_bytes"],
         "relay_max_rss_mb": (s["process"].get("relay", {}).get("max_rss_bytes") or 0) / 1e6 or None,
     })
     return row
 
 
-# controller_params is a condition key too: the arm name "grid" was used before and
-# after the probe cap was added (2026-09-30), and those must never be pooled.
-CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups", "network_profile", "qdisc",
-                  "background_flows", "ladder_id"]
+# Condition key: everything that must never be pooled. controller_params is part of it
+# because the arm name "grid" was used before and after the probe cap was added
+# (2026-09-30); qdisc and the relay's congestion controller are factors of the 2026-10
+# grid (tail-drop vs fq_codel, cubic vs bbr).
+CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups",
+                  "network_profile", "qdisc", "congestion_controller", "background_flows", "ladder_id"]
 
 
 def bootstrap_ci(values: list[float], iterations: int = 2000, seed: int = 1) -> tuple[float, float] | None:
@@ -1470,7 +1532,11 @@ def bootstrap_ci(values: list[float], iterations: int = 2000, seed: int = 1) -> 
 
 def condition_stats(rows: list[dict]) -> list[dict]:
     """Per condition (every identity key except repeat_index and the timestamps): n,
-    median, IQR and a bootstrap 95 % CI of the median for each metric column."""
+    median, IQR and a bootstrap 95 % CI of the median for each metric column.
+    Censored columns (``*_ms``, None = never) become ``<name>_n`` (runs with the event),
+    ``<name>_of`` (applicable runs), ``<name>_median_s`` (over the runs with the event) and
+    ``<name>_median_censored_s`` (never = inf, the number to report); Bernoulli columns
+    report ``_frac`` and ``_of`` only, never a median."""
     groups: dict[tuple, list[dict]] = {}
     for r in rows:
         groups.setdefault(tuple(r.get(k) for k in CONDITION_KEYS), []).append(r)
@@ -1479,7 +1545,24 @@ def condition_stats(rows: list[dict]) -> list[dict]:
         rec: dict = dict(zip(CONDITION_KEYS, key))
         rec["n"] = len(members)
         for m in METRIC_COLUMNS:
-            vals = [r[m] for r in members if r.get(m) is not None]
+            if m in FRACTION_COLUMNS:
+                vals = [r[m] for r in members if r.get(m) is not None]
+                rec[f"{m}_frac"] = (sum(1 for v in vals if v) / len(vals)) if vals else None
+                rec[f"{m}_of"] = len(vals)
+                continue
+            if m in CENSORED_COLUMNS:
+                # Applicability: a run where the metric is not defined (live-edge client for
+                # time to half shift; reaction N/A) is left out before censoring.
+                if m == "time_to_half_shift_ms":
+                    app = [r for r in members if r.get("half_shift_lost") is not None]
+                else:
+                    app = [r for r in members if not r.get("reaction_na_reason")]
+                c = censored_summary([(r[m] / 1000) if r.get(m) is not None else None for r in app])
+                base = m.removesuffix("_ms")
+                rec[f"{base}_n"], rec[f"{base}_of"] = c["n"], c["of"]
+                rec[f"{base}_median_s"], rec[f"{base}_median_censored_s"] = c["median_s"], c["median_censored_s"]
+                continue
+            vals = [r[m] for r in members if r.get(m) is not None and not isinstance(r[m], str)]
             if not vals:
                 continue
             rec[f"{m}_median"] = statistics.median(vals)
@@ -1551,7 +1634,7 @@ def main() -> int:
             print("  " + ", ".join(f"{k}={c.get(k)}" for k in CONDITION_KEYS if c.get(k) is not None) + f": n={c['n']}"
                   + "".join(f"  {m}={fmt(c.get(m + '_median'))} [{fmt(c.get(m + '_q1'))}..{fmt(c.get(m + '_q3'))}]"
                             for m in ("startup_delay_ms", "stall_count", "switch_count", "aba_reversals",
-                                      "switch_visibility_delay_p50_ms", "shift_abs_err_p95_ms")))
+                                      "switch_visibility_delay_p50_ms", "presented_rung_mean")))
     return 0
 
 
