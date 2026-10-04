@@ -48,6 +48,14 @@ const TEST_ALPN: &[u8] = b"test-moqt";
 
 /// A connected (client, server) pair of raw QUIC connections on the loopback.
 pub(crate) async fn quic_pair() -> (TransportConnection, TransportConnection) {
+  quic_pair_with_server_transport(None).await
+}
+
+/// As `quic_pair`, with the server end running on `transport` (e.g. the relay's own
+/// `AppConfig::transport_config`).
+pub(crate) async fn quic_pair_with_server_transport(
+  transport: Option<quinn::TransportConfig>,
+) -> (TransportConnection, TransportConnection) {
   let server_identity =
     wtransport::Identity::self_signed(std::iter::once("localhost")).expect("self-signed identity");
 
@@ -55,7 +63,10 @@ pub(crate) async fn quic_pair() -> (TransportConnection, TransportConnection) {
   server_tls.alpn_protocols = vec![TEST_ALPN.to_vec()];
   let quic_server_config =
     quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("server crypto");
-  let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+  let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+  if let Some(transport) = transport {
+    server_config.transport_config(Arc::new(transport));
+  }
   let server_endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
     .expect("server endpoint");
   let server_addr = server_endpoint.local_addr().unwrap();

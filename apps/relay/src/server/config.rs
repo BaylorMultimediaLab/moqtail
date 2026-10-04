@@ -74,6 +74,34 @@ impl CongestionController {
   }
 }
 
+/// UDP generic segmentation offload for the relay's QUIC sends (C5).
+///
+/// With GSO quinn-udp hands the kernel one buffer of up to ~43 datagrams with
+/// UDP_SEGMENT, and it stays a single skb through the qdisc: `ethtool -K ... gso off`
+/// on the veth does not split it, because segmentation happens after dequeue. A
+/// netem/HTB bottleneck therefore counts and drains whole batches (a 24 KB batch is
+/// ~128 ms at 1.5 Mbps), so the shaped link is bursty and `limit` counts batches, not
+/// packets. `off` (default) makes every QUIC datagram its own sendmsg, so the qdisc
+/// sees packets; `on` is quinn's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum UdpGso {
+  On,
+  Off,
+}
+
+impl UdpGso {
+  pub fn as_str(&self) -> &'static str {
+    match self {
+      UdpGso::On => "on",
+      UdpGso::Off => "off",
+    }
+  }
+
+  pub fn enabled(&self) -> bool {
+    matches!(self, UdpGso::On)
+  }
+}
+
 /// Upper bound on `--io-sockets`. Past the core count extra sockets only add
 /// accept loops with nothing to do.
 const MAX_IO_SOCKETS: usize = 256;
@@ -111,6 +139,11 @@ pub struct Cli {
   /// Recorded in RELAY_CONFIG; every other quinn transport default is kept.
   #[arg(long, value_enum, default_value = "cubic")]
   pub congestion_controller: CongestionController,
+  /// UDP GSO for QUIC sends: `off` (default, one datagram per send so a shaping
+  /// qdisc sees packets, not batches) or `on` (quinn's default). Recorded in
+  /// RELAY_CONFIG as `udp_gso`.
+  #[arg(long, value_enum, default_value = "off")]
+  pub udp_gso: UdpGso,
   #[arg(long, default_value = "/tmp")]
   pub log_folder: String,
   /// Project-local experiment event log (JSON lines). Empty disables it.
@@ -213,6 +246,7 @@ pub struct AppConfig {
   /// Seconds (see `Cli::keep_alive_interval`).
   pub keep_alive_interval: u64,
   pub congestion_controller: CongestionController,
+  pub udp_gso: UdpGso,
   pub cache_size: u16,
   pub log_folder: String,
   /// Path of the experiment event log; empty = disabled.
@@ -267,6 +301,7 @@ impl AppConfig {
       max_idle_timeout: cli.max_idle_timeout,
       keep_alive_interval: cli.keep_alive_interval,
       congestion_controller: cli.congestion_controller,
+      udp_gso: cli.udp_gso,
       cache_size: cli.cache_size,
       log_folder: cli.log_folder,
       event_log: cli.event_log,
@@ -325,9 +360,10 @@ impl AppConfig {
 
     let transport_config = self.transport_config()?;
     info!(
-      "QUIC transport: congestion_controller={} (initial window {} B), keep_alive={}s, idle_timeout={}s; {:?}",
+      "QUIC transport: congestion_controller={} (initial window {} B), udp_gso={}, keep_alive={}s, idle_timeout={}s; {:?}",
       self.congestion_controller.as_str(),
       self.congestion_controller.default_initial_window_bytes(),
+      self.udp_gso.as_str(),
       self.keep_alive_interval,
       self.max_idle_timeout,
       transport_config
@@ -357,11 +393,11 @@ impl AppConfig {
   }
 
   /// The quinn transport configuration every accepted connection runs on. Only the
-  /// congestion controller, keep-alive, idle timeout and the request-stream limit are
-  /// set; everything else is quinn's default (recorded in RELAY_CONFIG through
+  /// congestion controller, UDP GSO, keep-alive, idle timeout and the request-stream
+  /// limit are set; everything else is quinn's default (recorded in RELAY_CONFIG through
   /// `TransportConfig`'s Debug output: stream_receive_window 1.25 MB, receive_window
   /// unlimited, send_window 10 MB, max_concurrent_uni_streams 100, initial_mtu 1200
-  /// with MTU discovery on, initial_rtt 333 ms, GSO on).
+  /// with MTU discovery on, initial_rtt 333 ms).
   pub fn transport_config(&self) -> Result<TransportConfig> {
     let mut transport_config = TransportConfig::default();
     match self.congestion_controller {
@@ -372,6 +408,7 @@ impl AppConfig {
         transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
       }
     }
+    transport_config.enable_segmentation_offload(self.udp_gso.enabled());
     transport_config.keep_alive_interval(Some(Duration::from_secs(self.keep_alive_interval)));
     transport_config.max_idle_timeout(Some(Duration::from_secs(self.max_idle_timeout).try_into()?));
     // Request flow control: bound the number of concurrent request streams a peer
@@ -396,6 +433,7 @@ impl AppConfig {
       "key_file": self.key_file,
       "congestion_controller": self.congestion_controller.as_str(),
       "cc_initial_window_bytes": self.congestion_controller.default_initial_window_bytes(),
+      "udp_gso": self.udp_gso.as_str(),
       "keep_alive_interval_s": self.keep_alive_interval,
       "max_idle_timeout_s": self.max_idle_timeout,
       "cache_size": self.cache_size,
@@ -496,6 +534,7 @@ mod tests {
       max_idle_timeout: 7,
       keep_alive_interval: 3,
       congestion_controller: CongestionController::Cubic,
+      udp_gso: UdpGso::Off,
       cache_size: 1000,
       log_folder: "/tmp".to_string(),
       cache_expiration_type: CacheExpirationType::Ttl,
@@ -579,6 +618,68 @@ mod tests {
     assert!(Cli::try_parse_from(["relay", "--congestion-controller", "reno"]).is_err());
   }
 
+  /// C5: UDP GSO is off unless asked for, the transport config carries the choice,
+  /// and RELAY_CONFIG records it.
+  #[test]
+  fn udp_gso_defaults_to_off_and_reaches_the_transport_config() {
+    let cli = Cli::parse_from(["relay"]);
+    assert_eq!(cli.udp_gso, UdpGso::Off);
+    let config = AppConfig::from_cli(cli);
+    let dbg = format!("{:?}", config.transport_config().unwrap());
+    assert!(dbg.contains("enable_segmentation_offload: false"), "{dbg}");
+    assert_eq!(config.event_record()["udp_gso"], "off");
+
+    let config = AppConfig::from_cli(Cli::parse_from(["relay", "--udp-gso", "on"]));
+    assert_eq!(config.udp_gso, UdpGso::On);
+    let dbg = format!("{:?}", config.transport_config().unwrap());
+    assert!(dbg.contains("enable_segmentation_offload: true"), "{dbg}");
+    assert_eq!(config.event_record()["udp_gso"], "on");
+    assert!(Cli::try_parse_from(["relay", "--udp-gso", "maybe"]).is_err());
+  }
+
+  /// End to end over loopback QUIC: with `--udp-gso off` every datagram the relay
+  /// sends is its own I/O operation, so a qdisc sees packets. Where the platform has
+  /// GSO (Linux), `on` batches them, which is what the flag exists to turn off.
+  #[tokio::test]
+  async fn udp_gso_off_sends_one_datagram_per_io() {
+    async fn bulk_send(gso: &str) -> quinn::UdpStats {
+      let config = AppConfig::from_cli(Cli::parse_from(["relay", "--udp-gso", gso]));
+      let (peer, server) = crate::server::test_support::quic_pair_with_server_transport(Some(
+        config.transport_config().unwrap(),
+      ))
+      .await;
+      let mut send = server.open_uni().await.unwrap();
+      let reader = tokio::spawn(async move {
+        let mut recv = peer.accept_uni().await.unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(Some(_)) = recv.read(&mut buf).await {}
+        peer
+      });
+      send.write_all(&vec![7u8; 512 * 1024]).await.unwrap();
+      send.finish().await.unwrap();
+      let _peer = reader.await.unwrap();
+      server.stats().udp_tx
+    }
+
+    let off = bulk_send("off").await;
+    assert!(off.datagrams > 100, "{off:?}");
+    assert_eq!(off.ios, off.datagrams, "one datagram per send: {off:?}");
+    let on = bulk_send("on").await;
+    if cfg!(target_os = "linux") {
+      assert!(on.ios < on.datagrams, "GSO batches on Linux: {on:?}");
+    }
+  }
+
+  /// The runner reads `congestion_controller` at the top level of RELAY_CONFIG and
+  /// treats its absence as an error; the values are exactly `cubic` and `bbr`.
+  #[test]
+  fn relay_config_carries_the_controller_at_the_top_level() {
+    let config = AppConfig::from_cli(Cli::parse_from(["relay"]));
+    assert_eq!(config.event_record()["congestion_controller"], "cubic");
+    let config = AppConfig::from_cli(Cli::parse_from(["relay", "--congestion-controller", "bbr"]));
+    assert_eq!(config.event_record()["congestion_controller"], "bbr");
+  }
+
   /// The transport flags the runner pins on every branch, with their current
   /// defaults (seconds for keep-alive / idle timeout, milliseconds for the alias
   /// timeouts, groups for the cache).
@@ -643,6 +744,7 @@ mod tests {
       "host",
       "congestion_controller",
       "cc_initial_window_bytes",
+      "udp_gso",
       "keep_alive_interval_s",
       "max_idle_timeout_s",
       "cache_size",

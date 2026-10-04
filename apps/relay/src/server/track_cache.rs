@@ -449,6 +449,7 @@ mod tests_group_bounds {
       max_idle_timeout: 60,
       keep_alive_interval: 30,
       congestion_controller: crate::server::config::CongestionController::Cubic,
+      udp_gso: crate::server::config::UdpGso::Off,
       cache_size: 100,
       log_folder: String::new(),
       cache_expiration_type: CacheExpirationType::Ttl,
