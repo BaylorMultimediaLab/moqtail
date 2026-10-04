@@ -232,6 +232,9 @@ export class RecvStream {
               previousObjectId = object.objectId
             }
             this.#internalBuffer.commit()
+            // Receive stamp (M11): taken here, where the object leaves the wire, so
+            // that arrival spacing is independent of how fast the consumer reads.
+            object.recvAt = performance.now()
             controller.enqueue(object)
             if (this.onDataReceived) this.onDataReceived(object)
             continue
@@ -384,7 +387,35 @@ if (import.meta.vitest) {
         const receivePromise = reader.read()
         await sendStream.write(fetchObject)
         const { value: receivedObject } = await receivePromise
-        expect(receivedObject).toEqual(fetchObject)
+        expect(receivedObject).toBeInstanceOf(SubgroupObject)
+        const received = receivedObject as SubgroupObject
+        expect(received.objectId).toEqual(fetchObject.objectId)
+        expect(received.properties).toEqual(fetchObject.properties)
+        expect(received.objectStatus).toEqual(fetchObject.objectStatus)
+        expect(received.payload).toEqual(fetchObject.payload)
+        reader.releaseLock()
+      })
+
+      // M11: the receive time is taken where the object leaves the wire, not where
+      // the application consumes it, so a consumer that appends into MSE between
+      // reads does not stretch the measured arrival spacing.
+      test('stamps recvAt (performance.now()) on each object as it is parsed', async () => {
+        const reader = recvStream.stream.getReader()
+        const before = performance.now()
+        await sendStream.write(SubgroupObject.newWithPayload(1, null, new Uint8Array([1])))
+        const { value: first } = await reader.read()
+        const afterFirst = performance.now()
+        expect(typeof (first as SubgroupObject).recvAt).toBe('number')
+        expect((first as SubgroupObject).recvAt!).toBeGreaterThanOrEqual(before)
+        expect((first as SubgroupObject).recvAt!).toBeLessThanOrEqual(afterFirst)
+
+        // A consumer that is slow to read does not move the stamp: the second
+        // object is parsed as soon as its bytes arrive.
+        await sendStream.write(SubgroupObject.newWithPayload(2, null, new Uint8Array([2])))
+        await new Promise((r) => setTimeout(r, 30))
+        const slowReadAt = performance.now()
+        const { value: second } = await reader.read()
+        expect((second as SubgroupObject).recvAt!).toBeLessThan(slowReadAt - 20)
         reader.releaseLock()
       })
     })
