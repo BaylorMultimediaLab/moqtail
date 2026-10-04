@@ -866,8 +866,10 @@ impl Subscription {
         // if so, set this track as current
         let mut switch_at_next_group = false;
         let mut new_start_location = None;
+        let current_track_name = self.subscriber.switch_context.get_current().await;
+        let mut old_last_sent_max: Option<Location> = None;
 
-        if let Some(current_track_name) = self.subscriber.switch_context.get_current().await {
+        if let Some(current_track_name) = current_track_name.clone() {
           let current_subscription_opt = self
             .subscriber
             .subscriptions
@@ -880,6 +882,7 @@ impl Subscription {
             let current_subscription = current_subscription.read().await;
             let current_state = current_subscription.subscription_state.read().await;
             let last_sent_max_location = current_state.last_sent_max_location.clone();
+            old_last_sent_max = last_sent_max_location.clone();
 
             if let Some(loc) = last_sent_max_location {
               switch_at_next_group = object_location.group >= loc.group;
@@ -929,6 +932,10 @@ impl Subscription {
 
           state.end_group = 0; // remove end group limit
 
+          // old_track / old_last_sent_group: the track this one replaces and the
+          // group its last accepted write belonged to (the seam's anchor: start_group
+          // is that + 1). trigger_forwarded: as shipped the trigger is never forwarded
+          // (this branch returns false below).
           events::emit(
             "SWITCH_PROMOTED",
             serde_json::json!({
@@ -938,6 +945,9 @@ impl Subscription {
               "trigger_group": object_location.group,
               "trigger_object": object_location.object,
               "start_group": state.start_location.as_ref().map(|l| l.group),
+              "old_track": current_track_name.as_ref().map(events::track_name_string),
+              "old_last_sent_group": old_last_sent_max.as_ref().map(|l| l.group),
+              "trigger_forwarded": false,
             }),
           );
 
@@ -973,6 +983,22 @@ impl Subscription {
           let mut state = self.subscription_state.write().await;
           state.forward = false;
           state.end_group = object_location.group;
+          // The moment this (demoted) track stops forwarding: last_group is the group
+          // of its last accepted write, i.e. the old side of the seam; stop_group is
+          // the group whose first object found it demoted (not forwarded). Its open
+          // streams are FIN'd as the publisher's close, not reset.
+          events::emit(
+            "SWITCH_DEMOTED",
+            serde_json::json!({
+              "conn": self.client_connection_id,
+              "relay_track_id": self.relay_track_id,
+              "old_track": events::track_name_string(&self.full_track_name),
+              "last_group": state.last_sent_max_location.as_ref().map(|l| l.group),
+              "last_object": state.last_sent_max_location.as_ref().map(|l| l.object),
+              "stop_group": object_location.group,
+              "stop_object": object_location.object,
+            }),
+          );
         }
 
         false
@@ -2063,9 +2089,10 @@ mod tests_native_switch {
     new: Track,
   }
 
-  async fn fixture() -> Fixture {
+  /// `conn` must be unique per test: captured events are filtered by it.
+  async fn fixture(conn: usize) -> Fixture {
     let (peer, server) = quic_pair().await;
-    let client = relay_client(9, server);
+    let client = relay_client(conn, server);
     let received = collect_streams(peer);
     let old = test_track(OLD, "video-360p");
     let new = test_track(NEW, "video-720p");
@@ -2100,7 +2127,7 @@ mod tests_native_switch {
   /// mid-group, and the source is not demoted for it.
   #[tokio::test]
   async fn statuses_set_after_the_subscribe_let_a_mid_group_object_through() {
-    let f = fixture().await;
+    let f = fixture(21).await;
     let _new_sub = switched_subscribe(&f).await;
     publish(&f.new, 5, 3).await;
     assert!(
@@ -2116,7 +2143,7 @@ mod tests_native_switch {
   /// the source's last sent one, and nothing of group 5 is forwarded from it.
   #[tokio::test]
   async fn statuses_set_before_the_subscribe_gate_the_first_object() {
-    let f = fixture().await;
+    let f = fixture(22).await;
     let new_name = f.new.full_track_name.clone();
     let old_name = f.old.full_track_name.clone();
     with_native_switch_statuses(
@@ -2149,6 +2176,27 @@ mod tests_native_switch {
       f.received.objects(OLD)
     );
     assert_eq!(f.client.switch_context.get_current().await, Some(new_name));
+
+    // The relay's account of the same seam.
+    let promoted = crate::server::events::test_capture::records("SWITCH_PROMOTED", 22);
+    assert_eq!(promoted.len(), 1, "{promoted:?}");
+    let p = &promoted[0];
+    assert_eq!(p["track"], "moqtail/video-720p");
+    assert_eq!(p["trigger_group"], 5);
+    assert_eq!(p["trigger_object"], 3);
+    assert_eq!(p["start_group"], 6);
+    assert_eq!(p["old_track"], "moqtail/video-360p");
+    assert_eq!(p["old_last_sent_group"], 5);
+    assert_eq!(p["trigger_forwarded"], false);
+    let demoted = crate::server::events::test_capture::records("SWITCH_DEMOTED", 22);
+    assert_eq!(demoted.len(), 1, "{demoted:?}");
+    let d = &demoted[0];
+    assert_eq!(d["old_track"], "moqtail/video-360p");
+    assert_eq!(d["relay_track_id"], OLD);
+    assert_eq!(d["last_group"], 5);
+    assert_eq!(d["last_object"], 4);
+    assert_eq!(d["stop_group"], 6);
+    assert_eq!(d["stop_object"], 0);
   }
 
   /// The ordering itself: when the SUBSCRIBE runs (and with it SUBSCRIBE_OK and the
