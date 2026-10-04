@@ -49,6 +49,8 @@ PRE_DROP_WINDOW_S = 20.0
 # SEEK reasons: one gap-crossing policy. Old bundles used range-jump / unwedge for what is now `gap`.
 SEEK_REASON_NORMAL = {"startup": "startup", "gap": "gap", "range-jump": "gap", "unwedge": "gap", "wedge": "wedge",
                       "visibility": "visibility"}
+# Mechanisms whose relay emits SWITCH_PROMOTED for every switch (validate.py requires the stamp).
+PROMOTING_MECHANISMS = {"native", "pr1378"}
 
 
 def load(run: Path) -> list[dict]:
@@ -120,6 +122,13 @@ def censored_summary(values_s: list[float | None]) -> dict:
     filled = sorted(events + [math.inf] * (n_all - len(events)))
     return {"n": len(events), "of": n_all, "median_s": statistics.median(events) if events else None,
             "median_censored_s": statistics.median(filled)}
+
+
+def is_valid(validity: dict | None) -> bool:
+    """The inclusion test for aggregates: only runs whose validation passed. A run with
+    no validation.json (``valid`` None) or an aborted run (``failed: ["aborted"]``,
+    written by the runner) is excluded."""
+    return bool(validity) and validity.get("valid") is True
 
 
 def track_matches(relay_track, client_track) -> bool:
@@ -532,10 +541,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "target_shift_ms": client_meta.get("target_shift_ms"),
         "profile": meta.get("profile", {}).get("name"),
         "bg_flows": meta.get("args", {}).get("bg_flows"),
+        "duration_s": identity.get("duration_s") or meta.get("args", {}).get("duration"),
+        "net_backend": meta.get("net_backend"),
         "gops_per_variant": pub_meta.get("gops_per_variant"),
         "events": len(recs),
         "client_sessions": sessions,
         "wall_clock_gaps_ms": wall_clock_gaps(recs),
+        "run_end": {"present": run_end is not None, "elapsed_s": run_end.get("elapsed_s") if run_end else None,
+                    "ts": run_end["ts"] if run_end else None},
     }
 
     # Startup ---------------------------------------------------------------
@@ -1080,12 +1093,21 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "congestion_events": (client_conn[-1].get("congestion_events") or 0) if client_conn else None,
         "loss_rate": ((client_conn[-1].get("lost_packets") or 0) / (client_conn[-1].get("sent_packets") or 1)) if client_conn else None,
     }
+    relay_config = first(recs, "RELAY_CONFIG")
     out["relay"] = {
         "subscribes": len(by("SUBSCRIBE_RECV")), "holds": len(by("SUBSCRIBE_HOLD")),
         "clamped": sum(1 for r in by("SUBSCRIBE_RECV") if r.get("decision") == "clamped"),
         "switch_recv": len(switch_recv), "switch_promoted": len(promoted),
+        "switch_demoted": len(by("SWITCH_DEMOTED")), "switch_wait": len(by("SWITCH_WAIT")),
+        "config": {k: v for k, v in relay_config.items() if k not in ("ts", "src", "event")} if relay_config else None,
     }
     out["publisher"] = {"groups_emitted": len(by("GROUP_EMIT"))}
+    out["net"] = {
+        "changes": len(changes),
+        "applied": sum(1 for c in changes if c.get("applied")),
+        "unapplied": sum(1 for c in changes if not c.get("applied")),
+        "with_qdisc_stats": sum(1 for c in changes if c.get("qdisc_stats") is not None),
+    }
     # Playback progress: fraction of sample intervals in which the playhead
     # advanced, the longest stretch without progress, and the longest stretch
     # without progress WHILE PLAYABLE DATA EXISTED (buffer ahead of the playhead,
@@ -1115,12 +1137,21 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "longest_frozen_with_data_ms": longest_with_data,
         "frozen_with_data_ms_total": with_data_total,
         "presented_frames": samples[-1].get("total_frames") if samples else None,
+        "samples": len(samples),
     }
     # Delivery integrity (needs --log-objects): how many objects of each group the
     # client actually received. A group with fewer than half the expected objects is
-    # "truncated": the relay stopped mid-group (seen as 2-frame slivers followed by
-    # one range-jump per second on PR #1378 time-shifted runs after a capacity drop).
+    # "truncated": the relay stopped mid-group.
     objs = by("OBJECT_RECV")
+    discarded = {"objects": len(drops),
+                 "bytes": sum(r.get("bytes") or 0 for r in drops),
+                 "groups": len({(r.get("track"), r.get("group")) for r in drops}),
+                 # objects dropped between a new init segment and the first keyframe
+                 "pre_keyframe": sum(1 for r in drops if r.get("reason") == "pre-keyframe"),
+                 # library-level discard of a stream whose alias has no route (2026-10 contract)
+                 "unrouted": sum(1 for r in drops if r.get("reason") == "unrouted"),
+                 "unrouted_bytes": sum(r.get("bytes") or 0 for r in drops if r.get("reason") == "unrouted")}
+    out["discarded"] = discarded
     if objs:
         per_group: dict[tuple, set] = {}
         last_ts = max(r["ts"] for r in objs)
@@ -1130,29 +1161,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             per_group.setdefault((r.get("track"), r.get("group")), set()).add(r.get("object"))
         counts = [len(v) for v in per_group.values()]
         expected = max(counts) if counts else 0
-        # Objects the client received but discarded (DROP_STALE) still reached the
-        # client: a short group whose missing objects were dropped is a seam split or
-        # a stale tail, not a delivery failure. A short group with no drops was cut
-        # on the wire.
         dropped: dict[tuple, int] = {}
-        for r in by("DROP_STALE"):
+        for r in drops:
             k = (r.get("track"), r.get("group"))
             dropped[k] = dropped.get(k, 0) + 1
-        # Objects the relay delivered that the client threw away: the old track's
-        # undelivered backlog arriving after a switch landed. Link capacity spent
-        # for nothing (bytes are logged since 2026-09-29).
-        out["discarded"] = {"objects": len(by("DROP_STALE")),
-                            "bytes": sum(r.get("bytes") or 0 for r in by("DROP_STALE")),
-                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")}),
-                            # objects dropped between a new init segment and the first keyframe
-                            "pre_keyframe": sum(1 for r in by("DROP_STALE") if r.get("reason") == "pre-keyframe")}
         short = sorted(((t, g, len(v), dropped.get((t, g), 0)) for (t, g), v in per_group.items() if len(v) < 0.5 * expected),
                        key=lambda x: x[1])
         on_wire = [x for x in short if x[2] + x[3] < 0.5 * expected]
-        # With relay OBJECT_SENT records (runner --log-objects), split the wire cut:
-        # the relay never wrote the objects (its filter / the subscription state) vs.
-        # it wrote them and the client never appended them (stream reset, transport,
-        # or the client library).
         sent_by_group: dict[tuple, set] = {}
         for r in by("OBJECT_SENT"):
             if r.get("sent") is False:
@@ -1165,12 +1180,9 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         lost_after_send = [x for x in on_wire if sent_by_group and len(sent_by_group.get((x[0], x[1]), ())) >= 0.5 * expected]
         out["delivery"] = {"logged": True, "groups": len(per_group), "expected_objects_per_group": expected,
                            "objects_per_group": stats(counts),
-                           # groups of which the client received fewer than half the objects
                            "short_groups": len(short),
-                           # ... and fewer than half arrived at all (received + discarded): cut on the wire
                            "truncated_groups": len(on_wire),
                            "relay_logged": bool(sent_by_group),
-                           # of the wire-cut groups: the relay wrote fewer than half / at least half
                            "cut_at_relay": len(relay_cut) if sent_by_group else None,
                            "lost_after_send": len(lost_after_send) if sent_by_group else None,
                            "lost_after_send_list": [{"track": t, "group": g, "received": n, "sent": len(sent_by_group.get((t, g), ()))}
@@ -1178,17 +1190,12 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                            "truncated_list": [{"track": t, "group": g, "objects": n, "discarded": d} for t, g, n, d in on_wire[:100]],
                            "short_list": [{"track": t, "group": g, "objects": n, "discarded": d} for t, g, n, d in short[:100]]}
     else:
-        out["discarded"] = {"objects": len(by("DROP_STALE")),
-                            "bytes": sum(r.get("bytes") or 0 for r in by("DROP_STALE")),
-                            "groups": len({(r.get("track"), r.get("group")) for r in by("DROP_STALE")}),
-                            "pre_keyframe": sum(1 for r in by("DROP_STALE") if r.get("reason") == "pre-keyframe")}
         out["delivery"] = {"logged": False, "groups": 0, "expected_objects_per_group": None,
                            "objects_per_group": stats([]), "short_groups": None, "truncated_groups": None,
                            "relay_logged": False, "cut_at_relay": None, "lost_after_send": None, "lost_after_send_list": [],
                            "truncated_list": [], "short_list": []}
     # Probe load on the link and relay->client object latency (the latter needs the
-    # relay's OBJECT_SENT records, i.e. --log-objects). On a FIFO bottleneck the probe's
-    # "lowest priority" means nothing: its bytes queue in front of every media packet.
+    # relay's OBJECT_SENT records, i.e. --log-objects).
     probes = by("PROBE")
     probe_bytes = sum(r.get("p_bytes") or 0 for r in probes if r.get("src") == "client")
     span_s = ((recs[-1]["ts"] - recs[0]["ts"]) / 1000) if len(recs) > 1 else 0
@@ -1200,14 +1207,19 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                 break
     lat = [r["ts"] - sent_ts[(r.get("track"), r.get("group"), r.get("object"))] for r in by("OBJECT_RECV")
            if (r.get("track"), r.get("group"), r.get("object")) in sent_ts]
-    # Probe-measured throughput: each probe's bytes / wall time is a sample of what the
-    # connection actually delivered at top QUIC priority, i.e. the connection's usable
-    # capacity at that moment (a congestion-collapsed connection shows here as probes
-    # well below the shaped rate while the link itself is idle).
     probe_bps = [r["bps"] for r in probes if r.get("src") == "client" and r.get("bps")]
+    # Probe-measured throughput per capacity step: p50 of PROBE.bps between 5 s after the
+    # step and the next step (the preflight compares the lowest step against 0.8 x rate).
+    per_step = []
+    for i, ch in enumerate(changes):
+        nxt = changes[i + 1]["ts"] if i + 1 < len(changes) else math.inf
+        vals = [r["bps"] for r in probes if r.get("src") == "client" and r.get("bps") and ch["ts"] + SHARE_SETTLE_S * 1000 <= r["ts"] < nxt]
+        per_step.append({"at_s": ch.get("at_s"), "rate_mbps": ch.get("rate_mbps"), "probes": len(vals),
+                         "p50_mbps": (pct(vals, 0.5) / 1e6) if vals else None})
     out["link"] = {"probe_bytes": probe_bytes, "probe_mbps": (probe_bytes * 8 / span_s / 1e6) if span_s else None,
                    "probes": sum(1 for r in probes if r.get("src") == "client"),
                    "probe_measured_mbps": {k: (v / 1e6 if v is not None else None) for k, v in stats(probe_bps).items()},
+                   "probe_measured_per_step": per_step,
                    "send_recv_latency_ms": stats(lat)}
     out["client_errors"] = [r.get("message") for r in by("ERROR")]
     # Fatal media element errors (MEDIA_ERR_DECODE = 3 etc.): after one, every append fails.
@@ -1216,14 +1228,36 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     return out
 
 
+def run_marked_aborted(run: Path) -> bool:
+    """The runner's own abort marker: ``run_meta.json`` ``validity.aborted`` (2026-10) or
+    ``failed: ["aborted"]`` in the validation.json it writes for an aborted run."""
+    try:
+        meta = json.loads((run / "run_meta.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    if (meta.get("validity") or {}).get("aborted") is True:
+        return True
+    try:
+        v = json.loads((run / "validation.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return "aborted" in (v.get("failed") or [])
+
+
 def read_validity(run: Path) -> dict:
     """validation.json is written by validate.py (the runner calls it after every
-    run). No file = not validated: kept, but flagged."""
+    run) or, for an aborted run, by the runner itself with ``failed: ["aborted"]``
+    (and ``run_meta.json`` ``validity.aborted``). No file = not validated: ``valid``
+    None, which the aggregates exclude. An aborted run is never valid."""
     p = run / "validation.json"
+    aborted = run_marked_aborted(run)
     if not p.exists():
-        return {"valid": None, "reasons": ["not validated"]}
+        return {"valid": False if aborted else None, "reasons": ["aborted"] if aborted else ["not validated"], "aborted": aborted}
     v = json.loads(p.read_text())
-    return {"valid": bool(v.get("passed")), "reasons": v.get("failed", []), "final": v.get("final")}
+    failed = list(v.get("failed") or [])
+    if aborted and "aborted" not in failed:
+        failed.append("aborted")
+    return {"valid": bool(v.get("passed")) and not aborted, "reasons": failed, "final": v.get("final"), "aborted": aborted}
 
 
 def write_switch_windows(run: Path, s: dict) -> None:
@@ -1472,7 +1506,7 @@ def main() -> int:
     ap.add_argument("--sustain", type=float, default=5.0,
                     help="seconds the presented rung must hold for down-reaction / up-recovery")
     ap.add_argument("--include-invalid", action="store_true",
-                    help="keep runs whose validation.json says invalid in the aggregate CSV/stats (default: exclude)")
+                    help="keep runs whose validation did not pass (invalid, aborted or not validated) in the aggregate CSV/stats")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
     rows = []
@@ -1489,12 +1523,12 @@ def main() -> int:
         write_switch_windows(run, s)
         if not args.quiet:
             print(md)
-        if s["validity"]["valid"] is False and not args.include_invalid:
+        if not is_valid(s["validity"]) and not args.include_invalid:
             excluded.append((run.name, s["validity"]["reasons"]))
             continue
         rows.append(agg_row(s))
     for name, reasons in excluded:
-        print(f"excluded invalid run {name}: {reasons}")
+        print(f"excluded run {name} (validation not passed): {reasons}")
     if args.csv and rows:
         with args.csv.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=AGG_COLUMNS)
