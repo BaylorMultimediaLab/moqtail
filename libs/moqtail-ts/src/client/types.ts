@@ -35,6 +35,35 @@ import { PublishRequest } from './request/publish'
 import { TrackStatusRequest } from './request/track_status'
 
 /**
+ * Anything that can own a track alias in {@link MOQtailClient.subscriptions}: a
+ * {@link SubscribeRequest} or a pushed receiver created for a peer PUBLISH. Alias
+ * release is identity-guarded on the holder (M16): a relay hands out the same alias
+ * for the same track, so on A to B to A the first A's late completion must not
+ * delete the route the second A now owns.
+ */
+export interface TrackAliasHolder {
+  requestId: bigint
+  fullTrackName: FullTrackName
+}
+
+/**
+ * Receiver for a track the peer pushes with PUBLISH (see {@link MOQtailClient.acceptPushedTrack}
+ * and the PUBLISH handler). Mirrors the parts of {@link SubscribeRequest} that incoming
+ * data-stream routing and PUBLISH_DONE completion read.
+ *
+ * TODO(W6, pr1378): the relay-initiated PUBLISH that carries a SWITCH's target track
+ * lands here; completing it on PUBLISH_DONE (Close-After-Switch) goes through
+ * {@link MOQtailClient.completeIfDone} like any other pushed receiver.
+ */
+export interface PushedReceiver extends TrackAliasHolder {
+  streamsAccepted: bigint
+  /** Set by PUBLISH_DONE: the number of data streams the publisher opened. */
+  expectedStreams: bigint | undefined
+  largestLocation: Location | undefined
+  controller: ReadableStreamDefaultController<MoqtObject>
+}
+
+/**
  * Why and at what cost the client dropped an incoming data stream without delivering
  * its objects (see {@link MOQtailClient.onStreamDiscarded}).
  *

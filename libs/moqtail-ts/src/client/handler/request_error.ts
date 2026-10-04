@@ -46,6 +46,10 @@ export const handlerRequestError: RequestStreamMessageHandler<RequestError> = as
     return
   }
 
+  // A REQUEST_ERROR on a SUBSCRIBE's stream while a SWITCH is in flight refuses the
+  // SWITCH, not the subscription (M16): the subscription stays live and in `requests`.
+  if (request instanceof SubscribeRequest && request.resolveSwitch(msg)) return
+
   logger.debug('handler/request_error', `requestId=${requestId} — resolving ${request.constructor.name} with error`)
   if (
     request instanceof SubscribeRequest ||
