@@ -115,16 +115,31 @@ def startup(track: str = R[0]) -> list[dict]:
             ev("STARTUP", T0, track=track, playhead_ms=0, startup_delay_ms=1200.0)]
 
 
-def switch(seq: int, ts: float, frm: str, to: str, land_after_ms: float | None = 500.0, with_seq: bool = False) -> list[dict]:
+def switch(seq: int, ts: float, frm: str, to: str, land_after_ms: float | None = 500.0, with_seq: bool = False,
+           rule_reason: str = "throughput", decided_before_ms: float = 1.0, decision: str = "landing",
+           decision_seq: bool | None = None) -> list[dict]:
+    """One switch as the player and controller log it. The controller decides at
+    ``ts - decided_before_ms`` and logs ABR_DECISION only when the switch LANDS (at
+    SWITCH_APPLIED, with ``decided_ts`` and ``landed_after_ms``; ``switch_seq`` too when
+    ``decision_seq``, default ``with_seq``). ``decision="legacy"`` reproduces clients
+    before 2026-10-04 (ABR_DECISION at the decision, no decided_ts); ``"none"`` omits it."""
     extra = {"switch_seq": seq} if with_seq else {}
-    out = [ev("ABR_DECISION", ts - 1, **{"from": frm, "to": to, "reason": "auto-upgrade" if R.index(to) > R.index(frm) else "auto-downgrade", "rule_reason": "throughput"}),
-           ev("SWITCH_SENT", ts, **{"from": frm, "to": to, "request_id": seq * 2, "old_request_id": seq * 2 - 2, "playhead_ms": ts - T0}, **extra),
+    reason = "auto-upgrade" if R.index(to) > R.index(frm) else "auto-downgrade"
+    decided = ts - decided_before_ms
+    out = [ev("SWITCH_SENT", ts, **{"from": frm, "to": to, "request_id": seq * 2, "old_request_id": seq * 2 - 2, "playhead_ms": ts - T0}, **extra),
            ev("SWITCH_OK", ts + 50, to=to, request_id=seq * 2, rtt_ms=50, **extra)]
+    if decision == "legacy":
+        out.append(ev("ABR_DECISION", decided, **{"from": frm, "to": to, "reason": reason, "rule_reason": rule_reason}))
     if land_after_ms is not None:
-        out += [ev("SWITCH_FIRST_OBJECT", ts + land_after_ms, **{"from": frm, "to": to, "group": 20 + seq, "object": 0, "since_sent_ms": land_after_ms}, **extra),
+        out += [ev("SWITCH_FIRST_OBJECT", ts + land_after_ms, **{"from": frm, "to": to, "group": 20 + seq, "object": 0, "since_sent_ms": land_after_ms,
+                                                                 "landed_on_keyframe": True}, **extra),
                 ev("SWITCH_APPLIED", ts + land_after_ms + 1, **{"from": frm, "to": to, "group": 20 + seq, "object": 0, "media_seam_gap_ms": 0,
                                                               "seam_ahead_of_playhead_ms": 9000, "landed_on_group_start": True, "landed_on_keyframe": True,
                                                               "since_sent_ms": land_after_ms + 1}, **extra)]
+        if decision == "landing":
+            dseq = {"switch_seq": seq} if (with_seq if decision_seq is None else decision_seq) else {}
+            out.append(ev("ABR_DECISION", ts + land_after_ms + 1, **{"from": frm, "to": to, "reason": reason, "rule_reason": rule_reason,
+                                                                    "decided_ts": decided, "landed_after_ms": ts + land_after_ms + 1 - decided}, **dseq))
     return out
 
 
@@ -482,6 +497,93 @@ class SwitchIdentityEdges(TmpRun):
         s = analyze.analyze(write_run(self.dir, client))
         sw = s["switches"]["list"]
         self.assertEqual([(x["terminal"], x["terminal_source"]) for x in sw], [("superseded", "inferred"), ("first_frame", "record")])
+
+
+class DecisionJoin(TmpRun):
+    """D1 (review 2026-10-04): ABR_DECISION is emitted at the LANDING with decided_ts, and was
+    joined as "the last decision with ts <= SENT + 5 ms and the same target"."""
+
+    def test_decision_logged_at_landing_joins_its_own_switch(self):
+        A, B = R[0], R[4]
+        for with_seq in (False, True):
+            with self.subTest(with_seq=with_seq):
+                client = startup(A)
+                client += switch(1, T0 + 1000, A, B, rule_reason="probe bwe", decided_before_ms=2, with_seq=with_seq)
+                client += switch(2, T0 + 2000, B, A, rule_reason="buffer-drain", with_seq=with_seq)
+                client += switch(3, T0 + 3000, A, B, rule_reason="throughput", decided_before_ms=3, with_seq=with_seq)
+                client.append(first_frame(T0 + 5000, A, B, vis_ms=2000.0, seq=3 if with_seq else None))
+                client += samples(T0, T0 + 8000, lambda t: A)
+                s = analyze.analyze(write_run(self.dir, client))
+                sw = s["switches"]["list"]
+                # Before the fix: #1 and #2 had no decision (theirs is logged after SENT) and #3
+                # took #1's decision (logged at #1's landing, 1500 ms before #3 was sent).
+                self.assertEqual([x["rule_reason"] for x in sw], ["probe bwe", "buffer-drain", "throughput"])
+                self.assertEqual([x["t2_decision_ms"] for x in sw], [2, 1, 3])
+                self.assertEqual([x["decision_source"] for x in sw], ["switch_seq" if with_seq else "decided_ts"] * 3)
+                self.assertEqual(s["switching"]["switches_by_rule"], {"probe bwe": 1, "buffer-drain": 1, "throughput": 1})
+
+    def test_decided_ts_join_requires_matching_pair_and_bound(self):
+        A, B = R[0], R[4]
+        client = startup(A)
+        # Decided 1.5 s before it was sent: outside [0, 1000] ms, so it is not this switch's decision.
+        client += switch(1, T0 + 2000, A, B, decided_before_ms=1500)
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        self.assertIsNone(s["switches"]["list"][0]["t2_decision_ms"])
+        self.assertIsNone(s["switches"]["list"][0]["decision_source"])
+        self.assertEqual(s["switches"]["decision_join"]["unjoined_decisions"], 1)
+        self.assertEqual(s["switches"]["join"]["unjoined"], {})   # the switch join (terminals check) is unaffected
+
+    def test_switch_that_never_lands_from_phantom_or_tick(self):
+        A, B, C = R[0], R[2], R[4]
+        client = startup(A)
+        # #1 never lands and the controller logged a phantom; #2 never lands, no phantom:
+        # the last ABR_TICK at or before its SWITCH_SENT whose chosen index is the target.
+        client += switch(1, T0 + 1000, A, C, land_after_ms=None)
+        client.append(ev("ABR_SWITCH_PHANTOM", T0 + 1500, **{"from": A, "to": C, "landed": A, "reason": "auto-upgrade",
+                                                            "rule_reason": "probe bwe", "decided_ms_ago": 501}))
+        client.append(ev("ABR_TICK", T0 + 2500, track=A, active_index=0, chosen={"index": 3, "reason": "throughput", "rule": "ThroughputRule"}))
+        client.append(ev("ABR_TICK", T0 + 2750, track=A, active_index=0, chosen={"index": 2, "reason": "latency trend 150% > 120%",
+                                                                                 "rule": "LatencyTrendRule"}))
+        client.append(ev("ABR_TICK", T0 + 2900, track=A, active_index=0, chosen=None))
+        client += switch(2, T0 + 3000, A, B, land_after_ms=None)
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switches"]["list"]
+        self.assertEqual([x["decision_source"] for x in sw], ["phantom", "tick"])
+        self.assertEqual([x["rule_reason"] for x in sw], ["probe bwe", "latency trend 150% > 120%"])
+        self.assertEqual(sw[0]["t2_decision_ms"], 1)      # decided at 1500 - 501 ms, sent at 1000
+        self.assertEqual(sw[1]["t2_decision_ms"], 250)
+        self.assertEqual(sw[1]["reason"], "auto-upgrade")
+        self.assertEqual(s["switching"]["switches_by_rule"], {"probe bwe": 1, "latency trend": 1})
+        self.assertEqual(s["switching"]["decision_sources"], {"phantom": 1, "tick": 1})
+
+    def test_legacy_decision_before_sent(self):
+        A, B = R[0], R[4]
+        client = startup(A) + switch(1, T0 + 1000, A, B, decision="legacy", rule_reason="latency trend 130% > 120%")
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        x = s["switches"]["list"][0]
+        self.assertEqual((x["decision_source"], x["t2_decision_ms"], x["rule_reason"]), ("legacy_ts", 1, "latency trend 130% > 120%"))
+
+    def test_detection_t2_and_quiet_before_use_decided_ts(self):
+        A, B = R[4], R[2]
+        net = [runner("NET_CHANGE", T0 - 5000, rate_mbps=6, at_s=0, applied=True),
+               runner("NET_CHANGE", T0 + 60_000, rate_mbps=0.8, at_s=60, applied=True),
+               runner("NET_CHANGE", T0 + 120_000, rate_mbps=6, at_s=120, applied=True),
+               runner("RUN_END", T0 + 200_000, elapsed_s=200.0)]
+        client = startup(A)
+        # A switch decided 6 s before the drop that LANDS 1 s before it: the controller was
+        # quiet in the 5 s before t0 (before the fix its landing-time record made it "not quiet").
+        client += switch(1, T0 + 53_900, A, R[3], land_after_ms=5000, decided_before_ms=100)
+        # Reaction: decided at t0 + 1000, sent at t0 + 1010, landed at t0 + 3010.
+        client += switch(2, T0 + 61_010, R[3], B, land_after_ms=2000, decided_before_ms=10)
+        client += samples(T0, T0 + 199_000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client, net, profile="detect_step", startup_track=A))
+        d = s["detection"][0]
+        self.assertTrue(d["quiet_before"])
+        self.assertEqual(d["t2_ms"], 1000)              # before the fix: 2011 (the landing)
+        self.assertEqual(d["t3_ms"], 1010)
 
 
 class Starvation(TmpRun):

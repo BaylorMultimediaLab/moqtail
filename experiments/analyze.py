@@ -327,6 +327,133 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
     return joined, diag
 
 
+# Decision attribution ------------------------------------------------------------------
+
+DECISION_JOIN_MAX_MS = 1000.0   # a switch is sent within this long of its decision (same tick, in practice)
+LEGACY_DECISION_TOL_MS = 5.0     # pre-2026-10 clients logged ABR_DECISION a few ms around SWITCH_SENT
+
+
+def _decided_at(r: dict) -> float | None:
+    """Decision time (epoch ms) of an ABR_DECISION / ABR_SWITCH_PHANTOM: ``decided_ts``
+    (2026-10), else ``ts - decided_ms_ago`` (phantoms before ``decided_ts``), else None
+    (a pre-2026-10 ABR_DECISION, logged at the decision itself)."""
+    if r.get("decided_ts") is not None:
+        return float(r["decided_ts"])
+    if r.get("decided_ms_ago") is not None:
+        return r["ts"] - float(r["decided_ms_ago"])
+    return None
+
+
+def join_decisions(joined: list[dict], recs: list[dict], index_of: dict) -> tuple[list[dict | None], list[dict], dict]:
+    """The controller decision behind every switch, and every decision as an event.
+
+    Since 2026-10-04 the controller logs ABR_DECISION when the switch LANDS on its target
+    (with ``decided_ts``, ``landed_after_ms`` and, from the 2026-10 contract on,
+    ``switch_seq``), and ABR_SWITCH_PHANTOM when it ends without landing. A switch that is
+    still pending at the run end has neither. Passes, in this order, each record used once:
+
+    1. ``switch_seq`` on the ABR_DECISION (source ``switch_seq``);
+    2. ``decided_ts``: same from and to, 0 <= SENT.ts - decided_ts <= 1000 ms, the latest
+       such decision (``decided_ts``);
+    3. pre-2026-10 ABR_DECISION (no decided_ts, logged at the decision): same target,
+       -5 ms <= SENT.ts - ts <= 1000 ms, the latest (``legacy_ts``);
+    4. ABR_SWITCH_PHANTOM by ``switch_seq``, else by decision time as in 2 (``phantom``);
+    5. the last ABR_TICK at or before SWITCH_SENT (within 1000 ms) whose chosen index is
+       the switch target's rung (``tick``; ``reason`` from the direction, auto-emergency
+       when EmergencyBufferRule chose it).
+
+    Returns (per-switch attribution or None, decision events, diagnostics). A decision
+    event is ``{"ts": decision time, reason, rule_reason, from, to, switch: index | None,
+    source}``; decisions and phantoms that joined no switch (pre-2026-10 clients skipped
+    the request without a SWITCH_SENT) are kept as events with ``switch`` None."""
+    decisions = [r for r in recs if r.get("event") == "ABR_DECISION"]
+    phantoms = [r for r in recs if r.get("event") == "ABR_SWITCH_PHANTOM"]
+    ticks = [r for r in recs if r.get("event") == "ABR_TICK"]
+    n = len(joined)
+    out: list[dict | None] = [None] * n
+    used: set[int] = set()
+
+    def attach(i: int, r: dict, at: float, source: str) -> None:
+        used.add(id(r))
+        out[i] = {"ts": at, "reason": r.get("reason"), "rule_reason": r.get("rule_reason"), "source": source, "record": r}
+
+    def by_seq(pool: list[dict], source: str) -> None:
+        idx = {j["switch_seq"]: i for i, j in enumerate(joined) if j["switch_seq_source"] == "record"}
+        for r in pool:
+            i = idx.get(r.get("switch_seq")) if r.get("switch_seq") is not None else None
+            if i is not None and out[i] is None and id(r) not in used:
+                at = _decided_at(r)
+                attach(i, r, at if at is not None else r["ts"], source)
+
+    def by_time(pool: list[dict], source: str, legacy: bool) -> None:
+        for i, j in enumerate(joined):
+            if out[i] is not None:
+                continue
+            sent = j["sent"]
+            best, best_at = None, None
+            for r in pool:
+                if id(r) in used or r.get("switch_seq") is not None:
+                    continue
+                at = _decided_at(r)
+                if legacy != (at is None):
+                    continue
+                at = r["ts"] if at is None else at
+                lag = sent["ts"] - at
+                lo = -LEGACY_DECISION_TOL_MS if legacy else 0.0
+                if not (lo <= lag <= DECISION_JOIN_MAX_MS) or r.get("to") != sent.get("to"):
+                    continue
+                if not legacy and r.get("from") is not None and sent.get("from") is not None and r["from"] != sent["from"]:
+                    continue
+                if best_at is None or at >= best_at:
+                    best, best_at = r, at
+            if best is not None:
+                attach(i, best, best_at, source)
+
+    by_seq(decisions, "switch_seq")
+    by_time(decisions, "decided_ts", legacy=False)
+    by_time(decisions, "legacy_ts", legacy=True)
+    by_seq(phantoms, "phantom")
+    by_time(phantoms, "phantom", legacy=False)
+    for i, j in enumerate(joined):
+        if out[i] is not None:
+            continue
+        sent = j["sent"]
+        ti, fi = index_of.get(sent.get("to"), -1), index_of.get(sent.get("from"), -1)
+        tick = None
+        for r in ticks:
+            if r["ts"] > sent["ts"]:
+                break
+            ch = r.get("chosen") or {}
+            if id(r) not in used and sent["ts"] - r["ts"] <= DECISION_JOIN_MAX_MS and ch.get("index") is not None and ch["index"] == ti:
+                tick = r
+        if tick is not None:
+            ch = tick["chosen"]
+            reason = ("auto-emergency" if ch.get("rule") == "EmergencyBufferRule" else "auto-downgrade") if ti < fi else "auto-upgrade"
+            used.add(id(tick))
+            out[i] = {"ts": tick["ts"], "reason": reason, "rule_reason": ch.get("reason"), "source": "tick", "record": tick}
+    events = []
+    for i, a in enumerate(out):
+        if a is not None:
+            sent = joined[i]["sent"]
+            events.append({"ts": a["ts"], "reason": a["reason"], "rule_reason": a["rule_reason"], "from": sent.get("from"),
+                           "to": sent.get("to"), "switch": i, "source": a["source"]})
+    loose = [r for r in decisions + phantoms if id(r) not in used]
+    for r in loose:
+        at = _decided_at(r)
+        events.append({"ts": at if at is not None else r["ts"], "reason": r.get("reason"), "rule_reason": r.get("rule_reason"),
+                       "from": r.get("from"), "to": r.get("to"), "switch": None,
+                       "source": "unjoined_" + ("decision" if r.get("event") == "ABR_DECISION" else "phantom")})
+    events.sort(key=lambda e: e["ts"])
+    sources: dict[str, int] = {}
+    for a in out:
+        k = a["source"] if a is not None else "none"
+        sources[k] = sources.get(k, 0) + 1
+    diag = {"sources": sources,
+            "unjoined_decisions": sum(1 for r in loose if r.get("event") == "ABR_DECISION"),
+            "unjoined_phantoms": sum(1 for r in loose if r.get("event") == "ABR_SWITCH_PHANTOM")}
+    return out, events, diag
+
+
 # Presented track -------------------------------------------------------------------
 
 class PresentedSeries:
@@ -450,9 +577,12 @@ def switching_diagnostics(switches: list[dict], by, window_s: float, run_duratio
             if a["from"] == b["to"]:
                 aba += 1
     by_rule: dict[str, int] = {}
+    by_source: dict[str, int] = {}
     for s in switches:
         k = rule_name(s.get("rule_reason"))
         by_rule[k] = by_rule.get(k, 0) + 1
+        src = s.get("decision_source") or "none"
+        by_source[src] = by_source.get(src, 0) + 1
     return {
         "reversal_window_s": window_s,
         "run_duration_s": run_duration_s,
@@ -471,6 +601,9 @@ def switching_diagnostics(switches: list[dict], by, window_s: float, run_duratio
         # Probe readings dropped for a too-short burst (controller arm 'probe'/'both').
         "probes_discarded": len(by("PROBE_DISCARDED")),
         "switches_by_rule": by_rule,
+        # Where each switch's rule came from (join_decisions): switch_seq, decided_ts,
+        # legacy_ts, phantom, tick; none = no decision found.
+        "decision_sources": {k: v for k, v in sorted(by_source.items())},
     }
 
 
@@ -687,18 +820,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     # Switch timelines -------------------------------------------------------
     switch_recv = by("SWITCH_RECV")
     promoted = by("SWITCH_PROMOTED")
-    decisions = by("ABR_DECISION")
     drops = by("DROP_STALE")
     joined, join_diag = join_switches(recs)
+    attribution, decision_events, decision_diag = join_decisions(joined, recs, index_of)
     switches = []
-    for j in joined:
+    for j, decision in zip(joined, attribution):
         sent = j["sent"]
         rid = sent.get("request_id")
-        decision = None
-        for r in reversed([d for d in decisions if d["ts"] <= sent["ts"] + 5]):
-            if r.get("to") == sent.get("to"):
-                decision = r
-                break
         ok, err, fobj, applied, fframe = j["ok"], j["error"], j["first_object"], j["applied"], j["first_frame"]
         # The relay's SWITCH_RECV names the subscription being replaced (old_request_id)
         # on every mechanism; the new id may be absent (null) on PR #1378.
@@ -726,8 +854,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "landed": j["landed"],
             "first_frame_ts": fframe["ts"] if fframe else None,
             "direction": "up" if ti > fi else "down" if ti < fi else "same",
-            "reason": decision.get("reason") if decision else None,
-            "rule_reason": decision.get("rule_reason") if decision else None,
+            # The controller decision behind this switch (join_decisions): its decision
+            # time (decided_ts; ABR_DECISION itself is logged at the landing), reason and
+            # rule, and where the attribution came from.
+            "reason": decision["reason"] if decision else None,
+            "rule_reason": decision["rule_reason"] if decision else None,
+            "decision_source": decision["source"] if decision else None,
+            "decided_ts": decision["ts"] if decision else None,
             "t2_decision_ms": (sent["ts"] - decision["ts"]) if decision else None,
             "t3_ok_ms": d(ok), "error": err.get("reason") if err else None,
             "skipped_reason": j["skipped"].get("reason") if j["skipped"] else None,
@@ -811,6 +944,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "landed_on_keyframe": sum(1 for s in switches if s["landed_on_keyframe"]),
         "landed_on_keyframe_known": sum(1 for s in switches if s["landed_on_keyframe"] is not None),
         "list": switches,
+        # Decision attribution (join_decisions): counts per source, decisions that joined no switch.
+        "decision_join": decision_diag,
         "guard_timeouts": len(by("ABR_GUARD_TIMEOUT")),
         "gated_slow_start": len(by("ABR_GATED")),
         # SWITCH_SKIPPED records that belong to no SWITCH_SENT (clients before 2026-10-04
@@ -951,10 +1086,15 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                    lambda r: r["ts"] < window_end and (
                        (direction == "down" and r.get("bps", 0) <= target_bps * (1 + t1_tol)) or
                        (direction == "up" and r.get("bps", 0) >= min(prev_rate * 1e6 * (1 + t1_tol), target_bps * (1 - t1_tol)))))
-        t2 = first(recs, "ABR_DECISION", t0, lambda r: r["ts"] < window_end and
-                   ((direction == "down" and r.get("reason") in ("auto-downgrade", "auto-emergency")) or
-                    (direction == "up" and r.get("reason") == "auto-upgrade")))
-        sw = next((s for s in switches if t2 and s["to"] == t2.get("to") and abs(s["ts"] - t2["ts"]) < 5000), None)
+        # t2: the first controller decision (by its decision time, not the landing-time
+        # ABR_DECISION record) in the step's window, in the step's direction.
+        t2 = next((e for e in decision_events if t0 <= e["ts"] < window_end and
+                   ((direction == "down" and e.get("reason") in ("auto-downgrade", "auto-emergency")) or
+                    (direction == "up" and e.get("reason") == "auto-upgrade"))), None)
+        if t2 is not None and t2["switch"] is not None:
+            sw = switches[t2["switch"]]
+        else:  # a decision without its own SWITCH_SENT (pre-2026-10 clients skipped it): nearest switch to its target
+            sw = next((s for s in switches if t2 and s["to"] == t2.get("to") and abs(s["ts"] - t2["ts"]) < 5000), None)
 
         # Reaction to a down-step: the PRESENTED rung is one that fits the new capacity
         # and stays there for `sustain_s`. Recovery after an up-step: the presented rung
@@ -981,7 +1121,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                "t5_ms": (sw["ts"] + sw["switch_visibility_delay_ms"] - t0) if sw and sw["switch_visibility_delay_ms"] else None}
         # Attribution: t2 is the controller's reaction to THIS change only if the
         # controller was quiet before it (no decision in the feedback window before t0).
-        decisions_before = [r for r in decisions if t0 - feedback_window_s * 1000 <= r["ts"] < t0]
+        decisions_before = [e for e in decision_events if t0 - feedback_window_s * 1000 <= e["ts"] < t0]
         rec["quiet_before"] = len(decisions_before) == 0
         rec["sample_before_decision"] = bool(t1 and t2 and t1["ts"] <= t2["ts"])
         rec["reliable"] = rec["quiet_before"]
