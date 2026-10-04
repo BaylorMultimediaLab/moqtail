@@ -933,6 +933,65 @@ tar czf pr1378-r0-logs.tar.gz "$R"/relay.log "$R"/browser.log "$R"/relay-logs
 Until this is understood, pr1378's time-shifted stall and starvation
 numbers are provisional (the other columns do not depend on it).
 
+### 11e. The pr1378 post-switch pauses, read from the relay log (2026-10-03)
+
+`results-linux-2026-10-01/pr1378-r0-logs` (relay.log of the stalled rep).
+The relay did not withhold anything. At 04:14:03.827 (103.4 s) it opened
+the 240p PUBLISH (request 57), wrote the catch-up FETCH for group 125 and,
+in the same millisecond, replayed group 126 from the cache onto
+`subgroup_1_126_0`; from then on it opened one live stream per second
+(127 at 04.25, 128 at 05.25, ... 131 at 08.25), each closed cleanly 70 ms
+later. The client received group 125 at once and groups 126-133 together
+at 04:14:13.3. The nine seconds were spent in the QUIC connection, not in
+the relay.
+
+What the connection was doing is visible in the client's own probes, which
+measure what the connection delivers at top QUIC priority:
+
+| 1.5 Mbps window      | pr1378 10 s shift (rep 0) | native forward-trigger 10 s shift | pr1378 live-edge |
+| -------------------- | ------------------------- | --------------------------------- | ---------------- |
+| 60-75 s (after drop) | 0.96-1.31                 | 1.26-1.58                         | 1.30-1.58        |
+| 95-103 s (flapping)  | 0.96-1.18                 | 1.29-1.58                         | 1.29-1.57        |
+| 104-112 s (the hold) | 0.42-0.61                 | 1.29-1.55                         | 1.30-1.58        |
+
+The pr1378 time-shifted connection was running 20-30 % below the shaped
+rate the whole time and collapsed to a third of it during the hold, while
+two other connections on the identical link delivered the full rate. The
+relay's QUIC stack is quinn with BBR; the bottleneck is a 100-packet
+tail-drop FIFO (0.7 s at 1.5 Mbps, 0.17 s at 6 Mbps). pr1378 on a
+time-shifted client is the one configuration that dumps several cached
+groups onto the link at once on every switch (catch-up FETCH plus the
+joining replay, both written in one go, on top of the FIN'd remainder of
+the replaced subscription), and the frozen controller was switching every
+0.3-1 s in that window. Burst, queue overflow, loss, congestion-window
+collapse; and within the collapsed window the relay's stream scheduler
+(ascending group order across every stream of the connection) sends the
+older, already-abandoned bytes before the live group the client needs.
+Across both grids the same pauses appear in 3-6 switches of every pr1378
+time-shifted run and in none of the live-edge or forward-trigger runs, so
+this is a property of the configuration, not of one rep. It is a transport
+interaction, not a relay defect, and it is exactly what the fq_codel
+profile in section 10 is there to test: if the pauses vanish under AQM the
+queue is the cause; if they stay, the relay's catch-up pacing is.
+
+Made observable: the relay now emits `CONN_STATS` once per second per
+connection (rtt, cwnd, cumulative lost packets/bytes, congestion events,
+bytes sent); the analyzer's `conn` block and compare.py's "QUIC loss rate",
+"cwnd min" and "congestion events" rows read it, and "probe-measured
+throughput min / p50" turns the probes into a capacity reading for every
+run. Next on the Linux box, with the same `run_grid` as 11c:
+
+```sh
+run_grid step_down_up_fqcodel          # same steps, AQM queue: do the pauses vanish?
+bash experiments/pack_results.sh results fqcodel.tar.gz
+```
+
+If they do, the paper reports pr1378's time-shifted stalls as a tail-drop
+artefact and uses the fq_codel grid for the time-shifted comparison; if
+not, the relay's catch-up delivery gets pacing and the pr1378 time-shifted
+cells are re-run. Either way the 11d numbers for the other five cells
+stand.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

@@ -272,6 +272,13 @@ impl TransportConnection {
       Self::Quic(c) => c.remote_address(),
     }
   }
+  /// QUIC connection statistics (path RTT, cwnd, losses, congestion events).
+  pub fn stats(&self) -> quinn::ConnectionStats {
+    match self {
+      Self::WebTransport(c) => c.quic_connection().stats(),
+      Self::Quic(c) => c.stats(),
+    }
+  }
 
   /// Closes the connection with an application error code and reason.
   pub fn close(&self, error_code: u32, reason: &[u8]) {
