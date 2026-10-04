@@ -618,6 +618,9 @@ def capacity_steps(changes: list[dict]) -> dict:
     return out
 
 
+GATED_WHYS = ("slow-start", "post-switch-up-guard", "up-dwell")
+
+
 def switching_diagnostics(switches: list[dict], by, window_s: float, run_duration_s: float | None) -> dict:
     """Behavioural diagnostics of the switch sequence itself. A run with
     A->B->A->B is different from four monotonic adaptations even at equal
@@ -634,6 +637,10 @@ def switching_diagnostics(switches: list[dict], by, window_s: float, run_duratio
             reversals += 1
             if a["from"] == b["to"]:
                 aba += 1
+    gated: dict[str, int] = {}
+    for r in by("ABR_GATED"):
+        k = r.get("why") or "slow-start"
+        gated[k] = gated.get(k, 0) + 1
     by_rule: dict[str, int] = {}
     by_source: dict[str, int] = {}
     for s in switches:
@@ -653,9 +660,17 @@ def switching_diagnostics(switches: list[dict], by, window_s: float, run_duratio
         "direction_reversals": reversals,
         "aba_reversals": aba,
         "cooldown_activations": len(by("ABR_GUARD_TIMEOUT")),
-        "slow_start_vetoes": sum(1 for r in by("ABR_GATED") if r.get("why", "slow-start") == "slow-start"),
+        # ABR_GATED per `why` (a record without `why` is from a client that gated only on slow-start).
+        "gated_by_why": gated,
+        "slow_start_vetoes": gated.get("slow-start", 0),
         # Up-switches held by the post-switch up-guard (controller arm 'guard'/'both').
-        "up_guard_vetoes": sum(1 for r in by("ABR_GATED") if r.get("why") == "post-switch-up-guard"),
+        "up_guard_vetoes": gated.get("post-switch-up-guard", 0),
+        # Up-switches held by the min arm's dwell (upDwellGroups groups since the last landing).
+        "up_dwell_vetoes": gated.get("up-dwell", 0),
+        "other_gated": {k: v for k, v in gated.items() if k not in GATED_WHYS},
+        # Switches the controller requested that ended without landing on their target
+        # (refused, skipped or failed): ABR_SWITCH_PHANTOM.
+        "phantom_switches": len(by("ABR_SWITCH_PHANTOM")),
         # Probe readings dropped for a too-short burst (controller arm 'probe'/'both').
         "probes_discarded": len(by("PROBE_DISCARDED")),
         "switches_by_rule": by_rule,
@@ -1020,7 +1035,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         # Decision attribution (join_decisions): counts per source, decisions that joined no switch.
         "decision_join": decision_diag,
         "guard_timeouts": len(by("ABR_GUARD_TIMEOUT")),
-        "gated_slow_start": len(by("ABR_GATED")),
+        # ABR_GATED with why = slow-start (or no why); the other reasons are in switching.gated_by_why.
+        "gated_slow_start": sum(1 for r in by("ABR_GATED") if (r.get("why") or "slow-start") == "slow-start"),
         # SWITCH_SKIPPED: a switch attempt the player did not send (the previous switch had
         # no alias yet). Emitted instead of a SWITCH_SENT, so never a switch (diagnostic).
         "skipped_not_sent": join_diag["unjoined"].get("SWITCH_SKIPPED", 0),
@@ -1552,7 +1568,7 @@ def to_markdown(s: dict) -> str:
          "| metric | value |", "|---|---|",
          f"| first group / expected / clamped | {s['startup']['first_group']} / {s['startup']['expected_start_group']} / {s['startup']['clamped_by_relay']} |",
          f"| seeks (all): startup / gap / wedge / visibility; deferred gaps | {stl['seeks']['startup']} / {stl['seeks']['gap']} / {stl['seeks']['wedge']} / {stl['seeks']['visibility']}; {stl['range_jumps_deferred']} |",
-         f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
+         f"| controller arm; gated (slow-start / up-guard / up-dwell / other); phantom switches; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['slow_start_vetoes']} / {s['switching']['up_guard_vetoes']} / {s['switching']['up_dwell_vetoes']} / {sum(s['switching']['other_gated'].values())}; {s['switching']['phantom_switches']}; {s['switching']['probes_discarded']} |",
          f"| delivery (needs --log-objects): groups / objects per group p50,min / short / truncated on the wire | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
          f"| of the wire-cut groups (relay OBJECT_SENT): cut at the relay / lost after send | {s['delivery']['cut_at_relay']} / {s['delivery']['lost_after_send']} |",
          f"| probe load: probes / MB / mean Mbps; relay->client object latency ms p50 / p95 | {s['link']['probes']} / {s['link']['probe_bytes'] / 1e6:.1f} / {fmt(s['link']['probe_mbps'])}; {fmt(s['link']['send_recv_latency_ms'].get('p50'))} / {fmt(s['link']['send_recv_latency_ms'].get('p95'))} |",
@@ -1620,7 +1636,8 @@ METRIC_COLUMNS = ["startup_delay_ms", "run_duration_s", "stall_count", "stall_to
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "half_shift_lost", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "reaction_na_reason", "data_starved_ms", "data_starved_raw_ms",
-                  "gap_seeks", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
+                  "gap_seeks", "range_jumps_deferred", "slow_start_vetoes", "up_guard_vetoes", "up_dwell_vetoes", "other_gated",
+                  "phantom_switches", "skipped_attempts", "probes_discarded", "media_errors",
                   "presented_rung_mean", "presented_kbps", "subscribed_rung_mean", "subscribed_kbps",
                   "fit_share_low", "pre_drop_share_after_restore", "pre_drop_rung", "rung_at_drop", "fit_rung",
                   "truncated_groups", "discarded_objects", "discarded_mb",
@@ -1698,7 +1715,12 @@ def agg_row(s: dict) -> dict:
         "data_starved_raw_ms": s["starvation"].get("raw_total_ms"),
         "gap_seeks": stl["gap_seeks"],
         "range_jumps_deferred": stl["range_jumps_deferred"],
+        "slow_start_vetoes": s["switching"].get("slow_start_vetoes"),
         "up_guard_vetoes": s["switching"]["up_guard_vetoes"],
+        "up_dwell_vetoes": s["switching"].get("up_dwell_vetoes"),
+        "other_gated": sum((s["switching"].get("other_gated") or {}).values()),
+        "phantom_switches": s["switching"].get("phantom_switches"),
+        "skipped_attempts": s["switches"].get("skipped_attempts"),
         "probes_discarded": s["switching"]["probes_discarded"],
         "media_errors": len(s["media_errors"]),
         "presented_rung_mean": br.get("presented_rung_mean"), "presented_kbps": br.get("presented_kbps"),

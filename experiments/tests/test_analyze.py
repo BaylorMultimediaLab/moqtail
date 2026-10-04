@@ -285,6 +285,34 @@ class SeamHole(TmpRun):
         self.assertEqual(x["seam_hole_rule"], "analyzer-100ms")
 
 
+class GatedAndPhantom(TmpRun):
+    """D11: ABR_GATED was counted as one number (switches.gated_slow_start = every ABR_GATED);
+    up-dwell vetoes and phantom switches were not counted at all."""
+
+    def test_gated_per_why_and_phantoms(self):
+        A, B = R[0], R[4]
+        client = startup(A)
+        for i, why in enumerate(["slow-start", "slow-start", "post-switch-up-guard", "up-dwell", "up-dwell", "up-dwell", "novel"]):
+            client.append(ev("ABR_GATED", T0 + 100 * (i + 1), why=why, from_index=0, to_index=4))
+        client.append(ev("ABR_GATED", T0 + 900, from_index=0, to_index=4))   # pre-`why` clients: slow-start
+        for i in range(2):
+            client.append(ev("ABR_SWITCH_PHANTOM", T0 + 2000 + i, **{"from": A, "to": B, "landed": A, "reason": "auto-upgrade",
+                                                                    "rule_reason": "throughput", "decided_ms_ago": 10}))
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switching"]
+        self.assertEqual((sw["slow_start_vetoes"], sw["up_guard_vetoes"], sw["up_dwell_vetoes"]), (3, 1, 3))
+        self.assertEqual(sw["other_gated"], {"novel": 1})
+        self.assertEqual(sw["phantom_switches"], 2)
+        self.assertEqual(s["switches"]["gated_slow_start"], 3)        # before: 8 (every ABR_GATED)
+        rows = {name: fn for name, fn, _ in compare.ROWS}
+        self.assertEqual(rows["up-dwell vetoes"](s), 3)
+        self.assertEqual(rows["slow-start vetoes"](s), 3)
+        self.assertEqual(rows["other gated (any other why)"](s), 1)
+        self.assertEqual(rows["phantom switches (never landed)"](s), 2)
+        self.assertEqual(rows["skipped attempts (not sent)"](s), 0)
+
+
 class Censoring(unittest.TestCase):
     """M19: censored metrics summarised by the median of the runs where the event happened."""
 

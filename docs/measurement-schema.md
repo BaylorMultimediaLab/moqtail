@@ -298,7 +298,10 @@ Other definitions, unchanged:
   `landed_behind_playhead` counts switches whose seam lay more than half a GOP
   behind the playhead at send.
 - **Switching diagnostics** (`switching`): inter-switch interval median/min,
-  cooldown activations, slow-start and up-guard vetoes, probes discarded,
+  cooldown activations, `ABR_GATED` per `why` (`gated_by_why`; `slow_start_vetoes`
+  (also a record without `why`), `up_guard_vetoes`, `up_dwell_vetoes`, and
+  `other_gated` for any other reason), `phantom_switches` (ABR_SWITCH_PHANTOM:
+  requested switches that never landed on their target), probes discarded,
   switches by triggering rule (`switches_by_rule`) and where each rule came from
   (`decision_sources`).
 - **Decision attribution** (`analyze.join_decisions`; per switch `reason`,
