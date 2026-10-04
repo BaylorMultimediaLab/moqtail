@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import MSEBuffer from '@/lib/buffer';
+import MSEBuffer, { GapFillLog } from '@/lib/buffer';
 import { events } from '@/lib/events/EventLog';
 
 /**
@@ -64,10 +64,22 @@ describe('gap-crossing policy (M14)', () => {
     vi.useRealTimers();
   });
 
-  const start = (video: ReturnType<typeof fakeVideo>, front: { s?: number }) => {
+  /**
+   * `front.s` is the last-appended front (logged only); `fills` holds the
+   * appends that landed inside a gap (the player's GapFillLog), the only
+   * thing the deferral reads (F4).
+   */
+  const start = (
+    video: ReturnType<typeof fakeVideo>,
+    front: { s?: number },
+    fills: GapFillLog = new GapFillLog(),
+  ) => {
     const b = new MSEBuffer(video as unknown as HTMLVideoElement, {
       liveEdgeDelay: 10,
-      gapFillProbe: () => ({ appendFrontS: front.s }),
+      gapFillProbe: q => ({
+        appendFrontS: front.s,
+        ...fills.state(q, performance.now()),
+      }),
       gopDurationMs: 1000,
     });
     buffers.push(b);
@@ -85,10 +97,13 @@ describe('gap-crossing policy (M14)', () => {
       16.2,
     );
     const front = { s: 16.3 };
-    start(video, front);
+    const fills = new GapFillLog();
+    fills.record(front.s, performance.now());
+    start(video, front, fills);
     for (let i = 0; i < 10; i++) {
       vi.advanceTimersByTime(250);
       front.s += 0.02; // still filling
+      fills.record(front.s, performance.now());
     }
     expect(seeks).toEqual([]);
 
@@ -231,5 +246,77 @@ describe('gap-crossing policy (M14)', () => {
     vi.advanceTimersByTime(250);
     expect(seeks).toHaveLength(1);
     expect(seeks[0]!.skipped_buffered_ms as number).toBeCloseTo(300);
+  });
+
+  it('G2: a fill inside the gap interleaved with live appends beyond it is waited for (F4)', () => {
+    // pr1378-style refetch: the target fills [16.2, 17.0) while live objects of
+    // the same track keep landing at the far end. The last-appended front
+    // alternates between the two; the in-gap appends are what count.
+    const video = fakeVideo(
+      [
+        [0, 16.2],
+        [17.0, 30],
+      ],
+      16.2,
+    );
+    const front = { s: 16.3 };
+    const fills = new GapFillLog();
+    fills.record(16.3, performance.now());
+    start(video, front, fills);
+    vi.advanceTimersByTime(250);
+    expect(seeks).toEqual([]);
+    // A live object was appended last: the front is now beyond the next range.
+    front.s = 30.03;
+    vi.advanceTimersByTime(250);
+    expect(seeks).toEqual([]);
+    // The fill goes on, interleaved with live appends.
+    for (let i = 1; i <= 8; i++) {
+      fills.record(16.3 + 0.05 * i, performance.now());
+      front.s = 30.03 + 0.033 * i;
+      vi.advanceTimersByTime(250);
+    }
+    expect(seeks).toEqual([]);
+    // The fill dies; the live appends do not keep the deferral alive.
+    for (let i = 0; i < 12; i++) {
+      front.s += 0.25;
+      vi.advanceTimersByTime(250);
+    }
+    expect(seeks).toHaveLength(1);
+    expect(seeks[0]).toMatchObject({ reason: 'gap', from_ms: 16_200, to_ms: 17_000 });
+  });
+
+  it('an old in-gap append (older than the window) does not defer a crossing', () => {
+    const video = fakeVideo(
+      [
+        [0, 16.2],
+        [17.0, 30],
+      ],
+      16.2,
+    );
+    video.paused = true; // not playing yet: nothing is crossed
+    const fills = new GapFillLog();
+    fills.record(16.5, performance.now());
+    start(video, { s: 29.9 }, fills);
+    vi.advanceTimersByTime(3_250);
+    expect(seeks).toEqual([]);
+    video.paused = false;
+    vi.advanceTimersByTime(250);
+    expect(seeks).toHaveLength(1);
+    expect(seeks[0]!.deferred_ms).toBe(0);
+  });
+});
+
+describe('GapFillLog (F4)', () => {
+  it('reports the furthest recent append end inside the queried interval and how long ago it landed', () => {
+    const log = new GapFillLog();
+    log.record(16.3, 1000);
+    log.record(16.4, 1100);
+    log.record(17.5, 1150); // beyond the interval
+    expect(log.state({ fromS: 15.95, toS: 17.0, windowMs: 3000 }, 1200)).toEqual({
+      fillFrontS: 16.4,
+      fillLastAgoMs: 100,
+    });
+    // Outside the window: nothing.
+    expect(log.state({ fromS: 15.95, toS: 17.0, windowMs: 3000 }, 4200)).toEqual({});
   });
 });

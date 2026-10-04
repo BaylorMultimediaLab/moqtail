@@ -65,21 +65,81 @@ export function contiguousBufferAheadS(
 
 /** Where new media is landing in the buffer right now (from the player's append path). */
 export interface GapFillState {
-  /** End PTS (s) of the most recently appended frame; undefined before the first append. */
+  /** End PTS (s) of the most recently appended frame (logged only); undefined before the first append. */
   appendFrontS?: number;
+  /**
+   * Furthest end PTS (s) of the recent appends that landed inside a gap (with
+   * buffered media after them) and end in the queried interval; undefined
+   * when there is none in the window (F4).
+   */
+  fillFrontS?: number;
+  /** How long ago (ms) the latest of those appends landed. */
+  fillLastAgoMs?: number;
+}
+
+/** The interval and recency the gap-crossing policy asks the fill probe about. */
+export interface GapFillQuery {
+  /** Lower bound (s): the current range end minus 0.25 s (a fill extends the range). */
+  fromS: number;
+  /** Upper bound (s, exclusive): the start of the next range. */
+  toS: number;
+  /** Only appends younger than this count (ms). */
+  windowMs: number;
+}
+
+/**
+ * The appends that landed inside a gap: frames that, once in the buffer, had
+ * buffered media after them (a later range). That is a fill: a catch-up or a
+ * switch re-fetching from the playhead group while older data ahead is still
+ * buffered. Appends at the end of the last range (live delivery) are not
+ * recorded, so an interleaved live append cannot end a fill's deferral by
+ * moving "the" append front past the next range (F4). Bounded in time and
+ * count. `at` is any monotonic clock (the player uses performance.now()).
+ */
+export class GapFillLog {
+  #log: Array<{ endS: number; at: number }> = [];
+
+  constructor(
+    readonly keepMs = 10_000,
+    readonly maxEntries = 2048,
+  ) {}
+
+  /** A frame ending at `endS` was appended inside a gap at `at`. */
+  record(endS: number, at: number): void {
+    this.#log.push({ endS, at });
+    let drop = 0;
+    while (drop < this.#log.length && at - this.#log[drop]!.at > this.keepMs) drop++;
+    if (this.#log.length - drop > this.maxEntries) drop = this.#log.length - this.maxEntries;
+    if (drop > 0) this.#log.splice(0, drop);
+  }
+
+  /** The fill state for `q` at `now` (empty when no in-gap append qualifies). */
+  state(q: GapFillQuery, now: number): Pick<GapFillState, 'fillFrontS' | 'fillLastAgoMs'> {
+    let front: number | undefined;
+    let lastAt: number | undefined;
+    for (const e of this.#log) {
+      if (now - e.at > q.windowMs || e.endS < q.fromS || e.endS >= q.toS) continue;
+      if (front === undefined || e.endS > front) front = e.endS;
+      if (lastAt === undefined || e.at > lastAt) lastAt = e.at;
+    }
+    return front === undefined ? {} : { fillFrontS: front, fillLastAgoMs: now - lastAt! };
+  }
 }
 
 /**
  * Whether a range-jump across a real gap should wait instead of seeking.
  *
- * The gap is being filled when the append front (where the newest frame
- * landed) lies inside it: a catch-up or a switch that re-fetches from the
- * playhead group appends there, and MSE's coded-frame removal has opened a
- * hole between that front and the older data ahead. Jumping then lands the
- * playhead past everything the fill will deliver: a time-shifted client
- * loses its shift in one seek (16.2 s -> 24.0 s in the PR #1378 playhead-floor
- * runs). The wait is bounded by `noProgressMs` since the front last moved, so
- * a fill that has died is jumped over like any other hole.
+ * The gap is being filled when an append landed inside it recently: a
+ * catch-up or a switch that re-fetches from the playhead group appends there,
+ * and MSE's coded-frame removal has opened a hole between that fill and the
+ * older data ahead. Jumping then lands the playhead past everything the fill
+ * will deliver: a time-shifted client loses its shift in one seek (16.2 s ->
+ * 24.0 s in the PR #1378 playhead-floor runs). Only appends that landed inside
+ * a gap count (`fill.fillFrontS`, from GapFillLog): the last-appended front
+ * alternates between the fill and live objects beyond the gap, and keying on it
+ * jumped over a fill as soon as a live object was appended last (F4). The
+ * wait is bounded by `noProgressMs` since the last in-gap append, so a fill
+ * that has died is jumped over like any other hole.
  */
 export function shouldDeferRangeJump(args: {
   gapS: number;
@@ -91,7 +151,7 @@ export function shouldDeferRangeJump(args: {
 }): boolean {
   if (args.gapS < MSE_IMMEDIATE_SEEK_THRESHOLD) return false;
   if (args.frontStalledMs >= args.noProgressMs) return false;
-  const front = args.fill?.appendFrontS;
+  const front = args.fill?.fillFrontS;
   if (front === undefined) return false;
   return front >= args.currentRangeEndS - 0.25 && front < args.nextRangeStartS;
 }
@@ -117,9 +177,9 @@ interface MSEBufferConfig {
   frameDurationProbe?: () => number | undefined;
   /** Playback rate for catching up to live edge (default: 1.05 = 5% faster) */
   catchupPlaybackRate: number;
-  /** Reports where new media is being appended, so a range-jump does not cross a gap being filled. */
-  gapFillProbe?: () => GapFillState;
-  /** Give up deferring a range-jump once the append front has not moved for this long (ms). */
+  /** Reports recent appends inside the gap being crossed, so a range-jump does not cross a fill (F4). */
+  gapFillProbe?: (q: GapFillQuery) => GapFillState;
+  /** Give up deferring a range-jump once nothing has been appended inside the gap for this long (ms). */
   rangeJumpNoProgressMs: number;
   /**
    * Do not jump into a last range shorter than this (s): a 40 ms range at the
@@ -220,13 +280,11 @@ class MSEBuffer {
   private isCatchingUp: boolean = false;
   private isCatchingDown: boolean = false;
   private originalPlaybackRate: number = 1.0;
-  // Range-jump deferral state: the gap being waited on (its next-range start),
-  // when the wait began, and the append front's last position/movement time.
+  // Range-jump deferral state: the gap being waited on (its next-range start)
+  // and when the wait began.
   private deferGapKey: number | null = null;
   private shortTargetKey: number | null = null;
   private deferSince = 0;
-  private deferFrontS: number | undefined;
-  private deferFrontMovedAt = 0;
   // Playhead progress, for the wedge path: last position and when it moved.
   private progressTimeS: number | undefined;
   private progressAt = 0;
@@ -452,21 +510,19 @@ class MSEBuffer {
     if (this.deferGapKey !== plan.toS) {
       this.deferGapKey = plan.toS;
       this.deferSince = now;
-      this.deferFrontS = undefined;
-      this.deferFrontMovedAt = now;
     }
-    const fill = this.config.gapFillProbe?.();
+    const fill = this.config.gapFillProbe?.({
+      fromS: plan.rangeEndS - 0.25,
+      toS: plan.toS,
+      windowMs: this.config.rangeJumpNoProgressMs,
+    });
     const front = fill?.appendFrontS;
-    if (front !== undefined && front !== this.deferFrontS) {
-      this.deferFrontS = front;
-      this.deferFrontMovedAt = now;
-    }
     const defer = shouldDeferRangeJump({
       gapS: plan.gapS,
       currentRangeEndS: plan.rangeEndS,
       nextRangeStartS: plan.toS,
       fill,
-      frontStalledMs: now - this.deferFrontMovedAt,
+      frontStalledMs: fill?.fillLastAgoMs ?? Infinity,
       noProgressMs: this.config.rangeJumpNoProgressMs,
     });
     if (defer) {
@@ -476,6 +532,7 @@ class MSEBuffer {
           range_end_ms: plan.rangeEndS * 1000,
           next_start_ms: plan.toS * 1000,
           append_front_ms: front !== undefined ? front * 1000 : null,
+          fill_front_ms: fill?.fillFrontS !== undefined ? fill.fillFrontS * 1000 : null,
         });
       }
       return null;

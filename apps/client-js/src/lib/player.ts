@@ -34,7 +34,13 @@ import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
 import { events } from '@/lib/events/EventLog';
 import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
-import { DEFAULT_LIVE_EDGE_DELAY, contiguousBufferAheadS } from '@/lib/buffer';
+import {
+  DEFAULT_LIVE_EDGE_DELAY,
+  GapFillLog,
+  contiguousBufferAheadS,
+  type GapFillQuery,
+  type GapFillState,
+} from '@/lib/buffer';
 import {
   SeamTracker,
   nextPageSwitchSeq,
@@ -295,6 +301,9 @@ export class Player {
   // Per-switch records (C1): switch_seq, landing, seam and first-frame state.
   // Numbers come from the page-wide sequence so a reconnect never reuses one.
   #seams = new SeamTracker(nextPageSwitchSeq);
+  // Video appends that landed inside a gap (buffered media after them): the
+  // fills the gap-crossing policy waits for (F4).
+  #gapFills = new GapFillLog();
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -973,6 +982,15 @@ export class Player {
               if (info !== undefined) {
                 struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
                 struct.lastFrameDurationMs = info.frameDurationMs;
+                // A frame with buffered media after it landed inside a gap: a
+                // fill (refetch or catch-up), not live delivery at the end (F4).
+                if (this.catalog?.getRole(struct.trackName) === 'video') {
+                  const endS = struct.lastAppendedEndPTS_ms / 1000;
+                  const ranges = sourceBuffer.buffered;
+                  if (ranges.length > 0 && ranges.start(ranges.length - 1) > endS + 0.001) {
+                    this.#gapFills.record(endS, nowPerf);
+                  }
+                }
                 // Feed the TimeMap so measurements can resolve playhead -> group.
                 // Only the first object of each group records (idempotent in TimeMap),
                 // and frame 0 of a group has decodeTime == group start PTS.
@@ -1346,6 +1364,19 @@ export class Player {
   getAppendFrontMs(): number | undefined {
     return this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')
       ?.lastAppendedEndPTS_ms;
+  }
+
+  /**
+   * The gap-crossing policy's fill probe (F4): the furthest end of the video
+   * appends that landed inside a gap within `q.windowMs` and end inside
+   * [q.fromS, q.toS), with the last-appended front for the record.
+   */
+  getGapFillState(q: GapFillQuery): GapFillState {
+    const front = this.getAppendFrontMs();
+    return {
+      appendFrontS: front !== undefined ? front / 1000 : undefined,
+      ...this.#gapFills.state(q, performance.now()),
+    };
   }
 
   /** Duration (ms) of the most recently parsed video frame; undefined before the first one. */
