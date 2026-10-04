@@ -524,6 +524,7 @@ export function App() {
             const front = player.getAppendFrontMs();
             return { appendFrontS: front !== undefined ? front / 1000 : undefined };
           },
+          gopDurationMs,
         });
         await player.addMediaTrack(firstVideo.name);
         // Anchor the throughput EMA to the startup track's own bitrate so the

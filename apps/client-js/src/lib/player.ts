@@ -458,14 +458,11 @@ export class Player {
     if (!this.#element) throw new Error('Media element not attached');
     if (this.#streams.length === 0) throw new Error('No active media streams to start');
 
-    // Wedge watchdog. Each ABR switch leaves a ~1-frame gap in the MSE
-    // timeline (the relay activates the new track at the next group boundary,
-    // so a few frames at the boundary are dropped). When currentTime walks
-    // into one of those gaps, MSE goes ready_state=2 and stops advancing
-    // forever even though data is buffered on the far side. Detect that
-    // exact pattern (frames frozen, currentTime sitting at the end of a
-    // buffered range, with another range immediately after) and seek across
-    // the gap.
+    // Stall watchdog. Detects a playhead that does not advance while playing
+    // (a stall whether or not the element fired `waiting`) and records what
+    // it saw. It never seeks: crossing gaps and recovering from a decoder
+    // wedge is the one gap-crossing policy in MSEBuffer (lib/buffer.ts, M14),
+    // which used to be overridden from here after 1 s.
     const el = this.#element;
     let lastFrames = 0;
     let lastTime = -1;
@@ -478,8 +475,7 @@ export class Player {
       // Progress means the playhead moved. Decoded frames alone do not: one
       // run sat at the same currentTime with readyState 2 for 28 s while
       // totalVideoFrames rose by 9000 (the decoder chewing through a 37 s
-      // buffer it never presented), and the old frame-based test called that
-      // "playing" and never seeked.
+      // buffer it never presented).
       const time = el.currentTime;
       const advanced = time > lastTime + 0.01 || (lastTime < 0 && frames > lastFrames);
       lastFrames = frames;
@@ -497,74 +493,11 @@ export class Player {
       // Frozen frames while playing is a stall whether or not the element
       // fired `waiting`; the interval is credited from the first frozen tick.
       this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
-      const buf = el.buffered;
-      // Decoder wedge: frozen for 3 s while playing with data buffered ahead
-      // of the playhead. Seen on Firefox after rapid switches, with readyState
-      // 2 (cannot decode at this position) and also with readyState 4 (the
-      // playhead parked on a group boundary while the buffer kept growing for
-      // 100 s). Skip forward to the next group boundary; the alternative is a
-      // frozen picture for the rest of the run.
-      if (frozenSince >= 6) {
-        for (let i = 0; i < buf.length; i++) {
-          if (el.currentTime >= buf.start(i) - 0.05 && buf.end(i) - el.currentTime > 1.5) {
-            const gopS = (this.#timeMap?.gopDurationMs ?? 1000) / 1000;
-            const target = Math.min(
-              buf.end(i) - 0.5,
-              (Math.floor(el.currentTime / gopS) + 1) * gopS + 0.001,
-            );
-            logger.warn(
-              'media',
-              `Decoder wedge at ${el.currentTime.toFixed(2)}s (readyState ${el.readyState}), seeking to ${target.toFixed(2)}s`,
-            );
-            events.emit('SEEK', {
-              reason: 'unwedge',
-              from_ms: el.currentTime * 1000,
-              to_ms: target * 1000,
-              ready_state: el.readyState,
-            });
-            el.currentTime = target;
-            frozenSince = 0;
-            return;
-          }
-        }
-      }
-      for (let i = 0; i < buf.length - 1; i++) {
-        const start = buf.start(i);
-        const end = buf.end(i);
-        const nextStart = buf.start(i + 1);
-        // Only the range the playhead is actually sitting at the end of. Firefox
-        // keeps every old range (Chrome coalesces or evicts them), so without the
-        // lower bound an old hole far behind the playhead matches and the seek
-        // throws playback back by many seconds.
-        // A gap of any size once the freeze has lasted 3 s: the buffer's own
-        // range-jump should have crossed it, so if we are still here something
-        // held it back and the picture is frozen either way.
-        if (
-          el.currentTime >= start - 0.05 &&
-          el.currentTime >= end - 0.05 &&
-          el.currentTime <= end + 0.25 &&
-          nextStart > end &&
-          (nextStart - end < 1.5 || frozenSince >= 6)
-        ) {
-          logger.info(
-            'media',
-            `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
-          );
-          events.emit('SEEK', {
-            reason: 'wedge',
-            from_ms: el.currentTime * 1000,
-            to_ms: (nextStart + 0.001) * 1000,
-            gap_ms: (nextStart - end) * 1000,
-          });
-          el.currentTime = nextStart + 0.001;
-          frozenSince = 0;
-          return;
-        }
-      }
-      // Frozen for 3 s and no branch applied: say what the watchdog saw, once
-      // every 10 s, so the next such run is diagnosable from the log.
+      // Frozen for 3 s: say what the watchdog saw, once every 10 s, so a run
+      // the gap policy could not recover is diagnosable from the log.
       if (frozenSince >= 6 && (frozenSince - 6) % 20 === 0) {
         this.#watchdog.unhandled += 1;
+        const buf = el.buffered;
         const parts: string[] = [];
         for (let i = 0; i < buf.length; i++)
           parts.push(`${buf.start(i).toFixed(3)}-${buf.end(i).toFixed(3)}`);
