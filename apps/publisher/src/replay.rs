@@ -1,12 +1,10 @@
 use anyhow::Result;
-use bytes::Bytes;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::cache;
-use crate::cmaf;
 use crate::encoder::EncodedGop;
 use crate::pacing::pace_gop_emit_async;
 
@@ -55,12 +53,9 @@ pub async fn replay_variant(
 
     pace_gop_emit_async(pacing_start, gop_duration_secs, group_id).await;
 
-    // Stamp every packet's prft box with the current wall clock. The cached
-    // bytes carry the encode-time NTP timestamp, which would otherwise tell
-    // the receiver this segment is hours old and starve playback (latency
-    // tracker drains the buffer, ABR bottoms out, framerate readout dies).
-    let gop = stamp_prft_now(gop);
-
+    // The cached chunks carry their encode-time NTP in prft; the sender re-stamps
+    // each one as it is written (ObjectTiming::prft_at_send), so the receiver's
+    // per-frame latency is measured from the object's own send.
     if gop_tx.send(gop).await.is_err() {
       info!("Replay ({}): downstream sender dropped, exiting", label);
       return Ok(());
@@ -82,18 +77,5 @@ pub async fn replay_variant(
         label, group_id
       );
     }
-  }
-}
-
-fn stamp_prft_now(gop: EncodedGop) -> EncodedGop {
-  let ntp = cmaf::now_ntp_timestamp();
-  let packets: Vec<Bytes> = gop
-    .packets
-    .into_iter()
-    .map(|pkt| cmaf::replace_prft_ntp(pkt, ntp))
-    .collect();
-  EncodedGop {
-    group_id: gop.group_id,
-    packets,
   }
 }

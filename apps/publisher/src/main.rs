@@ -229,7 +229,7 @@ async fn run_live_variant(
     publisher_priority,
     gop_rx,
     emit_barrier,
-    None,
+    sender::ObjectTiming::LIVE,
   ));
 
   let (sr, er, sd) = tokio::join!(scale_handle, encode_handle, send_handle);
@@ -672,7 +672,10 @@ async fn run_replay_variant(
     publisher_priority,
     gop_rx,
     emit_barrier,
-    Some(REPLAY_INTER_OBJECT_DELAY),
+    sender::ObjectTiming {
+      inter_object_delay: Some(REPLAY_INTER_OBJECT_DELAY),
+      prft_at_send: true,
+    },
   ));
 
   let (rr, sr) = tokio::join!(read_handle, send_handle);
@@ -718,6 +721,7 @@ fn emit_publisher_config(
       "no_loop": cli.no_loop,
       "replay_inter_object_delay_ms": (mode == "replay")
         .then_some(REPLAY_INTER_OBJECT_DELAY.as_millis() as u64),
+      "prft": if mode == "replay" { "per_object_at_send" } else { "per_frame_at_encode" },
       "cache_path": cache_path.map(|p| p.display().to_string()),
       "meta_sha256": meta_sha256,
       "ladder": catalog_tracks.iter().enumerate().map(|(i, t)| serde_json::json!({

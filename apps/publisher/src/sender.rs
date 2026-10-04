@@ -10,7 +10,38 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::cmaf;
 use crate::encoder::EncodedGop;
+
+/// How the objects of a group are timed on the way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectTiming {
+  /// Sleep this long after each object (replay mode; see `send_track`).
+  pub inter_object_delay: Option<Duration>,
+  /// Re-stamp each chunk's `prft` NTP time when the object is sent. Replay mode:
+  /// the cached chunks carry their encode-time NTP, and stamping a whole GOP once
+  /// at emission gave every object of the group the same time, so per-frame
+  /// latency on the client was group-granular. Live mode keeps the encoder's
+  /// per-frame stamp (`false`).
+  pub prft_at_send: bool,
+}
+
+impl ObjectTiming {
+  pub const LIVE: Self = Self {
+    inter_object_delay: None,
+    prft_at_send: false,
+  };
+}
+
+/// The payload to send for one encoded chunk: with `prft_at_send`, its leading
+/// `prft` box carries the current wall clock; otherwise the bytes are unchanged.
+pub fn object_payload(packet: &bytes::Bytes, prft_at_send: bool) -> bytes::Bytes {
+  if prft_at_send {
+    cmaf::replace_prft_ntp(packet.clone(), cmaf::now_ntp_timestamp())
+  } else {
+    packet.clone()
+  }
+}
 
 /// Subgroup ID used for the single subgroup per group in this publisher.
 /// Per MoQ draft, having exactly one subgroup per group (subgroup_id = 0) is
@@ -38,7 +69,8 @@ const SINGLE_SUBGROUP_ID: u8 = 0;
 /// multi-group delivery on one stream, but the current library API does not
 /// expose that stream type yet.
 ///
-/// `inter_object_delay`: if `Some`, sleep that long after each object send.
+/// `timing.inter_object_delay`: if `Some`, sleep that long after each object send.
+/// `timing.prft_at_send`: re-stamp each chunk's prft NTP time as it is sent.
 /// Live mode passes `None` because the upstream encoder naturally paces
 /// packets ~ms apart (each frame is an encoder round-trip). Replay mode reads
 /// a whole GOP from disk in microseconds and would otherwise burst all 60
@@ -53,7 +85,7 @@ pub async fn send_track(
   publisher_priority: u8,
   mut gop_rx: tokio::sync::mpsc::Receiver<EncodedGop>,
   emit_barrier: Arc<tokio::sync::Barrier>,
-  inter_object_delay: Option<Duration>,
+  timing: ObjectTiming,
 ) -> Result<()> {
   info!("Sender ({} alias={}): starting", label, track_alias);
 
@@ -83,15 +115,7 @@ pub async fn send_track(
       }),
     );
 
-    match send_group(
-      &connection,
-      track_alias,
-      publisher_priority,
-      &gop,
-      inter_object_delay,
-    )
-    .await
-    {
+    match send_group(&connection, track_alias, publisher_priority, &gop, timing).await {
       Ok(()) => {
         groups_sent += 1;
         if !first_group_logged {
@@ -143,7 +167,7 @@ async fn send_group(
   track_alias: u64,
   publisher_priority: u8,
   gop: &EncodedGop,
-  inter_object_delay: Option<Duration>,
+  timing: ObjectTiming,
 ) -> Result<()> {
   let stream = connection
     .open_uni()
@@ -176,7 +200,8 @@ async fn send_group(
       object_id,
       properties: None, // None is correct; Some(vec![]) wastes bytes on the wire
       object_status: None,
-      payload: Some(packet_data.clone()), // Bytes::clone is O(1) — no copy needed
+      // Bytes::clone is O(1); a prft re-stamp copies the chunk once.
+      payload: Some(object_payload(packet_data, timing.prft_at_send)),
     };
 
     let object = Object::try_from_subgroup(
@@ -196,7 +221,7 @@ async fn send_group(
 
     prev_object_id = Some(object_id);
 
-    if let Some(delay) = inter_object_delay {
+    if let Some(delay) = timing.inter_object_delay {
       tokio::time::sleep(delay).await;
     }
   }
@@ -217,6 +242,46 @@ async fn send_group(
 mod tests {
   use super::*;
   use bytes::Bytes;
+
+  fn prft_ntp(chunk: &Bytes) -> u64 {
+    u64::from_be_bytes(chunk[16..24].try_into().unwrap())
+  }
+
+  fn ntp_to_ms(ntp: u64) -> f64 {
+    (ntp >> 32) as f64 * 1000.0 + (ntp & 0xFFFF_FFFF) as f64 * 1000.0 / 4294967296.0
+  }
+
+  /// Replay mode: two objects of one group sent a few ms apart carry their own
+  /// send times (they used to share the group's emission stamp), so the client's
+  /// per-frame latency is per object.
+  #[test]
+  fn replay_objects_carry_their_own_send_time() {
+    let encoded_at = cmaf::wrap_cmaf_chunk(1, 0, 3000, true, b"frame");
+    std::thread::sleep(Duration::from_millis(20));
+    let first = object_payload(&encoded_at, true);
+    std::thread::sleep(Duration::from_millis(10));
+    let second = object_payload(&encoded_at, true);
+    let gap_ms = ntp_to_ms(prft_ntp(&second)) - ntp_to_ms(prft_ntp(&first));
+    assert!((9.0..200.0).contains(&gap_ms), "gap {gap_ms} ms");
+    assert!(
+      prft_ntp(&first) > prft_ntp(&encoded_at),
+      "re-stamped at send"
+    );
+    assert_eq!(
+      &first[24..],
+      &encoded_at[24..],
+      "only the NTP field changes"
+    );
+  }
+
+  /// Live mode keeps the encoder's stamp untouched.
+  #[test]
+  fn live_objects_keep_the_encoder_stamp() {
+    let encoded_at = cmaf::wrap_cmaf_chunk(1, 0, 3000, true, b"frame");
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(object_payload(&encoded_at, false), encoded_at);
+    assert_eq!(ObjectTiming::LIVE.inter_object_delay, None);
+  }
 
   #[test]
   fn test_single_subgroup_id_is_zero() {
