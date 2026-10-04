@@ -41,6 +41,8 @@ import re
 import statistics
 from pathlib import Path
 
+TERMINALS = ("first_frame", "superseded", "error", "skipped", "open")
+
 
 def load(run: Path) -> list[dict]:
     recs: list[dict] = []
@@ -159,6 +161,127 @@ def rule_name(rule_reason) -> str:
         return "unknown"
     m = RULE_NAME_RE.match(str(rule_reason))
     return (m.group(0) if m else str(rule_reason)).strip().lower() or "unknown"
+
+
+# Switch identity -----------------------------------------------------------------
+
+_SWITCH_SLOTS = {"SWITCH_OK": "ok", "SWITCH_ERROR": "error", "SWITCH_SKIPPED": "skipped",
+                 "SWITCH_FIRST_OBJECT": "first_object", "SWITCH_APPLIED": "applied",
+                 "SWITCH_FIRST_FRAME": "first_frame", "SWITCH_SUPERSEDED": "superseded_rec", "SWITCH_FLOOR": "floor"}
+_SWITCH_RECORD_FIELDS = ("ok", "error", "skipped", "first_object", "applied", "first_frame", "superseded_rec", "floor")
+
+
+def _fallback_join(joined: list[dict], r: dict, slot: str, diag: dict) -> dict | None:
+    """Join a switch record without ``switch_seq`` to its SWITCH_SENT (bundles from before
+    2026-10-04). Returns the switch entry or None (unjoined).
+
+    * SWITCH_FIRST_FRAME, SWITCH_FIRST_OBJECT, SWITCH_APPLIED: the LAST SWITCH_SENT with
+      ``ts <= record.ts`` whose ``from`` and ``to`` both match the record's. The client
+      keeps one pending seam per stream and overwrites it whenever a newer switch lands,
+      so a first frame belongs to the latest switch with that (from, to), never to an
+      earlier one. If that switch already holds such a record the new one is counted as
+      a duplicate, not moved to an earlier switch. A record whose ``from`` matches no
+      SWITCH_SENT (the source changed between send and landing) falls back to ``to``
+      alone and is counted in ``diag["to_only_joins"]``.
+    * SWITCH_OK / SWITCH_ERROR: the SWITCH_SENT with the same ``request_id``; without one
+      (pr1378 adopts the relay's id), the earliest unanswered SWITCH_SENT to the same
+      target (responses come back in order).
+    * SWITCH_FLOOR (pr1378) precedes its SWITCH_SENT by at most a few ms and joins the
+      next SWITCH_SENT.
+    * SWITCH_SKIPPED and SWITCH_SUPERSEDED need ``switch_seq``: old clients emitted
+      SWITCH_SKIPPED instead of a SWITCH_SENT (it is not a switch) and never emitted
+      SWITCH_SUPERSEDED.
+    Every unresolved switch that is not given a first frame here is classified later by
+    ``join_switches`` (superseded when a later switch overwrote its seam, else open)."""
+    ts = r.get("ts", 0)
+    if slot in ("skipped", "superseded_rec"):
+        return None
+    if slot == "floor":
+        return next((j for j in joined if j["floor"] is None and ts - 50 <= j["sent"]["ts"] <= ts + 2000), None)
+    to, frm, rid = r.get("to"), r.get("from"), r.get("request_id")
+    before = [j for j in joined if j["sent"]["ts"] <= ts + 1 and (to is None or j["sent"].get("to") == to)]
+    if slot in ("ok", "error"):
+        if rid is not None:
+            by_rid = [j for j in before if j["sent"].get("request_id") == rid]
+            if by_rid:
+                return by_rid[-1]
+        open_ = [j for j in before if j["ok"] is None and j["error"] is None]
+        return open_[0] if open_ else None
+    exact = [j for j in before if frm is None or j["sent"].get("from") == frm]
+    if exact:
+        return exact[-1]
+    if before:
+        diag["to_only_joins"] += 1
+        return before[-1]
+    return None
+
+
+def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
+    """One entry per SWITCH_SENT with every later record of the same switch and its
+    terminal state. Join key: ``switch_seq`` when the records carry it, else the
+    documented fallback (see ``_fallback_join``).
+
+    Terminal (exactly one per switch, in this precedence): ``error`` (SWITCH_ERROR),
+    ``skipped`` (SWITCH_SKIPPED), ``first_frame`` (its own SWITCH_FIRST_FRAME),
+    ``superseded`` (a SWITCH_SUPERSEDED record, or inferred when there is none: a later
+    switch overwrote this one's pending state before its first frame, i.e. a later switch
+    landed after this one landed, or a later switch was acknowledged (SWITCH_OK, which
+    replaces the pending switch) before this one landed), ``open`` (none of these before
+    the run ended). ``terminal_source`` is ``record`` or ``inferred``. Returns
+    (switches, diagnostics)."""
+    sents = [r for r in recs if r.get("event") == "SWITCH_SENT"]
+    joined = []
+    for i, s in enumerate(sents):
+        seq = s.get("switch_seq")
+        entry = {"sent": s, "switch_seq": seq if seq is not None else i + 1,
+                 "switch_seq_source": "record" if seq is not None else "fallback"}
+        entry.update({k: None for k in _SWITCH_RECORD_FIELDS})
+        joined.append(entry)
+    by_seq = {j["switch_seq"]: j for j in joined if j["switch_seq_source"] == "record"}
+    diag = {"unjoined": {}, "duplicates": {}, "conflicting_terminals": 0, "to_only_joins": 0, "seq_join": bool(by_seq)}
+    for r in recs:
+        slot = _SWITCH_SLOTS.get(r.get("event"))
+        if slot is None:
+            continue
+        seq = r.get("switch_seq")
+        target = by_seq.get(seq) if seq is not None else _fallback_join(joined, r, slot, diag)
+        if target is None:
+            diag["unjoined"][r["event"]] = diag["unjoined"].get(r["event"], 0) + 1
+            continue
+        if target[slot] is not None:
+            diag["duplicates"][r["event"]] = diag["duplicates"].get(r["event"], 0) + 1
+            continue
+        target[slot] = r
+    for j in joined:
+        j["landed"] = j["first_object"] is not None or j["applied"] is not None
+        land = [x["ts"] for x in (j["first_object"], j["applied"]) if x is not None]
+        j["landed_ts"] = min(land) if land else None
+    for idx, j in enumerate(joined):
+        j["superseded_by"], j["terminal_source"] = None, "record"
+        if j["error"] is not None:
+            j["terminal"] = "error"
+        elif j["skipped"] is not None:
+            j["terminal"] = "skipped"
+        elif j["first_frame"] is not None:
+            j["terminal"] = "first_frame"
+            if j["superseded_rec"] is not None:
+                diag["conflicting_terminals"] += 1
+        elif j["superseded_rec"] is not None:
+            j["terminal"] = "superseded"
+            j["superseded_by"] = j["superseded_rec"].get("by_switch_seq")
+        else:
+            later = None
+            for k in joined[idx + 1:]:
+                if k["error"] is not None or k["skipped"] is not None:
+                    continue
+                if k["landed"] or k["first_frame"] is not None or (not j["landed"] and k["ok"] is not None):
+                    later = k
+                    break
+            if later is not None:
+                j["terminal"], j["superseded_by"], j["terminal_source"] = "superseded", later["switch_seq"], "inferred"
+            else:
+                j["terminal"] = "open"
+    return joined, diag
 
 
 def switching_diagnostics(switches: list[dict], by, window_s: float) -> dict:
@@ -347,19 +470,19 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     # Switch timelines -------------------------------------------------------
     switch_recv = by("SWITCH_RECV")
     promoted = by("SWITCH_PROMOTED")
+    decisions = by("ABR_DECISION")
+    drops = by("DROP_STALE")
+    joined, join_diag = join_switches(recs)
     switches = []
-    for sent in by("SWITCH_SENT"):
+    for j in joined:
+        sent = j["sent"]
         rid = sent.get("request_id")
         decision = None
-        for r in reversed([d for d in by("ABR_DECISION") if d["ts"] <= sent["ts"] + 5]):
+        for r in reversed([d for d in decisions if d["ts"] <= sent["ts"] + 5]):
             if r.get("to") == sent.get("to"):
                 decision = r
                 break
-        # The client's SWITCH_OK/ERROR for this switch is the first one for the same
-        # target after it was sent (request ids differ between mechanisms: native
-        # allocates one up front, PR #1378 adopts the relay's afterwards).
-        ok = first(recs, "SWITCH_OK", sent["ts"], lambda r: r.get("to") == sent.get("to"))
-        err = first(recs, "SWITCH_ERROR", sent["ts"], lambda r: r.get("to") == sent.get("to"))
+        ok, err, fobj, applied, fframe = j["ok"], j["error"], j["first_object"], j["applied"], j["first_frame"]
         # The relay's SWITCH_RECV names the subscription being replaced (old_request_id)
         # on every mechanism; the new id may be absent (null) on PR #1378.
         old_rid = sent.get("old_request_id")
@@ -368,39 +491,56 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                            or (old_rid is not None and r.get("old_request_id") == old_rid))), None)
         rprom = first(promoted, "SWITCH_PROMOTED", rrecv["ts"] if rrecv else sent["ts"],
                       lambda r: track_matches(r.get("track"), sent.get("to"))) if rrecv else None
-        fobj = first(recs, "SWITCH_FIRST_OBJECT", sent["ts"], lambda r: r.get("to") == sent.get("to"))
-        applied = first(recs, "SWITCH_APPLIED", sent["ts"], lambda r: r.get("to") == sent.get("to"))
-        fframe = first(recs, "SWITCH_FIRST_FRAME", sent["ts"], lambda r: r.get("to") == sent.get("to"))
         fi, ti = index_of.get(sent.get("from"), -1), index_of.get(sent.get("to"), -1)
         d = lambda r: (r["ts"] - sent["ts"]) if r else None  # noqa: E731
+        presented = j["terminal"] == "first_frame"
+        # t5 from the record's own clock (perf-based) when present; the wall-clock
+        # difference otherwise (bundles before 2026-09).
+        vis = None
+        if presented:
+            vis = fframe.get("switch_visibility_delay_ms")
+            if vis is None:
+                vis = fframe["ts"] - sent["ts"]
         switches.append({
             "ts": sent["ts"], "from": sent.get("from"), "to": sent.get("to"),
+            "switch_seq": j["switch_seq"], "switch_seq_source": j["switch_seq_source"],
+            "terminal": j["terminal"], "terminal_source": j["terminal_source"],
+            "superseded": j["terminal"] == "superseded", "superseded_by": j["superseded_by"],
+            "landed": j["landed"],
+            "first_frame_ts": fframe["ts"] if fframe else None,
             "direction": "up" if ti > fi else "down" if ti < fi else "same",
             "reason": decision.get("reason") if decision else None,
             "rule_reason": decision.get("rule_reason") if decision else None,
             "t2_decision_ms": (sent["ts"] - decision["ts"]) if decision else None,
             "t3_ok_ms": d(ok), "error": err.get("reason") if err else None,
+            "skipped_reason": j["skipped"].get("reason") if j["skipped"] else None,
             "relay_recv_ms": d(rrecv), "relay_promoted_ms": d(rprom),
             "relay_start_group": rprom.get("start_group") if rprom else None,
+            # pr1378: the Minimum Switching Group the client asked for.
+            "selected_min_group": j["floor"].get("selected_min_group") if j["floor"] else None,
             # t4: first object of the target arrives at the client.
             "switch_delivery_latency_ms": d(fobj), "t4_group": fobj.get("group") if fobj else None,
             "applied_ms": d(applied),
-            # Buffer continuity at the seam (first target PTS - last source end PTS).
+            # Buffer continuity at the seam (first appended target PTS - last source end PTS).
             "media_seam_gap_ms": applied.get("media_seam_gap_ms") if applied else None,
             # Media the viewer still plays before reaching the seam (first target PTS - playhead at send).
             "seam_ahead_of_playhead_ms": applied.get("seam_ahead_of_playhead_ms") if applied else None,
-            # t5: first presented frame of the new representation (presented mediaTime crossed the seam).
-            "switch_visibility_delay_ms": d(fframe),
+            "seam_behind_playhead": fframe.get("seam_behind_playhead") if fframe else None,
+            "discarded_before_keyframe": applied.get("discarded_before_keyframe") if applied else None,
+            # t5: first presented frame of the new representation. Only for a switch with
+            # its OWN first-frame record (terminal first_frame).
+            "switch_visibility_delay_ms": vis,
+            "first_frame_source": fframe.get("source") if fframe else None,
             # Presented-mediaTime discontinuity at the seam beyond one frame (0 = played through).
-            "playback_position_jump_ms": fframe.get("playback_position_jump_ms") if fframe else None,
+            "playback_position_jump_ms": fframe.get("playback_position_jump_ms") if presented else None,
             # Wall-clock pause at the seam beyond one frame period.
-            "viewer_pause_ms": fframe.get("viewer_pause_ms") if fframe else None,
+            "viewer_pause_ms": fframe.get("viewer_pause_ms") if presented else None,
             # Hole in the element's buffered ranges at the seam (what a range-jump seek crosses).
             # The client reports the hole just behind the presented frame's range, which can be
             # an older hole still in the buffer; attribute it to this seam only when the first
             # presented frame is later than the seam itself (something at the seam was skipped).
-            "seam_buffer_hole_ms": seam_hole(fframe),
-            "buffer_hole_behind_ms": fframe.get("seam_buffer_hole_ms") if fframe else None,
+            "seam_buffer_hole_ms": seam_hole(fframe) if presented else None,
+            "buffer_hole_behind_ms": fframe.get("seam_buffer_hole_ms") if presented else None,
             # Whether the target began on object 0 of its group (its keyframe).
             "landed_on_group_start": applied.get("landed_on_group_start") if applied else None,
             # Whether the landing object's moof carries the sync-sample flag (a real keyframe).
@@ -408,19 +548,21 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             # Source-track objects that arrived after the target landed and were discarded
             # (the relay kept delivering the source's in-progress group).
             "seam_dropped_source_frames": sum(
-                1 for r in by("DROP_STALE")
+                1 for r in drops
                 if applied and applied["ts"] <= r["ts"] < applied["ts"] + 3000 and r.get("track") == sent.get("from")),
             "playhead_ms": sent.get("playhead_ms"), "playhead_group": sent.get("playhead_group"),
             "last_received_group": sent.get("last_received_group"),
         })
-    # A switch whose seam the viewer never reached because a later switch landed
-    # first has no first-frame record; mark it rather than leave t5 blank.
-    for i, sw in enumerate(switches):
-        nxt = switches[i + 1] if i + 1 < len(switches) else None
-        sw["superseded"] = bool(sw["switch_visibility_delay_ms"] is None and nxt is not None and nxt["applied_ms"] is not None)
+    presented_sw = [s for s in switches if s["terminal"] == "first_frame"]
+    terminals = {t: sum(1 for s in switches if s["terminal"] == t) for t in TERMINALS}
     out["switches"] = {
         "count": len(switches),
-        "superseded": sum(1 for s in switches if s["superseded"]),
+        "terminals": terminals,
+        "join": join_diag,
+        "superseded": terminals["superseded"],
+        "superseded_frac": (terminals["superseded"] / len(switches)) if switches else None,
+        "presented": terminals["first_frame"],
+        "open": terminals["open"],
         # Landed more than half a GOP behind the playhead: the mechanism (re)delivered
         # media the client had already played or buffered (buffer-unaware floor
         # selection, catch-up fills). Observable for every mechanism.
@@ -430,18 +572,23 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             and s["seam_ahead_of_playhead_ms"] < -(client_meta.get("gop_duration_ms") or 1000) / 2),
         "up": sum(1 for s in switches if s["direction"] == "up"),
         "down": sum(1 for s in switches if s["direction"] == "down"),
-        "failed": sum(1 for s in switches if s["error"]),
+        "failed": terminals["error"],
+        "skipped": terminals["skipped"],
+        "landed": sum(1 for s in switches if s["landed"]),
+        # Delivery-side stamps over every landed switch (mechanism metrics).
         "switch_delivery_latency_ms": stats([s["switch_delivery_latency_ms"] for s in switches]),
-        "switch_visibility_delay_ms": stats([s["switch_visibility_delay_ms"] for s in switches]),
+        "relay_promoted_ms": stats([s["relay_promoted_ms"] for s in switches]),
         "media_seam_gap_ms": stats([s["media_seam_gap_ms"] for s in switches]),
         "seam_ahead_of_playhead_ms": stats([s["seam_ahead_of_playhead_ms"] for s in switches]),
         "abs_seam_ahead_of_playhead_ms": stats([abs(s["seam_ahead_of_playhead_ms"]) for s in switches
                                                 if s["seam_ahead_of_playhead_ms"] is not None]),
-        "playback_position_jump_ms": stats([s["playback_position_jump_ms"] for s in switches]),
-        "abs_playback_position_jump_ms": stats([abs(s["playback_position_jump_ms"]) for s in switches
+        # Seam statistics: only switches with their own first frame.
+        "switch_visibility_delay_ms": stats([s["switch_visibility_delay_ms"] for s in presented_sw]),
+        "playback_position_jump_ms": stats([s["playback_position_jump_ms"] for s in presented_sw]),
+        "abs_playback_position_jump_ms": stats([abs(s["playback_position_jump_ms"]) for s in presented_sw
                                                 if s["playback_position_jump_ms"] is not None]),
-        "viewer_pause_ms": stats([s["viewer_pause_ms"] for s in switches]),
-        "seam_buffer_hole_ms": stats([s["seam_buffer_hole_ms"] for s in switches]),
+        "viewer_pause_ms": stats([s["viewer_pause_ms"] for s in presented_sw]),
+        "seam_buffer_hole_ms": stats([s["seam_buffer_hole_ms"] for s in presented_sw]),
         "seam_dropped_source_frames": stats([s["seam_dropped_source_frames"] for s in switches]),
         "landed_on_group_start": sum(1 for s in switches if s["landed_on_group_start"]),
         "landed_on_keyframe": sum(1 for s in switches if s["landed_on_keyframe"]),
@@ -449,11 +596,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "list": switches,
         "guard_timeouts": len(by("ABR_GUARD_TIMEOUT")),
         "gated_slow_start": len(by("ABR_GATED")),
+        # SWITCH_SKIPPED records that belong to no SWITCH_SENT (clients before 2026-10-04
+        # skipped the request before sending it).
+        "skipped_not_sent": join_diag["unjoined"].get("SWITCH_SKIPPED", 0),
+        "session_destroyed": any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR")),
     }
+    out["switches"]["skipped_not_landed"] = out["switches"]["skipped_not_sent"]  # legacy name
     out["switching"] = switching_diagnostics(switches, by, reversal_window_s)
     out["feedback"] = feedback_windows(switches, by, feedback_window_s)
-    out["switches"]["skipped_not_landed"] = len(by("SWITCH_SKIPPED"))
-    out["switches"]["session_destroyed"] = any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR"))
 
     # Samples: time shift, live edge, bitrate --------------------------------
     samples = [s for s in by("SAMPLE") if st is None or s["ts"] >= st["ts"]]

@@ -23,7 +23,8 @@ Figures (one file per metric or facet; `--facet` picks what becomes a panel):
   traj_rung_*          played ladder rung vs time (same layout)
   traj_buffer_*        buffer level vs time (same layout)
   seam_*               ECDFs of per-switch seam costs (viewer pause, buffer
-                       hole, visibility delay) pooled over repetitions
+                       hole, visibility delay) over switches with their own
+                       first frame, pooled over repetitions
 
 Requires matplotlib (pip install matplotlib). Everything else is stdlib.
 """
@@ -128,6 +129,15 @@ def events(run: Path, name: str, wanted: set[str]) -> list[dict]:
             if e.get("event") in wanted:
                 out.append(e)
     return out
+
+
+def presented_switch(sw: dict) -> bool:
+    """A switch with its own first frame. Summaries from before 2026-10-04 carry only the
+    (wrong) `superseded` flag; those are accepted when the flag is false."""
+    term = sw.get("terminal")
+    if term is not None:
+        return term == "first_frame"
+    return not sw.get("superseded")
 
 
 def trajectory(run: dict, field: str) -> tuple[list[float], list[float], list[float]]:
@@ -348,7 +358,7 @@ def make_seams(plt, runs, x, hue, facet, out, formats, index):
                         continue
                     for sw in r["switches"].get("list", []):
                         v = sw.get(field)
-                        if v is not None and not sw.get("superseded"):
+                        if v is not None and presented_switch(sw):
                             vals.append(v)
                 if not vals:
                     continue
@@ -372,7 +382,7 @@ def make_seams(plt, runs, x, hue, facet, out, formats, index):
         fig.suptitle(facet_title(facet, key))
         fig.tight_layout()
         save(fig, out, f"seam_{slug(facet_title(facet, key))}", formats, index,
-             "ECDF of per-switch seam costs, superseded switches excluded, pooled over repetitions")
+             "ECDF of per-switch seam costs over switches with their own first frame, pooled over repetitions")
         plt.close(fig)
 
 
