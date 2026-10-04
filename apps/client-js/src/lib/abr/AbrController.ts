@@ -1,7 +1,6 @@
-import type { Player } from '@/lib/player';
 import { events } from '@/lib/events/EventLog';
 import type { AbrRulesCollection } from './AbrRulesCollection';
-import { ProbeManager } from './ProbeManager';
+import { ProbeManager, type ProbeResult } from './ProbeManager';
 import {
   type AbrSettings,
   type RulesContext,
@@ -43,6 +42,52 @@ export interface AbrMetrics {
 
 const MAX_HISTORY = 60;
 
+/**
+ * The player metrics the controller consumes (`player.getMetrics()`), listed so
+ * the player (W3) and the controller (W5) agree on names. Required fields are
+ * the shipped ones; optional fields are the rebuild additions and fall back as
+ * documented when absent.
+ */
+export interface AbrPlayerMetrics {
+  /** SWMA of the last 5 arrival-spaced group throughput samples, bps. */
+  bandwidthBps: number;
+  fastEmaBps: number;
+  slowEmaBps: number;
+  /** Total buffered-ahead: last buffered range end minus playhead, s. */
+  bufferSeconds: number;
+  activeTrack: string | null;
+  droppedFrames: number;
+  totalFrames: number;
+  playbackRate: number;
+  deliveryTimeMs: number;
+  lastObjectBytes: number;
+  /** Completed-group throughput samples so far (the dwell clock counts these). */
+  sampleCount: number;
+  /** Raw capture-to-receipt trend ratio (legacy; see RulesContext.latencyTrendRatio). */
+  latencyTrendRatio: number;
+  lastLatencyMs: number;
+  /** Half-window means of the latency tracker, ms (C6). */
+  latencyRecentMeanMs?: number;
+  latencyOlderMeanMs?: number;
+  /** The client's target shift behind live, ms: 0 live-edge, delayGroups × GOP time-shifted (C6). */
+  targetShiftMs?: number;
+  // Diagnostics copied into AbrMetrics for the UI / SAMPLE log.
+  readyState?: number;
+  paused?: boolean;
+  currentTime?: number;
+  bufferedRanges?: string;
+  mseReadyState?: string;
+  videoErrorCode?: number;
+}
+
+/** What the controller needs from the player. `Player` satisfies it structurally. */
+export interface AbrPlayer {
+  getMetrics(): AbrPlayerMetrics;
+  switchTrack(trackName: string): Promise<void>;
+  setEmaHalfLives(fastHalfLifeSeconds: number, slowHalfLifeSeconds: number): void;
+  probeTrackBandwidth(trackName: string, durationMs: number): Promise<number | ProbeResult>;
+}
+
 /** A switch that has been sent and not yet confirmed by the player (see onTrackSwitched). */
 interface PendingSwitch {
   fromTrack: string;
@@ -66,7 +111,7 @@ interface PendingSwitch {
 }
 
 export class AbrController {
-  #player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>;
+  #player: AbrPlayer;
   #rulesCollection: AbrRulesCollection;
   #tracks: Track[];
   #settings: AbrSettings;
@@ -150,7 +195,7 @@ export class AbrController {
   #lastLandingSampleCount: number | null = null;
 
   constructor(
-    player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>,
+    player: AbrPlayer,
     rulesCollection: AbrRulesCollection,
     tracks: Track[],
     settings: AbrSettings,
@@ -377,6 +422,9 @@ export class AbrController {
       videoErrorCode,
       latencyTrendRatio,
       lastLatencyMs,
+      latencyRecentMeanMs,
+      latencyOlderMeanMs,
+      targetShiftMs,
     } = raw;
 
     // Find the active track index in the sorted tracks array
@@ -400,12 +448,12 @@ export class AbrController {
       switchHistory: [...this.#switchHistory],
       mode,
       switching: this.#switching,
-      readyState,
-      paused,
-      currentTime,
-      bufferedRanges,
-      mseReadyState,
-      videoErrorCode,
+      readyState: readyState ?? 0,
+      paused: paused ?? false,
+      currentTime: currentTime ?? 0,
+      bufferedRanges: bufferedRanges ?? '',
+      mseReadyState: mseReadyState ?? '',
+      videoErrorCode: videoErrorCode ?? 0,
       latencyTrendRatio,
       lastLatencyMs,
     };
@@ -538,6 +586,9 @@ export class AbrController {
       abrSettings: this.#settings,
       probeBandwidthBps: this.#probeManager.getFreshBandwidthBps(),
       latencyTrendRatio,
+      latencyRecentMeanMs,
+      latencyOlderMeanMs,
+      targetShiftMs,
     };
 
     const evaluation = this.#rulesCollection.evaluate(context);

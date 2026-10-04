@@ -53,7 +53,7 @@ function makePlayerMetrics(overrides: Partial<ReturnType<MockPlayer['getMetrics'
     latencyTrendRatio: 1,
     lastLatencyMs: 0,
     ...overrides,
-  };
+  } as ReturnType<MockPlayer['getMetrics']> & Record<string, unknown>;
 }
 
 function makeController(
@@ -837,6 +837,42 @@ describe('AbrController', () => {
       );
       await controller._tick();
       expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+    });
+  });
+
+  describe('C6: the latency means and targetShiftMs reach LatencyTrendRule through _tick', () => {
+    it('a 10 s shift client down-switches on an 80 ms rise although its raw ratio is 1.008', async () => {
+      const { controller, player } = makeController(
+        {
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          bandwidthBps: 2_000_000, // ThroughputRule is content with 720p
+          latencyTrendRatio: 10_180 / 10_100,
+          latencyOlderMeanMs: 10_100,
+          latencyRecentMeanMs: 10_180,
+          targetShiftMs: 10_000,
+        },
+        { videoAutoSwitch: true },
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('360p');
+    });
+
+    it('and a live-edge client takes the same decision on the same rise', async () => {
+      const { controller, player } = makeController(
+        {
+          bufferSeconds: 5,
+          activeTrack: '720p',
+          bandwidthBps: 2_000_000,
+          latencyTrendRatio: 180 / 100,
+          latencyOlderMeanMs: 100,
+          latencyRecentMeanMs: 180,
+          targetShiftMs: 0,
+        },
+        { videoAutoSwitch: true },
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('360p');
     });
   });
 });

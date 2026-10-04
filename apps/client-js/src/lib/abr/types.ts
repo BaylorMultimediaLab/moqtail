@@ -224,7 +224,10 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
     LatencyTrendRule: {
       active: true,
       priority: SwitchRequestPriority.STRONG,
-      parameters: { trendThreshold: 1.2 },
+      // trendThreshold: ratio of the shift-corrected half-window means that
+      // fires the rule. trendDeltaMs: absolute rise (ms) used instead when the
+      // player does not expose targetShiftMs or the corrected base is <= 0.
+      parameters: { trendThreshold: 1.2, trendDeltaMs: 100 },
     },
     DroppedFramesRule: {
       active: false,
@@ -282,8 +285,28 @@ export interface RulesContext {
    * mean(recent 50 samples) / mean(older 50 samples) over the last 100
    * frames (≈ 4 s at 25 fps). 1.0 = no change; > 1.20 is the thesis
    * downswitch trigger (Algorithm 1 lines 14-16).
+   *
+   * This is the raw capture-to-receipt ratio and is client-type dependent
+   * (C6): a 10 s shift makes a 20 % rise a 2 s rise. LatencyTrendRule uses
+   * it only when the half-window means below are absent.
    */
   latencyTrendRatio: number;
+  /**
+   * Mean capture-to-receipt latency (ms) over the recent half and the older
+   * half of the latency window, as the player's LatencyTracker computes them.
+   * With `targetShiftMs` LatencyTrendRule forms its ratio on
+   * `mean − targetShiftMs`, the queueing component the two client types
+   * share. Absent on players that only expose the ratio.
+   */
+  latencyRecentMeanMs?: number;
+  latencyOlderMeanMs?: number;
+  /**
+   * The client's target shift behind the live edge (ms): 0 for a live-edge
+   * client, delayGroups × GOP for a time-shifted one (`events/liveEdge.ts`
+   * targetShiftMs). Absent → LatencyTrendRule falls back to an absolute rise
+   * threshold (`trendDeltaMs`).
+   */
+  targetShiftMs?: number;
 }
 
 export interface AbrRule {
