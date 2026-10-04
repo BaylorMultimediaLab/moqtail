@@ -313,6 +313,46 @@ class GatedAndPhantom(TmpRun):
         self.assertEqual(rows["skipped attempts (not sent)"](s), 0)
 
 
+class ClientConnection(TmpRun):
+    """R3-D8: the client's QUIC connection in CONN_STATS was 'the one with the most bytes sent',
+    and its summaries included the relay's 10 s shutdown drain after RUN_END."""
+
+    @staticmethod
+    def conn_stats(conn: int, t: float, *, rtt: float, tx: int, lost: int, sent: int, cwnd: int = 30_000) -> dict:
+        return {"ts": t, "src": "relay", "event": "CONN_STATS", "conn": conn, "rtt_ms": rtt, "cwnd": cwnd, "udp_tx_bytes": tx,
+                "udp_tx_datagrams": sent, "udp_tx_ios": sent, "lost_packets": lost, "sent_packets": sent, "congestion_events": lost,
+                "pacer_rate_bps": cwnd * 8 * 1.25 / (rtt / 1000)}
+
+    def test_client_conn_by_id_and_run_window(self):
+        client = startup() + samples(T0, T0 + 60_000, lambda t: R[0])
+        relay = [{"ts": T0 - 1000, "src": "relay", "event": "SUBSCRIBE_RECV", "conn": 11, "request_id": 2, "track": "moqtail/" + R[0]},
+                 {"ts": T0 - 1500, "src": "relay", "event": "SUBSCRIBE_RECV", "conn": 11, "request_id": 0, "track": "moqtail/catalog"}]
+        for i in range(-3, 71):
+            t = T0 + i * 1000
+            phase = "pre" if i < 0 else "run" if t <= T0 + 60_000 else "drain"
+            # conn 11 (the client): 100 sent / 5 lost before STARTUP, then 1000 sent / 10 lost in the run,
+            # then the drain with a 400 ms RTT and heavy loss.
+            sent = {"pre": 100, "run": 100 + 1000 * i // 60, "drain": 1100 + 10 * (i - 60)}[phase]
+            lost = {"pre": 5, "run": 5 + 10 * i // 60, "drain": 15 + 10 * (i - 60)}[phase]
+            relay.append(self.conn_stats(11, t, rtt={"pre": 40.0, "run": 40.0, "drain": 400.0}[phase], tx=sent * 1200, lost=lost, sent=sent))
+            # conn 12 (not the client: the publisher's connection in this test) sends more bytes.
+            relay.append(self.conn_stats(12, t, rtt=2.0, tx=10_000_000 + i, lost=0, sent=10_000 + i))
+        run = [runner("RUN_END", T0 + 60_000, elapsed_s=61.0)]
+        s = analyze.analyze(write_run(self.dir, client, run, duration_s=61.0, relay_recs=relay))
+        c = s["conn"]
+        self.assertEqual((c["conn_id"], c["conn_source"]), (11, "relay_records"))    # before: conn 12 (most bytes)
+        self.assertEqual(c["rtt_ms"]["max"], 40.0)                                   # the drain's 400 ms excluded
+        self.assertEqual((c["lost_packets"], c["sent_packets"]), (10, 1000))         # within [STARTUP, RUN_END]
+        self.assertAlmostEqual(c["loss_rate"], 0.01)
+
+    def test_old_bundle_falls_back_to_most_bytes(self):
+        client = startup() + samples(T0, T0 + 10_000, lambda t: R[0])
+        relay = [self.conn_stats(c, T0 + i * 1000, rtt=40.0, tx=(i + 1) * (1000 if c == 12 else 10), lost=0, sent=i + 1)
+                 for i in range(10) for c in (11, 12)]
+        s = analyze.analyze(write_run(self.dir, client, relay_recs=relay))
+        self.assertEqual((s["conn"]["conn_id"], s["conn"]["conn_source"]), (12, "most_bytes"))
+
+
 class Censoring(unittest.TestCase):
     """M19: censored metrics summarised by the median of the runs where the event happened."""
 

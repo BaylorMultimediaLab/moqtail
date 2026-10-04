@@ -222,6 +222,23 @@ def _clip_episodes(episodes: list[dict], end_ts: float | None) -> list[dict]:
     return out
 
 
+def client_connection_id(recs: list[dict], ladder: list[dict]) -> tuple[int | None, str | None]:
+    """The relay's connection id of the client's session: the ``conn`` of the relay's records of
+    the client's own requests (SUBSCRIBE_RECV or OBJECT_SENT for a ladder track, SWITCH_RECV),
+    the latest one when there are several (a reload opens a new connection; the analyzer keeps
+    the last client session). (None, None) when the bundle has no such record."""
+    tracks = [t["track"] for t in ladder]
+    last = None
+    for r in recs:
+        if r.get("src") != "relay" or r.get("conn") is None:
+            continue
+        ev_ = r.get("event")
+        if ev_ == "SWITCH_RECV" or (ev_ in ("SUBSCRIBE_RECV", "OBJECT_SENT")
+                                    and any(track_matches(r.get("track"), t) for t in tracks)):
+            last = r["conn"]
+    return (last, "relay_records") if last is not None else (None, None)
+
+
 def landing_keyframe(first_object: dict | None, applied: dict | None) -> bool | None:
     """landed_on_keyframe of the landing object: SWITCH_FIRST_OBJECT's flag (2026-10), else
     SWITCH_APPLIED's (older bundles carry it there only); None when neither says."""
@@ -1323,27 +1340,45 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         p["cpu"].append(r.get("cpu_pct", 0.0))
     out["process"] = {k: {"max_rss_bytes": max(v["rss"]), "mean_cpu_pct": statistics.fmean(v["cpu"])}
                       for k, v in procs.items() if v["rss"]}
-    # QUIC path statistics of the client's connection (relay CONN_STATS, once per
-    # second, cumulative counters): the connection the client's session used is the
-    # one with the most bytes sent (the publisher's upstream connection is the other).
+    # QUIC path statistics of the client's connection (relay CONN_STATS, once per second,
+    # cumulative counters). The client's connection is identified by its id in the relay's
+    # own records of the client's requests (client_connection_id); only bundles without
+    # such records fall back to the connection with the most bytes sent. Summaries cover
+    # the run, [STARTUP, RUN_END]: the relay's shutdown drain after RUN_END (up to 10 s)
+    # and the setup before the first frame stay out; cumulative counters are differences
+    # against the last sample before the window (zero when there is none).
     conn_stats: dict[int, list[dict]] = {}
     for r in by("CONN_STATS"):
         conn_stats.setdefault(r.get("conn"), []).append(r)
-    client_conn = max(conn_stats.values(), key=lambda v: v[-1].get("udp_tx_bytes") or 0, default=[])
+    conn_id, conn_source = client_connection_id(recs, ladder)
+    if conn_id is None or conn_id not in conn_stats:
+        conn_id = max(conn_stats, key=lambda k: conn_stats[k][-1].get("udp_tx_bytes") or 0, default=None)
+        conn_source = "most_bytes" if conn_id is not None else None
+    client_conn_all = conn_stats.get(conn_id, [])
+    w_lo = st["ts"] if st else -math.inf
+    w_hi = run_end["ts"] if run_end else math.inf
+    client_conn = [r for r in client_conn_all if w_lo <= r["ts"] <= w_hi]
+    base = next((r for r in reversed(client_conn_all) if r["ts"] < w_lo), None)
+    delta = lambda k: ((client_conn[-1].get(k) or 0) - ((base or {}).get(k) or 0)) if client_conn else None  # noqa: E731
     cwnd = [r["cwnd"] for r in client_conn if r.get("cwnd") is not None]
+    sent_pk = delta("sent_packets")
     out["conn"] = {
+        "conn_id": conn_id,
+        # relay_records: by id from SUBSCRIBE_RECV / OBJECT_SENT / SWITCH_RECV for the client's
+        # tracks; most_bytes: old-bundle fallback.
+        "conn_source": conn_source,
+        "window": {"from_ts": st["ts"] if st else None, "to_ts": run_end["ts"] if run_end else None},
         "samples": len(client_conn),
         "rtt_ms": stats([r["rtt_ms"] for r in client_conn if r.get("rtt_ms") is not None]),
         "cwnd_bytes": stats(cwnd),
-        "lost_packets": (client_conn[-1].get("lost_packets") or 0) if client_conn else None,
-        "lost_bytes": (client_conn[-1].get("lost_bytes") or 0) if client_conn else None,
-        "sent_packets": (client_conn[-1].get("sent_packets") or 0) if client_conn else None,
-        "congestion_events": (client_conn[-1].get("congestion_events") or 0) if client_conn else None,
-        "loss_rate": ((client_conn[-1].get("lost_packets") or 0) / (client_conn[-1].get("sent_packets") or 1)) if client_conn else None,
+        "lost_packets": delta("lost_packets"),
+        "lost_bytes": delta("lost_bytes"),
+        "sent_packets": sent_pk,
+        "congestion_events": delta("congestion_events"),
+        "loss_rate": ((delta("lost_packets") or 0) / sent_pk) if client_conn and sent_pk else (0.0 if client_conn else None),
         # UDP datagrams per send I/O on the client connection: 1.0 means no UDP
         # segmentation batches (C5); > 1 means quinn sent GSO batches.
-        "tx_datagrams_per_io": ((client_conn[-1].get("udp_tx_datagrams") or 0) / client_conn[-1]["udp_tx_ios"])
-        if client_conn and client_conn[-1].get("udp_tx_ios") else None,
+        "tx_datagrams_per_io": (delta("udp_tx_datagrams") / delta("udp_tx_ios")) if client_conn and delta("udp_tx_ios") else None,
         "pacer_rate_bps": stats([r["pacer_rate_bps"] for r in client_conn if r.get("pacer_rate_bps") is not None]),
     }
     relay_config = first(recs, "RELAY_CONFIG")
