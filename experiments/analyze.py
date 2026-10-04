@@ -15,7 +15,8 @@ definitions"). In short, per run and over the last client session:
                          with ts <= record.ts and matching from AND to; every other
                          unresolved switch it overwrote is superseded). Every switch
                          ends in exactly one ``terminal``: first_frame, superseded,
-                         error, skipped or open (run ended first). Seam statistics
+                         error or open (run ended first); SWITCH_SKIPPED is an attempt
+                         that was never sent, not a switch. Seam statistics
                          (visibility, viewer pause, hole, jump) are computed only
                          over switches with their own SWITCH_FIRST_FRAME.
 * presented rung         time-weighted over SAMPLE intervals in which the playhead
@@ -51,7 +52,9 @@ import re
 import statistics
 from pathlib import Path
 
-TERMINALS = ("first_frame", "superseded", "error", "skipped", "open")
+# Terminal states of a switch (one SWITCH_SENT). SWITCH_SKIPPED is not one: the player emits it
+# instead of a SWITCH_SENT, with its own switch_seq (an attempt; switches.skipped_not_sent).
+TERMINALS = ("first_frame", "superseded", "error", "open")
 STALL_MIN_EPISODE_MS = 250.0
 FIT_SAFETY = 0.9
 SHARE_SETTLE_S = 5.0
@@ -163,18 +166,106 @@ RULE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z \-]*?(?=\s*[\d≥>=<(]|$)")
 
 
 def seam_hole(fframe: dict | None, tol_ms: float = 100.0) -> float | None:
-    """Buffer hole attributable to this seam: the reported hole when the first presented frame
-    after the seam lies more than `tol_ms` past the seam PTS, else 0 (the hole behind the
-    presented range is then an older one that playback already crossed or will cross later)."""
+    """Buffer hole attributable to this seam. One rule, the player's: since 2026-10-02 the
+    client reports ``seam_buffer_hole_ms`` as the hole behind the presented frame's range only
+    when that range begins at the seam (else 0), and the raw hole as ``buffer_hole_behind_ms``;
+    such records (``buffer_hole_behind_ms`` present; 2026-10 records also carry
+    ``seam_behind_playhead``) are used as is. Older clients reported the raw hole as
+    ``seam_buffer_hole_ms``; for them only, the fallback attributes it to the seam when the
+    first presented frame lies more than ``tol_ms`` past the seam PTS (something at the seam
+    was skipped), else 0. Applying that rule on top of the player's would zero exactly the
+    holes the player attributes (the range begins at the seam, so the first presented frame
+    is the seam frame)."""
     if not fframe:
         return None
     hole = fframe.get("seam_buffer_hole_ms")
     if hole is None:
         return None
+    if seam_hole_rule(fframe) == "player":
+        return hole
     seam, presented = fframe.get("seam_pts_ms"), fframe.get("presented_pts_ms")
     if seam is None or presented is None:
         return hole
     return hole if presented - seam > tol_ms else 0
+
+
+def seam_hole_rule(fframe: dict | None) -> str | None:
+    """``player`` (records with ``buffer_hole_behind_ms`` or ``seam_behind_playhead``: the client
+    attributed the hole itself) or ``analyzer-100ms`` (older records)."""
+    if not fframe:
+        return None
+    return "player" if ("buffer_hole_behind_ms" in fframe or "seam_behind_playhead" in fframe) else "analyzer-100ms"
+
+
+def hole_behind(fframe: dict | None) -> float | None:
+    """The raw hole behind the presented frame's range: the record's own
+    ``buffer_hole_behind_ms``; old clients reported it as ``seam_buffer_hole_ms``."""
+    if not fframe:
+        return None
+    if "buffer_hole_behind_ms" in fframe:
+        return fframe["buffer_hole_behind_ms"]
+    return fframe.get("seam_buffer_hole_ms")
+
+
+def _clip_episodes(episodes: list[dict], end_ts: float | None) -> list[dict]:
+    """Episodes ({ts, duration_ms}) clipped to ``end_ts`` (RUN_END): one starting at or after
+    it is dropped, one spanning it ends there (``clipped_at_run_end``)."""
+    if end_ts is None:
+        return episodes
+    out = []
+    for e in episodes:
+        if e["ts"] >= end_ts:
+            continue
+        if e.get("duration_ms") is not None and e["ts"] + e["duration_ms"] > end_ts:
+            e = dict(e, duration_ms=end_ts - e["ts"], clipped_at_run_end=True)
+        out.append(e)
+    return out
+
+
+def client_connection_id(recs: list[dict], ladder: list[dict]) -> tuple[int | None, str | None]:
+    """The relay's connection id of the client's session: the ``conn`` of the relay's records of
+    the client's own requests (SUBSCRIBE_RECV or OBJECT_SENT for a ladder track, SWITCH_RECV),
+    the latest one when there are several (a reload opens a new connection; the analyzer keeps
+    the last client session). (None, None) when the bundle has no such record."""
+    tracks = [t["track"] for t in ladder]
+    last = None
+    for r in recs:
+        if r.get("src") != "relay" or r.get("conn") is None:
+            continue
+        ev_ = r.get("event")
+        if ev_ == "SWITCH_RECV" or (ev_ in ("SUBSCRIBE_RECV", "OBJECT_SENT")
+                                    and any(track_matches(r.get("track"), t) for t in tracks)):
+            last = r["conn"]
+    return (last, "relay_records") if last is not None else (None, None)
+
+
+def _merge_overlapping(episodes: list[dict]) -> tuple[list[dict], int]:
+    """Stall episodes as the union of their intervals: an episode starting before the previous
+    one ended is merged into it (the end is the later of the two). Returns (episodes, merged)."""
+    out: list[dict] = []
+    merged = 0
+    for e in sorted(episodes, key=lambda x: x["ts"]):
+        if out and out[-1].get("duration_ms") is not None and e.get("duration_ms") is not None \
+                and e["ts"] < out[-1]["ts"] + out[-1]["duration_ms"]:
+            prev = out[-1]
+            end = max(prev["ts"] + prev["duration_ms"], e["ts"] + e["duration_ms"])
+            out[-1] = dict(prev, duration_ms=end - prev["ts"], merged=prev.get("merged", 0) + 1,
+                           open_at_end=prev.get("open_at_end") or e.get("open_at_end"))
+            if not out[-1]["open_at_end"]:
+                out[-1].pop("open_at_end")
+            merged += 1
+            continue
+        out.append(e)
+    return out, merged
+
+
+def landing_keyframe(first_object: dict | None, applied: dict | None) -> bool | None:
+    """landed_on_keyframe of the landing object: SWITCH_FIRST_OBJECT's flag (2026-10), else
+    SWITCH_APPLIED's (older bundles carry it there only); None when neither says."""
+    for r in (first_object, applied):
+        if r is not None and r.get("landed_on_keyframe") is not None:
+            return r["landed_on_keyframe"]
+    return None
 
 
 def playable_data_ahead(sample: dict, min_buffer_s: float = 0.5, min_later_range_s: float = 0.1) -> bool:
@@ -211,7 +302,7 @@ def rule_name(rule_reason) -> str:
 _SWITCH_SLOTS = {"SWITCH_OK": "ok", "SWITCH_ERROR": "error", "SWITCH_SKIPPED": "skipped",
                  "SWITCH_FIRST_OBJECT": "first_object", "SWITCH_APPLIED": "applied",
                  "SWITCH_FIRST_FRAME": "first_frame", "SWITCH_SUPERSEDED": "superseded_rec", "SWITCH_FLOOR": "floor"}
-_SWITCH_RECORD_FIELDS = ("ok", "error", "skipped", "first_object", "applied", "first_frame", "superseded_rec", "floor")
+_SWITCH_RECORD_FIELDS = ("ok", "error", "first_object", "applied", "first_frame", "superseded_rec", "floor")
 
 
 def _fallback_join(joined: list[dict], r: dict, slot: str, diag: dict) -> dict | None:
@@ -231,13 +322,12 @@ def _fallback_join(joined: list[dict], r: dict, slot: str, diag: dict) -> dict |
       target (responses come back in order).
     * SWITCH_FLOOR (pr1378) precedes its SWITCH_SENT by at most a few ms and joins the
       next SWITCH_SENT.
-    * SWITCH_SKIPPED and SWITCH_SUPERSEDED need ``switch_seq``: old clients emitted
-      SWITCH_SKIPPED instead of a SWITCH_SENT (it is not a switch) and never emitted
-      SWITCH_SUPERSEDED.
+    * SWITCH_SUPERSEDED needs ``switch_seq`` (old clients never emitted it). SWITCH_SKIPPED
+      never joins (see ``join_switches``).
     Every unresolved switch that is not given a first frame here is classified later by
     ``join_switches`` (superseded when a later switch overwrote its seam, else open)."""
     ts = r.get("ts", 0)
-    if slot in ("skipped", "superseded_rec"):
+    if slot == "superseded_rec":
         return None
     if slot == "floor":
         return next((j for j in joined if j["floor"] is None and ts - 50 <= j["sent"]["ts"] <= ts + 2000), None)
@@ -264,8 +354,12 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
     terminal state. Join key: ``switch_seq`` when the records carry it, else the
     documented fallback (see ``_fallback_join``).
 
+    SWITCH_SKIPPED is never joined: the player emits it INSTEAD of a SWITCH_SENT, with a
+    switch_seq of its own, so it is an attempt that was not sent, not a switch; every
+    SWITCH_SKIPPED is counted in ``diag["unjoined"]["SWITCH_SKIPPED"]`` (switches.skipped_not_sent).
+
     Terminal (exactly one per switch, in this precedence): ``error`` (SWITCH_ERROR),
-    ``skipped`` (SWITCH_SKIPPED), ``first_frame`` (its own SWITCH_FIRST_FRAME),
+    ``first_frame`` (its own SWITCH_FIRST_FRAME),
     ``superseded`` (a SWITCH_SUPERSEDED record, or inferred when there is none: a later
     switch overwrote this one's pending state before its first frame, i.e. a later switch
     landed after this one landed, or a later switch was acknowledged (SWITCH_OK, which
@@ -287,7 +381,10 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         if slot is None:
             continue
         seq = r.get("switch_seq")
-        target = by_seq.get(seq) if seq is not None else _fallback_join(joined, r, slot, diag)
+        if slot == "skipped":
+            target = None
+        else:
+            target = by_seq.get(seq) if seq is not None else _fallback_join(joined, r, slot, diag)
         if target is None:
             diag["unjoined"][r["event"]] = diag["unjoined"].get(r["event"], 0) + 1
             continue
@@ -303,8 +400,6 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         j["superseded_by"], j["terminal_source"] = None, "record"
         if j["error"] is not None:
             j["terminal"] = "error"
-        elif j["skipped"] is not None:
-            j["terminal"] = "skipped"
         elif j["first_frame"] is not None:
             j["terminal"] = "first_frame"
             if j["superseded_rec"] is not None:
@@ -315,7 +410,7 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         else:
             later = None
             for k in joined[idx + 1:]:
-                if k["error"] is not None or k["skipped"] is not None:
+                if k["error"] is not None:
                     continue
                 if k["landed"] or k["first_frame"] is not None or (not j["landed"] and k["ok"] is not None):
                     later = k
@@ -325,6 +420,133 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
             else:
                 j["terminal"] = "open"
     return joined, diag
+
+
+# Decision attribution ------------------------------------------------------------------
+
+DECISION_JOIN_MAX_MS = 1000.0   # a switch is sent within this long of its decision (same tick, in practice)
+LEGACY_DECISION_TOL_MS = 5.0     # pre-2026-10 clients logged ABR_DECISION a few ms around SWITCH_SENT
+
+
+def _decided_at(r: dict) -> float | None:
+    """Decision time (epoch ms) of an ABR_DECISION / ABR_SWITCH_PHANTOM: ``decided_ts``
+    (2026-10), else ``ts - decided_ms_ago`` (phantoms before ``decided_ts``), else None
+    (a pre-2026-10 ABR_DECISION, logged at the decision itself)."""
+    if r.get("decided_ts") is not None:
+        return float(r["decided_ts"])
+    if r.get("decided_ms_ago") is not None:
+        return r["ts"] - float(r["decided_ms_ago"])
+    return None
+
+
+def join_decisions(joined: list[dict], recs: list[dict], index_of: dict) -> tuple[list[dict | None], list[dict], dict]:
+    """The controller decision behind every switch, and every decision as an event.
+
+    Since 2026-10-04 the controller logs ABR_DECISION when the switch LANDS on its target
+    (with ``decided_ts``, ``landed_after_ms`` and, from the 2026-10 contract on,
+    ``switch_seq``), and ABR_SWITCH_PHANTOM when it ends without landing. A switch that is
+    still pending at the run end has neither. Passes, in this order, each record used once:
+
+    1. ``switch_seq`` on the ABR_DECISION (source ``switch_seq``);
+    2. ``decided_ts``: same from and to, 0 <= SENT.ts - decided_ts <= 1000 ms, the latest
+       such decision (``decided_ts``);
+    3. pre-2026-10 ABR_DECISION (no decided_ts, logged at the decision): same target,
+       -5 ms <= SENT.ts - ts <= 1000 ms, the latest (``legacy_ts``);
+    4. ABR_SWITCH_PHANTOM by ``switch_seq``, else by decision time as in 2 (``phantom``);
+    5. the last ABR_TICK at or before SWITCH_SENT (within 1000 ms) whose chosen index is
+       the switch target's rung (``tick``; ``reason`` from the direction, auto-emergency
+       when EmergencyBufferRule chose it).
+
+    Returns (per-switch attribution or None, decision events, diagnostics). A decision
+    event is ``{"ts": decision time, reason, rule_reason, from, to, switch: index | None,
+    source}``; decisions and phantoms that joined no switch (pre-2026-10 clients skipped
+    the request without a SWITCH_SENT) are kept as events with ``switch`` None."""
+    decisions = [r for r in recs if r.get("event") == "ABR_DECISION"]
+    phantoms = [r for r in recs if r.get("event") == "ABR_SWITCH_PHANTOM"]
+    ticks = [r for r in recs if r.get("event") == "ABR_TICK"]
+    n = len(joined)
+    out: list[dict | None] = [None] * n
+    used: set[int] = set()
+
+    def attach(i: int, r: dict, at: float, source: str) -> None:
+        used.add(id(r))
+        out[i] = {"ts": at, "reason": r.get("reason"), "rule_reason": r.get("rule_reason"), "source": source, "record": r}
+
+    def by_seq(pool: list[dict], source: str) -> None:
+        idx = {j["switch_seq"]: i for i, j in enumerate(joined) if j["switch_seq_source"] == "record"}
+        for r in pool:
+            i = idx.get(r.get("switch_seq")) if r.get("switch_seq") is not None else None
+            if i is not None and out[i] is None and id(r) not in used:
+                at = _decided_at(r)
+                attach(i, r, at if at is not None else r["ts"], source)
+
+    def by_time(pool: list[dict], source: str, legacy: bool) -> None:
+        for i, j in enumerate(joined):
+            if out[i] is not None:
+                continue
+            sent = j["sent"]
+            best, best_at = None, None
+            for r in pool:
+                if id(r) in used or r.get("switch_seq") is not None:
+                    continue
+                at = _decided_at(r)
+                if legacy != (at is None):
+                    continue
+                at = r["ts"] if at is None else at
+                lag = sent["ts"] - at
+                lo = -LEGACY_DECISION_TOL_MS if legacy else 0.0
+                if not (lo <= lag <= DECISION_JOIN_MAX_MS) or r.get("to") != sent.get("to"):
+                    continue
+                if not legacy and r.get("from") is not None and sent.get("from") is not None and r["from"] != sent["from"]:
+                    continue
+                if best_at is None or at >= best_at:
+                    best, best_at = r, at
+            if best is not None:
+                attach(i, best, best_at, source)
+
+    by_seq(decisions, "switch_seq")
+    by_time(decisions, "decided_ts", legacy=False)
+    by_time(decisions, "legacy_ts", legacy=True)
+    by_seq(phantoms, "phantom")
+    by_time(phantoms, "phantom", legacy=False)
+    for i, j in enumerate(joined):
+        if out[i] is not None:
+            continue
+        sent = j["sent"]
+        ti, fi = index_of.get(sent.get("to"), -1), index_of.get(sent.get("from"), -1)
+        tick = None
+        for r in ticks:
+            if r["ts"] > sent["ts"]:
+                break
+            ch = r.get("chosen") or {}
+            if id(r) not in used and sent["ts"] - r["ts"] <= DECISION_JOIN_MAX_MS and ch.get("index") is not None and ch["index"] == ti:
+                tick = r
+        if tick is not None:
+            ch = tick["chosen"]
+            reason = ("auto-emergency" if ch.get("rule") == "EmergencyBufferRule" else "auto-downgrade") if ti < fi else "auto-upgrade"
+            used.add(id(tick))
+            out[i] = {"ts": tick["ts"], "reason": reason, "rule_reason": ch.get("reason"), "source": "tick", "record": tick}
+    events = []
+    for i, a in enumerate(out):
+        if a is not None:
+            sent = joined[i]["sent"]
+            events.append({"ts": a["ts"], "reason": a["reason"], "rule_reason": a["rule_reason"], "from": sent.get("from"),
+                           "to": sent.get("to"), "switch": i, "source": a["source"]})
+    loose = [r for r in decisions + phantoms if id(r) not in used]
+    for r in loose:
+        at = _decided_at(r)
+        events.append({"ts": at if at is not None else r["ts"], "reason": r.get("reason"), "rule_reason": r.get("rule_reason"),
+                       "from": r.get("from"), "to": r.get("to"), "switch": None,
+                       "source": "unjoined_" + ("decision" if r.get("event") == "ABR_DECISION" else "phantom")})
+    events.sort(key=lambda e: e["ts"])
+    sources: dict[str, int] = {}
+    for a in out:
+        k = a["source"] if a is not None else "none"
+        sources[k] = sources.get(k, 0) + 1
+    diag = {"sources": sources,
+            "unjoined_decisions": sum(1 for r in loose if r.get("event") == "ABR_DECISION"),
+            "unjoined_phantoms": sum(1 for r in loose if r.get("event") == "ABR_SWITCH_PHANTOM")}
+    return out, events, diag
 
 
 # Presented track -------------------------------------------------------------------
@@ -433,6 +655,9 @@ def capacity_steps(changes: list[dict]) -> dict:
     return out
 
 
+GATED_WHYS = ("slow-start", "post-switch-up-guard", "up-dwell")
+
+
 def switching_diagnostics(switches: list[dict], by, window_s: float, run_duration_s: float | None) -> dict:
     """Behavioural diagnostics of the switch sequence itself. A run with
     A->B->A->B is different from four monotonic adaptations even at equal
@@ -449,10 +674,17 @@ def switching_diagnostics(switches: list[dict], by, window_s: float, run_duratio
             reversals += 1
             if a["from"] == b["to"]:
                 aba += 1
+    gated: dict[str, int] = {}
+    for r in by("ABR_GATED"):
+        k = r.get("why") or "slow-start"
+        gated[k] = gated.get(k, 0) + 1
     by_rule: dict[str, int] = {}
+    by_source: dict[str, int] = {}
     for s in switches:
         k = rule_name(s.get("rule_reason"))
         by_rule[k] = by_rule.get(k, 0) + 1
+        src = s.get("decision_source") or "none"
+        by_source[src] = by_source.get(src, 0) + 1
     return {
         "reversal_window_s": window_s,
         "run_duration_s": run_duration_s,
@@ -465,12 +697,23 @@ def switching_diagnostics(switches: list[dict], by, window_s: float, run_duratio
         "direction_reversals": reversals,
         "aba_reversals": aba,
         "cooldown_activations": len(by("ABR_GUARD_TIMEOUT")),
-        "slow_start_vetoes": sum(1 for r in by("ABR_GATED") if r.get("why", "slow-start") == "slow-start"),
+        # ABR_GATED per `why` (a record without `why` is from a client that gated only on slow-start).
+        "gated_by_why": gated,
+        "slow_start_vetoes": gated.get("slow-start", 0),
         # Up-switches held by the post-switch up-guard (controller arm 'guard'/'both').
-        "up_guard_vetoes": sum(1 for r in by("ABR_GATED") if r.get("why") == "post-switch-up-guard"),
+        "up_guard_vetoes": gated.get("post-switch-up-guard", 0),
+        # Up-switches held by the min arm's dwell (upDwellGroups groups since the last landing).
+        "up_dwell_vetoes": gated.get("up-dwell", 0),
+        "other_gated": {k: v for k, v in gated.items() if k not in GATED_WHYS},
+        # Switches the controller requested that ended without landing on their target
+        # (refused, skipped or failed): ABR_SWITCH_PHANTOM.
+        "phantom_switches": len(by("ABR_SWITCH_PHANTOM")),
         # Probe readings dropped for a too-short burst (controller arm 'probe'/'both').
         "probes_discarded": len(by("PROBE_DISCARDED")),
         "switches_by_rule": by_rule,
+        # Where each switch's rule came from (join_decisions): switch_seq, decided_ts,
+        # legacy_ts, phantom, tick; none = no decision found.
+        "decision_sources": {k: v for k, v in sorted(by_source.items())},
     }
 
 
@@ -584,8 +827,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     }
     win_start = st["ts"] if st else None
     win_end = (st["ts"] + initial_window_s * 1000) if st else None
+    # Client records after the runner's RUN_END (the browser logs on through teardown) are
+    # outside the run: samples, playback, stalls, starvation and seeks are clipped to it.
+    clip_end = run_end["ts"] if run_end else None
+    within = lambda ts: clip_end is None or ts <= clip_end  # noqa: E731
     client_end = max((r["ts"] for r in recs if r.get("src") == "client"), default=None)
-    samples = [s for s in by("SAMPLE") if st is None or s["ts"] >= st["ts"]]
+    if client_end is not None and clip_end is not None:
+        client_end = min(client_end, clip_end)
+    samples = [s for s in by("SAMPLE") if (st is None or s["ts"] >= st["ts"]) and within(s["ts"])]
     # Run duration: first presented frame to RUN_END (or the last SAMPLE when the runner
     # record is missing). The denominator of switches/min and the end of the share windows.
     end_ts = run_end["ts"] if run_end else (samples[-1]["ts"] if samples else client_end)
@@ -599,14 +848,24 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         if r.get("event") == "STALL_START":
             open_start = r
         elif r.get("event") == "STALL_END" and open_start is not None:
-            episodes.append({"ts": open_start["ts"], "cause": r.get("cause"), "duration_ms": r.get("duration_ms"),
+            # The episode starts at STALL_END.ts - duration_ms: the player backdates a
+            # `frozen` stall to its first frozen watchdog tick (STALL_START is logged 0.5-1 s
+            # later), and duration_ms is measured from that start on the monotonic clock.
+            dur = r.get("duration_ms")
+            start_ts = (r["ts"] - dur) if dur is not None else open_start["ts"]
+            episodes.append({"ts": start_ts, "start_logged_ts": open_start["ts"], "cause": r.get("cause"), "duration_ms": dur,
                              "playhead_ms": r.get("playhead_ms"), "track": open_start.get("track")})
             open_start = None
     # A stall still open when the run ended is a stall to the end of the run.
     if open_start is not None:
         last_ts = client_end if client_end is not None else open_start["ts"]
-        episodes.append({"ts": open_start["ts"], "cause": open_start.get("cause"), "duration_ms": last_ts - open_start["ts"],
+        episodes.append({"ts": open_start["ts"], "cause": open_start.get("cause"), "duration_ms": max(0.0, last_ts - open_start["ts"]),
                          "playhead_ms": open_start.get("playhead_ms"), "track": open_start.get("track"), "open_at_end": True})
+    # Clip to RUN_END: an episode starting after it is not part of the run, one spanning it ends there.
+    episodes = _clip_episodes(episodes, clip_end)
+    # Overlapping episodes are one stall: a frozen stall that `playing` closed while the
+    # watchdog still counted frozen ticks is reopened backdated to the original freeze start.
+    episodes, merged_overlaps = _merge_overlapping(episodes)
     # Only episodes after the first presented frame count; the client already excludes
     # pre-startup `waiting`, this is the analyzer's own guarantee.
     episodes = [e for e in episodes if st is None or e["ts"] >= st["ts"]]
@@ -620,14 +879,16 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         s["_kind"] = SEEK_REASON_NORMAL.get(s.get("reason"), s.get("reason") or "unknown")
     after_window = lambda s: win_end is not None and s["ts"] >= win_end  # noqa: E731
     span = lambda s: max(0.0, (s.get("to_ms") or 0) - (s.get("from_ms") or 0)) if s.get("to_ms") is not None and s.get("from_ms") is not None else (s.get("gap_ms") or 0)  # noqa: E731
-    gap_after = [s for s in seeks if s["_kind"] == "gap" and after_window(s)]
-    wedge_after = [s for s in seeks if s["_kind"] == "wedge" and after_window(s)]
+    gap_after = [s for s in seeks if s["_kind"] == "gap" and after_window(s) and within(s["ts"])]
+    wedge_after = [s for s in seeks if s["_kind"] == "wedge" and after_window(s) and within(s["ts"])]
     out["stalls"] = {
         # Episodes >= STALL_MIN_EPISODE_MS; shorter `waiting` blips (15-30 ms around a gap seek) are counted apart.
         "count": len(major), "total_ms": sum(durations), "max_ms": max(durations) if durations else 0,
         "min_episode_ms": STALL_MIN_EPISODE_MS,
         "blips": len(blips), "blips_ms": sum(e["duration_ms"] or 0 for e in blips),
         "all_count": len(episodes),
+        # Episodes that overlapped an earlier one (reopened backdated) and were merged into it.
+        "overlapping_merged": merged_overlaps,
         "episodes": episodes,
         # Normalised seek vocabulary (gap = gap | range-jump | unwedge), all seeks of the session.
         "seeks": {k: sum(1 for s in seeks if s["_kind"] == k) for k in ("startup", "gap", "wedge", "visibility")},
@@ -670,6 +931,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         start = open_st["ts"] - (open_st.get("since_last_append_ms") or 0)
         starved.append({"ts": start, "duration_ms": client_end - start, "track": open_st.get("track"),
                         "pending": open_st.get("pending"), "last_group": open_st.get("last_group"), "open_at_end": True})
+    starved = _clip_episodes(starved, clip_end)
     stall_in_starvation = 0.0
     for e in starved:
         a, b = e["ts"], e["ts"] + (e["duration_ms"] or 0)
@@ -687,18 +949,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     # Switch timelines -------------------------------------------------------
     switch_recv = by("SWITCH_RECV")
     promoted = by("SWITCH_PROMOTED")
-    decisions = by("ABR_DECISION")
     drops = by("DROP_STALE")
     joined, join_diag = join_switches(recs)
+    attribution, decision_events, decision_diag = join_decisions(joined, recs, index_of)
     switches = []
-    for j in joined:
+    for j, decision in zip(joined, attribution):
         sent = j["sent"]
         rid = sent.get("request_id")
-        decision = None
-        for r in reversed([d for d in decisions if d["ts"] <= sent["ts"] + 5]):
-            if r.get("to") == sent.get("to"):
-                decision = r
-                break
         ok, err, fobj, applied, fframe = j["ok"], j["error"], j["first_object"], j["applied"], j["first_frame"]
         # The relay's SWITCH_RECV names the subscription being replaced (old_request_id)
         # on every mechanism; the new id may be absent (null) on PR #1378.
@@ -726,11 +983,15 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "landed": j["landed"],
             "first_frame_ts": fframe["ts"] if fframe else None,
             "direction": "up" if ti > fi else "down" if ti < fi else "same",
-            "reason": decision.get("reason") if decision else None,
-            "rule_reason": decision.get("rule_reason") if decision else None,
+            # The controller decision behind this switch (join_decisions): its decision
+            # time (decided_ts; ABR_DECISION itself is logged at the landing), reason and
+            # rule, and where the attribution came from.
+            "reason": decision["reason"] if decision else None,
+            "rule_reason": decision["rule_reason"] if decision else None,
+            "decision_source": decision["source"] if decision else None,
+            "decided_ts": decision["ts"] if decision else None,
             "t2_decision_ms": (sent["ts"] - decision["ts"]) if decision else None,
             "t3_ok_ms": d(ok), "error": err.get("reason") if err else None,
-            "skipped_reason": j["skipped"].get("reason") if j["skipped"] else None,
             "relay_recv_ms": d(rrecv), "relay_promoted_ms": d(rprom),
             "relay_start_group": rprom.get("start_group") if rprom else None,
             # pr1378: the Minimum Switching Group the client asked for.
@@ -752,16 +1013,19 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "playback_position_jump_ms": fframe.get("playback_position_jump_ms") if presented else None,
             # Wall-clock pause at the seam beyond one frame period.
             "viewer_pause_ms": fframe.get("viewer_pause_ms") if presented else None,
-            # Hole in the element's buffered ranges at the seam (what a range-jump seek crosses).
-            # The client reports the hole just behind the presented frame's range, which can be
-            # an older hole still in the buffer; attribute it to this seam only when the first
-            # presented frame is later than the seam itself (something at the seam was skipped).
+            # Hole in the element's buffered ranges at the seam (what a gap seek crosses): the
+            # player's attribution on 2026-10 records, the 100 ms rule on older ones (seam_hole).
             "seam_buffer_hole_ms": seam_hole(fframe) if presented else None,
-            "buffer_hole_behind_ms": fframe.get("seam_buffer_hole_ms") if presented else None,
+            "seam_hole_rule": seam_hole_rule(fframe) if presented else None,
+            # The raw hole behind the presented frame's range (may be an older hole).
+            "buffer_hole_behind_ms": hole_behind(fframe) if presented else None,
             # Whether the target began on object 0 of its group (its keyframe).
             "landed_on_group_start": applied.get("landed_on_group_start") if applied else None,
             # Whether the landing object's moof carries the sync-sample flag (a real keyframe).
-            "landed_on_keyframe": applied.get("landed_on_keyframe") if applied else None,
+            # From SWITCH_FIRST_OBJECT (2026-10: the landing object), so a switch that landed
+            # off a keyframe and was superseded before the keyframe gate appended anything
+            # (no SWITCH_APPLIED) stays in the denominator; SWITCH_APPLIED for older bundles.
+            "landed_on_keyframe": landing_keyframe(fobj, applied),
             # Source-track objects that arrived after the target landed and were discarded
             # (the relay kept delivering the source's in-progress group).
             "seam_dropped_source_frames": sum(
@@ -790,7 +1054,6 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "up": sum(1 for s in switches if s["direction"] == "up"),
         "down": sum(1 for s in switches if s["direction"] == "down"),
         "failed": terminals["error"],
-        "skipped": terminals["skipped"],
         "landed": sum(1 for s in switches if s["landed"]),
         # Delivery-side stamps over every landed switch (mechanism metrics).
         "switch_delivery_latency_ms": stats([s["switch_delivery_latency_ms"] for s in switches]),
@@ -811,11 +1074,15 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "landed_on_keyframe": sum(1 for s in switches if s["landed_on_keyframe"]),
         "landed_on_keyframe_known": sum(1 for s in switches if s["landed_on_keyframe"] is not None),
         "list": switches,
+        # Decision attribution (join_decisions): counts per source, decisions that joined no switch.
+        "decision_join": decision_diag,
         "guard_timeouts": len(by("ABR_GUARD_TIMEOUT")),
-        "gated_slow_start": len(by("ABR_GATED")),
-        # SWITCH_SKIPPED records that belong to no SWITCH_SENT (clients before 2026-10-04
-        # skipped the request before sending it).
+        # ABR_GATED with why = slow-start (or no why); the other reasons are in switching.gated_by_why.
+        "gated_slow_start": sum(1 for r in by("ABR_GATED") if (r.get("why") or "slow-start") == "slow-start"),
+        # SWITCH_SKIPPED: a switch attempt the player did not send (the previous switch had
+        # no alias yet). Emitted instead of a SWITCH_SENT, so never a switch (diagnostic).
         "skipped_not_sent": join_diag["unjoined"].get("SWITCH_SKIPPED", 0),
+        "skipped_attempts": len(by("SWITCH_SKIPPED")),
         "session_destroyed": any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR")),
     }
     out["switches"]["skipped_not_landed"] = out["switches"]["skipped_not_sent"]  # legacy name
@@ -951,10 +1218,15 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                    lambda r: r["ts"] < window_end and (
                        (direction == "down" and r.get("bps", 0) <= target_bps * (1 + t1_tol)) or
                        (direction == "up" and r.get("bps", 0) >= min(prev_rate * 1e6 * (1 + t1_tol), target_bps * (1 - t1_tol)))))
-        t2 = first(recs, "ABR_DECISION", t0, lambda r: r["ts"] < window_end and
-                   ((direction == "down" and r.get("reason") in ("auto-downgrade", "auto-emergency")) or
-                    (direction == "up" and r.get("reason") == "auto-upgrade")))
-        sw = next((s for s in switches if t2 and s["to"] == t2.get("to") and abs(s["ts"] - t2["ts"]) < 5000), None)
+        # t2: the first controller decision (by its decision time, not the landing-time
+        # ABR_DECISION record) in the step's window, in the step's direction.
+        t2 = next((e for e in decision_events if t0 <= e["ts"] < window_end and
+                   ((direction == "down" and e.get("reason") in ("auto-downgrade", "auto-emergency")) or
+                    (direction == "up" and e.get("reason") == "auto-upgrade"))), None)
+        if t2 is not None and t2["switch"] is not None:
+            sw = switches[t2["switch"]]
+        else:  # a decision without its own SWITCH_SENT (pre-2026-10 clients skipped it): nearest switch to its target
+            sw = next((s for s in switches if t2 and s["to"] == t2.get("to") and abs(s["ts"] - t2["ts"]) < 5000), None)
 
         # Reaction to a down-step: the PRESENTED rung is one that fits the new capacity
         # and stays there for `sustain_s`. Recovery after an up-step: the presented rung
@@ -981,7 +1253,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                "t5_ms": (sw["ts"] + sw["switch_visibility_delay_ms"] - t0) if sw and sw["switch_visibility_delay_ms"] else None}
         # Attribution: t2 is the controller's reaction to THIS change only if the
         # controller was quiet before it (no decision in the feedback window before t0).
-        decisions_before = [r for r in decisions if t0 - feedback_window_s * 1000 <= r["ts"] < t0]
+        decisions_before = [e for e in decision_events if t0 - feedback_window_s * 1000 <= e["ts"] < t0]
         rec["quiet_before"] = len(decisions_before) == 0
         rec["sample_before_decision"] = bool(t1 and t2 and t1["ts"] <= t2["ts"])
         rec["reliable"] = rec["quiet_before"]
@@ -1093,27 +1365,45 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         p["cpu"].append(r.get("cpu_pct", 0.0))
     out["process"] = {k: {"max_rss_bytes": max(v["rss"]), "mean_cpu_pct": statistics.fmean(v["cpu"])}
                       for k, v in procs.items() if v["rss"]}
-    # QUIC path statistics of the client's connection (relay CONN_STATS, once per
-    # second, cumulative counters): the connection the client's session used is the
-    # one with the most bytes sent (the publisher's upstream connection is the other).
+    # QUIC path statistics of the client's connection (relay CONN_STATS, once per second,
+    # cumulative counters). The client's connection is identified by its id in the relay's
+    # own records of the client's requests (client_connection_id); only bundles without
+    # such records fall back to the connection with the most bytes sent. Summaries cover
+    # the run, [STARTUP, RUN_END]: the relay's shutdown drain after RUN_END (up to 10 s)
+    # and the setup before the first frame stay out; cumulative counters are differences
+    # against the last sample before the window (zero when there is none).
     conn_stats: dict[int, list[dict]] = {}
     for r in by("CONN_STATS"):
         conn_stats.setdefault(r.get("conn"), []).append(r)
-    client_conn = max(conn_stats.values(), key=lambda v: v[-1].get("udp_tx_bytes") or 0, default=[])
+    conn_id, conn_source = client_connection_id(recs, ladder)
+    if conn_id is None or conn_id not in conn_stats:
+        conn_id = max(conn_stats, key=lambda k: conn_stats[k][-1].get("udp_tx_bytes") or 0, default=None)
+        conn_source = "most_bytes" if conn_id is not None else None
+    client_conn_all = conn_stats.get(conn_id, [])
+    w_lo = st["ts"] if st else -math.inf
+    w_hi = run_end["ts"] if run_end else math.inf
+    client_conn = [r for r in client_conn_all if w_lo <= r["ts"] <= w_hi]
+    base = next((r for r in reversed(client_conn_all) if r["ts"] < w_lo), None)
+    delta = lambda k: ((client_conn[-1].get(k) or 0) - ((base or {}).get(k) or 0)) if client_conn else None  # noqa: E731
     cwnd = [r["cwnd"] for r in client_conn if r.get("cwnd") is not None]
+    sent_pk = delta("sent_packets")
     out["conn"] = {
+        "conn_id": conn_id,
+        # relay_records: by id from SUBSCRIBE_RECV / OBJECT_SENT / SWITCH_RECV for the client's
+        # tracks; most_bytes: old-bundle fallback.
+        "conn_source": conn_source,
+        "window": {"from_ts": st["ts"] if st else None, "to_ts": run_end["ts"] if run_end else None},
         "samples": len(client_conn),
         "rtt_ms": stats([r["rtt_ms"] for r in client_conn if r.get("rtt_ms") is not None]),
         "cwnd_bytes": stats(cwnd),
-        "lost_packets": (client_conn[-1].get("lost_packets") or 0) if client_conn else None,
-        "lost_bytes": (client_conn[-1].get("lost_bytes") or 0) if client_conn else None,
-        "sent_packets": (client_conn[-1].get("sent_packets") or 0) if client_conn else None,
-        "congestion_events": (client_conn[-1].get("congestion_events") or 0) if client_conn else None,
-        "loss_rate": ((client_conn[-1].get("lost_packets") or 0) / (client_conn[-1].get("sent_packets") or 1)) if client_conn else None,
+        "lost_packets": delta("lost_packets"),
+        "lost_bytes": delta("lost_bytes"),
+        "sent_packets": sent_pk,
+        "congestion_events": delta("congestion_events"),
+        "loss_rate": ((delta("lost_packets") or 0) / sent_pk) if client_conn and sent_pk else (0.0 if client_conn else None),
         # UDP datagrams per send I/O on the client connection: 1.0 means no UDP
         # segmentation batches (C5); > 1 means quinn sent GSO batches.
-        "tx_datagrams_per_io": ((client_conn[-1].get("udp_tx_datagrams") or 0) / client_conn[-1]["udp_tx_ios"])
-        if client_conn and client_conn[-1].get("udp_tx_ios") else None,
+        "tx_datagrams_per_io": (delta("udp_tx_datagrams") / delta("udp_tx_ios")) if client_conn and delta("udp_tx_ios") else None,
         "pacer_rate_bps": stats([r["pacer_rate_bps"] for r in client_conn if r.get("pacer_rate_bps") is not None]),
     }
     relay_config = first(recs, "RELAY_CONFIG")
@@ -1319,7 +1609,7 @@ def to_markdown(s: dict) -> str:
          "| metric | value |", "|---|---|",
          f"| run duration s (first frame to RUN_END); switches; switches/min | {fmt(s.get('run_duration_s'))}; {sw['count']}; {fmt(s['switching']['switches_per_minute'])} |",
          f"| A->B->A reversals (direction reversals) | {s['switching']['aba_reversals']} ({s['switching']['direction_reversals']}) |",
-         f"| switch terminals: first_frame / superseded / error / skipped / open | {sw['terminals']['first_frame']} / {sw['terminals']['superseded']} / {sw['terminals']['error']} / {sw['terminals']['skipped']} / {sw['terminals']['open']} (superseded frac {fmt(sw['superseded_frac'])}; join by {'switch_seq' if sw['join'].get('seq_join') else 'fallback'}) |",
+         f"| switch terminals: first_frame / superseded / error / open | {sw['terminals']['first_frame']} / {sw['terminals']['superseded']} / {sw['terminals']['error']} / {sw['terminals']['open']} (superseded frac {fmt(sw['superseded_frac'])}; join by {'switch_seq' if sw['join'].get('seq_join') else 'fallback'}) |",
          f"| presented rung mean / presented kbps (advancing time, source {br.get('presented_source')}) | {fmt(br.get('presented_rung_mean'))} / {fmt(br.get('presented_kbps'))} |",
          f"| subscribed rung mean / kbps (diagnostic, wall time) | {fmt(br.get('subscribed_rung_mean'))} / {fmt(br.get('subscribed_kbps'))} |",
          f"| fit share in the low window (fit rung {sh.get('fit_rung')}, rung at drop {sh.get('rung_at_drop')}) | {fmt(sh.get('fit_share_low'))} over {fmt(sh.get('low_window_advancing_s'))} s advancing |",
@@ -1338,13 +1628,13 @@ def to_markdown(s: dict) -> str:
          "| metric | value |", "|---|---|",
          f"| first group / expected / clamped | {s['startup']['first_group']} / {s['startup']['expected_start_group']} / {s['startup']['clamped_by_relay']} |",
          f"| seeks (all): startup / gap / wedge / visibility; deferred gaps | {stl['seeks']['startup']} / {stl['seeks']['gap']} / {stl['seeks']['wedge']} / {stl['seeks']['visibility']}; {stl['range_jumps_deferred']} |",
-         f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
+         f"| controller arm; gated (slow-start / up-guard / up-dwell / other); phantom switches; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['slow_start_vetoes']} / {s['switching']['up_guard_vetoes']} / {s['switching']['up_dwell_vetoes']} / {sum(s['switching']['other_gated'].values())}; {s['switching']['phantom_switches']}; {s['switching']['probes_discarded']} |",
          f"| delivery (needs --log-objects): groups / objects per group p50,min / short / truncated on the wire | {s['delivery']['groups']} / {fmt(s['delivery']['objects_per_group'].get('p50'))},{fmt(s['delivery']['objects_per_group'].get('min'))} / {s['delivery']['short_groups']} / {s['delivery']['truncated_groups']} |",
          f"| of the wire-cut groups (relay OBJECT_SENT): cut at the relay / lost after send | {s['delivery']['cut_at_relay']} / {s['delivery']['lost_after_send']} |",
          f"| probe load: probes / MB / mean Mbps; relay->client object latency ms p50 / p95 | {s['link']['probes']} / {s['link']['probe_bytes'] / 1e6:.1f} / {fmt(s['link']['probe_mbps'])}; {fmt(s['link']['send_recv_latency_ms'].get('p50'))} / {fmt(s['link']['send_recv_latency_ms'].get('p95'))} |",
          f"| discarded by the client (stale objects / groups / MB; pre-keyframe; unrouted bytes) | {s['discarded']['objects']} / {s['discarded']['groups']} / {s['discarded']['bytes'] / 1e6:.1f}; {s['discarded']['pre_keyframe']}; {s['discarded'].get('unrouted_bytes')} |",
          f"| media element errors (code) / client ERROR events | {len(s['media_errors'])} ({', '.join(str(e['code']) for e in s['media_errors'])}) / {len(s['client_errors'])} |",
-         f"| switches (up / down / failed / skipped / landed) | {sw['count']} ({sw['up']} / {sw['down']} / {sw['failed']} / {sw['skipped']} / {sw['landed']}) |",
+         f"| switches (up / down / failed / landed); attempts skipped without a SWITCH_SENT | {sw['count']} ({sw['up']} / {sw['down']} / {sw['failed']} / {sw['landed']}); {sw['skipped_attempts']} |",
          f"| switch delivery latency ms, t4 (median / p95) | {fmt(sw['switch_delivery_latency_ms'].get('p50'))} / {fmt(sw['switch_delivery_latency_ms'].get('p95'))} |",
          f"| relay promoted ms (median / n of {sw['count']}) | {fmt(sw['relay_promoted_ms'].get('p50'))} / {sw['relay_promoted_ms'].get('n')} |",
          f"| media seam gap ms (median / max) | {fmt(sw['media_seam_gap_ms'].get('p50'))} / {fmt(sw['media_seam_gap_ms'].get('max'))} |",
@@ -1352,7 +1642,7 @@ def to_markdown(s: dict) -> str:
          f"| playback position jump ms (median / abs p95) | {fmt(sw['playback_position_jump_ms'].get('p50'))} / {fmt(sw['abs_playback_position_jump_ms'].get('p95'))} |",
          f"| seam buffer hole ms (median / max) | {fmt(sw['seam_buffer_hole_ms'].get('p50'))} / {fmt(sw['seam_buffer_hole_ms'].get('max'))} |",
          f"| seam dropped source frames (median / max); landed on object 0 | {fmt(sw['seam_dropped_source_frames'].get('p50'))} / {fmt(sw['seam_dropped_source_frames'].get('max'))}; {sw['landed_on_group_start']} of {sw['count']} |",
-         f"| join diagnostics: unjoined / duplicates / conflicting terminals; SKIPPED without SENT | {sw['join'].get('unjoined')} / {sw['join'].get('duplicates')} / {sw['join'].get('conflicting_terminals')}; {sw['skipped_not_sent']} |",
+         f"| join diagnostics: unjoined / duplicates / conflicting terminals; SWITCH_SKIPPED (not sent) | {sw['join'].get('unjoined')} / {sw['join'].get('duplicates')} / {sw['join'].get('conflicting_terminals')}; {sw['skipped_not_sent']} |",
          f"| playback advancing fraction / longest no-progress s / longest frozen with playable data s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} / {fmt((s['playback'].get('longest_frozen_with_data_ms') or 0) / 1000)} |",
          f"| detection attributable (per change: quiet before t0) | {s['detection_reliable']}; down t2/t4 {fmt(rx['down_t2_ms'])}/{fmt(rx['down_t4_ms'])} ms, up t2 {fmt(rx['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
          f"| inter-switch interval ms (median / min); switch span s | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])}; {fmt(s['switching']['switch_span_s'])} |",
@@ -1406,7 +1696,8 @@ METRIC_COLUMNS = ["startup_delay_ms", "run_duration_s", "stall_count", "stall_to
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "half_shift_lost", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "reaction_na_reason", "data_starved_ms", "data_starved_raw_ms",
-                  "gap_seeks", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
+                  "gap_seeks", "range_jumps_deferred", "slow_start_vetoes", "up_guard_vetoes", "up_dwell_vetoes", "other_gated",
+                  "phantom_switches", "skipped_attempts", "probes_discarded", "media_errors",
                   "presented_rung_mean", "presented_kbps", "subscribed_rung_mean", "subscribed_kbps",
                   "fit_share_low", "pre_drop_share_after_restore", "pre_drop_rung", "rung_at_drop", "fit_rung",
                   "truncated_groups", "discarded_objects", "discarded_mb",
@@ -1484,7 +1775,12 @@ def agg_row(s: dict) -> dict:
         "data_starved_raw_ms": s["starvation"].get("raw_total_ms"),
         "gap_seeks": stl["gap_seeks"],
         "range_jumps_deferred": stl["range_jumps_deferred"],
+        "slow_start_vetoes": s["switching"].get("slow_start_vetoes"),
         "up_guard_vetoes": s["switching"]["up_guard_vetoes"],
+        "up_dwell_vetoes": s["switching"].get("up_dwell_vetoes"),
+        "other_gated": sum((s["switching"].get("other_gated") or {}).values()),
+        "phantom_switches": s["switching"].get("phantom_switches"),
+        "skipped_attempts": s["switches"].get("skipped_attempts"),
         "probes_discarded": s["switching"]["probes_discarded"],
         "media_errors": len(s["media_errors"]),
         "presented_rung_mean": br.get("presented_rung_mean"), "presented_kbps": br.get("presented_kbps"),

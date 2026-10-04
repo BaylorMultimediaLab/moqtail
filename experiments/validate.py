@@ -8,7 +8,9 @@ Run it on a short unshaped run of each client type before generating a series.
 Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
 
   single-session  one client page session, no wall-clock gaps > 5 s in SAMPLE
-  identity        run_meta.json carries the identity block and it matches the client RUN_META
+  identity        run_meta.json carries the identity block and it matches the client RUN_META (client type,
+                  delay groups, controller arm: RUN_META.controller_arm == identity.controller_family, or
+                  identity.controller when the family is absent; skipped when the client did not log it)
   aborted         the runner did not mark the run aborted (validation.json {"failed": ["aborted"]} or
                   run_meta.json validity.aborted)
   completed       RUN_END is present and elapsed_s is within --duration-tolerance-s of the configured duration
@@ -47,7 +49,8 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
   pf-relay-cc       RELAY_CONFIG.congestion_controller matches the run identity
   pf-qdisc          qdisc_stats on every applied NET_CHANGE; the recorded tc commands show netem / htb /
                     bfifo|fq_codel on a rate-limited step and netem on an unshaped one
-  pf-gso            gso_at_qdisc false on every rate-limited NET_CHANGE (fails when true)
+  pf-gso            qdisc_stats.leaf.gso_at_qdisc false on every rate-limited NET_CHANGE (fails when true;
+                    a top-level gso_at_qdisc is read only when the leaf has none)
   pf-maxpacket      qdisc_stats.leaf.maxpacket <= 1514 when recorded (reported above, fails above 3000)
   pf-warmup         BROWSER_START.warmup_measured_s within 15 +- 1 s (reported)
   pf-offloads       identity.offloads_disabled is true (reported)
@@ -58,7 +61,8 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
                     THROUGHPUT_SAMPLE rate of link-limited groups (bytes x 8 / 50 ms >= rate, i.e. a
                     group the publisher's ~50 ms burst cannot deliver faster than the link) lies in
                     [0.6, 1.15] x rate. When it does not, the 64 KB probe's pure transfer rate in the
-                    same window tells the cause: probe as low as video = the connection delivered
+                    same window (objects 2..N over the first-to-last object span; dt_ms on bundles
+                    without PROBE.first/last_object_ms) tells the cause: probe as low as video = the connection delivered
                     less than the link (transport / congestion control); probe near the rate while
                     video is low = client-side timing (M11)
   pf-probe-rate     lowest step <= 1.5 Mbps: probe-measured throughput p50 >= 0.8 x rate (reported;
@@ -104,12 +108,41 @@ def _median(vals: list[float]) -> float:
     return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
 
 
+PROBE_RATE_METHODS = {
+    "objects": "first-to-last object, objects 2..N",
+    "objects_unknown_n": "first-to-last object, object count unknown: all p_bytes over the span (overestimates by about 1/N)",
+    "dt_ms": "dt_ms: request to end of read, includes the request round trip and the idle wait (old bundle; a lower bound)",
+}
+
+
+def probe_transfer_rate(r: dict) -> tuple[float, str] | None:
+    """The probe's pure transfer rate in bps and how it was computed (a PROBE_RATE_METHODS key).
+
+    With ``first_object_ms`` / ``last_object_ms`` (2026-10): the bytes of objects 2..N over the
+    first-to-last arrival span, ``p_bytes x (n - 1) / n x 8 / (last - first)`` with n =
+    ``objects`` (equal-sized objects assumed; the first object's own transfer is not inside the
+    span). Without an object count all of ``p_bytes`` is put over the span. Old bundles (or a
+    span of 0, or fewer than 2 objects): ``p_bytes x 8 / dt_ms``, which includes the request
+    round trip and the idle wait after the last object, so it under-reads the link."""
+    pb = r.get("p_bytes") or 0
+    first_ms, last_ms, n = r.get("first_object_ms"), r.get("last_object_ms"), r.get("objects")
+    if first_ms is not None and last_ms is not None and last_ms > first_ms and pb > 0 and (n is None or n >= 2):
+        span_s = (last_ms - first_ms) / 1000
+        if n is not None:
+            return pb * (n - 1) / n * 8 / span_s, "objects"
+        return pb * 8 / span_s, "objects_unknown_n"
+    if r.get("dt_ms") and pb > 0:
+        return pb * 8 / (r["dt_ms"] / 1000), "dt_ms"
+    return None
+
+
 def delivery_rate(applied: list[dict], tput: list[dict], probes: list[dict] | None, client_end: float | None) -> tuple[bool | None, str]:
     """Per rate-limited step, the median THROUGHPUT_SAMPLE.bps of link-limited groups over
     [step + settle, next step) must lie in ESTIMATOR_BAND x rate. Returns (ok, detail);
     ok is None when no step had enough link-limited samples to judge. A step out of band is
-    attributed with the probe's pure transfer rate (p_bytes x 8 / dt_ms, probes >= 60 KB) in
-    the same window when probes exist: within 25 % of the video rate means the connection
+    attributed with the probe's pure transfer rate (``probe_transfer_rate``: objects 2..N over
+    the first-to-last object span, dt_ms on old bundles; probes >= 60 KB) in the same window
+    when probes exist: within 25 % of the video rate means the connection
     itself delivered that little (transport); at least 0.6 x rate means client-side timing."""
     steps = sorted((c for c in applied if c.get("rate_mbps") is not None), key=lambda c: c["ts"])
     if not steps:
@@ -135,17 +168,23 @@ def delivery_rate(applied: list[dict], tput: list[dict], probes: list[dict] | No
         bad += 0 if ok else 1
         cause = ""
         if not ok:
-            pr = [r["p_bytes"] * 8 / (r["dt_ms"] / 1000) for r in (probes or [])
-                  if r.get("src", "client") == "client" and r.get("dt_ms") and (r.get("p_bytes") or 0) >= 60_000
-                  and lo_t <= r["ts"] < end]
+            rated = [x for x in (probe_transfer_rate(r) for r in (probes or [])
+                                 if r.get("src", "client") == "client" and (r.get("p_bytes") or 0) >= 60_000
+                                 and lo_t <= r["ts"] < end) if x is not None]
+            pr = [bps for bps, _ in rated]
             if pr:
                 pmed = _median(pr)
+                methods: dict[str, int] = {}
+                for _, m in rated:
+                    methods[m] = methods.get(m, 0) + 1
+                how = "; ".join(f"{PROBE_RATE_METHODS[m]}: {k}" for m, k in sorted(methods.items()))
+                head = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes ({how})"
                 if abs(pmed - med) <= 0.25 * med:
-                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: the connection delivered this little (transport)"
+                    cause = head + ": the connection delivered this little (transport)"
                 elif pmed >= lo * rate_bps:
-                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: the link was there, client-side timing (M11)"
+                    cause = head + ": the link was there, client-side timing (M11)"
                 else:
-                    cause = f"; probe transfer {pmed / 1e6:.2f} Mbps over {len(pr)} probes: inconclusive"
+                    cause = head + ": inconclusive"
             else:
                 cause = "; no probe in the window to attribute the cause (see CONN_STATS cwnd/rtt)"
         parts.append(f"{c['rate_mbps']} Mbps at_s={c.get('at_s')}: median {med / 1e6:.2f} Mbps over {n} link-limited groups "
@@ -173,6 +212,21 @@ class Report:
     def render(self) -> str:
         w = max(len(r[0]) for r in self.rows)
         return "\n".join(f"{r[1]:4}  {r[0]:{w}}  {r[2]}" for r in self.rows)
+
+
+def _leaf(rec: dict) -> dict:
+    """qdisc_stats.leaf of a NET_CHANGE / RUN_END record ({} when absent)."""
+    qs = rec.get("qdisc_stats")
+    return (qs.get("leaf") or {}) if isinstance(qs, dict) else {}
+
+
+def _gso_at_qdisc(rec: dict):
+    """The GSO verdict of a NET_CHANGE: qdisc_stats.leaf.gso_at_qdisc (what the runner writes),
+    else a top-level gso_at_qdisc. True / False / None (unknown)."""
+    leaf = _leaf(rec)
+    if "gso_at_qdisc" in leaf:
+        return leaf["gso_at_qdisc"]
+    return rec.get("gso_at_qdisc")
 
 
 def _text(v) -> str:
@@ -212,9 +266,18 @@ def main() -> int:
     missing = [k for k in required if k not in identity]
     consistent = (identity.get("client_type") == client_meta.get("client_mode")
                   and identity.get("delay_groups") == client_meta.get("delay_groups"))
-    rep.add("identity", not missing and consistent,
+    # The controller arm the client ran (RUN_META.controller_arm, resolved by the controller)
+    # must be the one the runner asked for: identity.controller_family (the URL controllerArm
+    # of the runner arm), or identity.controller when the family is absent. Clients before the
+    # min arm did not log controller_arm; the comparison is then skipped.
+    want_arm = identity.get("controller_family") or identity.get("controller")
+    got_arm = client_meta.get("controller_arm")
+    arm_ok = got_arm is None or want_arm is None or got_arm == want_arm
+    rep.add("identity", not missing and consistent and arm_ok,
             f"missing={missing or 'none'}; client_type={identity.get('client_type')} vs client RUN_META "
-            f"{client_meta.get('client_mode')}; delay_groups={identity.get('delay_groups')} vs {client_meta.get('delay_groups')}")
+            f"{client_meta.get('client_mode')}; delay_groups={identity.get('delay_groups')} vs {client_meta.get('delay_groups')}; "
+            f"controller arm {want_arm} (identity.{'controller_family' if identity.get('controller_family') else 'controller'}) vs client "
+            f"RUN_META.controller_arm {got_arm if got_arm is not None else 'not logged'}")
 
     # aborted / completed / samples / net-applied ----------------------------------------
     # The runner marks an aborted run in validation.json (failed: ["aborted"]) and in
@@ -311,7 +374,7 @@ def main() -> int:
     client_end = max((r["ts"] for r in recs if r.get("src") == "client"), default=None)
     mech = identity.get("mechanism") or summary.get("mechanism")
     if mech in PROMOTING_MECHANISMS and switches:
-        due = [sw for sw in switches if sw["terminal"] not in ("error", "skipped")
+        due = [sw for sw in switches if sw["terminal"] != "error"
                and (client_end is None or sw["ts"] <= client_end - END_GRACE_MS)]
         missing_stamps = [sw for sw in due if sw.get("relay_promoted_ms") is None]
         rep.add("relay-stamps", not missing_stamps,
@@ -444,8 +507,10 @@ def main() -> int:
                     f"qdisc_stats on {len(with_stats)} of {len(applied)} applied NET_CHANGE; tc tree (netem only when unshaped, "
                     f"netem/htb/leaf when rate-limited) wrong on: {bad_tree or 'none'}")
         # Offloads: GSO super-packets at the qdisc make a packet-counted queue meaningless (C5).
+        # The runner writes the verdict into the leaf (net.leaf_stats: qdisc_stats.leaf.gso_at_qdisc);
+        # a top-level gso_at_qdisc is read only when the leaf has none.
         limited = [c for c in applied if c.get("rate_mbps") is not None]
-        gso = [c.get("gso_at_qdisc") for c in limited]
+        gso = [_gso_at_qdisc(c) for c in limited]
         if not limited:
             rep.add("pf-gso", None, "no rate-limited NET_CHANGE")
         elif any(g is True for g in gso):
@@ -456,7 +521,7 @@ def main() -> int:
             rep.info("pf-gso", f"gso_at_qdisc unknown on {sum(1 for g in gso if g is None)} of {len(limited)} rate-limited NET_CHANGE")
         maxpk = []
         for c in applied + list(by("RUN_END")):
-            leaf = ((c.get("qdisc_stats") or {}).get("leaf") or {}) if isinstance(c.get("qdisc_stats"), dict) else {}
+            leaf = _leaf(c)
             if leaf.get("maxpacket") is not None:
                 maxpk.append(leaf["maxpacket"])
         if not maxpk:
