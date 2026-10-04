@@ -35,6 +35,7 @@ import type { ProbeResult } from '@/lib/abr/ProbeManager';
 import { events } from '@/lib/events/EventLog';
 import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
 import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
+import { SeamTracker, nextPageSwitchSeq, type SwitchRecord } from '@/lib/seam';
 
 /**
  * One record per track-switch (or, in C4, per time-shifted connect).
@@ -79,14 +80,8 @@ interface PendingSwitch {
   trackName: string;
   initData: ArrayBuffer;
   mimeType: string;
-  /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
-  oldEndPTS_ms: number | undefined;
-  /** Snapshot of video.currentTime * 1000 at switchTrack() call, for `seamAheadOfPlayheadMs`. */
-  playheadPTS_ms: number | undefined;
-  /** performance.now() at switchTrack() call — for wallClockMs and the visibility delay. */
-  switchSentAt: number;
-  /** videoElement.getVideoPlaybackQuality().totalVideoFrames at switch time (diagnostic). */
-  framesAtSwitch: number;
+  /** The switch's own record (C1): identity, send-time snapshots, landing and seam. */
+  record: SwitchRecord;
 }
 
 interface MOQStreamStruct {
@@ -98,26 +93,10 @@ interface MOQStreamStruct {
   pendingSwitch: PendingSwitch | null;
   /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
-  /** Set true after the first new-track frame is presented post-switch. Reset when pendingSwitch is set. */
-  firstFrameAfterSwitchSeen?: boolean;
-  /**
-   * Media time (ms) where the new representation begins in the buffer: the
-   * first appended target frame's PTS. The rVFC poll watches presented
-   * `mediaTime` cross it; that presented frame is the first the viewer sees
-   * of the new representation. Set when the new init segment is applied;
-   * cleared by the poll.
-   */
-  postSwitchSeamPTS_ms?: number;
   /** Frame duration (ms) of the most recently parsed object, for seam arithmetic. */
   lastFrameDurationMs?: number;
-  /** Snapshot of pendingSwitch.switchSentAt at the moment of init-segment application. */
-  postSwitchSentAt?: number;
-  /** Source track of the switch whose first frame is awaited (for SWITCH_FIRST_FRAME). */
-  postSwitchFromTrack?: string;
   /** tracker.getSampleCount() after the previous object; a change means a THROUGHPUT_SAMPLE was finalised. */
   lastSampleCount?: number;
-  /** Track name to attach viewerPauseMs to in switchDiscontinuities. */
-  postSwitchToTrack?: string;
   /** performance.now() of the last successful media append (data-starvation watchdog). */
   lastAppendPerf?: number;
   /**
@@ -300,6 +279,9 @@ export class Player {
   #firstFrameSeen = false;
   // Open stall, if any: STALL_START was emitted and STALL_END is pending.
   #stall: { startPerf: number; cause: 'waiting' | 'frozen'; playheadMs: number } | null = null;
+  // Per-switch records (C1): switch_seq, landing, seam and first-frame state.
+  // Numbers come from the page-wide sequence so a reconnect never reuses one.
+  #seams = new SeamTracker(nextPageSwitchSeq);
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -830,37 +812,56 @@ export class Player {
             }
 
             if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
-              const {
-                initData,
-                mimeType,
-                trackName: newTrackName,
-                oldEndPTS_ms,
-                playheadPTS_ms,
-                switchSentAt,
-                framesAtSwitch,
-              } = struct.pendingSwitch;
+              const { initData, mimeType, trackName: newTrackName, record } = struct.pendingSwitch;
+              const switchSentAt = record.sentAt;
+              const oldEndPTS_ms = record.appendFrontAtSendMs;
+              const playheadPTS_ms = record.playheadAtSendMs;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
               // The source's last appended frame at the moment the switch lands
-              // (the send-time snapshot in pendingSwitch predates ~1 GOP of
-              // source frames that arrived while the SWITCH was in flight).
+              // (the send-time snapshot in the record predates ~1 GOP of source
+              // frames that arrived while the SWITCH was in flight).
               const sourceEndAtApplyPTS_ms = struct.lastAppendedEndPTS_ms;
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
-              struct.firstFrameAfterSwitchSeen = false;
-              // Stash post-switch state on sibling struct fields that survive the
-              // pendingSwitch clear; the rVFC poll consumes them once the presented
-              // media time crosses the seam.
-              void framesAtSwitch;
-              struct.postSwitchSentAt = switchSentAt;
-              struct.postSwitchToTrack = newTrackName;
-              struct.postSwitchFromTrack = fromTrack;
+              // The landing object's PTS and sync flag (trun sync-sample flag of its moof).
+              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const landingBytes = new Uint8Array(
+                object.payload.buffer,
+                object.payload.byteOffset,
+                object.payload.byteLength,
+              );
+              const newStartPTS_ms =
+                newTimescale && newTimescale > 0
+                  ? parseMoofBaseMediaDecodeTime(landingBytes, newTimescale)
+                  : undefined;
+              const landingIsSync =
+                newTimescale && newTimescale > 0
+                  ? parseMoofMediaInfo(landingBytes, newTimescale)?.isSync
+                  : undefined;
+
               events.emit('SWITCH_FIRST_OBJECT', {
+                switch_seq: record.seq,
                 from: fromTrack,
                 to: newTrackName,
                 group: object.location.group,
                 object: object.location.object,
                 since_sent_ms: performance.now() - switchSentAt,
               });
+              // A previous landing whose seam was never presented is overwritten now.
+              const { superseded } = this.#seams.landed(record, {
+                group: Number(object.location.group),
+                object: Number(object.location.object),
+                landedOnKeyframe: landingIsSync ?? null,
+                sourceEndMs: sourceEndAtApplyPTS_ms,
+                now: performance.now(),
+              });
+              for (const old of superseded) {
+                events.emit('SWITCH_SUPERSEDED', {
+                  switch_seq: old.seq,
+                  by_switch_seq: record.seq,
+                  playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
+                });
+              }
 
               if (!(await applyInit(sourceBuffer, mimeType, initData, newTrackName))) {
                 // Keep the pipeline alive: retry the init before the next object
@@ -879,25 +880,18 @@ export class Player {
                 return;
               }
 
-              // Compute and push the discontinuity record. PTS-gap is the headline
-              // metric: signed difference between the first appended frame's PTS on
-              // the new track and the last appended frame's end PTS on the old track.
-              const newTimescale = this.catalog?.getTimescale(newTrackName);
-              const landingBytes = new Uint8Array(
-                object.payload.buffer,
-                object.payload.byteOffset,
-                object.payload.byteLength,
-              );
-              const newStartPTS_ms =
-                newTimescale && newTimescale > 0
-                  ? parseMoofBaseMediaDecodeTime(landingBytes, newTimescale)
-                  : undefined;
-              const landingIsSync =
-                newTimescale && newTimescale > 0
-                  ? parseMoofMediaInfo(landingBytes, newTimescale)?.isSync
-                  : undefined;
+              if (newStartPTS_ms !== undefined) {
+                this.#seams.appended({
+                  ptsMs: newStartPTS_ms,
+                  endPtsMs: newStartPTS_ms,
+                  group: Number(object.location.group),
+                  object: Number(object.location.object),
+                  now: performance.now(),
+                });
+              }
 
               events.emit('SWITCH_APPLIED', {
+                switch_seq: record.seq,
                 from: fromTrack,
                 to: newTrackName,
                 group: object.location.group,
@@ -928,7 +922,6 @@ export class Player {
                     : null,
                 since_sent_ms: performance.now() - switchSentAt,
               });
-              struct.postSwitchSeamPTS_ms = newStartPTS_ms;
               // Discard until a sync sample. The flag is read from each object's
               // moof; object index 0 is the fallback when a moof carries no flags.
               struct.awaitKeyframe = !(landingIsSync ?? object.location.object === 0n);
@@ -945,7 +938,7 @@ export class Player {
                 const seamAheadOfPlayheadMs =
                   playheadPTS_ms !== undefined ? newStartPTS_ms - playheadPTS_ms : undefined;
                 const wallClockMs = performance.now() - switchSentAt;
-                const record: DiscontinuityRecord = {
+                const disc: DiscontinuityRecord = {
                   eventType: 'switch',
                   switchSentAt,
                   switchAppliedAt: performance.now(),
@@ -972,7 +965,7 @@ export class Player {
                     switchDiscontinuities?: DiscontinuityRecord[];
                   };
                   metrics.switchDiscontinuities ??= [];
-                  metrics.switchDiscontinuities.push(record);
+                  metrics.switchDiscontinuities.push(disc);
                 }
               }
 
@@ -1492,71 +1485,59 @@ export class Player {
           startup_delay_ms: this.#tConnectStart !== undefined ? now - this.#tConnectStart : null,
         });
       }
-      for (const struct of this.#streams) {
-        const seam = struct.postSwitchSeamPTS_ms;
-        if (
-          struct.firstFrameAfterSwitchSeen !== true &&
-          seam !== undefined &&
-          struct.postSwitchSentAt !== undefined &&
-          struct.postSwitchToTrack !== undefined
-        ) {
-          const frameMs = struct.lastFrameDurationMs ?? 1000 / 30;
-          if (mediaMs < seam - frameMs / 2) continue;
-          struct.firstFrameAfterSwitchSeen = true;
-          const visibilityDelayMs = now - struct.postSwitchSentAt;
-          const jumpMs = prevMediaMs !== undefined ? mediaMs - prevMediaMs - frameMs : null;
-          const pauseMs = prevNowMs !== undefined ? Math.max(0, now - prevNowMs - frameMs) : null;
-          const targetTrack = struct.postSwitchToTrack;
-          // Ground truth for the seam: the hole in the element's buffered ranges
-          // at the seam (0 = the seam lies inside one contiguous range). This is
-          // what a range-jump seek crosses; the parsed-PTS gap above cannot see
-          // frames the decoder never presented. The hole behind the presented
-          // frame's range counts only when that range begins at or after the
-          // seam; otherwise it is an older hole still sitting in the buffer, and
-          // the seam itself was contiguous. The raw value stays available as
-          // buffer_hole_behind_ms.
-          let bufferHoleMs: number | null = null;
-          let bufferHoleBehindMs: number | null = null;
-          const ranges = this.#element.buffered;
-          for (let i = 0; i < ranges.length; i++) {
-            const startMs = ranges.start(i) * 1000;
-            if (startMs - frameMs <= mediaMs && mediaMs <= ranges.end(i) * 1000 + frameMs) {
-              bufferHoleBehindMs = i > 0 ? startMs - ranges.end(i - 1) * 1000 : 0;
-              bufferHoleMs = startMs >= seam - frameMs / 2 ? bufferHoleBehindMs : 0;
-              break;
-            }
+      const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+      const frameMs = videoStruct?.lastFrameDurationMs ?? 1000 / 30;
+      const rec = this.#seams.presented({ mediaMs, frameMs, now });
+      if (rec !== null && rec.seamPtsMs !== undefined) {
+        const seam = rec.seamPtsMs;
+        const visibilityDelayMs = now - rec.sentAt;
+        const jumpMs = prevMediaMs !== undefined ? mediaMs - prevMediaMs - frameMs : null;
+        const pauseMs = prevNowMs !== undefined ? Math.max(0, now - prevNowMs - frameMs) : null;
+        // Ground truth for the seam: the hole in the element's buffered ranges
+        // at the seam (0 = the seam lies inside one contiguous range). This is
+        // what a range-jump seek crosses; the parsed-PTS gap above cannot see
+        // frames the decoder never presented. The hole behind the presented
+        // frame's range counts only when that range begins at or after the
+        // seam; otherwise it is an older hole still sitting in the buffer, and
+        // the seam itself was contiguous. The raw value stays available as
+        // buffer_hole_behind_ms.
+        let bufferHoleMs: number | null = null;
+        let bufferHoleBehindMs: number | null = null;
+        const ranges = this.#element.buffered;
+        for (let i = 0; i < ranges.length; i++) {
+          const startMs = ranges.start(i) * 1000;
+          if (startMs - frameMs <= mediaMs && mediaMs <= ranges.end(i) * 1000 + frameMs) {
+            bufferHoleBehindMs = i > 0 ? startMs - ranges.end(i - 1) * 1000 : 0;
+            bufferHoleMs = startMs >= seam - frameMs / 2 ? bufferHoleBehindMs : 0;
+            break;
           }
-          events.emit('SWITCH_FIRST_FRAME', {
-            from: struct.postSwitchFromTrack ?? null,
-            to: targetTrack,
-            seam_pts_ms: seam,
-            presented_pts_ms: mediaMs,
-            switch_visibility_delay_ms: visibilityDelayMs,
-            playback_position_jump_ms: jumpMs,
-            viewer_pause_ms: pauseMs,
-            seam_buffer_hole_ms: bufferHoleMs,
-            buffer_hole_behind_ms: bufferHoleBehindMs,
-          });
+        }
+        events.emit('SWITCH_FIRST_FRAME', {
+          switch_seq: rec.seq,
+          from: rec.from,
+          to: rec.to,
+          seam_pts_ms: seam,
+          presented_pts_ms: mediaMs,
+          switch_visibility_delay_ms: visibilityDelayMs,
+          playback_position_jump_ms: jumpMs,
+          viewer_pause_ms: pauseMs,
+          seam_buffer_hole_ms: bufferHoleMs,
+          buffer_hole_behind_ms: bufferHoleBehindMs,
+        });
 
-          if (typeof window !== 'undefined' && window.__moqtailMetrics) {
-            const records = window.__moqtailMetrics.switchDiscontinuities;
-            if (records) {
-              for (let i = records.length - 1; i >= 0; i--) {
-                const r = records[i];
-                if (r && r.eventType === 'switch' && r.toTrack === targetTrack) {
-                  r.viewerPauseMs = pauseMs ?? undefined;
-                  break;
-                }
+        if (typeof window !== 'undefined' && window.__moqtailMetrics) {
+          const records = window.__moqtailMetrics.switchDiscontinuities;
+          if (records) {
+            for (let i = records.length - 1; i >= 0; i--) {
+              const r = records[i];
+              if (r && r.eventType === 'switch' && r.toTrack === rec.to) {
+                r.viewerPauseMs = pauseMs ?? undefined;
+                break;
               }
             }
           }
-
-          struct.postSwitchSeamPTS_ms = undefined;
-          struct.postSwitchSentAt = undefined;
-          struct.postSwitchToTrack = undefined;
-          struct.postSwitchFromTrack = undefined;
-          this.#options.onSwitchVisible?.(targetTrack);
         }
+        this.#options.onSwitchVisible?.(rec.to);
       }
       prevMediaMs = mediaMs;
       prevNowMs = now;
@@ -1776,7 +1757,6 @@ export class Player {
     // correct at the moment of decision).
     const playheadPTS_ms = this.#element !== null ? this.#element.currentTime * 1000 : undefined;
     const switchSentAt = performance.now();
-    const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
 
     // Pre-allocate the new request id and update videoStruct.requestId BEFORE
     // awaiting client.switch(). If a second switchTrack call (ABR tick or
@@ -1797,6 +1777,8 @@ export class Player {
         `switchTrack: previous switch has not landed; skipping switch to ${trackName}`,
       );
       events.emit('SWITCH_SKIPPED', {
+        // Not sent, so no SWITCH_SENT; the attempt still gets its own number.
+        switch_seq: this.#seams.allocateSeq(),
         from: videoStruct.trackName,
         to: trackName,
         reason: 'previous switch not landed',
@@ -1808,7 +1790,13 @@ export class Player {
     const newRequestId = this.client.allocateNextRequestId();
     videoStruct.requestId = newRequestId;
 
+    const record = this.#seams.sent(videoStruct.trackName, trackName, {
+      playheadMs: playheadPTS_ms,
+      appendFrontMs: videoStruct.lastAppendedEndPTS_ms,
+      sentAt: switchSentAt,
+    });
     events.emit('SWITCH_SENT', {
+      switch_seq: record.seq,
       from: videoStruct.trackName,
       to: trackName,
       request_id: newRequestId,
@@ -1836,6 +1824,7 @@ export class Player {
           result.reasonPhrase.phrase,
         );
         events.emit('SWITCH_ERROR', {
+          switch_seq: record.seq,
           to: trackName,
           request_id: newRequestId,
           reason: result.reasonPhrase.phrase,
@@ -1860,13 +1849,10 @@ export class Player {
         trackName,
         initData: initData.buffer as ArrayBuffer,
         mimeType,
-        oldEndPTS_ms: videoStruct.lastAppendedEndPTS_ms,
-        playheadPTS_ms,
-        switchSentAt,
-        framesAtSwitch,
+        record,
       };
-      videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
       events.emit('SWITCH_OK', {
+        switch_seq: record.seq,
         to: trackName,
         request_id: newRequestId,
         rtt_ms: performance.now() - switchSentAt,
@@ -1874,6 +1860,7 @@ export class Player {
     } catch (error) {
       logger.error('media', 'switchTrack: unexpected error', error);
       events.emit('SWITCH_ERROR', {
+        switch_seq: record.seq,
         to: trackName,
         request_id: newRequestId,
         reason: String(error),

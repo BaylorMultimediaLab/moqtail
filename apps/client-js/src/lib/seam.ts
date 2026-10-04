@@ -1,0 +1,178 @@
+/**
+ * Copyright 2026 The MOQtail Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * One record per track switch, from SWITCH_SENT to its terminal record (C1).
+ *
+ * The player used to keep one set of loose "post-switch" fields per stream and
+ * overwrite them on every landing, so a first-frame record could not say which
+ * switch it belonged to and the analyzer gave it to every earlier switch with
+ * the same target. Every event of a switch now carries the record's `seq`
+ * (`switch_seq`), and a seam that is overwritten before it was presented is
+ * reported as superseded instead of silently lost.
+ *
+ * Mechanism-neutral: it sees only what the player sees (send, landing, appends,
+ * presented frames).
+ */
+export interface SwitchRecord {
+  /** Per-session switch number, from 1 (`switch_seq`). */
+  readonly seq: number;
+  readonly from: string;
+  readonly to: string;
+  /** performance.now() at SWITCH_SENT. */
+  readonly sentAt: number;
+  /** Playhead (ms) when the switch was decided and sent. */
+  readonly playheadAtSendMs: number | undefined;
+  /** End PTS (ms) of the last appended frame when the switch was sent. */
+  readonly appendFrontAtSendMs: number | undefined;
+
+  // Landing: the first object of the target routed to the player.
+  landedAt?: number;
+  landingGroup?: number;
+  landingObject?: number;
+  /** Sync flag of the landing object's moof; null when the moof carries no flags. */
+  landedOnKeyframe?: boolean | null;
+  /** Source append front at landing (the old track's last appended frame end). */
+  sourceEndAtLandingMs?: number;
+
+  // Applied: the first target object actually appended.
+  appliedAt?: number;
+  /** PTS (ms) of the first appended target frame: where the new representation begins. */
+  seamPtsMs?: number;
+  firstAppendedGroup?: number;
+  firstAppendedObject?: number;
+  /** End PTS (ms) of the last appended target frame. */
+  targetAppendFrontMs?: number;
+
+  firstFrameSeen: boolean;
+  /** `seq` of the switch whose landing overwrote this one's pending seam. */
+  supersededBy?: number;
+}
+
+/** Monotonic switch numbers for the whole page (one EventLog session). */
+let pageSwitchSeq = 0;
+export const nextPageSwitchSeq = (): number => ++pageSwitchSeq;
+
+export class SeamTracker {
+  readonly #allocate: () => number;
+  /** The landed switch whose first frame has not been presented yet. */
+  #pending: SwitchRecord | null = null;
+
+  /**
+   * @param allocateSeq - Source of switch numbers. The player passes the
+   *   page-wide allocator so a reconnect within one page never reuses a number;
+   *   the default numbers per tracker (tests).
+   */
+  constructor(allocateSeq?: () => number) {
+    let n = 0;
+    this.#allocate = allocateSeq ?? (() => ++n);
+  }
+
+  /** A number for a switch attempt that is not sent (SWITCH_SKIPPED). */
+  allocateSeq(): number {
+    return this.#allocate();
+  }
+
+  sent(
+    from: string,
+    to: string,
+    at: { playheadMs: number | undefined; appendFrontMs: number | undefined; sentAt: number },
+  ): SwitchRecord {
+    return {
+      seq: this.#allocate(),
+      from,
+      to,
+      sentAt: at.sentAt,
+      playheadAtSendMs: at.playheadMs,
+      appendFrontAtSendMs: at.appendFrontMs,
+      firstFrameSeen: false,
+    };
+  }
+
+  /**
+   * The target's first object reached the player. A previous landing whose
+   * seam was not presented yet is superseded: its pending seam is overwritten.
+   */
+  landed(
+    rec: SwitchRecord,
+    at: {
+      group: number;
+      object: number;
+      landedOnKeyframe: boolean | null;
+      sourceEndMs: number | undefined;
+      now: number;
+    },
+  ): { superseded: SwitchRecord[] } {
+    const superseded: SwitchRecord[] = [];
+    const prev = this.#pending;
+    if (prev !== null && prev !== rec && !prev.firstFrameSeen) {
+      prev.supersededBy = rec.seq;
+      superseded.push(prev);
+    }
+    rec.landedAt = at.now;
+    rec.landingGroup = at.group;
+    rec.landingObject = at.object;
+    rec.landedOnKeyframe = at.landedOnKeyframe;
+    rec.sourceEndAtLandingMs = at.sourceEndMs;
+    this.#pending = rec;
+    return { superseded };
+  }
+
+  /** The landed switch awaiting its first presented frame, if any. */
+  get pending(): SwitchRecord | null {
+    return this.#pending;
+  }
+
+  /** The pending switch once its seam is known (a target frame was appended). */
+  get seam(): SwitchRecord | null {
+    return this.#pending !== null && this.#pending.seamPtsMs !== undefined ? this.#pending : null;
+  }
+
+  /**
+   * A target frame [ptsMs, endPtsMs) was appended. The first one applies the
+   * pending switch (returned); later ones only move its target append front.
+   */
+  appended(at: {
+    ptsMs: number;
+    endPtsMs: number;
+    group: number;
+    object: number;
+    now: number;
+  }): SwitchRecord | null {
+    const rec = this.#pending;
+    if (rec === null) return null;
+    rec.targetAppendFrontMs = Math.max(rec.targetAppendFrontMs ?? -Infinity, at.endPtsMs);
+    if (rec.seamPtsMs !== undefined) return null;
+    rec.appliedAt = at.now;
+    rec.seamPtsMs = at.ptsMs;
+    rec.firstAppendedGroup = at.group;
+    rec.firstAppendedObject = at.object;
+    return rec;
+  }
+
+  /**
+   * A frame with media time `mediaMs` was presented. Returns the pending switch
+   * when this is its first frame; the switch is then complete.
+   */
+  presented(at: { mediaMs: number; frameMs: number; now: number }): SwitchRecord | null {
+    const rec = this.seam;
+    if (rec === null || rec.seamPtsMs === undefined) return null;
+    if (at.mediaMs < rec.seamPtsMs - at.frameMs / 2) return null;
+    rec.firstFrameSeen = true;
+    this.#pending = null;
+    return rec;
+  }
+}
