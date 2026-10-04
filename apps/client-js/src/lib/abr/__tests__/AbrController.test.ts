@@ -785,4 +785,58 @@ describe('AbrController', () => {
       }
     });
   });
+
+  describe('M18: the probe is a veto through _tick (grid arm)', () => {
+    const gridSettings = () => ({
+      videoAutoSwitch: true,
+      controller: {
+        ...DEFAULT_ABR_SETTINGS.controller,
+        latencyResetOnLanding: true,
+        bufferSignal: 'envelope' as const,
+        switchHistoryMode: 'veto' as const,
+        switchHistoryWindowS: 60,
+        probeMaxBytes: 65_536,
+      },
+    });
+
+    it('a fresh probe without headroom holds the throughput rule at the active rung', async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        gridSettings(),
+      );
+      // The probe measured 1 Mbps on the wire: 0.8 Mbps < 1.5 Mbps (720p).
+      player.probeTrackBandwidth.mockResolvedValue({ bps: 1_000_000, dtMs: 400 });
+      // Tick 1 fires the probe; its result lands asynchronously.
+      await controller._tick();
+      await Promise.resolve();
+      await Promise.resolve();
+      // The first tick had no probe reading yet, so the throughput rule may have
+      // switched; what matters is the steady state once the reading is fresh.
+      player.switchTrack.mockClear();
+      controller.onTrackSwitched('360p');
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '360p', totalFrames: 2000 }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).not.toHaveBeenCalled();
+    });
+
+    it('a fresh probe with headroom does not limit the climb to one rung', async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        gridSettings(),
+      );
+      player.probeTrackBandwidth.mockResolvedValue({ bps: 10_000_000, dtMs: 400 });
+      await controller._tick();
+      await Promise.resolve();
+      await Promise.resolve();
+      player.switchTrack.mockClear();
+      controller.onTrackSwitched('360p');
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '360p', totalFrames: 2000 }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+    });
+  });
 });
