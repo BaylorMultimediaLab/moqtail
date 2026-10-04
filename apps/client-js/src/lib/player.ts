@@ -29,6 +29,7 @@ import { CMSFCatalog, MessageParameters, type MessageParameter } from 'moqtail/m
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
+import { StallTracker } from '@/lib/stall';
 import { parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
@@ -301,8 +302,17 @@ export class Player {
   #tConnectStart: number | undefined;
   #tFirstObject: number | undefined;
   #firstFrameSeen = false;
-  // Open stall, if any: STALL_START was emitted and STALL_END is pending.
-  #stall: { startPerf: number; cause: 'waiting' | 'frozen'; playheadMs: number } | null = null;
+  // Stall episodes (STALL_START / STALL_END) from the element's events and the
+  // frozen-playhead watchdog; never overlapping (F15).
+  #stalls = new StallTracker(
+    (event, fields) => events.emit(event, fields),
+    () => ({
+      ready: this.#element !== null && this.#firstFrameSeen,
+      playheadMs: (this.#element?.currentTime ?? 0) * 1000,
+      // The track the viewer is looking at, not the one being received (M13).
+      track: this.getMetrics().presentedTrack,
+    }),
+  );
   // Per-switch records (C1): switch_seq, landing, seam and first-frame state.
   // Numbers come from the page-wide sequence so a reconnect never reuses one.
   #seams = new SeamTracker(nextPageSwitchSeq);
@@ -510,7 +520,6 @@ export class Player {
     const el = this.#element;
     let lastFrames = 0;
     let lastTime = -1;
-    let frozenSince = 0;
     const wedgeIntervalId = setInterval(() => {
       this.#watchdog.ticks += 1;
       const q = el.getVideoPlaybackQuality?.();
@@ -523,20 +532,18 @@ export class Player {
       const time = el.currentTime;
       const advanced = time > lastTime + 0.01 || (lastTime < 0 && frames > lastFrames);
       lastFrames = frames;
-      if (advanced) {
-        lastTime = time;
-        frozenSince = 0;
-        this.#watchdog.frozen = 0;
-        this.#closeStall();
-        return;
-      }
-      if (el.paused || el.ended) return;
-      frozenSince += 1;
-      this.#watchdog.frozen = frozenSince;
-      if (frozenSince < 2) return; // wait ~1s of confirmed freeze
+      if (advanced) lastTime = time;
       // Frozen frames while playing is a stall whether or not the element
-      // fired `waiting`; the interval is credited from the first frozen tick.
-      this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
+      // fired `waiting`: the tracker opens one after ~1 s of confirmed freeze,
+      // credited from the first frozen tick but never from before the
+      // previous episode's end (F15).
+      const frozenSince = this.#stalls.watchdogTick(
+        performance.now(),
+        advanced,
+        !el.paused && !el.ended,
+      );
+      this.#watchdog.frozen = frozenSince;
+      if (advanced || el.paused || el.ended || frozenSince < 2) return;
       // Frozen for 3 s: say what the watchdog saw, once every 10 s, so a run
       // the gap policy could not recover is diagnosable from the log.
       if (frozenSince >= 6 && (frozenSince - 6) % 20 === 0) {
@@ -560,8 +567,8 @@ export class Player {
 
     // Element-reported stalls: `waiting` opens, `playing` closes. Frozen-frame
     // detection above catches stalls the element never reports.
-    const onWaiting = () => this.#openStall('waiting', performance.now());
-    const onPlaying = () => this.#closeStall();
+    const onWaiting = () => this.#stalls.waiting(performance.now());
+    const onPlaying = () => this.#stalls.playing(performance.now());
     // A fatal media element error (e.g. MEDIA_ERR_DECODE = 3 from the HEVC
     // decoder) makes every later append fail; record it as its own event so a
     // run that died this way is classified as a decoder failure, not a stall.
@@ -1408,30 +1415,6 @@ export class Player {
     return (
       this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')?.pendingSwitch != null
     );
-  }
-
-  #openStall(cause: 'waiting' | 'frozen', startPerf: number): void {
-    if (this.#stall !== null || !this.#element) return;
-    if (!this.#firstFrameSeen) return; // pre-startup waiting is startup delay, not a stall
-    const playheadMs = this.#element.currentTime * 1000;
-    this.#stall = { startPerf, cause, playheadMs };
-    events.emit('STALL_START', {
-      cause,
-      playhead_ms: playheadMs,
-      // The track the viewer is looking at, not the one being received (M13).
-      track: this.getMetrics().presentedTrack,
-    });
-  }
-
-  #closeStall(): void {
-    if (this.#stall === null) return;
-    const s = this.#stall;
-    this.#stall = null;
-    events.emit('STALL_END', {
-      cause: s.cause,
-      playhead_ms: s.playheadMs,
-      duration_ms: performance.now() - s.startPerf,
-    });
   }
 
   setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
