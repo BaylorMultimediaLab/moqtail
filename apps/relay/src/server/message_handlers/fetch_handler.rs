@@ -515,11 +515,8 @@ pub async fn handle(
                 send_stream = match stream_fn(client.clone(), &stream_id).await {
                   Some(ss) => Some(ss),
                   None => {
-                    client
-                      .fetch_cancel_senders
-                      .write()
-                      .await
-                      .remove(&request_id);
+                    // The early exit skips the cleanup at the end of this task.
+                    release_fetch_request(&client, request_id).await;
                     return Err(TerminationCode::InternalError);
                   }
                 };
@@ -545,11 +542,8 @@ pub async fn handle(
                   "handle_fetch_messages | Error writing object to stream: {:?}",
                   e
                 );
-                client
-                  .fetch_cancel_senders
-                  .write()
-                  .await
-                  .remove(&request_id);
+                // The early exit skips the cleanup at the end of this task.
+                release_fetch_request(&client, request_id).await;
                 return Err(TerminationCode::InternalError);
               }
 
@@ -631,11 +625,8 @@ pub async fn handle(
                           send_stream = match stream_fn(client.clone(), &stream_id).await {
                             Some(ss) => Some(ss),
                             None => {
-                              client
-                                .fetch_cancel_senders
-                                .write()
-                                .await
-                                .remove(&request_id);
+                              // The early exit skips the cleanup at the end of this task.
+                              release_fetch_request(&client, request_id).await;
                               return Err(TerminationCode::InternalError);
                             }
                           };
@@ -660,11 +651,8 @@ pub async fn handle(
                             "handle_fetch_messages | Error writing upstream object to stream: {:?}",
                             e
                           );
-                          client
-                            .fetch_cancel_senders
-                            .write()
-                            .await
-                            .remove(&request_id);
+                          // The early exit skips the cleanup at the end of this task.
+                          release_fetch_request(&client, request_id).await;
                           return Err(TerminationCode::InternalError);
                         }
 
@@ -839,24 +827,36 @@ pub async fn handle(
   }
 }
 
+/// Forget a FETCH request in every per-client map it was registered in: the cancel
+/// sender (returned, so a caller cancelling it can still signal the serving task),
+/// the inbound request entry and the incoming fetch entry.
+///
+/// The serving task's early exits used to remove only the cancel sender. Since a
+/// failed data-stream write is reported as an error (M21), a peer that stops the
+/// FETCH data stream takes one of those exits, and the request then stayed in
+/// `inbound_requests` and `incoming_fetch_requests` for the life of the session.
+pub(crate) async fn release_fetch_request(
+  client: &MOQTClient,
+  request_id: u64,
+) -> Option<watch::Sender<FetchStop>> {
+  let cancel_tx = client
+    .fetch_cancel_senders
+    .write()
+    .await
+    .remove(&request_id);
+  client.inbound_requests.write().await.remove(&request_id);
+  client
+    .incoming_fetch_requests
+    .write()
+    .await
+    .remove(&request_id);
+  cancel_tx
+}
+
 /// Cancel a fetch when its FETCH request stream is reset or closed: signal the
 /// serving task to stop and remove the request from the client maps.
 pub(crate) async fn cancel_fetch(client: Arc<MOQTClient>, request_id: u64) {
-  let cancel_tx = {
-    let mut senders = client.fetch_cancel_senders.write().await;
-    senders.remove(&request_id)
-  };
-
-  {
-    client.inbound_requests.write().await.remove(&request_id);
-    client
-      .incoming_fetch_requests
-      .write()
-      .await
-      .remove(&request_id);
-  }
-
-  if let Some(tx) = cancel_tx {
+  if let Some(tx) = release_fetch_request(&client, request_id).await {
     let _ = tx.send(FetchStop::Cancelled);
     info!("Cancelled fetch delivery for request_id: {}", request_id);
   }
@@ -1142,5 +1142,56 @@ mod tests {
   #[test]
   fn holding_nothing_always_needs_the_publisher() {
     assert!(!local_state_answers(&None, &loc(0, 1)));
+  }
+}
+
+/// M21 follow-up: a FETCH whose serving task exits early (a data-stream write that
+/// QUIC refused, a stream that could not be opened) must not stay registered.
+#[cfg(test)]
+mod tests_release_fetch_request {
+  use super::*;
+  use crate::server::test_support::{quic_pair, relay_client};
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+
+  #[tokio::test]
+  async fn an_early_exit_forgets_the_request_in_every_map() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+    let request_id = 4;
+    let fetch = Fetch::new_standalone(
+      request_id,
+      moqtail::model::control::fetch::StandaloneFetchProps {
+        track_namespace: Tuple::from_utf8_path("/moqtail"),
+        track_name: TupleField::from_utf8("video-720p"),
+        start_location: Location::new(0, 0),
+        end_location: Location::new(1, 0),
+      },
+      vec![],
+    );
+    let request = FetchRequest::new(request_id, 1, fetch, 0);
+    client
+      .inbound_requests
+      .write()
+      .await
+      .insert(request_id, PendingRequest::Fetch(request.clone()));
+    client
+      .incoming_fetch_requests
+      .write()
+      .await
+      .insert(request_id, request);
+    let (tx, rx) = watch::channel(FetchStop::Running);
+    client
+      .fetch_cancel_senders
+      .write()
+      .await
+      .insert(request_id, tx);
+
+    let returned = release_fetch_request(&client, request_id).await;
+
+    assert!(returned.is_some(), "the cancel sender is handed back");
+    assert!(client.inbound_requests.read().await.is_empty());
+    assert!(client.incoming_fetch_requests.read().await.is_empty());
+    assert!(client.fetch_cancel_senders.read().await.is_empty());
+    drop(rx);
   }
 }
