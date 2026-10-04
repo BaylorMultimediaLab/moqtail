@@ -8,7 +8,9 @@ Run it on a short unshaped run of each client type before generating a series.
 Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
 
   single-session  one client page session, no wall-clock gaps > 5 s in SAMPLE
-  identity        run_meta.json carries the identity block and it matches the client RUN_META
+  identity        run_meta.json carries the identity block and it matches the client RUN_META (client type,
+                  delay groups, controller arm: RUN_META.controller_arm == identity.controller_family, or
+                  identity.controller when the family is absent; skipped when the client did not log it)
   aborted         the runner did not mark the run aborted (validation.json {"failed": ["aborted"]} or
                   run_meta.json validity.aborted)
   completed       RUN_END is present and elapsed_s is within --duration-tolerance-s of the configured duration
@@ -228,9 +230,18 @@ def main() -> int:
     missing = [k for k in required if k not in identity]
     consistent = (identity.get("client_type") == client_meta.get("client_mode")
                   and identity.get("delay_groups") == client_meta.get("delay_groups"))
-    rep.add("identity", not missing and consistent,
+    # The controller arm the client ran (RUN_META.controller_arm, resolved by the controller)
+    # must be the one the runner asked for: identity.controller_family (the URL controllerArm
+    # of the runner arm), or identity.controller when the family is absent. Clients before the
+    # min arm did not log controller_arm; the comparison is then skipped.
+    want_arm = identity.get("controller_family") or identity.get("controller")
+    got_arm = client_meta.get("controller_arm")
+    arm_ok = got_arm is None or want_arm is None or got_arm == want_arm
+    rep.add("identity", not missing and consistent and arm_ok,
             f"missing={missing or 'none'}; client_type={identity.get('client_type')} vs client RUN_META "
-            f"{client_meta.get('client_mode')}; delay_groups={identity.get('delay_groups')} vs {client_meta.get('delay_groups')}")
+            f"{client_meta.get('client_mode')}; delay_groups={identity.get('delay_groups')} vs {client_meta.get('delay_groups')}; "
+            f"controller arm {want_arm} (identity.{'controller_family' if identity.get('controller_family') else 'controller'}) vs client "
+            f"RUN_META.controller_arm {got_arm if got_arm is not None else 'not logged'}")
 
     # aborted / completed / samples / net-applied ----------------------------------------
     # The runner marks an aborted run in validation.json (failed: ["aborted"]) and in

@@ -362,7 +362,11 @@ unless `--include-invalid` / `--all`.
 A run is invalid when the experiment cannot be interpreted because the
 apparatus failed; it stays valid when the system under test performs badly,
 even catastrophically, as long as the measurement remains correct. Checks:
-`single-session`, `identity`, `aborted`, `completed` (RUN_END present and
+`single-session`, `identity` (the identity block is complete and matches the
+client RUN_META: client type, delay groups, and the controller arm,
+`RUN_META.controller_arm` = `identity.controller_family`, or
+`identity.controller` when the family is absent; skipped for clients that
+did not log `controller_arm`), `aborted`, `completed` (RUN_END present and
 `elapsed_s` within ±5 s of the configured duration), `samples` (SAMPLE count
 ≥ 0.9 × duration / 0.25 s), `net-applied` (every NET_CHANGE applied; the
 `none` backend is unshaped by design), `live-edge` / `time-shifted` (setup

@@ -88,9 +88,10 @@ def samples(start: float, end: float, track_at, playhead_at=None, presented_at=N
 def write_run(tmp: Path, client: list[dict], runner_recs: list[dict] | None = None, profile: str = "step_down_up",
               client_mode: str = "time-shifted", target_shift_ms: int = 10_000, startup_track: str = R[0],
               duration_s: float = 200.0, identity_extra: dict | None = None, validation: dict | None = None,
-              relay_recs: list[dict] | None = None, meta_extra: dict | None = None) -> Path:
+              relay_recs: list[dict] | None = None, meta_extra: dict | None = None, client_meta_extra: dict | None = None) -> Path:
     meta = ev("RUN_META", T0 - 100, client_mode=client_mode, time_shift_s=target_shift_ms / 1000, delay_groups=target_shift_ms // 1000,
-              target_shift_ms=target_shift_ms, gop_duration_ms=1000, startup_track=startup_track, ladder=LADDER)
+              target_shift_ms=target_shift_ms, gop_duration_ms=1000, startup_track=startup_track, ladder=LADDER,
+              **(client_meta_extra or {}))
     recs = [meta] + sorted(client, key=lambda r: r["ts"])
     (tmp / "client-events.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
     (tmp / "runner-events.jsonl").write_text("\n".join(json.dumps(r) for r in (runner_recs or [])) + "\n")
@@ -741,7 +742,8 @@ class ValidateScript(TmpRun):
     def complete_run(self, *, run_end: bool = True, applied: bool = True, promoted: bool = True, with_seq: bool = False,
                      superseded_record: bool = True, validation: dict | None = None, mechanism_mode: str | None = None,
                      rates: tuple = (6, 1.5), net_fields: dict | None = None, meta_extra: dict | None = None,
-                     extra_client: list[dict] | None = None) -> Path:
+                     extra_client: list[dict] | None = None, identity_extra: dict | None = None,
+                     client_meta_extra: dict | None = None) -> Path:
         A, B = R[0], R[4]
         client = startup(A) + [ev("CLOCK_MAP", T0 - 1100, user_agent="Mozilla/5.0 Firefox/157.0")]
         client += switch(1, T0 + 1000, A, B, with_seq=with_seq) + switch(2, T0 + 2000, B, A, with_seq=with_seq)
@@ -760,7 +762,8 @@ class ValidateScript(TmpRun):
             if promoted:
                 relay.append({"ts": ts + 21, "src": "relay", "event": "SWITCH_PROMOTED", "track": "moqtail/" + to, "start_group": 20 + seq})
         return write_run(self.dir, client, runner_recs, duration_s=60.0, validation=validation, relay_recs=relay,
-                         identity_extra={"mechanism_mode": mechanism_mode}, meta_extra=meta_extra)
+                         identity_extra={"mechanism_mode": mechanism_mode, **(identity_extra or {})}, meta_extra=meta_extra,
+                         client_meta_extra=client_meta_extra)
 
     def validate(self, run: Path, *extra: str) -> tuple[int, dict[str, str]]:
         p = subprocess.run([sys.executable, str(EXPERIMENTS / "validate.py"), str(run), "--no-write", *extra],
@@ -777,6 +780,20 @@ class ValidateScript(TmpRun):
         self.assertEqual(code, 0, st)
         for k in ("completed", "samples", "net-applied", "terminals", "relay-stamps", "aborted"):
             self.assertEqual(st[k], "PASS", k)
+
+    def test_identity_controller_arm_matches_client(self):
+        # D10: the arm the client ran (RUN_META.controller_arm) must be the arm the runner recorded
+        # (identity.controller_family; identity.controller when the family is absent).
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "grid-noprobe", "controller_family": "grid"},
+                                                client_meta_extra={"controller_arm": "grid"}))
+        self.assertEqual(st["identity"], "PASS")
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "grid", "controller_family": "grid"},
+                                                client_meta_extra={"controller_arm": "min"}))
+        self.assertEqual(st["identity"], "FAIL")      # before the fix: PASS
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "min"}, client_meta_extra={"controller_arm": "baseline"}))
+        self.assertEqual(st["identity"], "FAIL")
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "min"}))   # old client: no controller_arm
+        self.assertEqual(st["identity"], "PASS")
 
     def test_aborted_marker_fails(self):
         code, st = self.validate(self.complete_run(validation={"passed": False, "failed": ["aborted"]}))
