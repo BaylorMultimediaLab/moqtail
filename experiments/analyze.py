@@ -901,7 +901,6 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "wedge_seeks": len(wedge_after),
         "wedge_skipped_ms": sum(span(s) for s in wedge_after),
         "open_at_end": any(e.get("open_at_end") for e in episodes),
-        "wedge_gap_ms_total": sum(s.get("gap_ms") or 0 for s in seeks if s.get("reason") == "wedge"),
         # Range-jumps the buffer held back because new media was landing inside the gap
         # (RANGE_JUMP_DEFERRED is emitted once per gap), and the total wait before the jumps
         # that did happen after a deferral.
