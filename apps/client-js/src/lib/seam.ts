@@ -70,6 +70,8 @@ export const nextPageSwitchSeq = (): number => ++pageSwitchSeq;
 
 export class SeamTracker {
   readonly #allocate: () => number;
+  /** The switch accepted by the relay (SWITCH_OK) that has not landed yet. */
+  #armed: SwitchRecord | null = null;
   /** The landed switch whose first frame has not been presented yet. */
   #pending: SwitchRecord | null = null;
   /**
@@ -137,6 +139,22 @@ export class SeamTracker {
   }
 
   /**
+   * The relay accepted `rec` (SWITCH_OK) and the player now waits for it to
+   * land. A previously accepted switch that has not landed is replaced and
+   * therefore superseded: it can never land any more.
+   */
+  armed(rec: SwitchRecord): { superseded: SwitchRecord[] } {
+    const superseded: SwitchRecord[] = [];
+    const prev = this.#armed;
+    if (prev !== null && prev !== rec && prev.landedAt === undefined) {
+      prev.supersededBy = rec.seq;
+      superseded.push(prev);
+    }
+    this.#armed = rec;
+    return { superseded };
+  }
+
+  /**
    * The target's first object reached the player. A previous landing whose
    * seam was not presented yet is superseded: its pending seam is overwritten.
    */
@@ -161,6 +179,7 @@ export class SeamTracker {
     rec.landingObject = at.object;
     rec.landedOnKeyframe = at.landedOnKeyframe;
     rec.sourceEndAtLandingMs = at.sourceEndMs;
+    if (this.#armed === rec) this.#armed = null;
     this.#pending = rec;
     this.#fronts = [];
     return { superseded };

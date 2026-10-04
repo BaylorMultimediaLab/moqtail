@@ -823,6 +823,7 @@ export class Player {
                   switch_seq: old.seq,
                   by_switch_seq: record.seq,
                   playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
+                  landed: true,
                 });
               }
               // Nothing of the target is appended before a sync sample, the landing
@@ -1765,12 +1766,12 @@ export class Player {
       // Tracker is intentionally not reset — the previous-track bandwidth
       // estimate is still a valid indicator of network capacity. (dash.js
       // doesn't reset throughput on quality switches either.)
-      videoStruct.pendingSwitch = {
+      this.#armPendingSwitch(videoStruct, {
         trackName,
         initData: initData.buffer as ArrayBuffer,
         mimeType,
         record,
-      };
+      });
       events.emit('SWITCH_OK', {
         switch_seq: record.seq,
         to: trackName,
@@ -1790,6 +1791,23 @@ export class Player {
       videoStruct.requestId = subscriptionRequestId;
       this.#options.onTrackSwitched?.(videoStruct.trackName);
     }
+  }
+
+  /**
+   * Waits for `pending` to land. A switch that was accepted earlier and has not
+   * landed is replaced here and can never land: it ends in SWITCH_SUPERSEDED
+   * (C1), so every switch has exactly one terminal record.
+   */
+  #armPendingSwitch(struct: MOQStreamStruct, pending: PendingSwitch): void {
+    for (const old of this.#seams.armed(pending.record).superseded) {
+      events.emit('SWITCH_SUPERSEDED', {
+        switch_seq: old.seq,
+        by_switch_seq: pending.record.seq,
+        playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
+        landed: false,
+      });
+    }
+    struct.pendingSwitch = pending;
   }
 
   async #newSourceBufferMSE(struct: MOQStreamStruct, trackName: string) {

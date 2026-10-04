@@ -224,3 +224,27 @@ describe('SeamTracker: presented track from (seam, track) transitions (M13)', ()
     expect(t.presentedTrack(20_500)).toBe('high');
   });
 });
+
+describe('SeamTracker: a switch replaced before it landed (C1, W1 preflight)', () => {
+  it('supersedes an armed switch that a later SWITCH_OK replaces before it landed', () => {
+    const t = new SeamTracker();
+    const a = send(t, 'low', 'mid');
+    expect(t.armed(a).superseded).toEqual([]);
+    const b = send(t, 'low', 'high', 1500);
+    expect(t.armed(b).superseded).toEqual([a]);
+    expect(a.supersededBy).toBe(b.seq);
+    // b lands: nothing else to supersede, a is not superseded twice.
+    expect(land(t, b, 6, 1600).superseded).toEqual([]);
+  });
+
+  it('does not supersede an armed switch once it has landed', () => {
+    const t = new SeamTracker();
+    const a = send(t, 'low', 'mid');
+    t.armed(a);
+    land(t, a, 5, 1100);
+    const b = send(t, 'mid', 'high', 1500);
+    expect(t.armed(b).superseded).toEqual([]);
+    // a's seam is overwritten when b lands, not when b is armed.
+    expect(land(t, b, 6, 1600).superseded).toEqual([a]);
+  });
+});
