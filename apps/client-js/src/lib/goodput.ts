@@ -56,6 +56,14 @@
  *   last object get the old behaviour: a later group of the track finalises it.
  * - Objects the player drops still crossed the link: they count in the sample
  *   and are reported as `discardedBytes` as well.
+ * - One sample per (track, group) (F5). A group can be delivered twice (a
+ *   catch-up redelivery on a second stream) or resume after the quiet rule
+ *   closed it (a catch-up stream stalled while live objects of the track
+ *   arrived). The keys of recently sampled groups are kept (bounded); a late
+ *   object of such a group is folded into that group's accounting (cumulative
+ *   bytes, `getLateObjects`) without opening a new accumulator, so it neither
+ *   produces a second sample nor a second `samplesByTrack` count (which would
+ *   pass the dwell early and over-weight the catch-up in the SWMA).
  */
 
 /** One finalised per-group throughput sample. */
@@ -97,6 +105,9 @@ interface OpenGroup {
   hinted: boolean;
 }
 
+/** Sampled (track, group) keys remembered so late objects do not sample a group twice (F5). */
+const CLOSED_KEYS_MAX = 256;
+
 /** A later group of the track finalises a hinted group once it has been quiet this long (ms) ... */
 const QUIET_MIN_MS = 50;
 /** ... or this many of its own mean inter-arrival times, whichever is longer. */
@@ -109,6 +120,10 @@ export class GoodputTracker {
 
   // Open groups keyed by `${track}\u0000${group}`.
   #open = new Map<string, OpenGroup>();
+  // Groups that have produced their sample, oldest first (bounded): late
+  // objects and bytes folded into them (F5).
+  #closed = new Map<string, { objects: number; bytes: number }>();
+  #lateObjects = 0;
   /** A group with no object for this long is finalised whatever else happens (ms). */
   #abandonMs: number;
 
@@ -172,6 +187,14 @@ export class GoodputTracker {
     }
 
     const key = `${track}\u0000${groupId}`;
+    const closed = this.#closed.get(key);
+    if (closed !== undefined) {
+      // A late object of a group that already produced its sample (F5).
+      closed.objects += 1;
+      closed.bytes += bytes;
+      this.#lateObjects += 1;
+      return out;
+    }
     let g = this.#open.get(key);
     if (g === undefined) {
       g = {
@@ -242,6 +265,11 @@ export class GoodputTracker {
     return { ...this.#samplesByTrack };
   }
 
+  /** Objects that arrived for a group after its sample closed (folded in, not sampled again). */
+  getLateObjects(): number {
+    return this.#lateObjects;
+  }
+
   /** Throughput (bps) of the most recently finalised group sample. */
   getLastSampleBps(): number {
     return this.#lastGroupBps;
@@ -284,6 +312,8 @@ export class GoodputTracker {
   reset(): void {
     this.#swma = [];
     this.#open.clear();
+    this.#closed.clear();
+    this.#lateObjects = 0;
     this.#lastObjectBytes = 0;
     this.#lastGroupDurationMs = 0;
     this.#lastGroupBps = 0;
@@ -317,6 +347,12 @@ export class GoodputTracker {
     this.#lastGroupBytes = bytes;
     this.#sampleCount++;
     this.#samplesByTrack[g.track] = (this.#samplesByTrack[g.track] ?? 0) + 1;
+    // Only a group that produced its sample is closed for good: one that
+    // closed with no sample (a single object) may still produce one later.
+    this.#closed.set(`${g.track}\u0000${g.group}`, { objects: 0, bytes: 0 });
+    if (this.#closed.size > CLOSED_KEYS_MAX) {
+      this.#closed.delete(this.#closed.keys().next().value!);
+    }
 
     this.#updateEma(groupBps, dtMs);
     return {
