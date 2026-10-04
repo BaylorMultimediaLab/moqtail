@@ -10,32 +10,32 @@ const base = {
 };
 
 describe('shouldDeferRangeJump', () => {
-  it('defers while the append front lies inside the gap (a fill in progress)', () => {
-    expect(shouldDeferRangeJump({ ...base, fill: { appendFrontS: 16.2 } })).toBe(true);
-    expect(shouldDeferRangeJump({ ...base, fill: { appendFrontS: 20.5 } })).toBe(true);
+  it('defers while an in-gap append front lies inside the gap (a fill in progress)', () => {
+    expect(shouldDeferRangeJump({ ...base, fill: { fillFrontS: 16.2 } })).toBe(true);
+    expect(shouldDeferRangeJump({ ...base, fill: { fillFrontS: 20.5 } })).toBe(true);
   });
 
   it('jumps when new data lands beyond the gap (an old hole nobody is filling)', () => {
-    expect(shouldDeferRangeJump({ ...base, fill: { appendFrontS: 24.04 } })).toBe(false);
-    expect(shouldDeferRangeJump({ ...base, fill: { appendFrontS: 30 } })).toBe(false);
+    expect(shouldDeferRangeJump({ ...base, fill: { fillFrontS: 24.04 } })).toBe(false);
+    expect(shouldDeferRangeJump({ ...base, fill: { fillFrontS: 30 } })).toBe(false);
   });
 
   it('jumps when the front is far behind the gap', () => {
-    expect(shouldDeferRangeJump({ ...base, fill: { appendFrontS: 10 } })).toBe(false);
+    expect(shouldDeferRangeJump({ ...base, fill: { fillFrontS: 10 } })).toBe(false);
   });
 
   it('never defers a tiny gap or an unknown front', () => {
-    expect(shouldDeferRangeJump({ ...base, gapS: 0.05, fill: { appendFrontS: 16.2 } })).toBe(false);
-    expect(shouldDeferRangeJump({ ...base, fill: { appendFrontS: undefined } })).toBe(false);
+    expect(shouldDeferRangeJump({ ...base, gapS: 0.05, fill: { fillFrontS: 16.2 } })).toBe(false);
+    expect(shouldDeferRangeJump({ ...base, fill: { fillFrontS: undefined } })).toBe(false);
     expect(shouldDeferRangeJump({ ...base, fill: undefined })).toBe(false);
   });
 
   it('gives up once the front has not moved for noProgressMs', () => {
     expect(
-      shouldDeferRangeJump({ ...base, fill: { appendFrontS: 16.2 }, frontStalledMs: 3000 }),
+      shouldDeferRangeJump({ ...base, fill: { fillFrontS: 16.2 }, frontStalledMs: 3000 }),
     ).toBe(false);
     expect(
-      shouldDeferRangeJump({ ...base, fill: { appendFrontS: 16.2 }, frontStalledMs: 2999 }),
+      shouldDeferRangeJump({ ...base, fill: { fillFrontS: 16.2 }, frontStalledMs: 2999 }),
     ).toBe(true);
   });
 });

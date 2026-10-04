@@ -24,9 +24,10 @@ definition the paper uses.
 | input                            | source (`player.getMetrics()`)                                                                                                             | used by                                                 |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
 | throughput SWMA                  | `bandwidthBps`: mean of the last 5 group samples, each the bytes of objects 2..N over the arrival span of the group (`recvAt`, M11)        | ThroughputRule, EmergencyBufferRule's low-buffer cap    |
-| completed groups per track       | `samplesByTrack` (optional; fallback `sampleCount`)                                                                                        | the dwell, the history's seam window                    |
-| contiguous buffer, instantaneous | `bufferContigSeconds` (fallback `bufferSeconds`): end of the buffered range that contains the playhead minus the playhead, 0 if none (M12) | EmergencyBufferRule                                     |
-| contiguous buffer, envelope      | its maximum over the last 1250 ms                                                                                                          | recorded as `buffer_rule_s`; no `min` rule reads it     |
+| completed groups per track       | `samplesByTrack` (optional; fallback `sampleCount`), one sample per (track, group) (F5)                                                    | the dwell                                               |
+| contiguous buffer, instantaneous | `bufferContigSeconds` (fallback `bufferSeconds`): end of the buffered range that contains the playhead minus the playhead, 0 if none (M12) | EmergencyBufferRule, empty branch (`== 0`)              |
+| contiguous buffer, envelope      | its maximum over the last 1250 ms (`RulesContext.bufferEnvelopeSeconds`; also `buffer_rule_s`)                                             | EmergencyBufferRule, low branch (`< 0.5 s`) (F1)        |
+| playhead and presented seam      | `playheadMs`, `latestSeamPtsMs`: the latest applied seam whose region (from the hole in front of it) the playhead has entered, or null     | SwitchHistoryRule's seam exemption (F2)                 |
 | switch history                   | the controller's own record of confirmed landings                                                                                          | SwitchHistoryRule                                       |
 | presented frames                 | `totalFrames > 0`                                                                                                                          | EmergencyBufferRule stays silent before the first frame |
 | landing callback                 | `onTrackSwitched(trackName)` on every terminal outcome of a switch                                                                         | history, `ABR_DECISION`, the dwell clock (M17)          |
@@ -37,11 +38,29 @@ visibility (t5).
 
 ### 0.2 Rules and the arbiter
 
-| rule                | tier    | decision                                                                                                                                                                                                                                         |
-| ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| ThroughputRule      | DEFAULT | the highest rung with `bitrate ≤ 0.9 × SWMA`; rung 0 when none fits (`downToLowest`); abstains with no sample yet                                                                                                                                |
-| EmergencyBufferRule | STRONG  | instantaneous contiguous buffer `== 0` → rung 0; `< 0.5 s` → the highest rung with `bitrate ≤ 0.7 × SWMA` if that is below the active rung, else abstain                                                                                         |
-| SwitchHistoryRule   | DEFAULT | veto: caps the ladder just below the first unsafe rung above the active one; a rung is unsafe with ≥ 8 events in the last 60 s, at least one up-switch to it and `drops / ups > 0.075`; drops decided ≤ 2 groups after a landing are not counted |
+| rule                | tier    | decision                                                                                                                                                                                                                                              |
+| ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ThroughputRule      | DEFAULT | the highest rung with `bitrate ≤ 0.9 × SWMA`; rung 0 when none fits (`downToLowest`); abstains with no sample yet                                                                                                                                     |
+| EmergencyBufferRule | STRONG  | instantaneous contiguous buffer `== 0` → rung 0; contiguous buffer **envelope** (maximum over 1250 ms) `< 0.5 s` → the highest rung with `bitrate ≤ 0.7 × SWMA` if that is below the active rung, else abstain                                        |
+| SwitchHistoryRule   | DEFAULT | veto: caps the ladder just below the first unsafe rung above the active one; a rung is unsafe with ≥ 8 events in the last 60 s, at least one up-switch to it and `drops / ups > 0.075`; drops decided while the playhead is at a seam are not counted |
+
+The emergency's two branches read two forms of the same contiguous buffer
+(F1). Empty is a stall now, so it is judged on the instantaneous value. Low
+is judged on the envelope, i.e. it fires only when the buffer stayed below
+0.5 s for a whole group plus a tick: a drain, not the trough of the live-edge
+per-group sawtooth (each group lands as a burst at ≈1.1 s and drains to
+≈0.2-0.35 s before the next).
+
+"At a seam" (F2) is measured in media time around the seam being presented,
+not in groups since the landing: the playhead is in the seam's region, which
+runs from the hole in front of the seam (the source's append front at landing,
+when that lies before the seam) to `historyIgnoreGroupsAfterLanding` (2) group
+durations past the seam PTS. Every decision is stamped with
+`msPastSeam = playheadMs − latestSeamPtsMs` (`ABR_DECISION.ms_past_seam`); a
+drop is exempt when `msPastSeam ≤ 2 × GOP` (negative = in the hole), and
+counted when the playhead was in no seam region (`null`) or further past it. A
+player that reports no seams falls back to "≤ 2 completed groups since the
+landing".
 
 The arbiter is dash.js's: the highest tier that has a request, then the lowest
 index. A tie (same index, same tier) is resolved by registration order
@@ -66,33 +85,40 @@ request (by rule identity); every other automatic down-switch is
 `auto-downgrade`. Both count as drops in the history.
 
 History and `ABR_DECISION` are written only when the player confirms a landing
-on the decided target (`onTrackSwitched(target)`); a refused, skipped or failed
-switch (callback with the old track) leaves only `ABR_SWITCH_PHANTOM`, and a
-switch whose guard times out is dropped from the pending record. This holds
-for every arm.
+on the decided target (`onTrackSwitched(target, switchSeq)`); a refused, skipped
+or failed switch (callback with the old track) leaves only
+`ABR_SWITCH_PHANTOM`. Both records carry `switch_seq` (the player's number for
+the switch, which `switchTrack` exposes synchronously as `lastSwitchSeq` and
+resolves to; the callback names it, so a callback resolves exactly its own
+decision) and `decided_ts`; `ABR_DECISION` is emitted at the landing (F14). A
+decision's record outlives its switching guard (F7): the guard may time out
+and release, but the record stays pending until its target lands (which also
+resolves every older record: an older switch cannot land after a newer one
+has), its own phantom callback arrives, or it ages out of the 8-entry list, so
+a landing later than 3 s is still history. This holds for every arm.
 
 ### 0.3 Constants
 
 `describeController(settings)` (`abr/index.ts`) returns these, after the arm
 is resolved, as plain JSON; it is what `RUN_META.controller` records.
 
-| constant                                                    | `min` value               | tunable?                              |
-| ----------------------------------------------------------- | ------------------------- | ------------------------------------- |
-| tick                                                        | 250 ms                    | no (`CONTROLLER_CONSTANTS`)           |
-| slow start                                                  | 3 samples                 | no                                    |
-| switching guard timeout / cool-down                         | 3000 / 5000 ms            | no                                    |
-| `upDwellGroups`                                             | 3                         | yes                                   |
-| `bandwidthSafetyFactor`                                     | 0.9                       | yes                                   |
-| EmergencyBufferRule `lowBufferS`, `throughputSafetyFactor`  | 0.5 s, 0.7                | yes (rule parameters)                 |
-| `switchHistoryMode`                                         | veto                      | pinned                                |
-| `switchHistoryWindowS`                                      | 60 s                      | yes (0 is not accepted, reads as 60)  |
-| SwitchHistoryRule `sampleSize`, `switchPercentageThreshold` | 8, 0.075                  | yes (rule parameters)                 |
-| `historyIgnoreGroupsAfterLanding`                           | 2                         | yes                                   |
-| history length                                              | 60 entries                | no                                    |
-| `bufferSignal`, `bufferEnvelopeMs`                          | envelope, 1250 ms         | signal pinned, window tunable         |
-| `segmentDurationS`                                          | catalog GOP (default 1 s) | from the catalog                      |
-| `probeMode`, `upGuardSamples`, `latencyResetOnLanding`      | off, 0, false             | pinned                                |
-| SWMA window                                                 | 5 groups                  | the player's (recorded, not set here) |
+| constant                                                                               | `min` value               | tunable?                              |
+| -------------------------------------------------------------------------------------- | ------------------------- | ------------------------------------- |
+| tick                                                                                   | 250 ms                    | no (`CONTROLLER_CONSTANTS`)           |
+| slow start                                                                             | 3 samples                 | no                                    |
+| switching guard timeout / cool-down                                                    | 3000 / 5000 ms            | no                                    |
+| `upDwellGroups`                                                                        | 3                         | yes                                   |
+| `bandwidthSafetyFactor`                                                                | 0.9                       | yes                                   |
+| EmergencyBufferRule `lowBufferS`, `throughputSafetyFactor`                             | 0.5 s, 0.7                | yes (rule parameters)                 |
+| `switchHistoryMode`                                                                    | veto                      | pinned                                |
+| `switchHistoryWindowS`                                                                 | 60 s                      | yes (0 is not accepted, reads as 60)  |
+| SwitchHistoryRule `sampleSize`, `switchPercentageThreshold`                            | 8, 0.075                  | yes (rule parameters)                 |
+| `historyIgnoreGroupsAfterLanding` (seam window, GOPs of media past the presented seam) | 2                         | yes                                   |
+| history length                                                                         | 60 entries                | no                                    |
+| `bufferSignal`, `bufferEnvelopeMs`                                                     | envelope, 1250 ms         | signal pinned, window tunable         |
+| `segmentDurationS`                                                                     | catalog GOP (default 1 s) | from the catalog                      |
+| `probeMode`, `upGuardSamples`, `latencyResetOnLanding`                                 | off, 0, false             | pinned                                |
+| SWMA window                                                                            | 5 groups                  | the player's (recorded, not set here) |
 
 The full description for the defaults:
 
@@ -166,7 +192,7 @@ The full description for the defaults:
 
 The paper compares a live-edge client with time-shifted clients (0.1-10 s
 behind live) across switching mechanisms, so the controller must not apply a
-different policy to one of them. `min` is built from three kinds of input, and
+different policy to one of them. `min` is built from the inputs below, and
 each is either the same quantity on every client or the same function of a
 physical quantity whose value the clients legitimately differ in:
 
@@ -178,15 +204,27 @@ physical quantity whose value the clients legitimately differ in:
    buffer inputs (and opposite latency, shift and playback-rate signals) and
    requires identical decisions.
 2. **Time is counted in groups**, not seconds of buffer or presentation: the
-   dwell is 3 completed groups of the landed track since the landing, the
-   seam window 2 groups, and the landing is the target's first applied object
+   dwell is 3 completed groups of the landed track since the landing (one
+   sample per (track, group), so a redelivered or split catch-up group does
+   not count twice, F5), and the landing is the target's first applied object
    (t4, about one group on every mechanism and both client types). Visibility
    (t5), which takes the whole shift on a time-shifted client, is not used. The
    history window (60 s) is wall-clock time and the same for everyone.
-3. **The only buffer rule is an emergency on playable seconds**, with the same
-   thresholds (0 and 0.5 s) for every client. A stall is a stall on either
-   client type; what differs is how much runway each has, which is the property
-   being measured, not a policy. This is the line `min` draws against
+3. **The seam exemption is anchored at the seam the viewer is shown**, in
+   media time (the hole before it and 2 GOPs after it), not at the landing. The
+   same hole reaches the playhead about one group after the landing at the
+   live edge and about one shift after it on a time-shifted client; anchored
+   at the landing (≤ 2 groups) it was exempt on the first and counted on the
+   second, so a time-shifted client paid a 60 s veto for the hole a live-edge
+   client was forgiven. Anchored at the seam it is exempt on both and no
+   other drop is exempt on either (F2; test `MinArm (j)`: identical
+   hole-induced drops on a 1-group and a 10-group client leave 720p uncapped on
+   both, ordinary drops cap it on both).
+4. **The only buffer rule is an emergency on playable seconds**, with the same
+   thresholds (0 and 0.5 s) for every client, judged on the level after each
+   group burst (the envelope) except for the empty test. A stall is a stall on
+   either client type; what differs is how much runway each has, which is the
+   property being measured, not a policy. This is the line `min` draws against
    InsufficientBufferRule (admission scaled by the buffer, so the same link
    event is judged differently) and LatencyTrendRule (sensitivity inversely
    proportional to the shift).
@@ -194,25 +232,32 @@ physical quantity whose value the clients legitimately differ in:
 Mechanism neutrality: no rule reads anything a mechanism produces differently
 by design (the probe, the catch-up latency burst, the seam hole as a drain).
 A seam hole costs what it costs (a stall if it empties the playable buffer),
-and a drop decided within 2 groups of the landing is kept out of the history,
-so a mechanism with a bigger hole does not also pay a 60 s ladder cap for it.
-Phantom switches are not history on any mechanism.
+and a drop decided while the playhead is at the seam is kept out of the
+history, so a mechanism with a bigger hole does not also pay a 60 s ladder cap
+for it. Phantom switches are not history on any mechanism, and a late landing
+is history on every mechanism.
+
+Two asymmetries of the first `min` version were policy, not physics, and are
+fixed (review of 2026-10-04):
+
+- **The live-edge sawtooth (F1).** The low-buffer branch read the
+  instantaneous contiguous buffer, whose live-edge trough (0.2-0.35 s) is below
+  0.5 s once per group, so with a SWMA in `[bitrate/0.9, bitrate/0.7)` the
+  live-edge client alternated between ThroughputRule's rung and the 0.7 × SWMA
+  rung while a 10 s client with the same throughput never moved. Reviewer's
+  simulation (120 s, 3-rung ladder, one group per 4 ticks, SWMA 2.0 Mbps on
+  720p, sawtooth 1.1/0.85/0.6/0.35 s vs the same +9 s): **before 45 switches
+  live-edge vs 0 time-shifted; after 0 vs 0** (trough 0.2 s at 1.9 Mbps: 45 vs
+  0 before, 0 vs 0 after; test `MinArm (i)`). A real drain (envelope below
+  0.5 s) still drops.
+- **The seam window anchored at the landing (F2)**, see item 3 above.
 
 What remains asymmetric, and is reported rather than tuned:
 
-- At the live edge the instantaneous contiguous buffer is a sawtooth whose
-  trough (~0.2 s) is below 0.5 s once per group, so the low-buffer branch is
-  armed there and a live-edge client is held to `0.7 × SWMA` whenever the
-  trough coincides with a SWMA below its rung's `bitrate / 0.7`. A 10 s client
-  never reaches 0.5 s short of a real stall. This is the 1 s runway, a property
-  of the client type.
-- The seam hole reaches the playhead about one group after landing at the live
-  edge but about one shift later on a time-shifted client. If the contiguous
-  buffer reads 0 at that moment (the playhead at the hole before the player's
-  gap seek), the emergency fires with `groupsSinceLanding` ≈ shift / GOP > 2
-  and the drop is counted. How often this happens depends on the player's
-  gap-crossing policy (one policy after M14); check it per run with
-  `ABR_DECISION.rule = EmergencyBufferRule` and `groups_since_landing`.
+- A live-edge client has about 1 s of runway and a 10 s client about 10 s, so
+  the same link collapse empties the live-edge buffer first (the empty branch
+  and, after 1250 ms below 0.5 s, the low branch fire there first). This is the
+  property being measured, not a policy.
 - Groups arrive faster than one per second during a catch-up replay or the
   connect backlog of a time-shifted client, so the dwell and slow start elapse
   sooner in wall time there (the minor "slow start is instant" finding). The
@@ -228,14 +273,18 @@ What remains asymmetric, and is reported rather than tuned:
 - `controller.segmentDurationS = catalog.getGopDurationMs(videoTrack) / 1000`.
 - `RUN_META.controller = describeController(effectiveAbrSettings)` (the
   settings actually given to the controller, after any override).
-- `player.setOnTrackSwitched(name => abr.onTrackSwitched(name))` for every
-  terminal outcome, with the track the player is now on (the deprecated
-  `releaseSwitchingGuard()` reads `activeTrack` instead).
+- `player.setOnTrackSwitched((name, seq) => abr.onTrackSwitched(name, seq))`
+  for every terminal outcome, with the track the player is now on and the
+  switch's `switch_seq` (the deprecated `releaseSwitchingGuard()` reads
+  `activeTrack` instead).
 - `player.setResetLatencyOnLanding(abr.settings.controller.latencyResetOnLanding)`
   (the resolved value; `min` pins it false).
 - Player metrics consumed: `bandwidthBps`, `sampleCount`, `samplesByTrack`
   (recommended: per-track counts keyed by THROUGHPUT_SAMPLE.track),
-  `bufferSeconds`, `bufferContigSeconds`, `activeTrack`, `totalFrames`; for
+  `bufferSeconds`, `bufferContigSeconds`, `activeTrack`, `totalFrames`,
+  `playheadMs` and `latestSeamPtsMs` (the seam exemption; absent → the
+  groups-since-landing fallback), and `player.lastSwitchSeq` after each
+  `switchTrack` call; for
   `grid` also `latencyRecentMeanMs`, `latencyOlderMeanMs` (undefined until the
   latency window is full) and `targetShiftMs` (C6; without the means
   LatencyTrendRule falls back to the raw ratio), `playbackRate`,

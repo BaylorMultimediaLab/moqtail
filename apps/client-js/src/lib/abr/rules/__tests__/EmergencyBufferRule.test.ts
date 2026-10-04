@@ -111,6 +111,27 @@ describe('EmergencyBufferRule', () => {
     ).toBeNull();
   });
 
+  it('the low branch reads the envelope: a sawtooth trough under 0.5 s with a 1.1 s envelope abstains (F1)', () => {
+    const rule = new EmergencyBufferRule();
+    const ctx = { bandwidthBps: 2_000_000, activeTrackIndex: 1 };
+    expect(
+      rule.getMaxIndex(
+        makeContext({ ...ctx, bufferInstantSeconds: 0.35, bufferEnvelopeSeconds: 1.1 }),
+      ),
+    ).toBeNull();
+    // Below 0.5 s for the whole window: a drain.
+    const r = rule.getMaxIndex(
+      makeContext({ ...ctx, bufferInstantSeconds: 0.3, bufferEnvelopeSeconds: 0.45 }),
+    );
+    expect(r?.representationIndex).toBe(0);
+    expect(r?.reason).toContain('envelope 0.45s');
+    // The empty branch stays instantaneous whatever the envelope says.
+    expect(
+      rule.getMaxIndex(makeContext({ ...ctx, bufferInstantSeconds: 0, bufferEnvelopeSeconds: 1.1 }))
+        ?.reason,
+    ).toBe('emergency-buffer-empty');
+  });
+
   it('falls back to bufferSeconds when no instantaneous value is given', () => {
     const rule = new EmergencyBufferRule();
     const r = rule.getMaxIndex(makeContext({ bufferSeconds: 0, bufferInstantSeconds: undefined }));

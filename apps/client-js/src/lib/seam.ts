@@ -86,7 +86,13 @@ export class SeamTracker {
    * target from its seam onward replaces everything buffered after it, so a
    * new seam drops every transition at or after it.
    */
-  #transitions: Array<{ seamMs: number; track: string }> = [];
+  #transitions: Array<{
+    seamMs: number;
+    track: string;
+    regionFromMs: number;
+    /** The switch that applied this seam (absent for the startup track). */
+    rec?: SwitchRecord;
+  }> = [];
 
   /**
    * @param allocateSeq - Source of switch numbers. The player passes the
@@ -100,20 +106,51 @@ export class SeamTracker {
 
   /** The track playback starts on (before any switch). Only the first call counts. */
   setInitialTrack(track: string): void {
-    if (this.#transitions.length === 0) this.#transitions.push({ seamMs: -Infinity, track });
+    if (this.#transitions.length === 0) {
+      this.#transitions.push({ seamMs: -Infinity, track, regionFromMs: -Infinity });
+    }
   }
 
   /**
    * The track whose media sits at `playheadMs` in the buffer, i.e. the track
    * being presented (M13); null before the initial track is known.
+   *
+   * A switch whose first frame has not been seen yet covers only
+   * [seam, target append front]: the target has delivered nothing beyond its
+   * front, so media after it (e.g. at the playhead, when the seam landed
+   * behind it) is still the previous track's (F8). Once its first frame is
+   * seen it covers everything up to the next seam.
    */
   presentedTrack(playheadMs: number): string | null {
     let track: string | null = null;
     for (const t of this.#transitions) {
       if (t.seamMs > playheadMs) break;
+      if (t.rec !== undefined && !t.rec.firstFrameSeen) {
+        if (playheadMs > (t.rec.targetAppendFrontMs ?? t.seamMs)) continue;
+      }
       track = t.track;
     }
     return track;
+  }
+
+  /**
+   * PTS (ms) of the latest applied seam whose region the playhead has entered,
+   * or null when it has entered none (F2). A seam's region begins at the hole
+   * in front of it: the source's append front at landing when that lies before
+   * the seam (a hole), else the seam itself (the target restarts inside source
+   * media). `toleranceMs` (one frame) admits a playhead that stopped a frame
+   * short of the hole. The caller judges how far past the seam the playhead
+   * is; this only says which seam it is anchored to, so the same hole anchors
+   * the same way whether it reaches the playhead one group after the landing
+   * (live edge) or one shift later (time-shifted).
+   */
+  seamRegionAt(playheadMs: number, toleranceMs: number): number | null {
+    let seam: number | null = null;
+    for (const t of this.#transitions) {
+      if (t.seamMs === -Infinity) continue;
+      if (t.regionFromMs - toleranceMs <= playheadMs) seam = t.seamMs;
+    }
+    return seam;
   }
 
   /** A number for a switch attempt that is not sent (SWITCH_SKIPPED). */
@@ -141,7 +178,9 @@ export class SeamTracker {
   /**
    * The relay accepted `rec` (SWITCH_OK) and the player now waits for it to
    * land. A previously accepted switch that has not landed is replaced and
-   * therefore superseded: it can never land any more.
+   * therefore superseded: it can never land any more. `rec` may already have
+   * landed (the player arms before the SWITCH is acknowledged, F12); it is
+   * then not waited for.
    */
   armed(rec: SwitchRecord): { superseded: SwitchRecord[] } {
     const superseded: SwitchRecord[] = [];
@@ -150,7 +189,7 @@ export class SeamTracker {
       prev.supersededBy = rec.seq;
       superseded.push(prev);
     }
-    this.#armed = rec;
+    this.#armed = rec.landedAt === undefined ? rec : null;
     return { superseded };
   }
 
@@ -204,6 +243,14 @@ export class SeamTracker {
   /**
    * A target frame [ptsMs, endPtsMs) was appended. The first one applies the
    * pending switch (returned); later ones only move its target append front.
+   *
+   * `now` is when the append completed (updateend's continuation);
+   * `appendStartedAt` when appendBuffer was called. The front history is dated
+   * at the call (F9): the element can present the frame between the call and
+   * the continuation, and the rVFC callback that reports it runs after the
+   * continuation with an earlier presentationTime, which must not be read as
+   * "before the frame was in the buffer" (that credited the first frame one
+   * frame late).
    */
   appended(at: {
     ptsMs: number;
@@ -211,11 +258,17 @@ export class SeamTracker {
     group: number;
     object: number;
     now: number;
+    appendStartedAt?: number;
   }): SwitchRecord | null {
     const rec = this.#pending;
     if (rec === null) return null;
     rec.targetAppendFrontMs = Math.max(rec.targetAppendFrontMs ?? -Infinity, at.endPtsMs);
-    this.#fronts.push({ at: at.now, frontMs: rec.targetAppendFrontMs });
+    // Keep the history ordered by time even if call times interleave.
+    const dated = Math.max(
+      at.appendStartedAt ?? at.now,
+      this.#fronts.length > 0 ? this.#fronts[this.#fronts.length - 1]!.at : -Infinity,
+    );
+    this.#fronts.push({ at: dated, frontMs: rec.targetAppendFrontMs });
     // Presentation times are recent; a seam that stays pending for long only
     // needs the newest part of the history (the oldest kept entry is the base).
     if (this.#fronts.length > 1024) this.#fronts.splice(0, 512);
@@ -225,7 +278,12 @@ export class SeamTracker {
     rec.firstAppendedGroup = at.group;
     rec.firstAppendedObject = at.object;
     this.#transitions = this.#transitions.filter(t => t.seamMs < at.ptsMs);
-    this.#transitions.push({ seamMs: at.ptsMs, track: rec.to });
+    this.#transitions.push({
+      seamMs: at.ptsMs,
+      track: rec.to,
+      regionFromMs: Math.min(at.ptsMs, rec.sourceEndAtLandingMs ?? at.ptsMs),
+      rec,
+    });
     return rec;
   }
 

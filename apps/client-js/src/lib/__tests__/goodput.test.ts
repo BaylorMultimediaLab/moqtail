@@ -327,4 +327,127 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       expect(out[1]!.discardedBytes).toBe(0);
     });
   });
+
+  describe('one sample per (track, group) (F5)', () => {
+    // 30 objects per 1 s group; lastInGroup as the player computes it.
+    const N = 30;
+    const last = (o: number) => o >= N - 1;
+
+    it('A: a group redelivered on a second stream produces one sample and one count', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      const out = [];
+      for (let o = 0; o < N; o++) {
+        out.push(
+          ...t.recordObject(1000, 10n, { recvAt: 1000 + o, track: 'B', lastInGroup: last(o) }),
+        );
+      }
+      // Catch-up redelivery of the same group.
+      for (let o = 0; o < N; o++) {
+        out.push(
+          ...t.recordObject(1000, 10n, { recvAt: 1100 + o, track: 'B', lastInGroup: last(o) }),
+        );
+      }
+      expect(out).toHaveLength(1);
+      expect(t.getSamplesByTrack()).toEqual({ B: 1 });
+      expect(t.getSampleCount()).toBe(1);
+      // The late bytes still crossed the link.
+      expect(t.getCumulativeBytes()).toBe(2 * N * 1000);
+    });
+
+    it('B: a catch-up group closed early by the quiet rule and resumed later is not sampled twice', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      const out = [];
+      for (let o = 0; o < 15; o++) {
+        out.push(
+          ...t.recordObject(1000, 5n, { recvAt: 1000 + o, track: 'B', lastInGroup: last(o) }),
+        );
+      }
+      // Live group 10 arrives while group 5's stream is stalled 80 ms.
+      for (let o = 0; o < 10; o++) {
+        out.push(
+          ...t.recordObject(1000, 10n, { recvAt: 1080 + o, track: 'B', lastInGroup: last(o) }),
+        );
+      }
+      // The rest of group 5.
+      for (let o = 15; o < N; o++) {
+        out.push(
+          ...t.recordObject(1000, 5n, { recvAt: 1100 + o, track: 'B', lastInGroup: last(o) }),
+        );
+      }
+      expect(out.filter(x => x.group === 5n)).toHaveLength(1);
+      expect(t.getSamplesByTrack()).toEqual({ B: 1 });
+    });
+
+    it('a group closed without a sample (one object) may still produce its one sample later', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      t.recordObject(1000, 5n, { recvAt: 1000, track: 'B', lastInGroup: false });
+      // Group 6 overtakes after a quiet spell: group 5 closes with no sample.
+      expect(t.recordObject(1000, 6n, { recvAt: 1100, track: 'B', lastInGroup: false })).toEqual(
+        [],
+      );
+      const out = [];
+      for (let o = 1; o < N; o++) {
+        out.push(
+          ...t.recordObject(1000, 5n, { recvAt: 1200 + o, track: 'B', lastInGroup: last(o) }),
+        );
+      }
+      expect(out.filter(x => x.group === 5n)).toHaveLength(1);
+    });
+  });
+
+  describe('library-discarded (unrouted) bytes reach a sample (F6)', () => {
+    const group = (t: GoodputTracker, g: bigint, track: string, at: number) => {
+      const out = [];
+      for (let o = 0; o < 30; o++) {
+        out.push(...t.recordObject(1000, g, { recvAt: at + o, track, lastInGroup: o >= 29 }));
+      }
+      return out;
+    };
+
+    it("bytes of an open group are that group's discarded_bytes", () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      t.recordObject(1000, 4n, { recvAt: 1000, track: 'A', lastInGroup: false });
+      t.recordDiscardedBytes(5000, 4n, 'A');
+      const out = [];
+      for (let o = 1; o < 30; o++) {
+        out.push(
+          ...t.recordObject(1000, 4n, { recvAt: 1000 + o, track: 'A', lastInGroup: o >= 29 }),
+        );
+      }
+      expect(out).toHaveLength(1);
+      expect(out[0]!.discardedBytes).toBe(5000);
+      expect(out[0]!.unroutedBytes).toBe(0);
+    });
+
+    it('bytes of a group with no open accumulator (closed, or never routed) go out with the next sample of the stream, once', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      expect(group(t, 4n, 'A', 1000)).toHaveLength(1);
+      // The old track's trailing stream arrives after its alias was dropped:
+      // group 4 has already been sampled, group 5 never reached the player.
+      t.recordDiscardedBytes(7000, 4n, 'A');
+      t.recordDiscardedBytes(9000, 5n, 'A');
+      const next = group(t, 20n, 'B', 2000);
+      expect(next).toHaveLength(1);
+      expect(next[0]!.track).toBe('B');
+      expect(next[0]!.discardedBytes).toBe(0);
+      expect(next[0]!.unroutedBytes).toBe(16_000);
+      expect(group(t, 21n, 'B', 3000)[0]!.unroutedBytes).toBe(0);
+    });
+  });
+
+  describe('highest group received per track (F10)', () => {
+    it('is the max group seen for the track, not the last one recorded', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      expect(t.getMaxGroup('B')).toBeUndefined();
+      t.recordObject(1000, 10n, { recvAt: 1000, track: 'B', lastInGroup: false });
+      // A catch-up group arrives after the live one.
+      t.recordObject(1000, 5n, { recvAt: 1001, track: 'B', lastInGroup: false });
+      t.recordObject(1000, 12n, { recvAt: 1002, track: 'A', lastInGroup: false });
+      expect(t.getMaxGroup('B')).toBe(10n);
+      expect(t.getMaxGroup('A')).toBe(12n);
+      // Dropped objects were received too; late objects of a sampled group as well.
+      t.recordObject(1000, 11n, { recvAt: 1003, track: 'B', discarded: true });
+      expect(t.getMaxGroup('B')).toBe(11n);
+    });
+  });
 });
