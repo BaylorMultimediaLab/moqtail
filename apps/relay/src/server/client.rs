@@ -30,6 +30,7 @@ use moqtail::{
     common::tuple::Tuple,
     control::{control_message::ControlMessage, setup::Setup},
     data::full_track_name::FullTrackName,
+    error::StreamResetCode,
   },
   transport::{
     connection::{TransportConnection, TransportKind, TransportSendStream, TransportWriteError},
@@ -331,33 +332,48 @@ impl MOQTClient {
     header_payload: Bytes,
     priority: i32, // Priority for the stream
   ) -> Result<Arc<Mutex<TransportSendStream>>> {
-    let send_stream = {
-      let send_stream_map = self.get_stream_map(stream_id);
-      let mut send_streams = send_stream_map.write().await;
-      match send_streams.entry(stream_id.get_stream_id().to_string()) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-          // The priority is in place before the first byte (the WebTransport stream
-          // header included), so the stream is never queued at quinn's default 0
-          // (R3-D6).
-          let send_stream = self
-            .connection
-            .open_uni_with_priority(priority)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open send stream: {:?}", e))?;
-          let s = Arc::new(Mutex::new(send_stream));
-          entry.insert(s.clone());
-          info!(
-            "open_stream | added send_stream to send streams ({}) connection_id: {}",
-            stream_id, self.connection_id
-          );
-          s
-        }
-        std::collections::hash_map::Entry::Occupied(s) => {
-          debug!(
-            "open_stream | Send stream for {} already exists connection_id: {}",
-            stream_id, self.connection_id
-          );
-          s.get().clone()
+    let send_stream = match self.get_stream(stream_id).await {
+      Some(s) => {
+        debug!(
+          "open_stream | Send stream for {} already exists connection_id: {}",
+          stream_id, self.connection_id
+        );
+        s
+      }
+      None => {
+        // Opening can wait for the subscriber to grant stream credit, so it happens
+        // with no partition lock held: the other streams of this partition keep
+        // being found and written meanwhile (R3-D5).
+        // The priority is in place before the first byte (the WebTransport stream
+        // header included), so the stream is never queued at quinn's default 0
+        // (R3-D6).
+        let opened = self
+          .connection
+          .open_uni_with_priority(priority)
+          .await
+          .map_err(|e| anyhow::anyhow!("Failed to open send stream: {:?}", e))?;
+        let send_stream_map = self.get_stream_map(stream_id);
+        let mut send_streams = send_stream_map.write().await;
+        match send_streams.entry(stream_id.get_stream_id().to_string()) {
+          std::collections::hash_map::Entry::Vacant(entry) => {
+            let s = Arc::new(Mutex::new(opened));
+            entry.insert(s.clone());
+            info!(
+              "open_stream | added send_stream to send streams ({}) connection_id: {}",
+              stream_id, self.connection_id
+            );
+            s
+          }
+          std::collections::hash_map::Entry::Occupied(existing) => {
+            // Another open of the same id won the race while this one waited.
+            debug!(
+              "open_stream | Send stream for {} opened concurrently connection_id: {}",
+              stream_id, self.connection_id
+            );
+            let mut extra = opened;
+            let _ = extra.reset(StreamResetCode::Cancelled.to_u64());
+            existing.get().clone()
+          }
         }
       }
     };
@@ -1023,6 +1039,58 @@ mod tests_write_stream_object {
     assert!(
       read < 256 * 1024,
       "the response arrived after {read} B of video"
+    );
+  }
+
+  /// R3-D5: opening a stream can wait for the subscriber to grant stream credit.
+  /// Meanwhile no partition lock is held, so the other streams of that partition
+  /// can still be found and written.
+  #[tokio::test]
+  async fn a_stream_waiting_for_credit_does_not_block_its_partition() {
+    let mut subscriber_transport = wtransport::quinn::TransportConfig::default();
+    subscriber_transport.max_concurrent_uni_streams(1u32.into());
+    let (peer, server) =
+      crate::server::test_support::quic_pair_with_transports(None, Some(subscriber_transport))
+        .await;
+    let client = relay_client(1, server);
+    let a = StreamId::new_subgroup(1, 0, Some(0));
+    let partition = client.get_partition_index(&a);
+    let b = (1..10_000u64)
+      .map(|g| StreamId::new_subgroup(1, g, Some(0)))
+      .find(|id| client.get_partition_index(id) == partition)
+      .expect("a stream id in the same partition");
+
+    client.open_stream(&a, header(), 0).await.unwrap();
+    let opener = {
+      let client = client.clone();
+      let b = b.clone();
+      tokio::spawn(async move { client.open_stream(&b, header(), 0).await.is_ok() })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!opener.is_finished(), "b waits for credit (one uni stream)");
+
+    let found = tokio::time::timeout(Duration::from_secs(1), client.get_stream(&a)).await;
+    assert!(
+      matches!(found, Ok(Some(_))),
+      "the partition is blocked while b waits for credit"
+    );
+    let written = tokio::time::timeout(
+      Duration::from_secs(1),
+      client.write_stream_object(&a, 0, Bytes::from_static(b"obj0"), None),
+    )
+    .await;
+    assert!(matches!(written, Ok(Ok(()))));
+
+    // Credit comes back once a's stream is done; b then opens.
+    let mut recv = peer.accept_uni().await.unwrap();
+    assert!(client.close_stream(&a).await.unwrap());
+    let mut buf = [0u8; 64];
+    while let Ok(Some(_)) = recv.read(&mut buf).await {}
+    assert!(
+      tokio::time::timeout(Duration::from_secs(5), opener)
+        .await
+        .expect("b opens once credit returns")
+        .unwrap()
     );
   }
 

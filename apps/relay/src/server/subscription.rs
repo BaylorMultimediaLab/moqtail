@@ -586,6 +586,12 @@ impl Subscription {
                             "FROM CACHE: Joining state - subscriber={} relay_track_id={} sending subgroup header: {:?}",
                             instance.client_connection_id, relay_track_id, subgroup_header
                           );
+                          // The previous group's replay is over (R3-D5).
+                          if let Some(previous) = last_stream_id.take() {
+                            instance
+                              .finish_replayed_stream_if_complete(&cache, &previous)
+                              .await;
+                          }
                           last_group = object.group_id;
                           let stream_id = instance.get_stream_id(&subgroup_header);
                           last_stream_id = Some(stream_id);
@@ -624,6 +630,13 @@ impl Subscription {
                       break;
                     }
                   }
+                }
+                // The last replayed group: finished only if the publisher is done
+                // with it too; the newest group normally is not, and continues live.
+                if let Some(last) = last_stream_id.take() {
+                  instance
+                    .finish_replayed_stream_if_complete(&cache, &last)
+                    .await;
                 }
               }
               // The live path's duplicate filter is `replayed_through` (per stream,
@@ -1668,6 +1681,59 @@ impl Subscription {
     }
   }
 
+  /// Called by the joining replay when it has written the last cached object of the
+  /// group on `stream_id` (R3-D5). If the publisher's stream for that subgroup has
+  /// already closed and the replay wrote everything the cache holds of it, the
+  /// subgroup is complete and its stream is finished here: a subscription
+  /// registered after the publisher's stream closed never receives the StreamClosed
+  /// that would otherwise finish it, and an unfinished stream holds one of the
+  /// subscriber's uni-stream credits for the rest of the session. A subgroup still
+  /// being published (normally the newest group) stays open and continues live;
+  /// its StreamClosed finishes it. So does one whose cache holds objects past what
+  /// the replay wrote (added after the replay read the group: they and the close
+  /// are in this subscription's live queue).
+  async fn finish_replayed_stream_if_complete(&self, cache: &TrackCache, stream_id: &StreamId) {
+    if self
+      .active_subgroup_headers
+      .read()
+      .await
+      .contains_key(stream_id)
+    {
+      return;
+    }
+    let Some(replayed) = self
+      .subscription_state
+      .read()
+      .await
+      .replayed_through
+      .get(stream_id)
+      .copied()
+    else {
+      return;
+    };
+    let (Some(group), Some(subgroup)) = (stream_id.group_id, stream_id.subgroup_id) else {
+      return;
+    };
+    let cached_last = match cache.get_group(group).await {
+      Some(objects) => objects
+        .read()
+        .await
+        .iter()
+        .filter(|o| o.subgroup_id == subgroup)
+        .map(|o| o.object_id)
+        .max(),
+      None => None,
+    };
+    if cached_last.is_some_and(|last| last > replayed) {
+      return;
+    }
+    info!(
+      "Joining replay finished complete group: subscriber={} stream_id={} relay_track_id={} last object {}",
+      self.client_connection_id, stream_id, self.relay_track_id, replayed
+    );
+    let _ = self.handle_stream_closed(stream_id).await;
+  }
+
   async fn handle_stream_closed(&self, stream_id: &StreamId) -> Result<()> {
     // Handle the stream closed event
     debug!("Stream closed: {}", stream_id.get_stream_id());
@@ -2137,6 +2203,160 @@ mod tests_replay_live_overlap {
       6,
       "12/3..6 and 13/0..3 were replayed and queued"
     );
+  }
+}
+
+/// R3-D5: a joining replay's streams for groups the publisher had already finished
+/// were never finished (no StreamClosed reaches a subscription registered after the
+/// publisher's stream closed), each holding one of the subscriber's uni-stream
+/// credits for the rest of the session.
+#[cfg(test)]
+mod tests_replay_finishes_complete_groups {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, collect_streams, publish, quic_pair, relay_client, subscribe, test_track,
+    wait_until,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use std::time::Duration;
+
+  const TRACK: u64 = 1;
+
+  fn from(group: u64) -> Subscribe {
+    Subscribe::new_absolute_start(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      Location::new(group, 0),
+      vec![],
+    )
+  }
+
+  async fn open(client: &Arc<MOQTClient>, group: u64) -> bool {
+    client
+      .get_stream(&StreamId::new_subgroup(TRACK, group, Some(0)))
+      .await
+      .is_some()
+  }
+
+  /// The reviewer's scenario: groups 10 and 11 complete (publisher streams closed)
+  /// and 12 in progress when the subscription replays from 10. After the replay the
+  /// streams of 10 and 11 are finished; 12 stays open, continues live on the same
+  /// stream, and is finished when the publisher closes it.
+  #[tokio::test]
+  async fn replayed_streams_of_complete_groups_are_finished() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(77, server);
+    let received = collect_streams(peer);
+    let track = test_track(TRACK, "video-720p");
+    for g in 10..=11 {
+      for o in 0..3 {
+        publish(&track, g, o).await;
+      }
+      track
+        .stream_closed(&StreamId::new_subgroup(TRACK, g, Some(0)))
+        .await
+        .unwrap();
+    }
+    for o in 0..3 {
+      publish(&track, 12, o).await;
+    }
+    let sub = subscribe(&track, &client, from(10), false).await;
+    sub.read().await.mark_alias_announced();
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let r = received.clone();
+        async move { r.objects(TRACK).len() >= 9 }
+      })
+      .await
+    );
+    assert!(
+      wait_until(Duration::from_secs(2), || {
+        let client = client.clone();
+        async move { !open(&client, 10).await && !open(&client, 11).await }
+      })
+      .await,
+      "the streams of complete groups 10 and 11 are still open"
+    );
+    assert!(
+      open(&client, 12).await,
+      "the newest group stays open for live"
+    );
+
+    for o in 3..5 {
+      publish(&track, 12, o).await;
+    }
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let r = received.clone();
+        async move { r.objects(TRACK).contains(&(12, 4)) }
+      })
+      .await
+    );
+    assert_eq!(
+      received.streams_for(TRACK, 12),
+      1,
+      "12 continues on one stream"
+    );
+    track
+      .stream_closed(&StreamId::new_subgroup(TRACK, 12, Some(0)))
+      .await
+      .unwrap();
+    assert!(
+      wait_until(Duration::from_secs(2), || {
+        let client = client.clone();
+        async move { !open(&client, 12).await }
+      })
+      .await
+    );
+    let expected: Vec<(u64, u64)> = (10..=11)
+      .flat_map(|g| (0..3).map(move |o| (g, o)))
+      .chain((0..5).map(|o| (12, o)))
+      .collect();
+    let mut got = received.objects(TRACK);
+    got.sort();
+    assert_eq!(got, expected);
+  }
+
+  /// A replayed group whose publisher stream is still open is left to the live
+  /// path (its StreamClosed finishes it), even when a later group exists.
+  #[tokio::test]
+  async fn a_replayed_group_still_being_published_stays_open() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(78, server);
+    let received = collect_streams(peer);
+    let track = test_track(TRACK, "video-720p");
+    for o in 0..3 {
+      publish(&track, 10, o).await;
+    }
+    for o in 0..3 {
+      publish(&track, 11, o).await;
+    }
+    let sub = subscribe(&track, &client, from(10), false).await;
+    sub.read().await.mark_alias_announced();
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let r = received.clone();
+        async move { r.objects(TRACK).len() >= 6 }
+      })
+      .await
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(open(&client, 10).await, "10 is still being published");
+    publish(&track, 10, 3).await;
+    track
+      .stream_closed(&StreamId::new_subgroup(TRACK, 10, Some(0)))
+      .await
+      .unwrap();
+    assert!(
+      wait_until(Duration::from_secs(2), || {
+        let client = client.clone();
+        async move { !open(&client, 10).await }
+      })
+      .await
+    );
+    assert!(received.objects(TRACK).contains(&(10, 3)));
+    assert_eq!(received.streams_for(TRACK, 10), 1);
   }
 }
 
