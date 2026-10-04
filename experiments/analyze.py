@@ -991,7 +991,11 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "decided_ts": decision["ts"] if decision else None,
             "t2_decision_ms": (sent["ts"] - decision["ts"]) if decision else None,
             "t3_ok_ms": d(ok), "error": err.get("reason") if err else None,
-            "relay_recv_ms": d(rrecv), "relay_promoted_ms": d(rprom),
+            # promoted_ts is the promotion decision; on the fixed native arm a held-back
+            # trigger's record is written after the joining replay, so its ts trails it.
+            "relay_recv_ms": d(rrecv),
+            "relay_promoted_ms": ((rprom.get("promoted_ts") if rprom.get("promoted_ts") is not None else rprom["ts"])
+                                  - sent["ts"]) if rprom else None,
             "relay_start_group": rprom.get("start_group") if rprom else None,
             # pr1378: the Minimum Switching Group the client asked for.
             "selected_min_group": j["floor"].get("selected_min_group") if j["floor"] else None,
