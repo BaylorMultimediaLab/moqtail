@@ -43,6 +43,28 @@ export interface AbrMetrics {
 
 const MAX_HISTORY = 60;
 
+/** A switch that has been sent and not yet confirmed by the player (see onTrackSwitched). */
+interface PendingSwitch {
+  fromTrack: string;
+  toTrack: string;
+  fromIndex: number;
+  toIndex: number;
+  fromBitrate: number;
+  toBitrate: number;
+  reason: SwitchReason;
+  ruleReason: string;
+  priority: number | null;
+  bufferSeconds: number;
+  bandwidthBps: number;
+  fastEmaBps: number;
+  slowEmaBps: number;
+  probeBps: number;
+  latencyTrend: number;
+  /** Completed groups since the last landing when the decision was taken; null before the first landing. */
+  groupsSinceLanding: number | null;
+  decidedTs: number;
+}
+
 export class AbrController {
   #player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>;
   #rulesCollection: AbrRulesCollection;
@@ -112,6 +134,20 @@ export class AbrController {
   // Recent instantaneous buffer levels for settings.controller.bufferSignal =
   // 'envelope' (see ControllerSettings).
   #bufferSamples: { ts: number; bufferSeconds: number }[] = [];
+  // The switch that has been sent but not confirmed (M17). History, ABR_DECISION,
+  // the up-guard arm and the probe's tracksize are written only when the player
+  // reports (onTrackSwitched) that the landed track is this record's target. A
+  // refused, skipped or failed switch calls back with the old track and leaves
+  // no trace other than ABR_SWITCH_PHANTOM.
+  #pendingSwitch: PendingSwitch | null = null;
+  // activeTrack as of the last tick; a callback with a different track is a
+  // landing even when no decision is pending (a switch that landed after its
+  // guard timed out).
+  #activeTrackAtTick: string | null = null;
+  // player.getMetrics().sampleCount at the last confirmed landing, or null before
+  // the first one. Completed groups since the landing = sampleCount minus this;
+  // it is the dwell clock and is stamped on every history entry.
+  #lastLandingSampleCount: number | null = null;
 
   constructor(
     player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>,
@@ -156,13 +192,99 @@ export class AbrController {
     );
   }
 
-  releaseSwitchingGuard(): void {
-    // Player fires this when the new track's init segment has been applied.
+  /**
+   * Player callback for every terminal outcome of a switchTrack call: the
+   * target's first object was applied (landed, `trackName` = target), or the
+   * switch was refused / skipped / failed (`trackName` = the track the player is
+   * still on). Only a landing on the pending target is a switch: it is then
+   * written to the history, logged as ABR_DECISION, arms the post-switch
+   * up-guard and starts the dwell clock. Anything else releases the switching
+   * guard and is logged as ABR_SWITCH_PHANTOM (M17).
+   *
+   * Without an argument (legacy wiring) the landed track is read from
+   * `player.getMetrics().activeTrack`, which the player updates before it calls
+   * back.
+   */
+  onTrackSwitched(landedTrack?: string): void {
+    const m = this.#player.getMetrics();
+    const landed = landedTrack ?? m.activeTrack ?? null;
+    const pending = this.#pendingSwitch;
+    this.#pendingSwitch = null;
+    this.#lastSampleCount = m.sampleCount;
     // Defer actually clearing #switching until totalVideoFrames advances past
     // the snapshot — that's when MSE has decoded an actual frame from the new
     // track. Prevents rapid switches from shredding the MSE timeline.
     this.#pendingFrameAdvance = true;
+
+    const isLanding = pending
+      ? landed === pending.toTrack
+      : landed !== null && landed !== this.#activeTrackAtTick;
+    if (!isLanding) {
+      if (pending) {
+        events.emit('ABR_SWITCH_PHANTOM', {
+          from: pending.fromTrack,
+          to: pending.toTrack,
+          landed,
+          reason: pending.reason,
+          rule_reason: pending.ruleReason,
+          decided_ms_ago: Date.now() - pending.decidedTs,
+        });
+      }
+      return;
+    }
+
+    this.#lastLandingSampleCount = m.sampleCount;
+    this.#activeTrackAtTick = landed;
+    if (pending) {
+      this.#recordHistory(pending);
+      events.emit('ABR_DECISION', {
+        from: pending.fromTrack,
+        to: pending.toTrack,
+        from_index: pending.fromIndex,
+        to_index: pending.toIndex,
+        from_bitrate: pending.fromBitrate,
+        to_bitrate: pending.toBitrate,
+        reason: pending.reason,
+        rule_reason: pending.ruleReason,
+        priority: pending.priority,
+        buffer_s: pending.bufferSeconds,
+        bandwidth_bps: pending.bandwidthBps,
+        fast_ema_bps: pending.fastEmaBps,
+        slow_ema_bps: pending.slowEmaBps,
+        probe_bps: pending.probeBps,
+        latency_trend: pending.latencyTrend,
+        groups_since_landing: pending.groupsSinceLanding,
+        decided_ts: pending.decidedTs,
+        landed_after_ms: Date.now() - pending.decidedTs,
+      });
+      // Update tracksize (Algorithm 1 lines 13/16): after upswitch, carry
+      // forward the gap from new current to next-up; after downswitch,
+      // carry forward the gap from previous tier to new current. Either
+      // way the value is the bitrate delta of the tier that's currently
+      // adjacent to the new position in the SAME direction as the switch.
+      const targetBitrate = pending.toBitrate;
+      if (pending.toIndex > pending.fromIndex) {
+        const next = this.#tracks[pending.toIndex + 1]?.bitrate ?? targetBitrate;
+        this.#tracksize = Math.max(0, next - targetBitrate);
+      } else if (pending.toIndex < pending.fromIndex) {
+        const prev = this.#tracks[pending.toIndex - 1]?.bitrate ?? targetBitrate;
+        this.#tracksize = Math.max(0, targetBitrate - prev);
+      }
+    }
+    this.#armUpGuard();
     if (this.#settings.controller?.upGuardRelease !== 'visible') this.#releaseUpGuard('landed');
+  }
+
+  /** @deprecated Use onTrackSwitched(trackName); kept for the existing app.tsx wiring. */
+  releaseSwitchingGuard(): void {
+    this.onTrackSwitched();
+  }
+
+  /** Completed groups since the last confirmed landing, or null before the first landing. */
+  groupsSinceLanding(sampleCount: number): number | null {
+    return this.#lastLandingSampleCount === null
+      ? null
+      : sampleCount - this.#lastLandingSampleCount;
   }
 
   /** Player fires this when the first frame of the switched-to track is presented (t5). */
@@ -204,9 +326,28 @@ export class AbrController {
     const m = this.#player.getMetrics();
     this.#framesAtSwitch = m.totalFrames;
     this.#pendingFrameAdvance = false;
-    this.#armUpGuard();
-    this.#recordHistory(m.activeTrack ?? '', trackName, 'manual', 0, 0);
-    events.emit('ABR_DECISION', { from: m.activeTrack, to: trackName, reason: 'manual' });
+    const fromTrack = m.activeTrack ?? '';
+    const fromIndex = this.#tracks.findIndex(t => t.name === fromTrack);
+    const toIndex = this.#tracks.findIndex(t => t.name === trackName);
+    this.#pendingSwitch = {
+      fromTrack,
+      toTrack: trackName,
+      fromIndex,
+      toIndex,
+      fromBitrate: this.#tracks[fromIndex]?.bitrate ?? 0,
+      toBitrate: this.#tracks[toIndex]?.bitrate ?? 0,
+      reason: 'manual',
+      ruleReason: 'manual',
+      priority: null,
+      bufferSeconds: m.bufferSeconds,
+      bandwidthBps: m.bandwidthBps,
+      fastEmaBps: m.fastEmaBps,
+      slowEmaBps: m.slowEmaBps,
+      probeBps: 0,
+      latencyTrend: m.latencyTrendRatio,
+      groupsSinceLanding: this.groupsSinceLanding(m.sampleCount),
+      decidedTs: Date.now(),
+    };
     void this.#player.switchTrack(trackName);
   }
 
@@ -271,6 +412,7 @@ export class AbrController {
 
     this.#onMetricsUpdate(metrics);
     this.#lastSampleCount = sampleCount;
+    this.#activeTrackAtTick = activeTrack;
 
     // Buffer level for the rules: instantaneous, or the maximum over the last
     // group (the level after each burst landed).
@@ -318,7 +460,11 @@ export class AbrController {
         track: activeTrack,
         held_ms: Date.now() - this.#switchingStartTs,
         cooldown_ms: AbrController.SWITCH_COOLDOWN_MS,
+        pending_to: this.#pendingSwitch?.toTrack ?? null,
       });
+      // The switch never confirmed: it is not history (M17). If the target
+      // lands later, onTrackSwitched still sees a landing and starts the dwell.
+      this.#pendingSwitch = null;
       // A switch that never lands must not hold up-switches forever: start the
       // fresh-sample count now.
       this.#releaseUpGuard('timeout');
@@ -497,44 +643,31 @@ export class AbrController {
       reason = 'auto-upgrade';
     }
 
-    // Activate switching guard, record history, and switch
+    // Activate the switching guard and send the switch. History, ABR_DECISION,
+    // the up-guard arm and tracksize wait for the landing (onTrackSwitched).
     this.#switching = true;
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
-    this.#armUpGuard();
-    this.#recordHistory(activeTrack ?? '', targetTrack.name, reason, bufferSeconds, fastEmaBps);
-    events.emit('ABR_DECISION', {
-      from: activeTrack,
-      to: targetTrack.name,
-      from_index: currentIdx,
-      to_index: targetIndex,
-      from_bitrate: currentBitrate,
-      to_bitrate: targetBitrate,
+    this.#pendingSwitch = {
+      fromTrack: activeTrack ?? '',
+      toTrack: targetTrack.name,
+      fromIndex: currentIdx,
+      toIndex: targetIndex,
+      fromBitrate: currentBitrate,
+      toBitrate: targetBitrate,
       reason,
-      rule_reason: switchRequest.reason,
+      ruleReason: switchRequest.reason,
       priority: switchRequest.priority,
-      buffer_s: bufferSeconds,
-      bandwidth_bps: bandwidthBps,
-      fast_ema_bps: fastEmaBps,
-      slow_ema_bps: slowEmaBps,
-      probe_bps: context.probeBandwidthBps,
-      latency_trend: latencyTrendRatio,
-    });
-    // Update tracksize (Algorithm 1 lines 13/16): after upswitch, carry
-    // forward the gap from new current to next-up; after downswitch,
-    // carry forward the gap from previous tier to new current. Either
-    // way the value is the bitrate delta of the tier that's currently
-    // adjacent to the new position in the SAME direction as the switch.
-    if (targetIndex > currentIdx) {
-      // upswitch: tracksize = b[newIdx+1] - b[newIdx]
-      const next = this.#tracks[targetIndex + 1]?.bitrate ?? targetBitrate;
-      this.#tracksize = Math.max(0, next - targetBitrate);
-    } else if (targetIndex < currentIdx) {
-      // downswitch: tracksize = b[newIdx] - b[newIdx-1]
-      const prev = this.#tracks[targetIndex - 1]?.bitrate ?? targetBitrate;
-      this.#tracksize = Math.max(0, targetBitrate - prev);
-    }
+      bufferSeconds,
+      bandwidthBps,
+      fastEmaBps,
+      slowEmaBps,
+      probeBps: context.probeBandwidthBps,
+      latencyTrend: latencyTrendRatio,
+      groupsSinceLanding: this.groupsSinceLanding(sampleCount),
+      decidedTs: Date.now(),
+    };
     void this.#player.switchTrack(targetTrack.name);
   }
 
@@ -561,20 +694,15 @@ export class AbrController {
     this.#rulesCollection.setShouldUseBolaRule(this.#usingBolaRule);
   }
 
-  #recordHistory(
-    fromTrack: string,
-    toTrack: string,
-    reason: SwitchReason,
-    bufferAtSwitch: number,
-    emaBwAtSwitch: number,
-  ): void {
+  #recordHistory(p: PendingSwitch): void {
     const event: SwitchEvent = {
       ts: Date.now(),
-      fromTrack,
-      toTrack,
-      reason,
-      bufferAtSwitch,
-      emaBwAtSwitch,
+      fromTrack: p.fromTrack,
+      toTrack: p.toTrack,
+      reason: p.reason,
+      bufferAtSwitch: p.bufferSeconds,
+      emaBwAtSwitch: p.fastEmaBps,
+      groupsSinceLanding: p.groupsSinceLanding ?? undefined,
     };
 
     this.#switchHistory.push(event);

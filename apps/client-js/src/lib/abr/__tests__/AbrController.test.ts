@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, type Mock } from 'vitest';
+import { describe, it, expect, vi, afterEach, type Mock } from 'vitest';
+import { events } from '@/lib/events/EventLog';
 import { AbrController } from '../AbrController';
 import type { AbrMetrics } from '../AbrController';
 import { AbrRulesCollection } from '../AbrRulesCollection';
@@ -124,6 +125,7 @@ describe('AbrController', () => {
         { videoAutoSwitch: false },
       );
       controller.manualSwitch('720p');
+      controller.onTrackSwitched('720p');
       await controller._tick();
       expect(metrics[0]!.switchHistory).toHaveLength(1);
       expect(metrics[0]!.switchHistory[0]!.reason).toBe('manual');
@@ -296,7 +298,7 @@ describe('AbrController', () => {
   describe('post-switch up-guard (settings.controller.upGuardSamples)', () => {
     const guarded = (playerOverrides: Partial<ReturnType<typeof makePlayerMetrics>> = {}) =>
       makeController(
-        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000, ...playerOverrides },
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 2_000_000, ...playerOverrides },
         {
           videoAutoSwitch: true,
           controller: { ...DEFAULT_ABR_SETTINGS.controller, upGuardSamples: 3 },
@@ -308,8 +310,8 @@ describe('AbrController', () => {
       player: MockPlayer,
       metrics: Partial<ReturnType<typeof makePlayerMetrics>>,
     ) => {
-      controller.releaseSwitchingGuard();
       player.getMetrics.mockReturnValue(makePlayerMetrics({ totalFrames: 2000, ...metrics }));
+      controller.onTrackSwitched(metrics.activeTrack ?? undefined);
     };
 
     it('holds the next up-switch until the previous switch landed and 3 fresh samples arrived', async () => {
@@ -410,7 +412,7 @@ describe('AbrController', () => {
 
     it("in 'visible' mode counts from notifySwitchVisible, not from landing", async () => {
       const { controller, player } = makeController(
-        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 2_000_000 },
         {
           videoAutoSwitch: true,
           controller: {
@@ -554,6 +556,7 @@ describe('AbrController', () => {
       const { controller } = makeController({ activeTrack: '360p' }, { videoAutoSwitch: false });
 
       controller.manualSwitch('720p');
+      controller.onTrackSwitched('720p');
 
       const history = controller.getHistory();
       expect(history).toHaveLength(1);
@@ -579,6 +582,7 @@ describe('AbrController', () => {
       const { controller } = makeController({ activeTrack: '360p' }, { videoAutoSwitch: false });
 
       controller.manualSwitch('720p');
+      controller.onTrackSwitched('720p');
       const h1 = controller.getHistory();
       const h2 = controller.getHistory();
 
@@ -594,7 +598,7 @@ describe('AbrController', () => {
 
       for (let i = 0; i < 65; i++) {
         controller.manualSwitch('720p');
-        controller.releaseSwitchingGuard();
+        controller.onTrackSwitched('720p');
         // Simulate a decoded frame from the new track so the guard's
         // frame-advance condition clears, allowing the next manualSwitch
         // through. _tick() polls metrics and applies that condition.
@@ -667,6 +671,118 @@ describe('AbrController', () => {
       // Mode should be reflected in emitted metrics
       const lastMetrics = metrics[metrics.length - 1]!;
       expect(lastMetrics.mode).toBe('manual');
+    });
+  });
+
+  describe('M17: history and ABR_DECISION only on a confirmed landing', () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    const decisions = (emit: AnyMock) =>
+      emit.mock.calls
+        .filter(c => c[0] === 'ABR_DECISION')
+        .map(c => c[1] as Record<string, unknown>);
+
+    it('a refused or skipped switch (onTrackSwitched with the old track) leaves no history, no ABR_DECISION and no armed up-guard', async () => {
+      const emit = vi.spyOn(events, 'emit') as unknown as AnyMock;
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        {
+          videoAutoSwitch: true,
+          controller: { ...DEFAULT_ABR_SETTINGS.controller, upGuardSamples: 3 },
+        },
+      );
+      await controller._tick(); // decides 360p -> 1080p
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+      // SWITCH_SKIPPED / SWITCH_ERROR / missing-catalog paths all call back with
+      // the track the player is still on.
+      controller.onTrackSwitched('360p');
+      expect(controller.getHistory()).toHaveLength(0);
+      expect(decisions(emit)).toHaveLength(0);
+      expect(emit.mock.calls.some(c => c[0] === 'ABR_SWITCH_PHANTOM')).toBe(true);
+
+      // The guard is released and nothing is armed: the client never left 360p,
+      // so the next decision is not held by a post-switch up-guard.
+      player.switchTrack.mockClear();
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '360p', totalFrames: 2000 }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+    });
+
+    it('a landed switch records history and one ABR_DECISION with the decision-time signals', async () => {
+      const emit = vi.spyOn(events, 'emit') as unknown as AnyMock;
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000, sampleCount: 7 },
+        { videoAutoSwitch: true },
+      );
+      await controller._tick();
+      expect(decisions(emit)).toHaveLength(0); // not yet: the switch is in flight
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '1080p', totalFrames: 2000 }),
+      );
+      controller.onTrackSwitched('1080p');
+      const history = controller.getHistory();
+      expect(history).toHaveLength(1);
+      expect(history[0]!.fromTrack).toBe('360p');
+      expect(history[0]!.toTrack).toBe('1080p');
+      expect(history[0]!.reason).toBe('auto-upgrade');
+      const d = decisions(emit);
+      expect(d).toHaveLength(1);
+      expect(d[0]!.from).toBe('360p');
+      expect(d[0]!.to).toBe('1080p');
+      expect(d[0]!.bandwidth_bps).toBe(10_000_000);
+      expect(d[0]!.rule_reason).toBe('throughput');
+    });
+
+    it('a manual switch is history only once it lands', async () => {
+      const { controller, player } = makeController(
+        { activeTrack: '360p' },
+        { videoAutoSwitch: false },
+      );
+      controller.manualSwitch('720p');
+      expect(controller.getHistory()).toHaveLength(0);
+      controller.onTrackSwitched('360p'); // refused
+      expect(controller.getHistory()).toHaveLength(0);
+      // The switching guard clears on the next tick with a frame advance.
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ activeTrack: '360p', totalFrames: 2000 }),
+      );
+      await controller._tick();
+      controller.manualSwitch('720p');
+      controller.onTrackSwitched('720p');
+      expect(controller.getHistory()).toHaveLength(1);
+    });
+
+    it("releaseSwitchingGuard() without a track confirms against the player's active track", async () => {
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+        { videoAutoSwitch: true },
+      );
+      await controller._tick(); // 360p -> 1080p
+      // The player flips activeTrack before it calls onTrackSwitched.
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '1080p', totalFrames: 2000 }),
+      );
+      controller.releaseSwitchingGuard();
+      expect(controller.getHistory()).toHaveLength(1);
+    });
+
+    it('a switch that times out is dropped from the pending record, not written to history', async () => {
+      vi.useFakeTimers();
+      try {
+        const { controller, player } = makeController(
+          { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000 },
+          { videoAutoSwitch: true },
+        );
+        await controller._tick();
+        expect(player.switchTrack).toHaveBeenCalledTimes(1);
+        vi.advanceTimersByTime(AbrController.SWITCH_TIMEOUT_MS + 1);
+        await controller._tick(); // ABR_GUARD_TIMEOUT
+        expect(controller.getHistory()).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

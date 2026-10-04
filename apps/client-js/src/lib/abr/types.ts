@@ -17,6 +17,14 @@ export interface SwitchEvent {
   reason: SwitchReason;
   bufferAtSwitch: number;
   emaBwAtSwitch: number;
+  /**
+   * Completed groups (throughput samples) between the last confirmed landing
+   * and this decision. Absent before the first landing. SwitchHistoryRule uses
+   * it to leave drops that happen within
+   * `controller.historyIgnoreGroupsAfterLanding` groups of a landing out of a
+   * rung's record: those are the seam, not the rung.
+   */
+  groupsSinceLanding?: number;
 }
 
 export enum SwitchRequestPriority {
