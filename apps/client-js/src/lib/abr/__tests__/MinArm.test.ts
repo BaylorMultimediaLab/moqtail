@@ -763,3 +763,37 @@ describe('min arm: (j) the history exemption is anchored at the presented seam (
     expect(ups(shifted)).toBe(4);
   });
 });
+
+describe('min arm: (k) a switch that lands after its guard timed out (F7)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('writes history and ABR_DECISION when it lands, even after a later decision was refused', async () => {
+    vi.useFakeTimers();
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    await h.tick();
+    expect(h.switches()).toEqual(['720p']);
+    // The guard times out (3 s) and the cool-down (5 s) passes without a landing.
+    vi.advanceTimersByTime(3_100);
+    await h.tick();
+    vi.advanceTimersByTime(5_100);
+    // A new decision (the link rose) while 720p is still in flight ...
+    await h.tick({ bandwidthBps: 10_000_000 });
+    expect(h.switches()).toEqual(['720p', '1080p']);
+    // ... which the player skips (previous switch not landed): a phantom.
+    h.controller.onTrackSwitched('360p');
+    // Then the first switch lands.
+    h.land('720p');
+    const history = h.controller.getHistory();
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ fromTrack: '360p', toTrack: '720p' });
+    const decisions = emit.mock.calls.filter(c => c[0] === 'ABR_DECISION');
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]![1]).toMatchObject({ from: '360p', to: '720p' });
+    const phantoms = emit.mock.calls.filter(c => c[0] === 'ABR_SWITCH_PHANTOM');
+    expect(phantoms.map(c => (c[1] as Record<string, unknown>).to)).toEqual(['1080p']);
+  });
+});

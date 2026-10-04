@@ -46,6 +46,8 @@ export interface AbrMetrics {
 }
 
 const MAX_HISTORY = CONTROLLER_CONSTANTS.maxHistory;
+/** Unresolved switch records kept (F7); the guard allows one in flight, so a few suffice. */
+const MAX_PENDING_SWITCHES = 8;
 
 /**
  * The player metrics the controller consumes (`player.getMetrics()`), listed so
@@ -224,12 +226,15 @@ export class AbrController {
   // Recent instantaneous buffer levels for settings.controller.bufferSignal =
   // 'envelope' (see ControllerSettings).
   #bufferSamples: { ts: number; bufferSeconds: number }[] = [];
-  // The switch that has been sent but not confirmed (M17). History, ABR_DECISION,
-  // the up-guard arm and the probe's tracksize are written only when the player
-  // reports (onTrackSwitched) that the landed track is this record's target. A
-  // refused, skipped or failed switch calls back with the old track and leaves
-  // no trace other than ABR_SWITCH_PHANTOM.
-  #pendingSwitch: PendingSwitch | null = null;
+  // Switches that have been sent and not resolved yet, oldest first (M17, F7).
+  // History, ABR_DECISION, the up-guard arm and the probe's tracksize are
+  // written only when the player reports (onTrackSwitched) that a record's
+  // target landed. A refused, skipped or failed switch calls back with the old
+  // track and leaves no trace other than ABR_SWITCH_PHANTOM. A record outlives
+  // its switching guard: the guard may time out (3 s) and a later decision may
+  // be sent, but the record stays until it lands, its own phantom callback
+  // arrives, or a newer switch lands (an older one can no longer land then).
+  #pendingSwitches: PendingSwitch[] = [];
   // activeTrack as of the last tick; a callback with a different track is a
   // landing even when no decision is pending (a switch that landed after its
   // guard timed out).
@@ -308,8 +313,7 @@ export class AbrController {
   onTrackSwitched(landedTrack?: string): void {
     const m = this.#player.getMetrics();
     const landed = landedTrack ?? m.activeTrack ?? null;
-    const pending = this.#pendingSwitch;
-    this.#pendingSwitch = null;
+    const pending = this.#resolvePending(landed);
     this.#lastSampleCount = m.sampleCount;
     // Defer actually clearing #switching until totalVideoFrames advances past
     // the snapshot — that's when MSE has decoded an actual frame from the new
@@ -382,6 +386,31 @@ export class AbrController {
     if (this.#settings.controller?.upGuardRelease !== 'visible') this.#releaseUpGuard('landed');
   }
 
+  /**
+   * The unresolved decision a callback with `landed` resolves, removed from
+   * the pending list: the newest one whose target is `landed` (a landing; it
+   * and every older record are done, since an older switch can no longer land
+   * once a newer one has), else the newest one (a refusal of the latest
+   * switch, ABR_SWITCH_PHANTOM). Null when nothing is pending.
+   */
+  #resolvePending(landed: string | null): PendingSwitch | null {
+    const list = this.#pendingSwitches;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i]!.toTrack === landed) {
+        const rec = list[i]!;
+        list.splice(0, i + 1);
+        return rec;
+      }
+    }
+    return list.pop() ?? null;
+  }
+
+  /** A switch was sent: its record waits for its callback (bounded; the oldest is forgotten). */
+  #addPending(rec: PendingSwitch): void {
+    this.#pendingSwitches.push(rec);
+    if (this.#pendingSwitches.length > MAX_PENDING_SWITCHES) this.#pendingSwitches.shift();
+  }
+
   /** @deprecated Use onTrackSwitched(trackName); kept for the existing app.tsx wiring. */
   releaseSwitchingGuard(): void {
     this.onTrackSwitched();
@@ -451,7 +480,7 @@ export class AbrController {
     const fromTrack = m.activeTrack ?? '';
     const fromIndex = this.#tracks.findIndex(t => t.name === fromTrack);
     const toIndex = this.#tracks.findIndex(t => t.name === trackName);
-    this.#pendingSwitch = {
+    this.#addPending({
       fromTrack,
       toTrack: trackName,
       fromIndex,
@@ -472,7 +501,7 @@ export class AbrController {
       groupsSinceLanding: this.groupsSinceLanding(m),
       msPastSeam: msPastSeamOf(m),
       decidedTs: Date.now(),
-    };
+    });
     void this.#player.switchTrack(trackName);
   }
 
@@ -600,11 +629,11 @@ export class AbrController {
         track: activeTrack,
         held_ms: Date.now() - this.#switchingStartTs,
         cooldown_ms: AbrController.SWITCH_COOLDOWN_MS,
-        pending_to: this.#pendingSwitch?.toTrack ?? null,
+        pending_to: this.#pendingSwitches.at(-1)?.toTrack ?? null,
       });
-      // The switch never confirmed: it is not history (M17). If the target
-      // lands later, onTrackSwitched still sees a landing and starts the dwell.
-      this.#pendingSwitch = null;
+      // The switch has not confirmed, so it is not history yet (M17); its
+      // record stays pending: a landing later than the guard is still this
+      // decision and writes its history and ABR_DECISION then (F7).
       // A switch that never lands must not hold up-switches forever: start the
       // fresh-sample count now.
       this.#releaseUpGuard('timeout');
@@ -824,7 +853,7 @@ export class AbrController {
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
-    this.#pendingSwitch = {
+    this.#addPending({
       fromTrack: activeTrack ?? '',
       toTrack: targetTrack.name,
       fromIndex: currentIdx,
@@ -845,7 +874,7 @@ export class AbrController {
       groupsSinceLanding: context.groupsSinceLanding ?? null,
       msPastSeam: msPastSeamOf(raw),
       decidedTs: Date.now(),
-    };
+    });
     void this.#player.switchTrack(targetTrack.name);
   }
 
