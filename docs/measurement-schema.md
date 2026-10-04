@@ -130,10 +130,15 @@ default) the source GOP of group `g` is `g`.
 
 `NET_CHANGE` (`rate_mbps` (null = unshaped), `delay_ms`, `loss_pct`, `queue`,
 `queue_pkts`, `at_s`, `applied`; _2026-10_: `apply_started_ts`, `elapsed_s`,
-`tc` (list of the resolved command lines), `qdisc_stats` (`{leaf: {bytes,
-packets, drops, backlog_bytes, backlog_pkts, maxpacket?, ecn_mark?,
-drop_overlimit?, new_flow_count?}}`, `tc -s` of the bottleneck leaf),
-`offloads`, `gso_at_qdisc` (true / false / null)), `BG_FLOWS`, `BG_FLOW_ON`,
+`tc` (list of the resolved command lines), `qdisc_stats` (`net.leaf_stats`:
+`{leaf, tree, raw}`; `leaf` is the bottleneck leaf of `tc -s qdisc show` (the
+netem root on an unshaped step), null when not found: `kind`, `handle`,
+`parent`, `options`, `sent_bytes`, `sent_pkts` (counts GSO segments),
+`dropped`, `overlimits`, `requeues`, `backlog_bytes`, `backlog_pkts` (skbs),
+fq_codel only: `maxpacket`, `drop_overlimit`, `new_flow_count`, `ecn_mark`;
+and the GSO evidence `max_skb_bytes`, `backlog_bytes_per_skb`,
+`gso_at_qdisc` (true / false / null = unknown); `tree` is every parsed qdisc
+with the same fields, `raw` the `tc -s` text), `offloads`), `BG_FLOWS`, `BG_FLOW_ON`,
 `BG_FLOW_OFF`, `BROWSER_START` (_2026-10_: `warmup_measured_s`),
 `PUBLISHER_READY`, `CLIENT_READY` (_2026-10_), `PROC_STATS` (`process`,
 `rss_bytes`, `cpu_pct`), `RUN_END` (`elapsed_s`; _2026-10_: final
@@ -364,8 +369,9 @@ bytes after the first switch settled; reported), `pf-relay-cc`
 (`RELAY_CONFIG.congestion_controller` = identity), `pf-qdisc` (`qdisc_stats`
 on every applied NET_CHANGE; the recorded `tc` commands contain netem, htb and
 bfifo or fq_codel on a rate-limited step, netem alone on an unshaped one),
-`pf-gso` (`gso_at_qdisc` false on every rate-limited NET_CHANGE; fails when
-true, reported when unknown), `pf-maxpacket` (`qdisc_stats.leaf.maxpacket`
+`pf-gso` (`qdisc_stats.leaf.gso_at_qdisc` false on every rate-limited
+NET_CHANGE; fails when true, reported when unknown; a top-level
+`gso_at_qdisc` is read only when the leaf has none), `pf-maxpacket` (`qdisc_stats.leaf.maxpacket`
 ≤ 1514 B when recorded; reported above, fails above 3000 B), `pf-warmup`
 (`BROWSER_START.warmup_measured_s` within 15 ± 1 s; reported), `pf-offloads`
 (`identity.offloads_disabled` true; reported), `pf-loss` (unshaped profile:

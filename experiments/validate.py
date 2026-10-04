@@ -47,7 +47,8 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
   pf-relay-cc       RELAY_CONFIG.congestion_controller matches the run identity
   pf-qdisc          qdisc_stats on every applied NET_CHANGE; the recorded tc commands show netem / htb /
                     bfifo|fq_codel on a rate-limited step and netem on an unshaped one
-  pf-gso            gso_at_qdisc false on every rate-limited NET_CHANGE (fails when true)
+  pf-gso            qdisc_stats.leaf.gso_at_qdisc false on every rate-limited NET_CHANGE (fails when true;
+                    a top-level gso_at_qdisc is read only when the leaf has none)
   pf-maxpacket      qdisc_stats.leaf.maxpacket <= 1514 when recorded (reported above, fails above 3000)
   pf-warmup         BROWSER_START.warmup_measured_s within 15 +- 1 s (reported)
   pf-offloads       identity.offloads_disabled is true (reported)
@@ -173,6 +174,21 @@ class Report:
     def render(self) -> str:
         w = max(len(r[0]) for r in self.rows)
         return "\n".join(f"{r[1]:4}  {r[0]:{w}}  {r[2]}" for r in self.rows)
+
+
+def _leaf(rec: dict) -> dict:
+    """qdisc_stats.leaf of a NET_CHANGE / RUN_END record ({} when absent)."""
+    qs = rec.get("qdisc_stats")
+    return (qs.get("leaf") or {}) if isinstance(qs, dict) else {}
+
+
+def _gso_at_qdisc(rec: dict):
+    """The GSO verdict of a NET_CHANGE: qdisc_stats.leaf.gso_at_qdisc (what the runner writes),
+    else a top-level gso_at_qdisc. True / False / None (unknown)."""
+    leaf = _leaf(rec)
+    if "gso_at_qdisc" in leaf:
+        return leaf["gso_at_qdisc"]
+    return rec.get("gso_at_qdisc")
 
 
 def _text(v) -> str:
@@ -444,8 +460,10 @@ def main() -> int:
                     f"qdisc_stats on {len(with_stats)} of {len(applied)} applied NET_CHANGE; tc tree (netem only when unshaped, "
                     f"netem/htb/leaf when rate-limited) wrong on: {bad_tree or 'none'}")
         # Offloads: GSO super-packets at the qdisc make a packet-counted queue meaningless (C5).
+        # The runner writes the verdict into the leaf (net.leaf_stats: qdisc_stats.leaf.gso_at_qdisc);
+        # a top-level gso_at_qdisc is read only when the leaf has none.
         limited = [c for c in applied if c.get("rate_mbps") is not None]
-        gso = [c.get("gso_at_qdisc") for c in limited]
+        gso = [_gso_at_qdisc(c) for c in limited]
         if not limited:
             rep.add("pf-gso", None, "no rate-limited NET_CHANGE")
         elif any(g is True for g in gso):
@@ -456,7 +474,7 @@ def main() -> int:
             rep.info("pf-gso", f"gso_at_qdisc unknown on {sum(1 for g in gso if g is None)} of {len(limited)} rate-limited NET_CHANGE")
         maxpk = []
         for c in applied + list(by("RUN_END")):
-            leaf = ((c.get("qdisc_stats") or {}).get("leaf") or {}) if isinstance(c.get("qdisc_stats"), dict) else {}
+            leaf = _leaf(c)
             if leaf.get("maxpacket") is not None:
                 maxpk.append(leaf["maxpacket"])
         if not maxpk:

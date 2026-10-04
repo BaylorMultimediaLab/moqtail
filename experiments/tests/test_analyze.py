@@ -691,6 +691,24 @@ class ValidateScript(TmpRun):
         self.assertEqual((st["pf-qdisc"], st["pf-gso"]), ("PASS", "SKIP"))
         self.assertEqual((st["pf-warmup"], st["pf-offloads"]), ("INFO", "INFO"))
 
+    def test_preflight_gso_read_from_the_leaf(self):
+        # D2: the runner writes gso_at_qdisc inside qdisc_stats.leaf (net.leaf_stats), not at the
+        # top level of NET_CHANGE; before the fix pf-gso saw "unknown" on every runner record.
+        shaped_tc = ["tc qdisc add dev veth-moqh root handle 1: netem delay 20ms limit 10000",
+                     "tc class add dev veth-moqh parent 1: classid 1:10 htb rate 6mbit ceil 6mbit",
+                     "tc qdisc add dev veth-moqh parent 1:10 handle 10: bfifo limit 150000"]
+        leaf = {"kind": "bfifo", "sent_bytes": 1, "sent_pkts": 1, "dropped": 0, "backlog_bytes": 0, "backlog_pkts": 0,
+                "max_skb_bytes": None, "backlog_bytes_per_skb": None}
+        _, st = self.validate(self.complete_run(net_fields={"tc": shaped_tc, "qdisc_stats": {"leaf": dict(leaf, gso_at_qdisc=True)}}),
+                              "--preflight")
+        self.assertEqual(st["pf-gso"], "FAIL")
+        _, st = self.validate(self.complete_run(net_fields={"tc": shaped_tc, "qdisc_stats": {"leaf": dict(leaf, gso_at_qdisc=False, maxpacket=1514)}}),
+                              "--preflight")
+        self.assertEqual(st["pf-gso"], "PASS")
+        _, st = self.validate(self.complete_run(net_fields={"tc": shaped_tc, "qdisc_stats": {"leaf": dict(leaf, gso_at_qdisc=None)}}),
+                              "--preflight")
+        self.assertEqual(st["pf-gso"], "INFO")
+
     def test_preflight_relay_gso_from_conn_stats(self):
         # C5: the relay must send one UDP datagram per I/O to the client (no GSO batches).
         def with_conn(datagrams, ios):
