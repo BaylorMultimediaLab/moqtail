@@ -42,6 +42,10 @@ import statistics
 from pathlib import Path
 
 TERMINALS = ("first_frame", "superseded", "error", "skipped", "open")
+STALL_MIN_EPISODE_MS = 250.0
+# SEEK reasons: one gap-crossing policy. Old bundles used range-jump / unwedge for what is now `gap`.
+SEEK_REASON_NORMAL = {"startup": "startup", "gap": "gap", "range-jump": "gap", "unwedge": "gap", "wedge": "wedge",
+                      "visibility": "visibility"}
 
 
 def load(run: Path) -> list[dict]:
@@ -347,10 +351,12 @@ def weighted_rung(intervals, index_of: dict, bitrate_of: dict, t0: float = -math
             "advancing_s": total / 1000}
 
 
-def switching_diagnostics(switches: list[dict], by, window_s: float) -> dict:
+def switching_diagnostics(switches: list[dict], by, window_s: float, run_duration_s: float | None) -> dict:
     """Behavioural diagnostics of the switch sequence itself. A run with
     A->B->A->B is different from four monotonic adaptations even at equal
-    counts and equal mean bitrate."""
+    counts and equal mean bitrate. ``switches_per_minute`` is over the run
+    duration ((RUN_END or last SAMPLE) - STARTUP), not the span between the first
+    and last switch (two switches 1 s apart are not 120/min)."""
     ts = [s["ts"] for s in switches]
     intervals = [b - a for a, b in zip(ts, ts[1:])]
     span_s = (ts[-1] - ts[0]) / 1000 if len(ts) >= 2 else 0.0
@@ -367,7 +373,10 @@ def switching_diagnostics(switches: list[dict], by, window_s: float) -> dict:
         by_rule[k] = by_rule.get(k, 0) + 1
     return {
         "reversal_window_s": window_s,
-        "switches_per_minute": (len(switches) / span_s * 60) if span_s > 0 else None,
+        "run_duration_s": run_duration_s,
+        "switches_per_minute": (len(switches) / run_duration_s * 60) if run_duration_s and run_duration_s > 0 else None,
+        # The old denominator (first to last switch), kept as a diagnostic only.
+        "switch_span_s": span_s,
         "inter_switch_interval_ms": stats(intervals),
         "median_inter_switch_interval_ms": statistics.median(intervals) if intervals else None,
         "min_inter_switch_interval_ms": min(intervals) if intervals else None,
@@ -447,6 +456,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     clock = first(recs, "CLOCK_MAP")
     ua = (clock or {}).get("user_agent") or ""
     browser_version = next((ua[ua.index(k) + len(k):].split()[0] for k in ("Firefox/", "Chrome/") if k in ua), None)
+    run_end = first(recs, "RUN_END")
     out: dict = {
         "run_id": meta.get("run_id", run.name),
         "identity": identity,
@@ -479,6 +489,15 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "clamped_by_relay": fo.get("clamped") if fo else None,
         "startup_track": startup_track,
     }
+    win_start = st["ts"] if st else None
+    win_end = (st["ts"] + initial_window_s * 1000) if st else None
+    client_end = max((r["ts"] for r in recs if r.get("src") == "client"), default=None)
+    samples = [s for s in by("SAMPLE") if st is None or s["ts"] >= st["ts"]]
+    # Run duration: first presented frame to RUN_END (or the last SAMPLE when the runner
+    # record is missing). The denominator of switches/min and the end of the share windows.
+    end_ts = run_end["ts"] if run_end else (samples[-1]["ts"] if samples else client_end)
+    run_duration_s = ((end_ts - st["ts"]) / 1000) if (st and end_ts is not None and end_ts > st["ts"]) else None
+    out["run_duration_s"] = run_duration_s
 
     # Stalls and seeks -------------------------------------------------------
     episodes = []
@@ -488,34 +507,65 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             open_start = r
         elif r.get("event") == "STALL_END" and open_start is not None:
             episodes.append({"ts": open_start["ts"], "cause": r.get("cause"), "duration_ms": r.get("duration_ms"),
-                             "playhead_ms": r.get("playhead_ms")})
+                             "playhead_ms": r.get("playhead_ms"), "track": open_start.get("track")})
             open_start = None
     # A stall still open when the run ended is a stall to the end of the run.
     if open_start is not None:
-        last_ts = max((r["ts"] for r in recs if r.get("src") == "client"), default=open_start["ts"])
+        last_ts = client_end if client_end is not None else open_start["ts"]
         episodes.append({"ts": open_start["ts"], "cause": open_start.get("cause"), "duration_ms": last_ts - open_start["ts"],
-                         "playhead_ms": open_start.get("playhead_ms"), "open_at_end": True})
-    durations = [e["duration_ms"] for e in episodes if e["duration_ms"] is not None]
+                         "playhead_ms": open_start.get("playhead_ms"), "track": open_start.get("track"), "open_at_end": True})
+    # Only episodes after the first presented frame count; the client already excludes
+    # pre-startup `waiting`, this is the analyzer's own guarantee.
+    episodes = [e for e in episodes if st is None or e["ts"] >= st["ts"]]
+    for e in episodes:
+        e["blip"] = (e["duration_ms"] or 0) < STALL_MIN_EPISODE_MS
+    major = [e for e in episodes if not e["blip"]]
+    blips = [e for e in episodes if e["blip"]]
+    durations = [e["duration_ms"] for e in major if e["duration_ms"] is not None]
     seeks = by("SEEK")
+    for s in seeks:
+        s["_kind"] = SEEK_REASON_NORMAL.get(s.get("reason"), s.get("reason") or "unknown")
+    after_window = lambda s: win_end is not None and s["ts"] >= win_end  # noqa: E731
+    span = lambda s: max(0.0, (s.get("to_ms") or 0) - (s.get("from_ms") or 0)) if s.get("to_ms") is not None and s.get("from_ms") is not None else (s.get("gap_ms") or 0)  # noqa: E731
+    gap_after = [s for s in seeks if s["_kind"] == "gap" and after_window(s)]
+    wedge_after = [s for s in seeks if s["_kind"] == "wedge" and after_window(s)]
     out["stalls"] = {
-        "count": len(episodes), "total_ms": sum(durations), "max_ms": max(durations) if durations else 0,
+        # Episodes >= STALL_MIN_EPISODE_MS; shorter `waiting` blips (15-30 ms around a gap seek) are counted apart.
+        "count": len(major), "total_ms": sum(durations), "max_ms": max(durations) if durations else 0,
+        "min_episode_ms": STALL_MIN_EPISODE_MS,
+        "blips": len(blips), "blips_ms": sum(e["duration_ms"] or 0 for e in blips),
+        "all_count": len(episodes),
         "episodes": episodes,
-        "seeks": {reason: sum(1 for s in seeks if s.get("reason") == reason)
-                  for reason in ("startup", "wedge", "range-jump", "visibility", "unwedge")},
+        # Normalised seek vocabulary (gap = gap | range-jump | unwedge), all seeks of the session.
+        "seeks": {k: sum(1 for s in seeks if s["_kind"] == k) for k in ("startup", "gap", "wedge", "visibility")},
+        "seeks_raw": {reason: sum(1 for s in seeks if s.get("reason") == reason) for reason in sorted({s.get("reason") for s in seeks} - {None})},
+        # Gap seeks after the initial window: excludes the startup positioning jump.
+        "gap_seeks": len(gap_after),
+        # Media the viewer never saw because a gap seek jumped over it (after the initial window).
+        "media_skipped_ms": sum(span(s) for s in gap_after),
+        # Wedge recovery seeks are listed apart (they repair a decoder wedge, not a buffer hole).
+        "wedge_seeks": len(wedge_after),
+        "wedge_skipped_ms": sum(span(s) for s in wedge_after),
         "open_at_end": any(e.get("open_at_end") for e in episodes),
         "wedge_gap_ms_total": sum(s.get("gap_ms") or 0 for s in seeks if s.get("reason") == "wedge"),
         # Range-jumps the buffer held back because new media was landing inside the gap
         # (RANGE_JUMP_DEFERRED is emitted once per gap), and the total wait before the jumps
         # that did happen after a deferral.
         "range_jumps_deferred": len(by("RANGE_JUMP_DEFERRED")),
-        "range_jump_deferred_ms_total": sum(s.get("deferred_ms") or 0 for s in seeks if s.get("reason") == "range-jump"),
+        "range_jump_deferred_ms_total": sum(s.get("deferred_ms") or 0 for s in seeks if s["_kind"] == "gap"),
     }
-    # Data starvation: nothing appended for 4 s with an empty buffer (DATA_STARVED, from
-    # the last append) until data flows again (DATA_RESUMED) or the run ends. A
-    # starving subscription is a delivery failure, not a decoder wedge.
+    for s in seeks:
+        s.pop("_kind", None)
+    # Data starvation: nothing appended for 4 s with <= 0.5 s left ahead (DATA_STARVED)
+    # until data flows again (DATA_RESUMED) or the run ends. A starving subscription is a
+    # delivery failure, not a decoder wedge. The client times an episode from the LAST
+    # APPEND, so the raw episode includes the seconds in which the buffer still played out
+    # (fresh-grid-v2 pr1378 shift r1: 10.8 s starved, 0 s stalled). The headline
+    # `starvation_s` is therefore the part of stall time (episodes >= 250 ms) that lies
+    # inside a starvation episode: a subset of `stall_s` by construction, never to be
+    # added to it. The raw episode total is kept as a diagnostic (`raw_total_ms`).
     starved = []
     open_st = None
-    client_end = max((r["ts"] for r in recs if r.get("src") == "client"), default=None)
     for r in recs:
         if r.get("event") == "DATA_STARVED" and open_st is None:
             open_st = r
@@ -527,9 +577,19 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         start = open_st["ts"] - (open_st.get("since_last_append_ms") or 0)
         starved.append({"ts": start, "duration_ms": client_end - start, "track": open_st.get("track"),
                         "pending": open_st.get("pending"), "last_group": open_st.get("last_group"), "open_at_end": True})
+    stall_in_starvation = 0.0
+    for e in starved:
+        a, b = e["ts"], e["ts"] + (e["duration_ms"] or 0)
+        for x in major:
+            xa, xb = x["ts"], x["ts"] + (x["duration_ms"] or 0)
+            stall_in_starvation += max(0.0, min(b, xb) - max(a, xa))
     out["starvation"] = {"episodes": starved, "count": len(starved),
-                         "total_ms": sum(e["duration_ms"] or 0 for e in starved),
-                         "open_at_end": any(e.get("open_at_end") for e in starved)}
+                         # stall time (episodes >= 250 ms) inside starvation episodes: the headline
+                         "total_ms": stall_in_starvation,
+                         # raw episodes from the last append to DATA_RESUMED (or the run end)
+                         "raw_total_ms": sum(e["duration_ms"] or 0 for e in starved),
+                         "open_at_end": any(e.get("open_at_end") for e in starved),
+                         "subset_of": "stalls.total_ms"}
 
     # Switch timelines -------------------------------------------------------
     switch_recv = by("SWITCH_RECV")
@@ -666,15 +726,12 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "session_destroyed": any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR")),
     }
     out["switches"]["skipped_not_landed"] = out["switches"]["skipped_not_sent"]  # legacy name
-    out["switching"] = switching_diagnostics(switches, by, reversal_window_s)
+    out["switching"] = switching_diagnostics(switches, by, reversal_window_s, run_duration_s)
     out["feedback"] = feedback_windows(switches, by, feedback_window_s)
 
     # Samples: time shift, live edge, bitrate --------------------------------
-    samples = [s for s in by("SAMPLE") if st is None or s["ts"] >= st["ts"]]
     tse = [s.get("time_shift_error_ms") for s in samples if s.get("time_shift_error_ms") is not None]
     led = [s.get("live_edge_distance_ms") for s in samples if s.get("live_edge_distance_ms") is not None]
-    win_start = st["ts"] if st else None
-    win_end = (st["ts"] + initial_window_s * 1000) if st else None
     initial = [s.get("live_edge_distance_ms") for s in samples
                if win_end is not None and s["ts"] < win_end and s.get("live_edge_distance_ms") is not None]
     out["time_shift"] = {
@@ -701,8 +758,10 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "buffer_contig_s": stats([s.get("buffer_contig_s") for s in samples]),
         # Shift retained: mean live-edge distance over the last 60 s of the run (after
         # the profile's events), and the closest the client came to live at any point.
-        "retained_live_edge_ms": statistics.fmean([s["live_edge_distance_ms"] for s in samples[-240:]
-                                                   if s.get("live_edge_distance_ms") is not None] or [float("nan")]),
+        # (by time: SAMPLEs within 60 s of the last one, not the last 240 records).
+        "retained_live_edge_ms": statistics.fmean([s["live_edge_distance_ms"] for s in samples
+                                                   if s["ts"] >= samples[-1]["ts"] - 60_000
+                                                   and s.get("live_edge_distance_ms") is not None] or [float("nan")]),
         "min_live_edge_ms": min((s["live_edge_distance_ms"] for s in samples if s.get("live_edge_distance_ms") is not None), default=None),
         "playback_rate": stats([s.get("playback_rate") for s in samples]),
         "latency_ms": stats([s.get("last_latency_ms") for s in samples if s.get("last_latency_ms")]),
@@ -1080,7 +1139,7 @@ def to_markdown(s: dict) -> str:
          f"| startup delay (ms) | {fmt(s['startup']['startup_delay_ms'])} |",
          f"| first group / expected / clamped | {s['startup']['first_group']} / {s['startup']['expected_start_group']} / {s['startup']['clamped_by_relay']} |",
          f"| stalls (count / total ms / max ms) | {s['stalls']['count']} / {fmt(s['stalls']['total_ms'])} / {fmt(s['stalls']['max_ms'])} |",
-         f"| seeks wedge / range-jump (deferred gaps) / unwedge | {s['stalls']['seeks']['wedge']} / {s['stalls']['seeks']['range-jump']} ({s['stalls']['range_jumps_deferred']}) / {s['stalls']['seeks']['unwedge']} |",
+         f"| seeks (all): startup / gap / wedge / visibility; deferred gaps | {s['stalls']['seeks']['startup']} / {s['stalls']['seeks']['gap']} / {s['stalls']['seeks']['wedge']} / {s['stalls']['seeks']['visibility']}; {s['stalls']['range_jumps_deferred']} |",
          f"| data starvation episodes / total s | {s['starvation']['count']} / {fmt(s['starvation']['total_ms'] / 1000)}{' (open at end)' if s['starvation']['open_at_end'] else ''} |",
          f"| down-reaction / up-recovery s (played rung held {s['reaction']['sustain_s']:g} s) | {fmt((s['reaction']['down_reaction_ms'] or 0) / 1000) if s['reaction']['down_reaction_ms'] is not None else '-'} / {fmt((s['reaction']['up_recovery_ms'] or 0) / 1000) if s['reaction']['up_recovery_ms'] is not None else '-'} |",
          f"| controller arm; up-guard vetoes; probes discarded | {(s.get('identity') or {}).get('controller') or 'baseline'}; {s['switching']['up_guard_vetoes']}; {s['switching']['probes_discarded']} |",
@@ -1149,7 +1208,7 @@ METRIC_COLUMNS = ["startup_delay_ms", "stall_count", "stall_total_ms", "switch_c
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
                   "detection_reliable", "down_reaction_ms", "up_recovery_ms", "data_starved_ms",
-                  "range_jumps", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
+                  "gap_seeks", "range_jumps_deferred", "up_guard_vetoes", "probes_discarded", "media_errors",
                   "mean_rung_index", "truncated_groups", "discarded_objects", "discarded_mb",
                   "probe_mbps", "probe_measured_min_mbps", "probe_measured_p50_mbps", "conn_loss_rate", "conn_cwnd_min_bytes",
                   "conn_congestion_events", "send_recv_latency_p50_ms", "down_t2_ms", "down_t4_ms", "up_t2_ms", "down_reliable", "up_reliable",
@@ -1206,7 +1265,7 @@ def agg_row(s: dict) -> dict:
         "down_reaction_ms": s["reaction"]["down_reaction_ms"],
         "up_recovery_ms": s["reaction"]["up_recovery_ms"],
         "data_starved_ms": s["starvation"]["total_ms"],
-        "range_jumps": s["stalls"]["seeks"]["range-jump"],
+        "gap_seeks": s["stalls"]["gap_seeks"],
         "range_jumps_deferred": s["stalls"]["range_jumps_deferred"],
         "up_guard_vetoes": s["switching"]["up_guard_vetoes"],
         "probes_discarded": s["switching"]["probes_discarded"],
