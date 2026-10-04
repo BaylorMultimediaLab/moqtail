@@ -135,6 +135,28 @@ class Safety(unittest.TestCase):
             self.assertFalse(rx.wait_log_line(log, "no such line", 0.3))
 
 
+class Controller(unittest.TestCase):
+    def _args(self, controller="min", overrides=None):
+        import argparse
+        return argparse.Namespace(controller=controller, controller_param=overrides)
+
+    def test_min_is_default_and_one_url_param(self):
+        self.assertEqual(rx.DEFAULT_CONTROLLER, "min")
+        self.assertEqual(rx.controller_params(self._args("min")), {rx.CONTROLLER_ARM_PARAM: "min"})
+        self.assertEqual(rx.controller_params(self._args("baseline")), {})
+        # grid keeps its knob params, untouched by the arm param
+        grid = rx.controller_params(self._args("grid"))
+        self.assertNotIn(rx.CONTROLLER_ARM_PARAM, grid)
+        self.assertEqual(grid["probeMaxBytes"], 65536)
+
+    def test_override_typing(self):
+        p = rx.controller_params(self._args("min", ["upDwellGroups=4", "bufferSignal=envelope", "safety=0.9"]))
+        self.assertEqual(p, {rx.CONTROLLER_ARM_PARAM: "min", "upDwellGroups": 4, "bufferSignal": "envelope",
+                             "safety": 0.9})
+        with self.assertRaises(SystemExit):
+            rx.controller_params(self._args("min", ["novalue"]))
+
+
 class Records(unittest.TestCase):
     def test_find_record_and_cache_meta(self):
         with tempfile.TemporaryDirectory() as d:

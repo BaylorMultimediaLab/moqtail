@@ -66,8 +66,15 @@ MECHANISM_URL_PARAM = {"native": None, "pr1378": "switchFloor", "switch-from": "
 # can attribute effects (docs/abr-controller.md, section 9).
 GUARD = {"upGuardSamples": 3, "upGuardRelease": "landed"}
 PROBE = {"probeMinBytes": 250000, "probeMinDurationMs": 300}
+# The paper controller `min` (docs/rebuild-2026-10-04.md, "Controller min") is
+# selected by one URL parameter; its constants live in the client (W5) and are
+# logged in RUN_META.controller. The name is kept here, in one place, so a
+# rename in W5's spec is a one-line change.
+CONTROLLER_ARM_PARAM = "controllerArm"
+DEFAULT_CONTROLLER = "min"
 CONTROLLER_PARAMS = {
     "baseline": {},
+    "min": {CONTROLLER_ARM_PARAM: "min"},
     "probe": PROBE,
     "guard": GUARD,
     "both": {**PROBE, **GUARD},
@@ -109,12 +116,18 @@ CONTROLLER_PARAMS = {
 
 
 def controller_params(args) -> dict:
+    """URL parameters for the selected arm plus --controller-param overrides
+    (numeric values become numbers, anything else stays a string)."""
     params = dict(CONTROLLER_PARAMS[args.controller])
     for kv in args.controller_param or []:
         k, _, v = kv.partition("=")
         if not v:
             sys.exit(f"--controller-param expects KEY=VALUE, got {kv!r}")
-        params[k] = v if k in ("upGuardRelease", "switchHistoryMode", "bufferSignal", "probeMode") else int(float(v))
+        try:
+            num = float(v)
+            params[k] = int(num) if num == int(num) else num
+        except ValueError:
+            params[k] = v
     return params
 
 
@@ -582,13 +595,14 @@ def main() -> int:
     ap.add_argument("--headed", action="store_true", help="show the browser window")
     ap.add_argument("--log-objects", action="store_true", help="one OBJECT_RECV per frame (needed for VMAF joins)")
     ap.add_argument("--abr", default="", help="extra ABR URL params, e.g. 'stableBufferTime=8&bufferTimeDefault=8'")
-    ap.add_argument("--controller", choices=list(CONTROLLER_PARAMS), default="baseline",
-                    help="controller stabilisation arm: baseline | probe (payload floor + min duration) | "
-                         "guard (post-switch up-guard) | both; recorded in the identity block")
+    ap.add_argument("--controller", choices=list(CONTROLLER_PARAMS), default=DEFAULT_CONTROLLER,
+                    help="ABR controller arm: min (the paper controller, default; one URL param "
+                         f"{CONTROLLER_ARM_PARAM}=min) | grid (the frozen pre-rebuild controller) | baseline (as shipped) "
+                         "| the ablation arms of docs/abr-controller.md 9; recorded in the identity block")
     ap.add_argument("--controller-param", action="append", metavar="KEY=VALUE",
-                    help="override one controller parameter (probeMinBytes, probeMinDurationMs, upGuardSamples, "
-                         "upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs, "
-                         "probeMode, probeMaxBytes)")
+                    help="override one controller URL parameter (grid/baseline knobs: probeMinBytes, probeMinDurationMs, "
+                         "upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, "
+                         "bufferSignal, bufferEnvelopeMs, probeMode, probeMaxBytes; min: see docs/abr-controller.md)")
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
     ap.add_argument("--no-analyze", action="store_true")
