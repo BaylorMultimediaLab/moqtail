@@ -434,4 +434,20 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       expect(group(t, 21n, 'B', 3000)[0]!.unroutedBytes).toBe(0);
     });
   });
+
+  describe('highest group received per track (F10)', () => {
+    it('is the max group seen for the track, not the last one recorded', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      expect(t.getMaxGroup('B')).toBeUndefined();
+      t.recordObject(1000, 10n, { recvAt: 1000, track: 'B', lastInGroup: false });
+      // A catch-up group arrives after the live one.
+      t.recordObject(1000, 5n, { recvAt: 1001, track: 'B', lastInGroup: false });
+      t.recordObject(1000, 12n, { recvAt: 1002, track: 'A', lastInGroup: false });
+      expect(t.getMaxGroup('B')).toBe(10n);
+      expect(t.getMaxGroup('A')).toBe(12n);
+      // Dropped objects were received too; late objects of a sampled group as well.
+      t.recordObject(1000, 11n, { recvAt: 1003, track: 'B', discarded: true });
+      expect(t.getMaxGroup('B')).toBe(11n);
+    });
+  });
 });

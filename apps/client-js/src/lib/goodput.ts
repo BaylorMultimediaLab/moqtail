@@ -139,6 +139,8 @@ export class GoodputTracker {
   #lateObjects = 0;
   // Unrouted bytes with no open group to take them, until the next sample (F6).
   #unroutedPending = 0;
+  // Highest group id received per track (F10).
+  #maxGroup = new Map<string, bigint>();
   /** A group with no object for this long is finalised whatever else happens (ms). */
   #abandonMs: number;
 
@@ -180,6 +182,8 @@ export class GoodputTracker {
     const track = opts.track ?? '';
     this.#lastObjectBytes = bytes;
     this.#cumulativeBytes += bytes;
+    const seen = this.#maxGroup.get(track);
+    if (seen === undefined || groupId > seen) this.#maxGroup.set(track, groupId);
     const out: GroupSample[] = [];
 
     // Groups of this track that a later group has overtaken, and groups
@@ -285,6 +289,16 @@ export class GoodputTracker {
     return { ...this.#samplesByTrack };
   }
 
+  /**
+   * Highest group id of any object recorded for `track` (appended or
+   * dropped), undefined before the first. Groups of one track arrive out of
+   * order (a catch-up beside live delivery, a refetch), so the last recorded
+   * group is not how far the client has received (F10).
+   */
+  getMaxGroup(track: string): bigint | undefined {
+    return this.#maxGroup.get(track);
+  }
+
   /** Objects that arrived for a group after its sample closed (folded in, not sampled again). */
   getLateObjects(): number {
     return this.#lateObjects;
@@ -335,6 +349,7 @@ export class GoodputTracker {
     this.#closed.clear();
     this.#lateObjects = 0;
     this.#unroutedPending = 0;
+    this.#maxGroup.clear();
     this.#lastObjectBytes = 0;
     this.#lastGroupDurationMs = 0;
     this.#lastGroupBps = 0;

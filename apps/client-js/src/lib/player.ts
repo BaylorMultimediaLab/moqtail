@@ -63,7 +63,6 @@ interface MOQStreamStruct {
   source: ReadableStream<MoqtObject>;
   requestId: bigint;
   tracker: GoodputTracker;
-  lastGroupId: bigint;
   pendingSwitch: PendingSwitch | null;
   /** End PTS (ms) of the last appended segment from the active track (the append front). Updated after a successful append only (M9). Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
@@ -1057,8 +1056,8 @@ export class Player {
             }
 
             // Throughput: arrival spacing of this object's group (M11). A frame
-            // that could not be appended still crossed the link.
-            struct.lastGroupId = object.location.group;
+            // that could not be appended still crossed the link. The tracker
+            // also keeps the highest group received per track (F10).
             this.#recordArrival(struct, object, objectTrackName, info, maxRetries < 0);
 
             // First-received-group export for E2E smoke + connect-time metrics (Phase C).
@@ -1380,7 +1379,7 @@ export class Player {
       track: vs.trackName,
       request_id: Number(vs.requestId),
       pending: vs.pendingSwitch?.trackName ?? null,
-      last_group: Number(vs.lastGroupId),
+      last_group: Number(this.#lastGroupOf(vs)),
       since_last_append_ms: now - vs.lastAppendPerf,
       playhead_ms: el.currentTime * 1000,
       buffered_end_ms: buf.length > 0 ? buf.end(buf.length - 1) * 1000 : null,
@@ -1388,6 +1387,11 @@ export class Player {
       mse_ready_state: this.#mse?.readyState ?? 'closed',
       init_pending: vs.pendingInit !== undefined,
     });
+  }
+
+  /** Highest group id received for the stream's current track, -1n before any (F10). */
+  #lastGroupOf(struct: MOQStreamStruct): bigint {
+    return struct.tracker.getMaxGroup(struct.trackName) ?? -1n;
   }
 
   /** End PTS (ms) of the most recently appended video frame: where new data is landing in the buffer. */
@@ -1784,7 +1788,9 @@ export class Player {
         playheadPTS_ms !== undefined && this.#timeMap?.hasAnchor()
           ? this.#timeMap.groupContainingPTS(playheadPTS_ms)
           : null,
-      last_received_group: videoStruct.lastGroupId,
+      // Highest group received on the current track (any order, dropped
+      // objects included), -1 before any (F10; feeds pr1378's floor).
+      last_received_group: this.#lastGroupOf(videoStruct),
       // The append front (end PTS of the last appended frame). buffered_end_ms
       // is the same value under its historical name; SAMPLE.buffered_end_ms is
       // the element's last buffered range end, a different quantity.
@@ -1949,7 +1955,6 @@ export class Player {
         requestId: result.requestId,
         source: result.stream,
         tracker,
-        lastGroupId: -1n,
         pendingSwitch: null,
         lastAppendedEndPTS_ms: undefined,
       };
@@ -2067,7 +2072,6 @@ export class Player {
       requestId: result.requestId,
       source: result.stream,
       tracker,
-      lastGroupId: -1n,
       pendingSwitch: null,
       lastAppendedEndPTS_ms: undefined,
     };
