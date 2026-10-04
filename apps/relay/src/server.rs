@@ -95,14 +95,37 @@ impl Server {
 
   /// Experiment instrumentation: once per second, record the size of every
   /// track cache (groups, bytes, oldest/newest group) to the event log so the
-  /// cost of holding several representations can be reported.
+  /// cost of holding several representations can be reported, and the QUIC
+  /// path statistics of every connection (CONN_STATS: rtt, cwnd, cumulative
+  /// lost packets/bytes, congestion events, bytes sent) so a congestion-
+  /// collapsed connection is distinguishable from a relay that withheld data.
   fn spawn_cache_stats_task(&self, mut shutdown: watch::Receiver<bool>) {
     let track_manager = self.track_manager.clone();
+    let clients = self.client_manager.clients.clone();
     tokio::spawn(async move {
       let mut ticker = tokio::time::interval(Duration::from_secs(1));
       loop {
         tokio::select! {
           _ = ticker.tick() => {
+            let conns: Vec<Arc<MOQTClient>> = clients.read().await.values().cloned().collect();
+            for c in conns {
+              let st = c.connection.stats();
+              events::emit(
+                "CONN_STATS",
+                serde_json::json!({
+                  "conn": c.connection_id,
+                  "transport": format!("{:?}", c.transport_kind),
+                  "rtt_ms": st.path.rtt.as_secs_f64() * 1000.0,
+                  "cwnd": st.path.cwnd,
+                  "lost_packets": st.path.lost_packets,
+                  "lost_bytes": st.path.lost_bytes,
+                  "sent_packets": st.path.sent_packets,
+                  "congestion_events": st.path.congestion_events,
+                  "udp_tx_bytes": st.udp_tx.bytes,
+                  "udp_rx_bytes": st.udp_rx.bytes,
+                }),
+              );
+            }
             let tracks: Vec<_> = track_manager.tracks.read().await.values().cloned().collect();
             for track in tracks {
               let (relay_track_id, name, stats) = {
