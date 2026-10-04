@@ -39,8 +39,23 @@ impl SubgroupObject {
   ) -> Result<Bytes, ParseError> {
     let mut buf = BytesMut::new();
 
+    // Object IDs within a subgroup strictly increase, so the delta is
+    // `object_id - previous - 1`. An object at or below the previous one (a
+    // duplicate, or one out of order) cannot be encoded: report it rather than
+    // underflow (a panic in debug builds, a wrapped delta and a failed varint
+    // write in release).
     let object_id_delta = if let Some(id) = previous_object_id {
-      self.object_id - id - 1
+      self
+        .object_id
+        .checked_sub(id)
+        .and_then(|d| d.checked_sub(1))
+        .ok_or_else(|| ParseError::ProtocolViolation {
+          context: "SubgroupObject::serialize(object_id)",
+          details: format!(
+            "object id {} does not follow previous object id {id} in this subgroup",
+            self.object_id
+          ),
+        })?
     } else {
       self.object_id
     };
@@ -208,6 +223,23 @@ mod tests {
     let deserialized = SubgroupObject::deserialize(&mut buf, &Some(prev_object_id), true).unwrap();
     assert_eq!(deserialized, subgroup_object);
     assert!(!buf.has_remaining());
+  }
+
+  /// An object at or below the previous one on the same subgroup stream (the
+  /// relay's replay/live overlap) is an error, not an underflow.
+  #[test]
+  fn test_object_not_after_previous_is_an_error() {
+    let object = |object_id| SubgroupObject {
+      object_id,
+      properties: None,
+      object_status: None,
+      payload: Some(Bytes::from_static(b"x")),
+    };
+    assert!(object(5).serialize(Some(5), false).is_err(), "duplicate");
+    assert!(object(3).serialize(Some(5), false).is_err(), "behind");
+    assert!(object(0).serialize(Some(u64::MAX), false).is_err());
+    let mut buf = object(6).serialize(Some(5), false).unwrap();
+    assert_eq!(buf.get_vi().unwrap(), 0, "next object: delta 0");
   }
 
   #[test]

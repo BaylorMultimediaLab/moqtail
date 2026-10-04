@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::holding_subscribes::HoldingSubscribes;
 use super::seen_objects::SeenObjects;
 use super::track_cache::TrackCache;
 use crate::server::config::AppConfig;
@@ -207,11 +206,6 @@ pub struct Track {
   /// while nothing downstream wants the track; this records whether it has
   /// since been raised, so it is raised only once.
   pub upstream_forward: Arc<AtomicBool>,
-  /// SUBSCRIBEs in delay-mode "holding" state, waiting for the live edge to
-  /// advance past their `delay_groups`. Drained by Task A8 when the publisher
-  /// emits new objects.
-  #[allow(dead_code)]
-  pub(crate) holding_subscribes: Arc<RwLock<HoldingSubscribes>>,
   /// Notified whenever `largest_location` advances. Subscribe handlers
   /// holding for the live edge to reach `delay_groups` await on this.
   pub(crate) live_edge_advanced: Arc<Notify>,
@@ -253,7 +247,6 @@ impl Track {
       upstream_subscribe_cancellers: Arc::new(Mutex::new(Vec::new())),
       pending_upstream_subscribe_count: Arc::new(AtomicUsize::new(0)),
       upstream_forward: Arc::new(AtomicBool::new(false)),
-      holding_subscribes: Arc::new(RwLock::new(HoldingSubscribes::default())),
       live_edge_advanced: Arc::new(Notify::new()),
     }
   }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
-use crate::server::client::switch_context::SwitchStatus;
+use crate::server::client::switch_context::{SwitchContext, SwitchStatus};
 use crate::server::events;
 use crate::server::message_handlers::parameters;
 use crate::server::session::Session;
@@ -24,6 +24,7 @@ use bytes::Bytes;
 use core::result::Result;
 use moqtail::model::common::location::Location;
 use moqtail::model::control::constant::FilterType;
+use moqtail::model::control::constant::GroupOrder;
 use moqtail::model::control::constant::PublishDoneStatusCode;
 use moqtail::model::control::publish_done::PublishDone;
 use moqtail::model::control::request_error::RequestError;
@@ -36,6 +37,7 @@ use moqtail::model::data::subgroup_object::SubgroupObject;
 use moqtail::model::error::RequestErrorCode;
 use moqtail::model::error::StreamResetCode;
 use moqtail::model::error::TerminationCode;
+use moqtail::model::parameter::constant::MessageParameterType;
 use moqtail::model::parameter::message_parameter::{
   MessageParameter, MessageParameterVecExt, apply_message_parameter_update,
 };
@@ -210,8 +212,16 @@ async fn handle_probe_subscribe(
 
   let stream_id = StreamId::new_subgroup(track_alias, 0, Some(0));
 
-  // Stream-scheduling priority 0 -- yield to real video under congestion.
-  let send_stream = match client.open_stream(&stream_id, header_bytes, 0).await {
+  // Stream-scheduling priority: the lowest slot of the lowest band, so the probe
+  // yields to every video stream whatever subscriber priority they carry (M3).
+  let send_stream = match client
+    .open_stream(
+      &stream_id,
+      header_bytes,
+      crate::server::subscription::probe_stream_priority(),
+    )
+    .await
+  {
     Ok(s) => s,
     Err(e) => {
       warn!("probe: failed to open stream: {:?}", e);
@@ -711,19 +721,15 @@ async fn handle_subscribe_message(
     );
     // Clone the handles out of the guard: the hold below awaits, and the
     // track lock must not be held across it.
-    let (live_edge_advanced, cache, holding_subscribes) = {
+    let (live_edge_advanced, cache) = {
       let track = track_arc.read().await;
-      (
-        track.live_edge_advanced.clone(),
-        track.cache.clone(),
-        track.holding_subscribes.clone(),
-      )
+      (track.live_edge_advanced.clone(), track.cache.clone())
     };
     // Loop until we can resolve the requested start position.
     // Mesa-style condition wait: arm the Notify *before* re-reading state
     // to avoid lost-wakeup races (a notify_waiters between our compute and
     // our await would otherwise be missed).
-    let mut registered = false;
+    let mut held = false;
     loop {
       let notified = live_edge_advanced.notified();
       tokio::pin!(notified);
@@ -753,7 +759,7 @@ async fn handle_subscribe_message(
               "largest_group": largest.as_ref().map(|l| l.group),
               "oldest_cached_group": oldest_cached,
               "start_group": loc.group,
-              "held": registered,
+              "held": held,
             }),
           );
           sub
@@ -763,14 +769,10 @@ async fn handle_subscribe_message(
               Some(loc),
               None,
             ));
-          // Drain any holding-state record for this request (informational).
-          if registered && let Some(largest) = largest {
-            let _ = holding_subscribes.write().await.try_resolve(largest);
-          }
           break;
         }
         DelayedStart::Hold { delay_groups: dg } => {
-          if !registered {
+          if !held {
             info!(
               "Subscribe delay-mode HOLD: request_id={} delay_groups={} \
                largest={:?}; awaiting live edge advance",
@@ -786,11 +788,7 @@ async fn handle_subscribe_message(
                 "largest_group": largest.as_ref().map(|l| l.group),
               }),
             );
-            holding_subscribes
-              .write()
-              .await
-              .register(sub.request_id, dg);
-            registered = true;
+            held = true;
           }
           // Wait for the live edge to advance, then re-check. The Notify arm
           // placed before the read still covers any notify_waiters that fired
@@ -1492,6 +1490,38 @@ async fn handle_subscribe_error_message(
   Ok(())
 }
 
+/// Parameters of the SUBSCRIBE a native SWITCH is turned into.
+///
+/// The player sends SWITCH with no parameters at all (the TS client forwards
+/// `parameters ?? []`), and `SubscriptionState::from` falls back to subscriber
+/// priority 128 / GroupOrder::Ascending for a SUBSCRIBE that carries neither. The
+/// original subscription was made at priority 0, so the promoted subscription's
+/// video dropped into a band below the old track's remaining streams and the probe.
+/// SubscriberPriority and GroupOrder therefore fall back to the subscription being
+/// switched from; a SWITCH that does carry them is honoured. Forward is always true.
+pub(crate) fn switch_subscribe_parameters(
+  mut switch_params: Vec<MessageParameter>,
+  inherited_priority: u8,
+  inherited_group_order: GroupOrder,
+) -> Vec<MessageParameter> {
+  if switch_params
+    .get_param(MessageParameterType::SubscriberPriority)
+    .is_none()
+  {
+    switch_params.set_param(MessageParameter::new_subscriber_priority(
+      inherited_priority,
+    ));
+  }
+  if switch_params
+    .get_param(MessageParameterType::GroupOrder)
+    .is_none()
+  {
+    switch_params.set_param(MessageParameter::new_group_order(inherited_group_order));
+  }
+  switch_params.set_param(MessageParameter::new_forward(true)); // forward always true for switch
+  switch_params
+}
+
 async fn handle_switch_message(
   client: Arc<MOQTClient>,
   stream_handler: &mut ControlStreamHandler,
@@ -1548,47 +1578,47 @@ async fn handle_switch_message(
 
   let switch_from_track = switch_from_track_guard.read().await;
 
-  if let Some(sub) = client
+  // The subscription being switched from: it must be live, and its scheduling
+  // parameters are what the switched subscription inherits.
+  let (inherited_priority, inherited_group_order) = if let Some(sub) = client
     .subscriptions
     .get_subscription(&switch_from_track.full_track_name)
     .await
   {
-    if sub.upgrade().is_none() {
+    let Some(sub) = sub.upgrade() else {
       warn!(
         "subscription weak reference is dead for track: {:?} subscriber: {}",
         switch_from_track.full_track_name, context.connection_id
       );
       return Err(TerminationCode::ProtocolViolation);
-    }
+    };
 
-    let mut is_active = false;
-    if let Some(sub) = sub.upgrade() {
-      let sub = sub.read().await;
-      is_active = sub.is_active().await;
-    }
-
-    if !is_active {
+    let sub = sub.read().await;
+    if !sub.is_active().await {
       warn!(
         "subscription is not active for track: {:?} subscriber: {}",
         switch_from_track.full_track_name, context.connection_id
       );
       return Err(TerminationCode::ProtocolViolation);
     }
+    let state = sub.subscription_state.read().await;
+    (state.subscriber_priority, state.group_order)
   } else {
     warn!(
       "no subscription found for track: {:?} subscriber: {}",
       switch_from_track.full_track_name, context.connection_id
     );
     return Err(TerminationCode::ProtocolViolation);
-  }
+  };
 
-  let mut switch_params: Vec<MessageParameter> = switch_message
+  let switch_params: Vec<MessageParameter> = switch_message
     .subscribe_parameters
     .iter()
     .filter_map(|kvp| MessageParameter::deserialize(kvp).ok())
     .collect();
 
-  switch_params.set_param(MessageParameter::new_forward(true)); // forward always true for switch
+  let switch_params =
+    switch_subscribe_parameters(switch_params, inherited_priority, inherited_group_order);
 
   let subscribe = Subscribe::new_latest_object(
     switch_message.request_id,
@@ -1599,35 +1629,63 @@ async fn handle_switch_message(
 
   let new_full_track_name = subscribe.get_full_track_name();
 
-  if let Err(e) = handle_subscribe_message(
-    client.clone(),
-    stream_handler,
-    subscribe,
-    context.clone(),
-    true, // is_switch
+  let result = with_native_switch_statuses(
+    &client.switch_context,
+    new_full_track_name,
+    switch_from_track.full_track_name.clone(),
+    handle_subscribe_message(
+      client.clone(),
+      stream_handler,
+      subscribe,
+      context.clone(),
+      true, // is_switch
+    ),
   )
-  .await
-  {
-    error!("error handling switch subscribe message: {:?}", e);
-    Err(e)
-  } else {
-    info!("switch subscribe message handled successfully");
-
-    // update the switch context
-    client
-      .switch_context
-      .add_or_update_switch_item(new_full_track_name, SwitchStatus::Next)
-      .await;
-
-    let switch_from_track_name = switch_from_track.full_track_name.clone();
-
-    client
-      .switch_context
-      .add_or_update_switch_item(switch_from_track_name, SwitchStatus::Current)
-      .await;
-
-    Ok(())
+  .await;
+  match &result {
+    Ok(()) => info!("switch subscribe message handled successfully"),
+    Err(e) => error!("error handling switch subscribe message: {:?}", e),
   }
+  result
+}
+
+/// Runs the SUBSCRIBE a native SWITCH is turned into with the switch context already
+/// saying target = Next, source = Current.
+///
+/// The statuses used to be set only after the SUBSCRIBE had been handled, i.e. after
+/// SUBSCRIBE_OK went out and `mark_alias_announced` released the switched
+/// subscription's forwarding. An object it dequeued in that window found no status
+/// for its track and was forwarded ungated (`check_switch_context`: "not in a switch
+/// context, always forward"), possibly mid-group, while the source track was never
+/// demoted for it; the one-shot `notify_switch` check was spent on it as well (Report
+/// 5, Minor: promotion race). With the statuses in place first, every object the
+/// switched subscription can see is gated by the Next branch.
+///
+/// If the SUBSCRIBE fails and the target has not been promoted meanwhile, the
+/// statuses are put back as they were.
+pub(crate) async fn with_native_switch_statuses<F>(
+  switch_context: &SwitchContext,
+  target: FullTrackName,
+  source: FullTrackName,
+  subscribe: F,
+) -> Result<(), TerminationCode>
+where
+  F: std::future::Future<Output = Result<(), TerminationCode>>,
+{
+  let before = switch_context.snapshot().await;
+  switch_context
+    .add_or_update_switch_item(target.clone(), SwitchStatus::Next)
+    .await;
+  switch_context
+    .add_or_update_switch_item(source, SwitchStatus::Current)
+    .await;
+
+  let result = subscribe.await;
+  if result.is_err() && switch_context.get_switch_status(&target).await == Some(SwitchStatus::Next)
+  {
+    switch_context.restore(before).await;
+  }
+  result
 }
 
 pub async fn handle(
@@ -1800,5 +1858,105 @@ mod tests_parse_probe_track_name {
     assert_eq!(parse_probe_track_name(b"video-720p"), None);
     assert_eq!(parse_probe_track_name(b".probe:0:1"), None);
     assert_eq!(parse_probe_track_name(b".probe:10:1:extra"), None);
+  }
+}
+
+/// The native SWITCH on the wire carries no parameters (player.ts passes none,
+/// client.ts forwards `parameters ?? []`); the relay turns it into a LatestObject
+/// SUBSCRIBE. These pin what the promoted subscription's scheduling ends up as.
+#[cfg(test)]
+mod tests_switch_subscribe_parameters {
+  use super::*;
+  use crate::server::subscription::{SubscriptionOrigin, SubscriptionState};
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+
+  fn state_for(params: Vec<MessageParameter>) -> SubscriptionState {
+    let sub = Subscribe::new_latest_object(
+      7,
+      Tuple::from_utf8_path("/moqtail"),
+      TupleField::from_utf8("video-720p"),
+      params,
+    );
+    SubscriptionState::from(SubscriptionOrigin::from(sub))
+  }
+
+  fn priority_of(params: &[MessageParameter]) -> Option<u8> {
+    params.iter().find_map(|p| match p {
+      MessageParameter::SubscriberPriority { priority } => Some(*priority),
+      _ => None,
+    })
+  }
+
+  fn order_of(params: &[MessageParameter]) -> Option<GroupOrder> {
+    params.iter().find_map(|p| match p {
+      MessageParameter::GroupOrder { order } => Some(*order),
+      _ => None,
+    })
+  }
+
+  /// Before the fix a parameterless SWITCH made the promoted subscription fall
+  /// back to priority 128 while the original SUBSCRIBE was at 0.
+  #[test]
+  fn parameterless_switch_inherits_the_old_subscriptions_priority_and_order() {
+    let params = switch_subscribe_parameters(vec![], 0, GroupOrder::Ascending);
+    assert_eq!(priority_of(&params), Some(0));
+    assert_eq!(order_of(&params), Some(GroupOrder::Ascending));
+    let state = state_for(params);
+    assert_eq!(state.subscriber_priority, 0);
+    assert_eq!(state.group_order, GroupOrder::Ascending);
+    assert!(state.forward);
+    assert_eq!(state.filter_type, FilterType::LatestObject);
+    assert_eq!(state.start_location, None);
+  }
+
+  /// A SWITCH that carries SubscriberPriority(0) is honoured even when the old
+  /// subscription sat at 128.
+  #[test]
+  fn explicit_switch_priority_is_honoured() {
+    let params = switch_subscribe_parameters(
+      vec![MessageParameter::new_subscriber_priority(0)],
+      128,
+      GroupOrder::Ascending,
+    );
+    assert_eq!(priority_of(&params), Some(0));
+    assert_eq!(state_for(params).subscriber_priority, 0);
+  }
+
+  #[test]
+  fn explicit_switch_group_order_is_honoured() {
+    let params = switch_subscribe_parameters(
+      vec![MessageParameter::new_group_order(GroupOrder::Descending)],
+      0,
+      GroupOrder::Ascending,
+    );
+    assert_eq!(order_of(&params), Some(GroupOrder::Descending));
+    assert_eq!(priority_of(&params), Some(0), "priority still inherited");
+    assert_eq!(state_for(params).group_order, GroupOrder::Descending);
+  }
+
+  /// Forward is always true for a switch, whatever the SWITCH said.
+  #[test]
+  fn forward_is_forced_true() {
+    let params = switch_subscribe_parameters(
+      vec![MessageParameter::new_forward(false)],
+      0,
+      GroupOrder::Ascending,
+    );
+    let forwards: Vec<bool> = params
+      .iter()
+      .filter_map(|p| match p {
+        MessageParameter::Forward { forward } => Some(*forward),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(forwards, vec![true]);
+    assert!(state_for(params).forward);
+  }
+
+  /// Without inheritance the relay default is 128: the value the audit measured.
+  #[test]
+  fn relay_default_without_inheritance_is_128() {
+    let state = state_for(vec![MessageParameter::new_forward(true)]);
+    assert_eq!(state.subscriber_priority, 128);
   }
 }
