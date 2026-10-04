@@ -87,7 +87,6 @@ interface MOQStreamStruct {
 
 interface SubscribeOptions {
   trackName: string;
-  priority?: number;
 }
 
 export interface PlayerOptions {
@@ -152,6 +151,30 @@ export function buildSubscribeParameters(opts: {
   const delayGroups = Math.round((opts.timeShiftSeconds * 1000) / opts.gopDurationMs);
   if (delayGroups <= 0) return undefined;
   return new MessageParameters().addDelayGroups(delayGroups).build();
+}
+
+/**
+ * Scheduling of every media subscription, identical on every branch
+ * (transport fairness): the relay orders streams by subscriber priority, then
+ * group order. The player's SUBSCRIBEs use these.
+ */
+export const MEDIA_SCHEDULING = { priority: 0, groupOrder: GroupOrder.Ascending } as const;
+
+/**
+ * Parameters of every SWITCH: the same SubscriberPriority and GroupOrder as the
+ * SUBSCRIBE, carried explicitly so the switched subscription is scheduled like
+ * the original one. A SWITCH without them is scheduled at the relay's default
+ * (priority 128): below the old subscription's remaining streams and the
+ * probe. The relay also inherits the old subscription's values for a native
+ * SWITCH that carries none; carrying them makes every branch say the same.
+ *
+ * Exported for unit testing.
+ */
+export function buildSwitchParameters(): MessageParameter[] {
+  return new MessageParameters()
+    .addSubscriberPriority(MEDIA_SCHEDULING.priority)
+    .addGroupOrder(MEDIA_SCHEDULING.groupOrder)
+    .build();
 }
 
 /**
@@ -1497,9 +1520,11 @@ export class Player {
     const vBytesStart = videoStruct?.tracker.getCumulativeBytes() ?? 0;
     const tStart = Date.now();
 
+    // The probe stays at the lowest subscriber priority: the relay derives its
+    // stream priority below every video stream regardless, and 255 says the same.
     const result = await this.client.subscribe({
       fullTrackName,
-      groupOrder: GroupOrder.Original,
+      groupOrder: MEDIA_SCHEDULING.groupOrder,
       filterType: FilterType.LatestObject,
       forward: true,
       priority: 255,
@@ -1708,6 +1733,7 @@ export class Player {
         requestId: newRequestId,
         fullTrackName,
         subscriptionRequestId,
+        parameters: buildSwitchParameters(),
       });
 
       if (result instanceof RequestError) {
@@ -1826,7 +1852,7 @@ export class Player {
 
     let struct: MOQStreamStruct;
     if (this.#options.receiveCatalogViaSubscribe) {
-      struct = await this.subscribe({ trackName: 'catalog', priority: 0 });
+      struct = await this.subscribe({ trackName: 'catalog' });
     } else {
       const result = await this.client.fetch({
         groupOrder: GroupOrder.Original,
@@ -1913,10 +1939,10 @@ export class Player {
     }
     const result = await this.client.subscribe({
       fullTrackName: getFullTrackName(this.#options.namespace, params.trackName),
-      groupOrder: GroupOrder.Original,
+      groupOrder: MEDIA_SCHEDULING.groupOrder,
       filterType: FilterType.LatestObject,
       forward: true,
-      priority: params.priority ?? 0,
+      priority: MEDIA_SCHEDULING.priority,
       parameters,
     });
     if (result instanceof RequestError) {

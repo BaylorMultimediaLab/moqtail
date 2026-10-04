@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { FullTrackName, Tuple } from 'moqtail';
-import { buildSubscribeParameters, computeStartupTarget, unroutedDropFields } from './player';
+import { FullTrackName, GroupOrder, Tuple } from 'moqtail';
+import { GroupOrderParam, SubscriberPriority } from 'moqtail/model';
+import {
+  MEDIA_SCHEDULING,
+  buildSubscribeParameters,
+  buildSwitchParameters,
+  computeStartupTarget,
+  unroutedDropFields,
+} from './player';
 
 describe('buildSubscribeParameters', () => {
   it('returns undefined for live-edge mode', () => {
@@ -182,5 +189,22 @@ describe('unroutedDropFields', () => {
         { current: '480p', pending: '720p' },
       ),
     ).toMatchObject({ track: null, subgroup: null, pending: '720p', bytes: 10 });
+  });
+});
+
+// Transport fairness: the relay schedules by subscriber priority, then group
+// order. A SWITCH without them fell back to priority 128 on the relay (C3 on
+// pr1378, and the native promoted subscription on harness), below the old
+// subscription's leftovers and the probe.
+describe('media scheduling parameters (transport fairness)', () => {
+  it('SUBSCRIBE: subscriber priority 0, ascending group order', () => {
+    expect(MEDIA_SCHEDULING).toEqual({ priority: 0, groupOrder: GroupOrder.Ascending });
+  });
+
+  it('SWITCH carries SubscriberPriority(0) and GroupOrder(Ascending) explicitly', () => {
+    expect(buildSwitchParameters().map(p => p.toKeyValuePair())).toEqual([
+      new SubscriberPriority(0).toKeyValuePair(),
+      new GroupOrderParam(GroupOrder.Ascending).toKeyValuePair(),
+    ]);
   });
 });

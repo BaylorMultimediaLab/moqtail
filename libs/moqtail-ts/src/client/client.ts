@@ -3289,6 +3289,39 @@ if (import.meta.vitest) {
       await client.disconnect()
     })
 
+    // Transport fairness: the SWITCH must carry the subscriber priority and group
+    // order on the wire (the relay honours them for the switched subscription and
+    // otherwise falls back to its own defaults).
+    it('sends the SWITCH parameters on the wire', async () => {
+      const { client, transport } = await connected()
+      const subscribing = client.subscribe({
+        fullTrackName: ftn,
+        filterType: FilterType.LatestObject,
+        forward: true,
+        groupOrder: GroupOrder.Ascending,
+        priority: 0,
+      })
+      const subscribeStream = await openedStream(transport, 0)
+      const subscribe = subscribeStream.messages[0] as Subscribe
+      subscribeStream.respond(SubscribeOk.create(7n, [], []))
+      await subscribing
+
+      const switching = client.switch({
+        fullTrackName: FullTrackName.tryNew('room/alice', 'video-hi'),
+        subscriptionRequestId: subscribe.requestId,
+        parameters: [new SubscriberPriority(0), new GroupOrderParam(GroupOrder.Ascending)],
+      })
+      await vi.waitFor(() => expect(subscribeStream.messages).toHaveLength(2))
+      const sw = subscribeStream.messages[1] as Switch
+      expect(sw.parameters).toEqual([
+        new SubscriberPriority(0).toKeyValuePair(),
+        new GroupOrderParam(GroupOrder.Ascending).toKeyValuePair(),
+      ])
+      subscribeStream.respond(SubscribeOk.create(8n, [], []))
+      await switching
+      await client.disconnect()
+    })
+
     // M16: relay aliases are stable per track, so A to B to A hands the second A
     // subscription the alias the first one had. The first one's late completion
     // must not delete the route the second one now owns.
