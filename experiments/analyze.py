@@ -43,6 +43,9 @@ from pathlib import Path
 
 TERMINALS = ("first_frame", "superseded", "error", "skipped", "open")
 STALL_MIN_EPISODE_MS = 250.0
+FIT_SAFETY = 0.9
+SHARE_SETTLE_S = 5.0
+PRE_DROP_WINDOW_S = 20.0
 # SEEK reasons: one gap-crossing policy. Old bundles used range-jump / unwedge for what is now `gap`.
 SEEK_REASON_NORMAL = {"startup": "startup", "gap": "gap", "range-jump": "gap", "unwedge": "gap", "wedge": "wedge",
                       "visibility": "visibility"}
@@ -101,6 +104,22 @@ def stats(values: list[float]) -> dict:
         "n": len(vals), "mean": statistics.fmean(vals), "p50": pct(vals, 0.5), "p95": pct(vals, 0.95),
         "min": min(vals), "max": max(vals),
     }
+
+
+def censored_summary(values_s: list[float | None]) -> dict:
+    """Summary of a right-censored metric over repetitions, values in seconds. ``None``
+    means the event never happened in that run (censored at the run end), not "unknown":
+    callers drop not-applicable runs before calling. Returns ``n`` (runs with the event),
+    ``of`` (all runs), ``median_s`` (median over the runs with the event only:
+    survivorship-biased, kept for reference) and ``median_censored_s`` (median with every
+    censored run counted as +inf), which is the number to report next to ``n``/``of``."""
+    n_all = len(values_s)
+    events = [v for v in values_s if v is not None]
+    if n_all == 0:
+        return {"n": 0, "of": 0, "median_s": None, "median_censored_s": None}
+    filled = sorted(events + [math.inf] * (n_all - len(events)))
+    return {"n": len(events), "of": n_all, "median_s": statistics.median(events) if events else None,
+            "median_censored_s": statistics.median(filled)}
 
 
 def track_matches(relay_track, client_track) -> bool:
@@ -349,6 +368,49 @@ def weighted_rung(intervals, index_of: dict, bitrate_of: dict, t0: float = -math
     return {"rung_mean": rung_t / total, "kbps": kbps_t / total,
             "rung_share": {str(index_of[k]): v / total for k, v in sorted(share.items(), key=lambda kv: index_of[kv[0]])},
             "advancing_s": total / 1000}
+
+
+def share_in_window(intervals, index_of: dict, t0: float, t1: float, pred) -> dict:
+    """Share of advancing-playhead time in [t0, t1) whose presented rung satisfies ``pred``."""
+    total, hit = 0.0, 0.0
+    for a, b, track in intervals:
+        dt = max(0.0, min(b, t1) - max(a, t0))
+        if dt <= 0 or track not in index_of:
+            continue
+        total += dt
+        if pred(index_of[track]):
+            hit += dt
+    return {"share": (hit / total) if total > 0 else None, "advancing_s": total / 1000}
+
+
+def fit_rung(ladder: list[dict], rate_mbps: float | None, safety: float = FIT_SAFETY) -> int | None:
+    """Highest rung whose bitrate <= safety x rate; the lowest rung when none fits."""
+    if rate_mbps is None or not ladder:
+        return None
+    fitting = [i for i, t in enumerate(ladder) if (t.get("bitrate") or 0) <= safety * rate_mbps * 1e6]
+    return max(fitting) if fitting else 0
+
+
+def capacity_steps(changes: list[dict]) -> dict:
+    """First capacity drop and the first restore after it, from the runner's NET_CHANGE
+    records (``rate_mbps`` None = unshaped). Returns ts and rates (None when absent)."""
+    drop_i = None
+    for i in range(1, len(changes)):
+        a, b = changes[i - 1].get("rate_mbps"), changes[i].get("rate_mbps")
+        if a is not None and b is not None and b < a:
+            drop_i = i
+            break
+    out = {"t_drop": None, "low_rate_mbps": None, "pre_rate_mbps": None, "t_restore": None, "restore_rate_mbps": None}
+    if drop_i is None:
+        return out
+    out.update({"t_drop": changes[drop_i]["ts"], "low_rate_mbps": changes[drop_i].get("rate_mbps"),
+                "pre_rate_mbps": changes[drop_i - 1].get("rate_mbps")})
+    for j in range(drop_i + 1, len(changes)):
+        r = changes[j].get("rate_mbps")
+        if r is not None and r > out["low_rate_mbps"]:
+            out.update({"t_restore": changes[j]["ts"], "restore_rate_mbps": r})
+            break
+    return out
 
 
 def switching_diagnostics(switches: list[dict], by, window_s: float, run_duration_s: float | None) -> dict:
@@ -734,20 +796,24 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     led = [s.get("live_edge_distance_ms") for s in samples if s.get("live_edge_distance_ms") is not None]
     initial = [s.get("live_edge_distance_ms") for s in samples
                if win_end is not None and s["ts"] < win_end and s.get("live_edge_distance_ms") is not None]
+    after_win = [s.get("live_edge_distance_ms") for s in samples
+                 if win_end is not None and s["ts"] >= win_end and s.get("live_edge_distance_ms") is not None]
+    target_shift = client_meta.get("target_shift_ms") or 0
+    tths = next(
+        (s["ts"] - st["ts"] for s in samples
+         if st and win_end is not None and s["ts"] >= win_end
+         and s.get("live_edge_distance_ms") is not None and target_shift > 0
+         and s["live_edge_distance_ms"] < target_shift / 2), None)
     out["time_shift"] = {
         "signed_error_ms": stats(tse), "abs_error_ms": stats([abs(v) for v in tse]),
         "live_edge_distance_ms": stats(led),
-        # The shift the relay actually delivered, measured before any playback
-        # drift: the first `initial_window_s` seconds after the first presented
-        # frame (a switch inside the window does not move the playhead).
-        # Shift erosion: first sample after the initial window at which the client
-        # sits closer than half its target to the live edge (None = never).
-        "time_to_half_shift_ms": next(
-            (s["ts"] - st["ts"] for s in samples
-             if st and win_end is not None and s["ts"] >= win_end
-             and s.get("live_edge_distance_ms") is not None
-             and (client_meta.get("target_shift_ms") or 0) > 0
-             and s["live_edge_distance_ms"] < (client_meta.get("target_shift_ms") or 0) / 2), None),
+        # Live-edge distance after the initial window (the live-edge client's headline number).
+        "live_edge_after_window_ms": stats(after_win),
+        # Shift erosion: first sample after the initial window at which the client sits closer
+        # than half its target to the live edge. None = never happened (right-censored at the run
+        # end) for a time-shifted client; `half_shift_lost` is None for a live-edge client.
+        "time_to_half_shift_ms": tths,
+        "half_shift_lost": (tths is not None) if target_shift > 0 else None,
         "initial_window": {
             "definition": f"first {initial_window_s:g} s after the first presented frame",
             "start_ms": win_start, "end_ms": win_end,
@@ -808,9 +874,39 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "total_frames": samples[-1].get("total_frames") if samples else None,
     }
 
+    # Capacity steps and shares -------------------------------------------------
+    changes = by("NET_CHANGE")
+    steps = capacity_steps(changes)
+    t_drop, t_restore = steps["t_drop"], steps["t_restore"]
+    fit_low = fit_rung(ladder, steps["low_rate_mbps"])
+    pre_drop_rung = None
+    if t_drop is not None:
+        pre = [index_of[tr] for tr in (series.track_at(s["ts"], s) for s in samples if t_drop - PRE_DROP_WINDOW_S * 1000 <= s["ts"] < t_drop)
+               if tr in index_of]
+        pre_drop_rung = statistics.median_low(pre) if pre else None
+    rung_at_drop = None
+    if t_drop is not None:
+        tr = series.track_at(t_drop)
+        rung_at_drop = index_of.get(tr) if tr is not None else None
+    low_share = share_in_window(adv, index_of, (t_drop + SHARE_SETTLE_S * 1000) if t_drop is not None else math.inf,
+                                t_restore if t_restore is not None else (end_ts if end_ts is not None else math.inf),
+                                lambda i: fit_low is not None and i <= fit_low) if (t_drop is not None and fit_low is not None) else {"share": None, "advancing_s": 0.0}
+    after_share = share_in_window(adv, index_of, (t_restore + SHARE_SETTLE_S * 1000) if t_restore is not None else math.inf,
+                                  end_ts if end_ts is not None else math.inf,
+                                  lambda i: pre_drop_rung is not None and i >= pre_drop_rung) if (t_restore is not None and pre_drop_rung is not None) else {"share": None, "advancing_s": 0.0}
+    out["shares"] = {
+        "t_drop": t_drop, "t_restore": t_restore, "low_rate_mbps": steps["low_rate_mbps"], "pre_rate_mbps": steps["pre_rate_mbps"],
+        "fit_safety": FIT_SAFETY, "settle_s": SHARE_SETTLE_S,
+        "fit_rung": fit_low,
+        "rung_at_drop": rung_at_drop,
+        "pre_drop_rung": pre_drop_rung, "pre_drop_window_s": PRE_DROP_WINDOW_S,
+        "fit_share_low": low_share["share"], "low_window_advancing_s": low_share["advancing_s"],
+        "pre_drop_share_after_restore": after_share["share"], "after_window_advancing_s": after_share["advancing_s"],
+    }
+
     # Detection timelines per NET_CHANGE ------------------------------------
     detections = []
-    changes = by("NET_CHANGE")
+    drop_precondition: bool | None = None
     for i, ch in enumerate(changes[1:], start=1):
         prev_rate = changes[i - 1].get("rate_mbps")
         new_rate = ch.get("rate_mbps")
@@ -828,17 +924,17 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                    ((direction == "down" and r.get("reason") in ("auto-downgrade", "auto-emergency")) or
                     (direction == "up" and r.get("reason") == "auto-upgrade")))
         sw = next((s for s in switches if t2 and s["to"] == t2.get("to") and abs(s["ts"] - t2["ts"]) < 5000), None)
-        # Reaction to a down-step: the played rung is one that fits the new capacity
-        # (highest rung with bitrate <= new rate) and stays there for `sustain_s`.
-        # Recovery after an up-step: the played rung is back at (or above) the
-        # pre-drop rung and stays there for `sustain_s`. Both are measured on SAMPLE
-        # (what is being played), so a one-tick excursion during a thrash does not count.
+
+        # Reaction to a down-step: the PRESENTED rung is one that fits the new capacity
+        # and stays there for `sustain_s`. Recovery after an up-step: the presented rung
+        # is back at (or above) the pre-drop rung and stays there for `sustain_s`.
         def sustained(pred, start_ts):
             run_from = None
             for smp in samples:
                 if smp["ts"] < start_ts or smp["ts"] >= window_end:
                     continue
-                if pred(smp):
+                tr = series.track_at(smp["ts"], smp)
+                if tr in index_of and pred(index_of[tr]):
                     run_from = run_from if run_from is not None else smp["ts"]
                     if smp["ts"] - run_from >= sustain_s * 1000:
                         return run_from
@@ -853,34 +949,49 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                "t4_ms": (sw["ts"] + sw["switch_delivery_latency_ms"] - t0) if sw and sw["switch_delivery_latency_ms"] else None,
                "t5_ms": (sw["ts"] + sw["switch_visibility_delay_ms"] - t0) if sw and sw["switch_visibility_delay_ms"] else None}
         # Attribution: t2 is the controller's reaction to THIS change only if the
-        # controller was quiet before it (no decision in the feedback window before
-        # t0); otherwise the first decision after t0 may just be the next switch of
-        # an ongoing sequence. Whether a throughput sample of the new rate preceded
-        # the decision (t1 <= t2) is recorded but not required: a buffer rule can
-        # legitimately react to the drop's effect before a full group sample exists.
-        decisions_before = [r for r in by("ABR_DECISION") if t0 - feedback_window_s * 1000 <= r["ts"] < t0]
+        # controller was quiet before it (no decision in the feedback window before t0).
+        decisions_before = [r for r in decisions if t0 - feedback_window_s * 1000 <= r["ts"] < t0]
         rec["quiet_before"] = len(decisions_before) == 0
         rec["sample_before_decision"] = bool(t1 and t2 and t1["ts"] <= t2["ts"])
         rec["reliable"] = rec["quiet_before"]
         if direction == "down":
-            fitting = [i_ for i_, t in enumerate(ladder) if (t.get("bitrate") or 0) <= target_bps]
-            fit_index = max(fitting) if fitting else 0
-            r_at = sustained(lambda smp: index_of.get(smp.get("track"), 99) <= fit_index, t0)
+            fit_index = fit_rung(ladder, new_rate)
+            tr0 = series.track_at(t0)
+            r0 = index_of.get(tr0) if tr0 is not None else None
             rec["fit_index"] = fit_index
+            rec["rung_at_drop"] = r0
+            # Precondition for a reaction time: the viewer was above the fitting rung when
+            # the capacity dropped. A client already at or below it has nothing to react to.
+            if r0 is None or fit_index is None:
+                rec["precondition"], rec["na_reason"] = False, "presented rung at the drop unknown"
+            elif r0 <= fit_index:
+                rec["precondition"], rec["na_reason"] = False, f"already at a fitting rung at the drop (rung {r0} <= fit {fit_index})"
+            else:
+                rec["precondition"], rec["na_reason"] = True, None
+            drop_precondition = rec["precondition"]
+            r_at = sustained(lambda i_: i_ <= fit_index, t0) if rec["precondition"] else None
             rec["down_reaction_ms"] = (r_at - t0) if r_at is not None else None
         if direction == "up":
-            # The pre-drop rung is the median played rung over the 20 s before the
-            # drop: the last sample alone is one tick of whatever the controller was
-            # doing at that instant.
+            # The pre-drop rung is the median presented rung over the 20 s before the drop.
             drop_ts = changes[i - 1]["ts"]
-            pre = [index_of[s["track"]] for s in samples if drop_ts - 20000 <= s["ts"] < drop_ts and s.get("track") in index_of]
-            pre_index = int(statistics.median(pre)) if pre else None
-            q = first(samples, "SAMPLE", t0, lambda s: pre_index is not None and index_of.get(s.get("track"), -1) >= pre_index)
+            pre = [index_of[tr] for tr in (series.track_at(s["ts"], s) for s in samples if drop_ts - PRE_DROP_WINDOW_S * 1000 <= s["ts"] < drop_ts)
+                   if tr in index_of]
+            pre_index = statistics.median_low(pre) if pre else None
             rec["pre_drop_index"] = pre_index
-            rec["quality_recovery_ms"] = (q["ts"] - t0) if q else None
-            r_at = sustained(lambda smp: pre_index is not None and index_of.get(smp.get("track"), -1) >= pre_index, t0)
-            rec["up_recovery_ms"] = (r_at - t0) if r_at is not None else None
-            # Offset recovery: |error| within tolerance for offset_hold_s.
+            rec["precondition"] = bool(drop_precondition) and pre_index is not None
+            rec["na_reason"] = None if rec["precondition"] else ("no qualifying drop before this restore" if drop_precondition is None else
+                                                                 "the preceding drop did not qualify (see its na_reason)" if not drop_precondition else
+                                                                 "pre-drop rung unknown")
+            if rec["precondition"]:
+                q = next((s for s in samples if s["ts"] >= t0 and index_of.get(series.track_at(s["ts"], s), -1) >= pre_index), None)
+                rec["quality_recovery_ms"] = (q["ts"] - t0) if q else None
+                r_at = sustained(lambda i_: i_ >= pre_index, t0)
+                rec["up_recovery_ms"] = (r_at - t0) if r_at is not None else None
+            else:
+                rec["quality_recovery_ms"] = None
+                rec["up_recovery_ms"] = None
+            # Offset recovery: |error| within tolerance for offset_hold_s (time-shift metric,
+            # independent of the rung precondition).
             hold_start = None
             off = None
             for s in samples:
@@ -896,29 +1007,39 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                     hold_start = None
             rec["offset_recovery_ms"] = (off - t0) if off else None
         detections.append(rec)
-    # Detection timelines (t1..t5) mean something only when the decision after a
-    # change can be attributed to it: per event, the controller was quiet in the
-    # feedback window before t0. The whole-run flag is the conjunction; the per-event flags are in
-    # each detection record. (The old criterion, median inter-switch interval >=
-    # the window, is kept as switching_quiet.)
     med_gap = out["switching"]["median_inter_switch_interval_ms"]
     out["switching_quiet"] = med_gap is None or med_gap >= feedback_window_s * 1000
     out["detection_reliable"] = bool(detections) and all(d["reliable"] for d in detections)
     out["detection"] = detections
-    # Headline reaction/recovery: the first down-step and the first up-step of the profile.
+    # Headline reaction/recovery: the first down-step and the first up-step of the
+    # profile, reported only from the detect_step profile and only when the client was
+    # above the fitting rung at the drop. The per-event records above keep the
+    # diagnostics for every profile.
     first_down = next((d for d in detections if d["direction"] == "down"), None)
     first_up = next((d for d in detections if d["direction"] == "up"), None)
+    na_reason = None
+    if out["profile"] != "detect_step":
+        na_reason = f"profile {out['profile']!r}: reaction metrics are reported only from the detect_step profile"
+    elif first_down is None:
+        na_reason = "no capacity drop in this run"
+    elif not first_down.get("precondition"):
+        na_reason = first_down.get("na_reason") or "precondition not met"
+    reported = na_reason is None
     out["reaction"] = {
         "sustain_s": sustain_s,
-        # outcome metrics (played rung held sustain_s): no attribution needed
-        "down_reaction_ms": first_down.get("down_reaction_ms") if first_down else None,
-        "up_recovery_ms": first_up.get("up_recovery_ms") if first_up else None,
+        "reaction_na_reason": na_reason,
+        "rung_at_drop": first_down.get("rung_at_drop") if first_down else None,
+        "fit_index": first_down.get("fit_index") if first_down else None,
+        "pre_drop_index": first_up.get("pre_drop_index") if first_up else None,
+        # outcome metrics (presented rung held sustain_s): no attribution needed
+        "down_reaction_ms": first_down.get("down_reaction_ms") if (reported and first_down) else None,
+        "up_recovery_ms": first_up.get("up_recovery_ms") if (reported and first_up) else None,
         # attribution-based reaction (t0 -> first decision), only when reliable
-        "down_t2_ms": first_down["t2_ms"] if first_down and first_down["reliable"] else None,
-        "down_t4_ms": first_down["t4_ms"] if first_down and first_down["reliable"] else None,
-        "up_t2_ms": first_up["t2_ms"] if first_up and first_up["reliable"] else None,
-        "down_reliable": first_down["reliable"] if first_down else None,
-        "up_reliable": first_up["reliable"] if first_up else None,
+        "down_t2_ms": first_down["t2_ms"] if reported and first_down and first_down["reliable"] else None,
+        "down_t4_ms": first_down["t4_ms"] if reported and first_down and first_down["reliable"] else None,
+        "up_t2_ms": first_up["t2_ms"] if reported and first_up and first_up["reliable"] else None,
+        "down_reliable": first_down["reliable"] if (reported and first_down) else None,
+        "up_reliable": first_up["reliable"] if (reported and first_up) else None,
     }
 
     # Relay cache and process stats -----------------------------------------
@@ -1349,7 +1470,7 @@ def main() -> int:
     ap.add_argument("--reversal-window", type=float, default=5.0, help="seconds within which opposite switches count as a reversal")
     ap.add_argument("--feedback-window", type=float, default=5.0, help="seconds around each switch for the feedback analysis")
     ap.add_argument("--sustain", type=float, default=5.0,
-                    help="seconds the played rung must hold for down-reaction / up-recovery")
+                    help="seconds the presented rung must hold for down-reaction / up-recovery")
     ap.add_argument("--include-invalid", action="store_true",
                     help="keep runs whose validation.json says invalid in the aggregate CSV/stats (default: exclude)")
     ap.add_argument("--quiet", action="store_true")
