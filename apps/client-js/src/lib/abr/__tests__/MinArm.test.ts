@@ -622,3 +622,70 @@ describe('grid and baseline keep the total buffer (only min reads the contiguous
     expect(h.switches()).toEqual([]);
   });
 });
+
+describe('min arm: (i) the live-edge sawtooth is not an emergency (F1)', () => {
+  // A live-edge client's contiguous buffer is a per-group sawtooth: each group
+  // lands as a burst (1.1 s ahead) and drains to its trough (0.35 s or 0.2 s)
+  // before the next one. A time-shifted client sees the same sawtooth 9 s
+  // higher. With a SWMA that fits the active rung by 0.9 but not by 0.7, the
+  // low-buffer branch fired at every trough on the live-edge client only.
+  const sim = async (saw: number[], swma: number, seconds: number) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      const h = harness(
+        { activeTrack: '720p', bandwidthBps: swma, bufferContigSeconds: saw[0]! },
+        { startupGroups: 10 },
+      );
+      for (let k = 0; k < seconds * 4; k++) {
+        if (k % 4 === 0) {
+          // A group completes on the group boundary; a pending switch lands on it.
+          const calls = h.player.switchTrack.mock.calls;
+          const target = calls.length > 0 ? (calls[calls.length - 1]![0] as string) : null;
+          if (target !== null && h.controller.isSwitching()) h.land(target);
+          h.complete();
+        }
+        await h.tick({ bufferContigSeconds: saw[k % 4]! });
+        vi.advanceTimersByTime(250);
+      }
+      return h.switches().length;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+
+  it('SWMA 2.0 Mbps (720p fits by 0.9, not by 0.7): at most 2 switches in 120 s on either client type', async () => {
+    const live = await sim([1.1, 0.85, 0.6, 0.35], 2_000_000, 120);
+    const shifted = await sim([10.1, 9.85, 9.6, 9.35], 2_000_000, 120);
+    expect(live).toBeLessThanOrEqual(2);
+    expect(shifted).toBeLessThanOrEqual(2);
+    expect(live).toBe(shifted);
+  });
+
+  it('trough 0.2 s, SWMA 1.9 Mbps: at most 2 switches in 120 s on either client type', async () => {
+    const live = await sim([1.0, 0.75, 0.45, 0.2], 1_900_000, 120);
+    const shifted = await sim([10.0, 9.75, 9.45, 9.2], 1_900_000, 120);
+    expect(live).toBeLessThanOrEqual(2);
+    expect(shifted).toBeLessThanOrEqual(2);
+  });
+
+  it('a real drain (below 0.5 s for the whole 1250 ms envelope) still drops to the 0.7 x SWMA rung', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      const h = harness({ activeTrack: '720p', bandwidthBps: 2_000_000, bufferContigSeconds: 1.0 });
+      await h.tick();
+      vi.advanceTimersByTime(250);
+      for (const b of [0.48, 0.45, 0.42, 0.39, 0.36]) {
+        await h.tick({ bufferContigSeconds: b });
+        vi.advanceTimersByTime(250);
+      }
+      // 1.0 s left the 1250 ms window only on the last tick.
+      expect(h.switches()).toEqual([]);
+      await h.tick({ bufferContigSeconds: 0.33 });
+      expect(h.switches()).toEqual(['360p']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

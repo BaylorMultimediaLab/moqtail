@@ -322,8 +322,8 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
     L2ARule: { active: false, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     LoLPRule: { active: false, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     // The min arm's emergency (rules/EmergencyBufferRule.ts): instantaneous
-    // contiguous buffer == 0 -> rung 0; < lowBufferS -> highest rung under
-    // throughputSafetyFactor x SWMA. Off in baseline and grid.
+    // contiguous buffer == 0 -> rung 0; its 1250 ms envelope < lowBufferS ->
+    // highest rung under throughputSafetyFactor x SWMA. Off in baseline and grid.
     EmergencyBufferRule: {
       active: false,
       priority: SwitchRequestPriority.STRONG,
@@ -593,6 +593,13 @@ export interface RulesContext {
   bufferSeconds: number;
   /** Instantaneous contiguous buffer at this tick, for the emergency rules. Defaults to bufferSeconds. */
   bufferInstantSeconds?: number;
+  /**
+   * Maximum of `bufferInstantSeconds` over the last `bufferEnvelopeMs`,
+   * whatever `bufferSignal` is: the buffer level after the last group burst.
+   * EmergencyBufferRule's low branch reads it (F1); absent → the
+   * instantaneous value.
+   */
+  bufferEnvelopeSeconds?: number;
   /** Total buffered-ahead across holes (last range end minus playhead), for the record only. */
   bufferTotalSeconds?: number;
   /** Completed groups since the last confirmed landing; null before the first landing. */

@@ -539,9 +539,10 @@ export class AbrController {
     while (this.#bufferSamples.length > 0 && nowTs - this.#bufferSamples[0]!.ts > envelopeMs) {
       this.#bufferSamples.shift();
     }
+    const bufferEnvelopeSeconds = bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs);
     const ruleBufferSeconds =
       this.#settings.controller.bufferSignal === 'envelope'
-        ? bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs)
+        ? bufferEnvelopeSeconds
         : bufferInstantSeconds;
 
     // Once the player signals the init segment landed, hold #switching until
@@ -643,6 +644,7 @@ export class AbrController {
       activeTrackIndex: currentIdx,
       bufferSeconds: ruleBufferSeconds,
       bufferInstantSeconds,
+      bufferEnvelopeSeconds,
       bufferTotalSeconds: bufferSeconds,
       groupsSinceLanding: this.groupsSinceLanding(raw),
       bandwidthBps,
