@@ -2245,6 +2245,7 @@ mod tests_native_switch {
       &f.client.switch_context,
       new_name.clone(),
       old_name,
+      true,
       async {
         switched_subscribe(&f).await;
         Ok(())
@@ -2305,7 +2306,7 @@ mod tests_native_switch {
     let seen_in = seen.clone();
     let ctx_in = ctx.clone();
     let (t, s) = (target.clone(), source.clone());
-    with_native_switch_statuses(&ctx, target.clone(), source.clone(), async move {
+    with_native_switch_statuses(&ctx, target.clone(), source.clone(), true, async move {
       *seen_in.lock().await = Some((
         ctx_in.get_switch_status(&t).await,
         ctx_in.get_switch_status(&s).await,
@@ -2331,12 +2332,95 @@ mod tests_native_switch {
       .add_or_update_switch_item(pending.clone(), SwitchStatus::Next)
       .await;
     let before = ctx.snapshot().await;
-    let res = with_native_switch_statuses(&ctx, target, source, async {
+    let res = with_native_switch_statuses(&ctx, target, source, true, async {
       Err(TerminationCode::InternalError)
     })
     .await;
     assert!(res.is_err());
     assert_eq!(ctx.snapshot().await, before);
+  }
+
+  /// R3-D4: without --native-status-before-subscribe the order is upstream's: the
+  /// SUBSCRIBE runs with no status for either track, and target = Next, source =
+  /// Current are set once it has succeeded.
+  #[tokio::test]
+  async fn flag_off_sets_the_statuses_after_the_subscribe_as_upstream() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let seen = Arc::new(Mutex::new(None));
+    let seen_in = seen.clone();
+    let ctx_in = ctx.clone();
+    let (t, s) = (target.clone(), source.clone());
+    with_native_switch_statuses(&ctx, target.clone(), source.clone(), false, async move {
+      *seen_in.lock().await = Some((
+        ctx_in.get_switch_status(&t).await,
+        ctx_in.get_switch_status(&s).await,
+      ));
+      Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+      *seen.lock().await,
+      Some((None, None)),
+      "during the SUBSCRIBE"
+    );
+    assert_eq!(
+      (
+        ctx.get_switch_status(&target).await,
+        ctx.get_switch_status(&source).await
+      ),
+      (Some(SwitchStatus::Next), Some(SwitchStatus::Current)),
+      "after it"
+    );
+  }
+
+  /// Upstream sets nothing when the SUBSCRIBE fails.
+  #[tokio::test]
+  async fn flag_off_a_failed_subscribe_sets_no_status() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let before = ctx.snapshot().await;
+    let res = with_native_switch_statuses(&ctx, target, source, false, async {
+      Err(TerminationCode::InternalError)
+    })
+    .await;
+    assert!(res.is_err());
+    assert_eq!(ctx.snapshot().await, before);
+  }
+
+  /// End to end with the flag off (as shipped): the switched subscription forwards
+  /// the object it dequeues before the statuses are set, ungated, which is the
+  /// upstream behaviour the as-shipped arm must keep.
+  #[tokio::test]
+  async fn flag_off_end_to_end_keeps_the_upstream_window() {
+    let f = fixture(23).await;
+    let new_name = f.new.full_track_name.clone();
+    let old_name = f.old.full_track_name.clone();
+    with_native_switch_statuses(
+      &f.client.switch_context,
+      new_name.clone(),
+      old_name,
+      false,
+      async {
+        switched_subscribe(&f).await;
+        publish(&f.new, 5, 3).await;
+        assert!(
+          wait_for(&f.received, NEW, (5, 3)).await,
+          "ungated before the statuses are set: {:?}",
+          f.received.objects(NEW)
+        );
+        Ok(())
+      },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      f.client.switch_context.get_switch_status(&new_name).await,
+      Some(SwitchStatus::Next)
+    );
   }
 }
 

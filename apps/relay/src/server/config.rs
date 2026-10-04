@@ -234,6 +234,13 @@ pub struct Cli {
   /// Capped, because the memory this costs also scales with the size of a group
   #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(0..=MAX_DEDUP_RETAINED_GROUPS))]
   pub dedup_retained_groups: u64,
+  /// Native SWITCH: set target = Next and source = Current before the SUBSCRIBE the
+  /// SWITCH becomes is handled, so the switched subscription cannot forward an object
+  /// ungated between SUBSCRIBE_OK and the statuses. Off (default) keeps upstream's
+  /// order (statuses set after the SUBSCRIBE succeeded). Part of the corrected native
+  /// arm, with --forward-promotion-trigger. Recorded in RELAY_CONFIG.
+  #[arg(long, default_value_t = false)]
+  pub native_status_before_subscribe: bool,
 }
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -283,6 +290,8 @@ pub struct AppConfig {
   /// Groups of Object ids retained per track for duplicate detection. Bounds what that
   /// costs; a publisher more than this many groups behind can slip a duplicate through.
   pub dedup_retained_groups: usize,
+  /// See `Cli::native_status_before_subscribe`. false = upstream order.
+  pub native_status_before_subscribe: bool,
 }
 
 impl AppConfig {
@@ -324,6 +333,7 @@ impl AppConfig {
       downstream_alias_timeout: Duration::from_millis(cli.downstream_alias_timeout_ms),
       publish_done_stream_timeout: Duration::from_millis(cli.publish_done_stream_timeout_ms),
       dedup_retained_groups: cli.dedup_retained_groups as usize,
+      native_status_before_subscribe: cli.native_status_before_subscribe,
     }
   }
 
@@ -450,6 +460,9 @@ impl AppConfig {
       "max_subscriber_lag": self.max_subscriber_lag,
       "max_publish_streams": self.max_publish_streams,
       "write_kbps_limit": self.write_kbps_limit,
+      // --native-status-before-subscribe: native SWITCH statuses set before (true)
+      // or, as upstream, after (false) the SUBSCRIBE.
+      "native_status_before_subscribe": self.native_status_before_subscribe,
       "redirect_uri": self.redirect_uri,
       "max_upstream_fetch_gaps": self.max_upstream_fetch_gaps,
       "upstream_fetch_timeout_secs": self.upstream_fetch_timeout.as_secs(),
@@ -560,6 +573,7 @@ mod tests {
       downstream_alias_timeout: Duration::from_millis(3000),
       publish_done_stream_timeout: Duration::from_millis(2000),
       dedup_retained_groups: 30,
+      native_status_before_subscribe: false,
       event_log: String::new(),
     }
   }
@@ -737,6 +751,27 @@ mod tests {
     assert!(dbg.contains("initial_mtu: 1200"), "{dbg}");
   }
 
+  /// R3-D4: the native SWITCH status order is upstream's (after the SUBSCRIBE)
+  /// unless --native-status-before-subscribe is given; RELAY_CONFIG records it.
+  #[test]
+  fn native_status_before_subscribe_defaults_to_off() {
+    let config = AppConfig::from_cli(Cli::parse_from(["relay"]));
+    assert!(!config.native_status_before_subscribe);
+    assert_eq!(
+      config.event_record()["native_status_before_subscribe"],
+      false
+    );
+    let config = AppConfig::from_cli(Cli::parse_from([
+      "relay",
+      "--native-status-before-subscribe",
+    ]));
+    assert!(config.native_status_before_subscribe);
+    assert_eq!(
+      config.event_record()["native_status_before_subscribe"],
+      true
+    );
+  }
+
   /// RELAY_CONFIG carries every resolved field, named as the flags are.
   #[test]
   fn event_record_lists_every_resolved_field() {
@@ -764,6 +799,7 @@ mod tests {
       "write_kbps_limit",
       "dedup_retained_groups",
       "forward_promotion_trigger",
+      "native_status_before_subscribe",
       "event_log",
       "quinn_transport",
     ] {
@@ -776,6 +812,7 @@ mod tests {
     assert_eq!(record["track_alias_resolution_timeout_ms"], 500);
     assert_eq!(record["cache_expiration_type"], "ttl");
     assert_eq!(record["forward_promotion_trigger"], false);
+    assert_eq!(record["native_status_before_subscribe"], false);
     assert_eq!(
       CongestionController::Cubic.default_initial_window_bytes(),
       12_000
