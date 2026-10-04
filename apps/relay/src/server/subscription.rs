@@ -977,6 +977,10 @@ impl Subscription {
               "old_track": current_track_name.as_ref().map(events::track_name_string),
               "old_last_sent_group": old_last_sent_max.as_ref().map(|l| l.group),
               "trigger_forwarded": false,
+              // When the promotion was decided (epoch ms); equals the record's time
+              // here. The fixed native arm emits a held-back trigger's record after
+              // the joining replay, so consumers use promoted_ts for the timeline.
+              "promoted_ts": events::now_ms(),
             }),
           );
 

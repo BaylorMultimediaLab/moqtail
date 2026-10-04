@@ -940,6 +940,24 @@ class ValidateScript(TmpRun):
                               "--preflight")
         self.assertEqual(st["pf-gso"], "INFO")
 
+    def test_relay_promoted_from_promoted_ts(self):
+        # Fixed native arm: a held-back trigger's SWITCH_PROMOTED is written after the
+        # joining replay; the timeline must use the decision time, or the ordering check
+        # sees promotion after the first object.
+        run = self.complete_run()
+        rel = run / "relay-events.jsonl"
+        recs = [json.loads(l) for l in rel.read_text().splitlines() if l.strip()]
+        for r in recs:
+            if r["event"] == "SWITCH_PROMOTED":
+                r["promoted_ts"] = r["ts"]
+                r["ts"] = r["ts"] + 5000          # emitted late, after the replay
+        rel.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        s = analyze.analyze(run)
+        first = s["switches"]["list"][0]
+        self.assertLess(first["relay_promoted_ms"], 100)
+        code, st = self.validate(run)
+        self.assertEqual(st["ordering"], "PASS")
+
     def test_preflight_relay_gso_from_conn_stats(self):
         # C5: the relay must send one UDP datagram per I/O to the client (no GSO batches).
         def with_conn(datagrams, ios):
