@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MetricsCollector } from '../MetricsCollector';
+import { events } from '@/lib/events/EventLog';
 
 function makeMockPlayer() {
   return {
@@ -8,7 +9,9 @@ function makeMockPlayer() {
       fastEmaBps: 3_000_000,
       slowEmaBps: 3_000_000,
       bufferSeconds: 10,
+      bufferContigSeconds: 1.5,
       activeTrack: '720p',
+      presentedTrack: '480p',
       droppedFrames: 0,
       totalFrames: 100,
       playbackRate: 1,
@@ -72,14 +75,47 @@ describe('MetricsCollector', () => {
     expect(onSnapshot).toHaveBeenCalledTimes(2);
   });
 
-  it('exports the live-edge and time-shift columns', () => {
-    const player = makeMockPlayer();
-    const collector = new MetricsCollector(player as any, { '720p': 2000 }, vi.fn());
-    collector.start();
-    vi.advanceTimersByTime(250);
-    collector.stop();
-    const [header, row] = collector.exportCsv().split('\n');
-    expect(header).toContain('live_edge_distance_ms,time_shift_error_ms');
-    expect(row).toContain('12000.0,22000.0,10400.0,400.0,120.0,720p,12');
+  // Report 1: the CSV POST to /__metrics duplicated SAMPLE (the analyzer reads
+  // the event log); the collector must not talk to the network at all.
+  it('sends nothing to /__metrics (SAMPLE in the event log is the record)', () => {
+    const fetchSpy = vi.fn(() => Promise.resolve(new Response()));
+    vi.stubGlobal('fetch', fetchSpy);
+    try {
+      const player = makeMockPlayer();
+      const collector = new MetricsCollector(player as any, { '720p': 2000 }, vi.fn());
+      collector.start();
+      vi.advanceTimersByTime(250 * 20);
+      collector.stop();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect((collector as unknown as { exportCsv?: unknown }).exportCsv).toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // M12/M13: SAMPLE carries the contiguous buffer next to the total, and the
+  // presented track next to the subscribed one.
+  it('logs buffer_contig_s and presented_track in SAMPLE', () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response())),
+    );
+    events.start('metrics-test');
+    try {
+      const collector = new MetricsCollector(makeMockPlayer() as any, { '720p': 2000 }, vi.fn());
+      collector.start();
+      vi.advanceTimersByTime(250);
+      collector.stop();
+      const sample = events.recent().find(r => r.event === 'SAMPLE');
+      expect(sample).toMatchObject({
+        buffer_s: 10,
+        buffer_contig_s: 1.5,
+        track: '720p',
+        presented_track: '480p',
+      });
+    } finally {
+      events.stop();
+      vi.unstubAllGlobals();
+    }
   });
 });

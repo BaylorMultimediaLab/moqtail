@@ -44,6 +44,20 @@ export class SubscribeRequest implements PromiseLike<SubscribeOk | RequestError>
   expectedStreams: bigint | undefined // Defined upon SUBSCRIBE_DONE
   readonly controller!: ReadableStreamDefaultController<MoqtObject>
   readonly stream: ReadableStream<MoqtObject>
+  /**
+   * The SWITCH in flight on this subscription, if any (M16). Its answer arrives on
+   * the SUBSCRIBE's own request stream, so it is resolved here rather than through
+   * the subscription's own promise: a refusal must leave the live subscription
+   * untouched, and only an OK applies the new track name and parameters.
+   */
+  pendingSwitch:
+    | {
+        fullTrackName: FullTrackName
+        parameters: MessageParameter[]
+        promise: Promise<SubscribeOk | RequestError>
+        resolve: (value: SubscribeOk | RequestError) => void
+      }
+    | undefined
   #promise: Promise<SubscribeOk | RequestError>
   #resolve!: (value: SubscribeOk | RequestError | PromiseLike<SubscribeOk | RequestError>) => void
   #reject!: (reason?: any) => void
@@ -90,13 +104,40 @@ export class SubscribeRequest implements PromiseLike<SubscribeOk | RequestError>
       applyMessageParameterUpdate(this.subscribeParameters, msg.parameters)
     }
   }
-  switch(newTrackName: FullTrackName, newParameters: MessageParameter[]): void {
-    this.fullTrackName = newTrackName
-    this.subscribeParameters = newParameters
-    this.#promise = new Promise<SubscribeOk | RequestError>((resolve, reject) => {
-      this.#resolve = resolve
-      this.#reject = reject
+  /**
+   * Arms a SWITCH to `newTrackName`: the returned promise settles with the relay's
+   * answer. The subscription keeps its current name until that answer is an OK.
+   */
+  beginSwitch(newTrackName: FullTrackName, newParameters: MessageParameter[]): Promise<SubscribeOk | RequestError> {
+    let resolve!: (value: SubscribeOk | RequestError) => void
+    const promise = new Promise<SubscribeOk | RequestError>((r) => {
+      resolve = r
     })
+    this.pendingSwitch = { fullTrackName: newTrackName, parameters: newParameters, promise, resolve }
+    return promise
+  }
+
+  /**
+   * Hands a response arriving on this subscription's stream to the SWITCH in flight.
+   * Returns false when no SWITCH is pending, in which case the response is the
+   * SUBSCRIBE's own and the caller resolves the request itself.
+   */
+  resolveSwitch(response: SubscribeOk | RequestError): boolean {
+    const pending = this.pendingSwitch
+    if (!pending) return false
+    this.pendingSwitch = undefined
+    if (response instanceof SubscribeOk) {
+      this.fullTrackName = pending.fullTrackName
+      this.subscribeParameters = pending.parameters
+      logger.debug('request/subscribe', `switch OK requestId=${this.requestId} -> "${this.fullTrackName}"`)
+    } else {
+      logger.warn(
+        'request/subscribe',
+        `switch refused requestId=${this.requestId} code=${response.errorCode}; subscription stays on "${this.fullTrackName}"`,
+      )
+    }
+    pending.resolve(response)
+    return true
   }
   unsubscribe(): void {
     this.isCanceled = true

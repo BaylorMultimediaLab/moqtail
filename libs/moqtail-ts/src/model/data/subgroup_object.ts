@@ -27,6 +27,13 @@ function normalizeProperties(properties: KeyValuePair[] | null): KeyValuePair[] 
 
 export class SubgroupObject {
   public readonly objectId: bigint
+  /**
+   * `performance.now()` at the moment the receiving data stream parsed this object
+   * off the wire (set by `RecvStream`, undefined for locally built objects). This is
+   * the arrival time a throughput estimate should use; the time the application
+   * dequeues the object can be much later.
+   */
+  public recvAt: number | undefined
 
   private constructor(
     objectId: bigint | number,

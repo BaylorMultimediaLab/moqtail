@@ -16,6 +16,7 @@
 import { Publish, RequestOk } from '../../model/control'
 import { RequestStreamMessageHandler } from './handler'
 import { MoqtObject } from '../../model/data' // Make sure to import MoqtObject
+import type { PushedReceiver } from '../types'
 import { logger } from '../../util/logger'
 
 export const handlerPublish: RequestStreamMessageHandler<Publish> = async (client, msg, stream) => {
@@ -33,19 +34,22 @@ export const handlerPublish: RequestStreamMessageHandler<Publish> = async (clien
 
   // 2. Set up the expectation in the client BEFORE accepting the push
   client.requestIdMap.addMapping(localPseudoRequestId, msg.fullTrackName)
-  client.subscriptionAliasMap.set(localPseudoRequestId, msg.trackAlias)
-  client.aliasFullTrackNameMap.set(msg.trackAlias, msg.fullTrackName)
 
   // This object mimics a SubscribeRequest so #handleRecvStreams can use it identically
-  const receiver = {
+  const receiver: PushedReceiver = {
     requestId: localPseudoRequestId,
-    streamsAccepted: 0,
+    fullTrackName: msg.fullTrackName,
+    streamsAccepted: 0n,
+    expectedStreams: undefined,
     largestLocation: undefined,
     controller: streamController,
   }
 
-  // 3. Register the receiver map so data streams don't trigger ProtocolViolationError
-  client.subscriptions.set(msg.trackAlias, receiver)
+  // 3. Register the receiver so data streams route to it, and file it under the
+  // PUBLISH's own request id so the PUBLISH_DONE that later arrives on this same
+  // stream can complete it (M16).
+  client.claimTrackAlias(msg.trackAlias, receiver)
+  client.pushedReceivers.set(msg.requestId, receiver)
 
   // 4. Bubble the event up to the application layer, passing the data stream!
   if (client.onPeerPublish) {

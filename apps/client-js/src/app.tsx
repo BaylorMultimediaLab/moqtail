@@ -26,6 +26,7 @@ import { MetricsCollector } from '@/lib/metrics/MetricsCollector';
 import { events } from '@/lib/events/EventLog';
 import { targetShiftMs } from '@/lib/events/liveEdge';
 import type { MetricsSnapshot } from '@/lib/metrics/types';
+import { controllerArmParam, type ControllerArmParam } from '@/lib/runParams';
 import { SettingsPanel } from '@/components/SettingsPanel';
 import { MetricsPanel } from '@/components/MetricsPanel';
 
@@ -236,6 +237,7 @@ function TrackGroup({
  *   ?autoConnect=1   connect and start playback without a click (headless runs)
  *   ?logObjects=1    one OBJECT_RECV record per received frame
  *   ?relay=<url> ?namespace=<ns>  connection defaults
+ *   ?controllerArm=min|grid|baseline  the ABR controller arm (abrSettings.controller.arm)
  * Together with ?clientMode, ?timeShift and the ABR overrides below.
  */
 const truthyParam = (v: string | null) => v === '1' || v === 'true';
@@ -249,6 +251,7 @@ function readRunParams() {
     logObjects: truthy(params.get('logObjects')),
     relay: params.get('relay'),
     namespace: params.get('namespace'),
+    controllerArm: controllerArmParam(params.get('controllerArm')),
   };
 }
 
@@ -329,6 +332,10 @@ export function App() {
     if (Number.isFinite(envMs) && envMs > 0) controller.bufferEnvelopeMs = envMs;
     const probe = params.get('probeMode');
     if (probe === 'on' || probe === 'off') controller.probeMode = probe;
+    // The controller arm (W5's AbrSettings.controller.arm). Typed loosely so this
+    // compiles on a base whose ControllerSettings has no `arm` yet.
+    const arm = controllerArmParam(params.get('controllerArm'));
+    if (arm !== null) (controller as typeof controller & { arm?: ControllerArmParam }).arm = arm;
     const rules = { ...DEFAULT_ABR_SETTINGS.rules };
     if (controller.switchHistoryMode === 'off') {
       rules.SwitchHistoryRule = { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false };
@@ -398,14 +405,13 @@ export function App() {
   }, [blurSettings]);
 
   useEffect(() => {
-    // Preserve fields populated outside React (e.g. firstReceivedGroupId,
-    // switchDiscontinuities — written from player.ts as media objects arrive).
+    // Preserve fields populated outside React (firstReceivedGroupId is written
+    // from player.ts as media objects arrive).
     const prev = window.__moqtailMetrics;
     window.__moqtailMetrics = {
       abr: abrMetrics,
       samples: metricsSnapshot,
       firstReceivedGroupId: prev?.firstReceivedGroupId,
-      switchDiscontinuities: prev?.switchDiscontinuities,
       catalogTracks: catalogTracks ?? prev?.catalogTracks,
     };
   }, [abrMetrics, metricsSnapshot, catalogTracks]);
@@ -436,58 +442,115 @@ export function App() {
     }
   }, []);
 
-  const handleConnect = useCallback(async () => {
-    if (!videoRef.current) return;
-    setStatus('connecting');
-    setError(null);
-    setTracks([]);
-    setSelectedVideo(null);
-    setSelectedAudio(null);
+  /**
+   * One playback session: connect, choose tracks, start media, then the ABR
+   * controller and sampling. `choice` null connects and lets the startup
+   * bandwidth estimate pick the video track (Connect button, ?autoConnect);
+   * otherwise the session restarts on the given tracks (audio toggle). Both
+   * paths used to be separate copies that had drifted (no logObjects and no
+   * RUN_META on the restart path).
+   */
+  const startSession = useCallback(
+    async (choice: { video: string | null; audio: string | null } | null) => {
+      if (!videoRef.current) return;
+      setError(null);
+      if (choice === null) {
+        setStatus('connecting');
+        setTracks([]);
+        setSelectedVideo(null);
+        setSelectedAudio(null);
+      } else {
+        setStatus('restarting');
+      }
 
-    await disposePlayer();
+      await disposePlayer();
+      if (choice !== null && !choice.video && !choice.audio) {
+        setStatus('ready');
+        return;
+      }
 
-    // Experiment event log: one run id per page load; a reconnect continues
-    // the same log with a fresh CONNECT_START.
-    if (runParams.runId && !events.active) {
-      events.start(runParams.runId);
-    }
+      // Experiment event log: one run id per page load; a reconnect continues
+      // the same log with a fresh CONNECT_START.
+      if (runParams.runId && !events.active) {
+        events.start(runParams.runId);
+      }
 
-    try {
-      const player = new Player({
-        relayUrl,
-        namespace: Tuple.fromUtf8Path(namespace),
-        receiveCatalogViaSubscribe: true,
-        clientMode,
-        timeShiftSeconds,
-        logObjects: runParams.logObjects,
-      });
-      playerRef.current = player;
+      try {
+        const player = new Player({
+          relayUrl,
+          namespace: Tuple.fromUtf8Path(namespace),
+          receiveCatalogViaSubscribe: true,
+          clientMode,
+          timeShiftSeconds,
+          logObjects: runParams.logObjects,
+        });
+        playerRef.current = player;
 
-      const catalog = await player.initialize();
-      const allTracks = catalog.getTracks();
-      setTracks(allTracks);
-      setCatalogTracks(allTracks);
+        const catalog = await player.initialize();
+        const allTracks = catalog.getTracks();
+        setTracks(allTracks);
+        setCatalogTracks(allTracks);
+        const videoTracks = allTracks
+          .filter(t => t.role === 'video')
+          .sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
 
-      // Pick startup video track: use WebTransport bandwidth estimate if available,
-      // fall back to lowest-bitrate track when no estimate is possible.
-      const videoTracksAll = allTracks.filter(t => t.role === 'video');
-      const sortedVideoTracks = [...videoTracksAll].sort(
-        (a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0),
-      );
-      let firstVideo = sortedVideoTracks[0]; // default: lowest bitrate
-      const initialBw = await player.estimateInitialBandwidth();
-      if (initialBw > 0 && sortedVideoTracks.length > 0) {
-        const safetyFactor = abrSettings.bandwidthSafetyFactor;
-        const effectiveBw = initialBw * safetyFactor;
-        // Pick highest track that fits within the estimated bandwidth
-        for (const track of sortedVideoTracks) {
-          if ((track.bitrate ?? 0) <= effectiveBw) {
-            firstVideo = track;
+        // Startup video track: the highest whose bitrate fits the WebTransport
+        // bandwidth estimate, the lowest when there is no estimate.
+        let initialBw: number | null = null;
+        let videoTrack = choice?.video ?? null;
+        const audioTrack = choice?.audio ?? null;
+        if (choice === null) {
+          videoTrack = videoTracks[0]?.name ?? null;
+          initialBw = await player.estimateInitialBandwidth();
+          if (initialBw > 0) {
+            const effectiveBw = initialBw * abrSettings.bandwidthSafetyFactor;
+            for (const track of videoTracks) {
+              if ((track.bitrate ?? 0) <= effectiveBw) videoTrack = track.name;
+            }
           }
         }
-      }
-      if (firstVideo) {
-        const gopDurationMs = catalog.getGopDurationMs(firstVideo.name);
+        if (!videoTrack && !audioTrack) {
+          setStatus('ready');
+          return;
+        }
+        if (videoTrack) setSelectedVideo(videoTrack);
+        setStatus('restarting');
+
+        const gopDurationMs = catalog.getGopDurationMs((videoTrack ?? audioTrack)!);
+        await player.attachMedia(videoRef.current);
+        bufferRef.current = new MSEBuffer(videoRef.current, {
+          liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
+          gapFillProbe: () => {
+            const front = player.getAppendFrontMs();
+            return { appendFrontS: front !== undefined ? front / 1000 : undefined };
+          },
+          gopDurationMs,
+        });
+        if (videoTrack) await player.addMediaTrack(videoTrack);
+        if (audioTrack) await player.addMediaTrack(audioTrack);
+        // Anchor the throughput EMA to the startup track's own bitrate so the
+        // first real per-group sample can't seed the EMA from a startup burst
+        // (which over-reads the sustainable rate). No-op once real samples exist.
+        const startupBitrate = videoTracks.find(t => t.name === videoTrack)?.bitrate ?? 0;
+        player.seedThroughputEstimate(startupBitrate);
+
+        // ── Controller integration point (W5) ─────────────────────────────
+        // The one place where the controller's settings become final, the
+        // controller is built and wired, and RUN_META records them. Nothing
+        // overrides the settings afterwards (the __abrSettingsOverride hook
+        // is gone), so RUN_META is what runs. At integration: set
+        // controller.segmentDurationS = gopDurationMs / 1000, log
+        // describeController(effective settings) as RUN_META.controller, and
+        // wire onTrackSwitched(trackName).
+        const controllerSettings = abrSettings;
+        const rulesCollection = new AbrRulesCollection(controllerSettings);
+        const abr = new AbrController(
+          player,
+          rulesCollection,
+          videoTracks,
+          controllerSettings,
+          setAbrMetrics,
+        );
         const shift = targetShiftMs({
           clientMode,
           timeShiftSeconds,
@@ -506,88 +569,29 @@ export function App() {
           target_shift_ms: shift.targetShiftMs,
           gop_duration_ms: gopDurationMs,
           initial_bandwidth_bps: initialBw,
-          startup_track: firstVideo.name,
-          abr_settings: abrSettings,
-          controller: abrSettings.controller,
-          ladder: videoTracksAll.map(t => ({
+          startup_track: videoTrack,
+          abr_settings: controllerSettings,
+          controller: controllerSettings.controller,
+          controller_arm: runParams.controllerArm,
+          ladder: videoTracks.map(t => ({
             track: t.name,
             bitrate: t.bitrate,
             width: t.width,
             height: t.height,
           })),
         });
-        setSelectedVideo(firstVideo.name);
-        setStatus('restarting');
-        await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current, {
-          liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
-          gapFillProbe: () => {
-            const front = player.getAppendFrontMs();
-            return { appendFrontS: front !== undefined ? front / 1000 : undefined };
-          },
-        });
-        await player.addMediaTrack(firstVideo.name);
-        // Anchor the throughput EMA to the startup track's own bitrate so the
-        // first real per-group sample can't seed the EMA from a startup burst
-        // (which over-reads the sustainable rate). The ABR then ramps up only
-        // as sustained evidence accumulates. No-op once real samples exist.
-        player.seedThroughputEstimate(firstVideo.bitrate ?? 0);
-        await player.startMedia();
-        setStatus('playing');
-        const videoTracks = allTracks.filter(t => t.role === 'video');
-        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
-        // before playback starts so we can sweep ABR rule configurations without
-        // shipping a UI control. Production paths leave this undefined and the
-        // deep merge becomes a no-op.
-        type AbrOverride = Partial<typeof abrSettings> & {
-          rules?: Partial<typeof abrSettings.rules>;
-        };
-        const override =
-          typeof window !== 'undefined'
-            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
-            : undefined;
-        const effectiveAbrSettings = override
-          ? {
-              ...abrSettings,
-              ...override,
-              rules: Object.fromEntries(
-                Object.entries({
-                  ...abrSettings.rules,
-                  ...(override.rules ?? {}),
-                }).map(([name, cfg]) => {
-                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
-                  if (!base) return [name, cfg];
-                  return [
-                    name,
-                    {
-                      ...base,
-                      ...cfg,
-                      parameters: {
-                        ...(base.parameters ?? {}),
-                        ...(cfg.parameters ?? {}),
-                      },
-                    },
-                  ];
-                }),
-              ),
-            }
-          : abrSettings;
-        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
         rulesRef.current = rulesCollection;
-        const abr = new AbrController(
-          player,
-          rulesCollection,
-          videoTracks,
-          effectiveAbrSettings,
-          setAbrMetrics,
-        );
         abrRef.current = abr;
         player.setOnTrackSwitched(trackName => {
           abrRef.current?.releaseSwitchingGuard();
           setSelectedVideo(trackName);
         });
         player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());
-        player.setResetLatencyOnLanding(effectiveAbrSettings.controller.latencyResetOnLanding);
+        player.setResetLatencyOnLanding(controllerSettings.controller.latencyResetOnLanding);
+        // ── end of the controller integration point ───────────────────────
+
+        await player.startMedia();
+        setStatus('playing');
         abr.start();
 
         const bitrateMap: Record<string, number> = {};
@@ -597,16 +601,17 @@ export function App() {
         const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
         metricsRef.current = mc;
         mc.start();
-      } else {
-        setStatus('ready');
+      } catch (err) {
+        setError((err as Error).message);
+        setStatus('error');
+        events.emit('ERROR', { where: 'connect-flow', message: (err as Error).message });
+        await disposePlayer();
       }
-    } catch (err) {
-      setError((err as Error).message);
-      setStatus('error');
-      events.emit('ERROR', { where: 'connect-flow', message: (err as Error).message });
-      await disposePlayer();
-    }
-  }, [relayUrl, namespace, disposePlayer, abrSettings, clientMode, timeShiftSeconds, runParams]);
+    },
+    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, timeShiftSeconds, runParams],
+  );
+
+  const handleConnect = useCallback(() => startSession(null), [startSession]);
 
   // Headless / scripted runs: connect once the video element is mounted.
   const autoConnected = useRef(false);
@@ -624,116 +629,9 @@ export function App() {
   }, []);
 
   const startPlayback = useCallback(
-    async (videoTrack: string | null, audioTrack: string | null) => {
-      if (!videoRef.current) return;
-      if (!videoTrack && !audioTrack) {
-        await disposePlayer();
-        setStatus('ready');
-        return;
-      }
-
-      setStatus('restarting');
-      await disposePlayer();
-
-      try {
-        const player = new Player({
-          relayUrl,
-          namespace: Tuple.fromUtf8Path(namespace),
-          receiveCatalogViaSubscribe: true,
-          clientMode,
-          timeShiftSeconds,
-        });
-        playerRef.current = player;
-
-        const catalog = await player.initialize();
-        const allTracksForPlayback = catalog.getTracks();
-        setTracks(allTracksForPlayback);
-        setCatalogTracks(allTracksForPlayback);
-
-        await player.attachMedia(videoRef.current);
-        bufferRef.current = new MSEBuffer(videoRef.current, {
-          liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
-          gapFillProbe: () => {
-            const front = player.getAppendFrontMs();
-            return { appendFrontS: front !== undefined ? front / 1000 : undefined };
-          },
-        });
-
-        if (videoTrack) await player.addMediaTrack(videoTrack);
-        if (audioTrack) await player.addMediaTrack(audioTrack);
-
-        await player.startMedia();
-        setStatus('playing');
-        const videoTracksForAbr = allTracksForPlayback.filter(t => t.role === 'video');
-        // Test harness override: tests/experiments/ injects window.__abrSettingsOverride
-        // before playback starts so we can sweep ABR rule configurations without
-        // shipping a UI control. Production paths leave this undefined and the
-        // deep merge becomes a no-op.
-        type AbrOverride = Partial<typeof abrSettings> & {
-          rules?: Partial<typeof abrSettings.rules>;
-        };
-        const override =
-          typeof window !== 'undefined'
-            ? (window as Window & { __abrSettingsOverride?: AbrOverride }).__abrSettingsOverride
-            : undefined;
-        const effectiveAbrSettings = override
-          ? {
-              ...abrSettings,
-              ...override,
-              rules: Object.fromEntries(
-                Object.entries({
-                  ...abrSettings.rules,
-                  ...(override.rules ?? {}),
-                }).map(([name, cfg]) => {
-                  const base = abrSettings.rules[name as keyof typeof abrSettings.rules];
-                  if (!base) return [name, cfg];
-                  return [
-                    name,
-                    {
-                      ...base,
-                      ...cfg,
-                      parameters: {
-                        ...(base.parameters ?? {}),
-                        ...(cfg.parameters ?? {}),
-                      },
-                    },
-                  ];
-                }),
-              ),
-            }
-          : abrSettings;
-        const rulesCollection = new AbrRulesCollection(effectiveAbrSettings);
-        rulesRef.current = rulesCollection;
-        const abr = new AbrController(
-          player,
-          rulesCollection,
-          videoTracksForAbr,
-          effectiveAbrSettings,
-          setAbrMetrics,
-        );
-        abrRef.current = abr;
-        player.setOnTrackSwitched(trackName => {
-          abrRef.current?.releaseSwitchingGuard();
-          setSelectedVideo(trackName);
-        });
-        player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());
-        player.setResetLatencyOnLanding(effectiveAbrSettings.controller.latencyResetOnLanding);
-        abr.start();
-
-        const bitrateMap: Record<string, number> = {};
-        for (const t of videoTracksForAbr) {
-          if (t.bitrate) bitrateMap[t.name] = Math.round(t.bitrate / 1000);
-        }
-        const mc = new MetricsCollector(player, bitrateMap, setMetricsSnapshot);
-        metricsRef.current = mc;
-        mc.start();
-      } catch (err) {
-        setError((err as Error).message);
-        setStatus('error');
-        await disposePlayer();
-      }
-    },
-    [relayUrl, namespace, disposePlayer, abrSettings, clientMode, timeShiftSeconds],
+    (videoTrack: string | null, audioTrack: string | null) =>
+      startSession({ video: videoTrack, audio: audioTrack }),
+    [startSession],
   );
 
   const handleTrackChange = useCallback(

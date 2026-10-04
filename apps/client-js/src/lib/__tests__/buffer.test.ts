@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { shouldDeferRangeJump } from '@/lib/buffer';
+import { contiguousBufferAheadS, shouldDeferRangeJump } from '@/lib/buffer';
 
 const base = {
   gapS: 7.8,
@@ -37,5 +37,44 @@ describe('shouldDeferRangeJump', () => {
     expect(
       shouldDeferRangeJump({ ...base, fill: { appendFrontS: 16.2 }, frontStalledMs: 2999 }),
     ).toBe(true);
+  });
+});
+
+// M12: buffer_s counts across holes; the contiguous value stops at the end of
+// the range containing the playhead.
+describe('contiguousBufferAheadS', () => {
+  const ranges = (pairs: Array<[number, number]>) => ({
+    length: pairs.length,
+    start: (i: number) => pairs[i]![0],
+    end: (i: number) => pairs[i]![1],
+  });
+
+  it('is the end of the range containing the playhead minus the playhead', () => {
+    expect(
+      contiguousBufferAheadS(
+        ranges([
+          [0, 10],
+          [11, 20],
+        ]),
+        8,
+      ),
+    ).toBeCloseTo(2);
+  });
+
+  it('is 0 when the playhead is in a hole or nothing is buffered', () => {
+    expect(
+      contiguousBufferAheadS(
+        ranges([
+          [0, 10],
+          [11, 20],
+        ]),
+        10.5,
+      ),
+    ).toBe(0);
+    expect(contiguousBufferAheadS(ranges([]), 3)).toBe(0);
+  });
+
+  it('counts a playhead a hair before the range start (seek rounding) as inside it', () => {
+    expect(contiguousBufferAheadS(ranges([[11, 20]]), 10.9995)).toBeCloseTo(9.0005);
   });
 });

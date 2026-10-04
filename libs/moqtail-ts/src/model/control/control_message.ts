@@ -112,6 +112,8 @@ export namespace ControlMessage {
         return Setup.parsePayload(payload)
       case ControlMessageType.PublishBlocked:
         return PublishBlocked.parsePayload(payload)
+      case ControlMessageType.Switch:
+        return Switch.parsePayload(payload)
       default:
         throw new Error(`Unknown or unhandled ControlMessageType: ${messageType}`)
     }
