@@ -124,6 +124,8 @@ export class RecvStream {
    * {@link MOQtailClient.onStreamDiscarded}), independent of what was parsed.
    */
   #bytesReceived: number
+  /** This side asked the peer to stop (stopSending): the stream ends here by choice. */
+  #stopped = false
   private constructor(
     readonly header: Header,
     reader: ReadableStreamDefaultReader<Uint8Array>,
@@ -285,7 +287,11 @@ export class RecvStream {
 
         const { done, value } = readResult
         if (done) {
-          if (this.#internalBuffer.remaining > 0) {
+          if (this.#stopped) {
+            // A partial object left over is expected: we cut the stream ourselves.
+            logger.debug('data_stream', `RecvStream stopped type=${this.header.type}`)
+            controller.close()
+          } else if (this.#internalBuffer.remaining > 0) {
             logger.error(
               'data_stream',
               `RecvStream closed with incomplete data remaining=${this.#internalBuffer.remaining}`,
@@ -328,6 +334,7 @@ export class RecvStream {
   /** Asks the peer to stop sending on this stream, reporting `code` (§3.3.3). */
   async stopSending(code: StreamResetCode): Promise<void> {
     logger.debug('data_stream', `RecvStream stopSending type=${this.header.type} code=${code}`)
+    this.#stopped = true
     await this.#reader.cancel(streamResetReason(code)).catch(() => {})
   }
 }
@@ -447,7 +454,7 @@ if (import.meta.vitest) {
 }
 
 if (import.meta.vitest) {
-  const { describe, test, expect } = import.meta.vitest
+  const { describe, test, expect, vi } = import.meta.vitest
 
   describe('SendStream', () => {
     test('write cleanly rejects out-of-order objects', async () => {
@@ -517,6 +524,28 @@ if (import.meta.vitest) {
       const { recv, reason } = await receiver()
       await recv.stopSending(StreamResetCode.TooFarBehind)
       expect(streamResetCodeOf(reason())).toBe(StreamResetCode.TooFarBehind)
+    })
+
+    // M15 follow-up: the client stops an unrouted stream mid-object. That is this
+    // side's own decision, not a truncated stream: the object stream ends
+    // quietly instead of erroring with "incomplete object data" (and logging it
+    // as an error) for every discarded stream.
+    test('stopSending mid-object ends the object stream without a truncation error', async () => {
+      const head = header().serialize().toUint8Array()
+      const partial = FetchObject.newObject(1, 0, 2, 0, ObjectForwardingPreference.Subgroup, null, new Uint8Array(100))
+        .serialize()
+        .toUint8Array()
+      const bytes = new Uint8Array(head.length + 10)
+      bytes.set(head)
+      bytes.set(partial.subarray(0, 10), head.length)
+      const readable = new ReadableStream<Uint8Array>({ start: (c) => c.enqueue(bytes) })
+      const recv = await RecvStream.new(readable)
+      const errors = vi.spyOn(logger, 'error')
+      const reader = recv.stream.getReader()
+      await recv.stopSending(StreamResetCode.Cancelled)
+      await expect(reader.read()).resolves.toEqual({ done: true, value: undefined })
+      expect(errors).not.toHaveBeenCalled()
+      errors.mockRestore()
     })
 
     test('cancelling the object stream forwards the code to the transport', async () => {
