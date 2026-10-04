@@ -221,7 +221,13 @@ RELAY_BRANCH_OPTIONAL = {"--t-switch-ms": "3000"}
 RELAY_REQUIRED_BY_MECHANISM = {"pr1378": ("--t-switch-ms",)}
 # Relay flags the contract requires (W4 adds them); their absence is an error
 # unless --allow-missing-relay-flags, and a --final run never allows it.
-RELAY_REQUIRED_NEW = ("--congestion-controller",)
+RELAY_REQUIRED_NEW = ("--congestion-controller", "--udp-gso")
+# QUIC UDP segmentation offload at the relay. Device offloads do not stop quinn's
+# UDP_SEGMENT batches, which reach the qdisc as one skb (C5); the relay turns them off.
+RELAY_UDP_GSO = "off"
+# Seconds to wait after SIGTERM before SIGKILL: above the relay's 10 s shutdown drain,
+# so its event log is flushed by the relay itself rather than lost to a kill.
+STOP_WAIT_S = 12.0
 PUBLISHER_REQUIRED_NEW = {"--variant-priority": "128"}
 
 # Readiness and safety constants (rebuild contract, "Shaping", runner paragraph).
@@ -314,6 +320,11 @@ def pinned_relay_args(flags: set[str], cc: str, cache_size: int, allow_missing: 
         record["pinned"]["--congestion-controller"] = cc
     else:
         record["missing"].append("--congestion-controller")
+    if "--udp-gso" in flags:
+        argv += ["--udp-gso", RELAY_UDP_GSO]
+        record["pinned"]["--udp-gso"] = RELAY_UDP_GSO
+    else:
+        record["missing"].append("--udp-gso")
     if record["missing"] and not allow_missing:
         raise SystemExit(
             "the relay binary does not accept " + ", ".join(record["missing"]) + " (checked `relay --help`).\n"
@@ -376,6 +387,13 @@ def check_relay_config(rec: dict | None, cc: str, allow_missing: bool) -> str | 
         return None if allow_missing else "relay RELAY_CONFIG has no congestion_controller field"
     if got != cc:
         return f"relay reports congestion_controller={got!r}, runner asked for {cc!r}"
+    gso = rec.get("udp_gso")
+    if gso is None and isinstance(rec.get("config"), dict):
+        gso = rec["config"].get("udp_gso")
+    if gso is None:
+        return None if allow_missing else "relay RELAY_CONFIG has no udp_gso field"
+    if str(gso).lower() != RELAY_UDP_GSO:
+        return f"relay reports udp_gso={gso!r}, runner requires {RELAY_UDP_GSO!r}"
     return None
 
 
@@ -547,7 +565,7 @@ def stop(p: subprocess.Popen | None, name: str, pattern: str | None = None) -> N
     if pattern:
         subprocess.run(["pkill", "-TERM", "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            p.wait(timeout=10)
+            p.wait(timeout=STOP_WAIT_S)
         except Exception:
             subprocess.run(["pkill", "-KILL", "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print(f"[run] stopped {name}")
@@ -558,7 +576,7 @@ def stop(p: subprocess.Popen | None, name: str, pattern: str | None = None) -> N
         return
     _killpg(pgid, signal.SIGTERM)
     try:
-        p.wait(timeout=10)
+        p.wait(timeout=STOP_WAIT_S)
     except Exception:
         _killpg(pgid, signal.SIGKILL)
     print(f"[run] stopped {name}")

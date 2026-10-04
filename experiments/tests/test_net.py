@@ -562,13 +562,15 @@ class RelayFlags(unittest.TestCase):
         self.assertNotIn("--t-switch-ms", flags)
 
     def test_pinned_args_identical_values_and_t_switch_only_where_accepted(self):
-        flags = set(rx.RELAY_PINNED) | {"--cache-size", "--congestion-controller"}
+        flags = set(rx.RELAY_PINNED) | {"--cache-size", "--congestion-controller", "--udp-gso"}
         argv, rec = rx.pinned_relay_args(flags, "cubic", 1000, allow_missing=False)
         self.assertEqual(argv[argv.index("--cache-size") + 1], "1000")
         for flag, value in rx.RELAY_PINNED.items():
             self.assertIn(flag, argv)
             self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertEqual(argv[argv.index("--congestion-controller") + 1], "cubic")
+        self.assertEqual(argv[argv.index("--udp-gso") + 1], "off")
+        self.assertEqual(rec["pinned"]["--udp-gso"], "off")
         self.assertEqual(rec["skipped"], ["--t-switch-ms"])
         self.assertEqual(rec["missing"], [])
         argv2, rec2 = rx.pinned_relay_args(flags | {"--t-switch-ms"}, "bbr", 1000, allow_missing=False)
@@ -579,7 +581,7 @@ class RelayFlags(unittest.TestCase):
         self.assertEqual(rx.RELAY_PINNED["--track-alias-resolution-timeout-ms"], "2000")
 
     def test_missing_contract_flag_is_a_clear_error(self):
-        flags = set(rx.RELAY_PINNED) | {"--cache-size"}  # no --congestion-controller
+        flags = set(rx.RELAY_PINNED) | {"--cache-size", "--udp-gso"}  # no --congestion-controller
         with self.assertRaises(SystemExit) as cm:
             rx.pinned_relay_args(flags, "cubic", 1000, allow_missing=False)
         self.assertIn("--congestion-controller", str(cm.exception))
@@ -587,6 +589,13 @@ class RelayFlags(unittest.TestCase):
         argv, rec = rx.pinned_relay_args(flags, "cubic", 1000, allow_missing=True)
         self.assertEqual(rec["missing"], ["--congestion-controller"])
         self.assertNotIn("--congestion-controller", argv)
+
+    def test_missing_udp_gso_is_a_clear_error(self):
+        # C5: without --udp-gso the relay's own default would decide the queue model silently.
+        flags = set(rx.RELAY_PINNED) | {"--cache-size", "--congestion-controller"}
+        with self.assertRaises(SystemExit) as cm:
+            rx.pinned_relay_args(flags, "cubic", 1000, allow_missing=False)
+        self.assertIn("--udp-gso", str(cm.exception))
 
     def test_publisher_variant_priority(self):
         argv, rec = rx.pinned_publisher_args({"--variant-priority"}, allow_missing=False)
@@ -754,7 +763,7 @@ class RelayFlagsAgainstSource(unittest.TestCase):
             self.assertIn(f, flags)
 
     def test_pr1378_requires_t_switch(self):
-        flags = set(rx.RELAY_PINNED) | {"--cache-size", "--congestion-controller"}
+        flags = set(rx.RELAY_PINNED) | {"--cache-size", "--congestion-controller", "--udp-gso"}
         with self.assertRaises(SystemExit) as cm:
             rx.pinned_relay_args(flags, "cubic", 1000, allow_missing=False, mechanism="pr1378")
         self.assertIn("--t-switch-ms", str(cm.exception))
@@ -763,7 +772,7 @@ class RelayFlagsAgainstSource(unittest.TestCase):
         self.assertEqual(argv[:2], ["--cache-size", "1000"])
 
     def test_cache_size_is_checked_too(self):
-        flags = set(rx.RELAY_PINNED) | {"--congestion-controller"}
+        flags = set(rx.RELAY_PINNED) | {"--congestion-controller", "--udp-gso"}
         with self.assertRaises(SystemExit) as cm:
             rx.pinned_relay_args(flags, "cubic", 1000, allow_missing=False)
         self.assertIn("--cache-size", str(cm.exception))
@@ -784,12 +793,21 @@ class RelayFlagsAgainstSource(unittest.TestCase):
 
 
 class RelayConfigCheck(unittest.TestCase):
+    def test_udp_gso_must_be_off(self):
+        self.assertIn("udp_gso", rx.check_relay_config({"congestion_controller": "cubic", "udp_gso": "on"}, "cubic", False))
+        self.assertIn("udp_gso", rx.check_relay_config({"congestion_controller": "cubic", "udp_gso": "on"}, "cubic", True))
+        self.assertIn("no udp_gso", rx.check_relay_config({"congestion_controller": "cubic"}, "cubic", False))
+        self.assertIsNone(rx.check_relay_config({"congestion_controller": "cubic"}, "cubic", True))
+
+    def test_stop_wait_exceeds_relay_drain(self):
+        self.assertGreater(rx.STOP_WAIT_S, 10.0)  # the relay drains for 10 s after SIGTERM
+
     def test_cc_must_match(self):
-        self.assertIsNone(rx.check_relay_config({"event": "RELAY_CONFIG", "congestion_controller": "cubic"},
+        self.assertIsNone(rx.check_relay_config({"event": "RELAY_CONFIG", "congestion_controller": "cubic", "udp_gso": "off"},
                                                 "cubic", False))
-        self.assertIsNone(rx.check_relay_config({"event": "RELAY_CONFIG", "congestion_controller": "Cubic"},
+        self.assertIsNone(rx.check_relay_config({"event": "RELAY_CONFIG", "congestion_controller": "Cubic", "udp_gso": "off"},
                                                 "cubic", False))
-        self.assertIsNone(rx.check_relay_config({"config": {"congestion_controller": "bbr"}}, "bbr", False))
+        self.assertIsNone(rx.check_relay_config({"config": {"congestion_controller": "bbr", "udp_gso": "off"}}, "bbr", False))
         self.assertIn("runner asked for 'cubic'",
                       rx.check_relay_config({"congestion_controller": "bbr"}, "cubic", False))
         # also enforced in smoke mode: a relay that reports a different cc is never accepted
