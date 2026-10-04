@@ -2018,3 +2018,181 @@ mod tests_replay_live_overlap {
     );
   }
 }
+
+/// Native SWITCH on harness: the switched (target) subscription is gated by
+/// `check_switch_context`; the source keeps forwarding until its next group.
+#[cfg(test)]
+mod tests_native_switch {
+  use super::*;
+  use crate::server::message_handlers::subscribe_handler::with_native_switch_statuses;
+  use crate::server::test_support::{
+    Received, TEST_NAMESPACE, collect_streams, publish, quic_pair, relay_client, subscribe,
+    test_track, wait_until,
+  };
+  use crate::server::track::Track;
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::model::error::TerminationCode;
+  use std::time::Duration;
+
+  const OLD: u64 = 1;
+  const NEW: u64 = 2;
+
+  fn latest(request_id: u64, track: &str) -> Subscribe {
+    Subscribe::new_latest_object(
+      request_id,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8(track),
+      vec![MessageParameter::new_forward(true)],
+    )
+  }
+
+  async fn wait_for(received: &Received, alias: u64, loc: (u64, u64)) -> bool {
+    wait_until(Duration::from_secs(5), || {
+      let received = received.clone();
+      async move { received.objects(alias).contains(&loc) }
+    })
+    .await
+  }
+
+  /// A client subscribed to the old track, which has delivered group 5 objects
+  /// 0..5, and a new track that has published group 5 objects 0..3.
+  struct Fixture {
+    client: Arc<MOQTClient>,
+    received: Received,
+    old: Track,
+    new: Track,
+  }
+
+  async fn fixture() -> Fixture {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(9, server);
+    let received = collect_streams(peer);
+    let old = test_track(OLD, "video-360p");
+    let new = test_track(NEW, "video-720p");
+    let old_sub = subscribe(&old, &client, latest(1, "video-360p"), false).await;
+    old_sub.read().await.mark_alias_announced();
+    for o in 0..5 {
+      publish(&old, 5, o).await;
+    }
+    assert!(wait_for(&received, OLD, (5, 4)).await);
+    for o in 0..3 {
+      publish(&new, 5, o).await;
+    }
+    Fixture {
+      client,
+      received,
+      old,
+      new,
+    }
+  }
+
+  /// What the handler's SUBSCRIBE does for the switch, as far as forwarding goes:
+  /// create the target subscription (is_switch arms the one-shot check) and release
+  /// its forwarding (SUBSCRIBE_OK sent).
+  async fn switched_subscribe(f: &Fixture) -> Arc<RwLock<Subscription>> {
+    let sub = subscribe(&f.new, &f.client, latest(3, "video-720p"), true).await;
+    sub.read().await.mark_alias_announced();
+    sub
+  }
+
+  /// The defect, reproduced with the old ordering (statuses set after the SUBSCRIBE
+  /// was handled): an object the target dequeues in between is forwarded ungated,
+  /// mid-group, and the source is not demoted for it.
+  #[tokio::test]
+  async fn statuses_set_after_the_subscribe_let_a_mid_group_object_through() {
+    let f = fixture().await;
+    let _new_sub = switched_subscribe(&f).await;
+    publish(&f.new, 5, 3).await;
+    assert!(
+      wait_for(&f.received, NEW, (5, 3)).await,
+      "the window forwards (5, 3) of the target: {:?}",
+      f.received.objects(NEW)
+    );
+    assert_eq!(f.client.switch_context.get_current().await, None);
+  }
+
+  /// The fix: the statuses are in place before the target can forward, so the same
+  /// object meets the Next branch: the target is promoted to start at the group after
+  /// the source's last sent one, and nothing of group 5 is forwarded from it.
+  #[tokio::test]
+  async fn statuses_set_before_the_subscribe_gate_the_first_object() {
+    let f = fixture().await;
+    let new_name = f.new.full_track_name.clone();
+    let old_name = f.old.full_track_name.clone();
+    with_native_switch_statuses(
+      &f.client.switch_context,
+      new_name.clone(),
+      old_name,
+      async {
+        switched_subscribe(&f).await;
+        Ok(())
+      },
+    )
+    .await
+    .unwrap();
+    publish(&f.new, 5, 3).await;
+    publish(&f.new, 5, 4).await;
+    for o in 0..3 {
+      publish(&f.old, 6, o).await;
+      publish(&f.new, 6, o).await;
+    }
+    assert!(wait_for(&f.received, NEW, (6, 2)).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+      f.received.objects(NEW),
+      vec![(6, 0), (6, 1), (6, 2)],
+      "the target starts at the next group"
+    );
+    assert!(
+      f.received.objects(OLD).iter().all(|(g, _)| *g == 5),
+      "the source stops at its next group: {:?}",
+      f.received.objects(OLD)
+    );
+    assert_eq!(f.client.switch_context.get_current().await, Some(new_name));
+  }
+
+  /// The ordering itself: when the SUBSCRIBE runs (and with it SUBSCRIBE_OK and the
+  /// release of forwarding), target = Next and source = Current are already set.
+  #[tokio::test]
+  async fn the_subscribe_runs_with_the_statuses_already_set() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let seen = Arc::new(Mutex::new(None));
+    let seen_in = seen.clone();
+    let ctx_in = ctx.clone();
+    let (t, s) = (target.clone(), source.clone());
+    with_native_switch_statuses(&ctx, target.clone(), source.clone(), async move {
+      *seen_in.lock().await = Some((
+        ctx_in.get_switch_status(&t).await,
+        ctx_in.get_switch_status(&s).await,
+      ));
+      Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+      *seen.lock().await,
+      Some((Some(SwitchStatus::Next), Some(SwitchStatus::Current)))
+    );
+  }
+
+  /// A SUBSCRIBE that fails leaves the switch context as it was.
+  #[tokio::test]
+  async fn a_failed_subscribe_restores_the_statuses() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let pending = crate::server::test_support::full_track_name("video-1080p");
+    ctx
+      .add_or_update_switch_item(pending.clone(), SwitchStatus::Next)
+      .await;
+    let before = ctx.snapshot().await;
+    let res = with_native_switch_statuses(&ctx, target, source, async {
+      Err(TerminationCode::InternalError)
+    })
+    .await;
+    assert!(res.is_err());
+    assert_eq!(ctx.snapshot().await, before);
+  }
+}

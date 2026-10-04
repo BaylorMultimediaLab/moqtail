@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
-use crate::server::client::switch_context::SwitchStatus;
+use crate::server::client::switch_context::{SwitchContext, SwitchStatus};
 use crate::server::events;
 use crate::server::message_handlers::parameters;
 use crate::server::session::Session;
@@ -1641,35 +1641,63 @@ async fn handle_switch_message(
 
   let new_full_track_name = subscribe.get_full_track_name();
 
-  if let Err(e) = handle_subscribe_message(
-    client.clone(),
-    stream_handler,
-    subscribe,
-    context.clone(),
-    true, // is_switch
+  let result = with_native_switch_statuses(
+    &client.switch_context,
+    new_full_track_name,
+    switch_from_track.full_track_name.clone(),
+    handle_subscribe_message(
+      client.clone(),
+      stream_handler,
+      subscribe,
+      context.clone(),
+      true, // is_switch
+    ),
   )
-  .await
-  {
-    error!("error handling switch subscribe message: {:?}", e);
-    Err(e)
-  } else {
-    info!("switch subscribe message handled successfully");
-
-    // update the switch context
-    client
-      .switch_context
-      .add_or_update_switch_item(new_full_track_name, SwitchStatus::Next)
-      .await;
-
-    let switch_from_track_name = switch_from_track.full_track_name.clone();
-
-    client
-      .switch_context
-      .add_or_update_switch_item(switch_from_track_name, SwitchStatus::Current)
-      .await;
-
-    Ok(())
+  .await;
+  match &result {
+    Ok(()) => info!("switch subscribe message handled successfully"),
+    Err(e) => error!("error handling switch subscribe message: {:?}", e),
   }
+  result
+}
+
+/// Runs the SUBSCRIBE a native SWITCH is turned into with the switch context already
+/// saying target = Next, source = Current.
+///
+/// The statuses used to be set only after the SUBSCRIBE had been handled, i.e. after
+/// SUBSCRIBE_OK went out and `mark_alias_announced` released the switched
+/// subscription's forwarding. An object it dequeued in that window found no status
+/// for its track and was forwarded ungated (`check_switch_context`: "not in a switch
+/// context, always forward"), possibly mid-group, while the source track was never
+/// demoted for it; the one-shot `notify_switch` check was spent on it as well (Report
+/// 5, Minor: promotion race). With the statuses in place first, every object the
+/// switched subscription can see is gated by the Next branch.
+///
+/// If the SUBSCRIBE fails and the target has not been promoted meanwhile, the
+/// statuses are put back as they were.
+pub(crate) async fn with_native_switch_statuses<F>(
+  switch_context: &SwitchContext,
+  target: FullTrackName,
+  source: FullTrackName,
+  subscribe: F,
+) -> Result<(), TerminationCode>
+where
+  F: std::future::Future<Output = Result<(), TerminationCode>>,
+{
+  let before = switch_context.snapshot().await;
+  switch_context
+    .add_or_update_switch_item(target.clone(), SwitchStatus::Next)
+    .await;
+  switch_context
+    .add_or_update_switch_item(source, SwitchStatus::Current)
+    .await;
+
+  let result = subscribe.await;
+  if result.is_err() && switch_context.get_switch_status(&target).await == Some(SwitchStatus::Next)
+  {
+    switch_context.restore(before).await;
+  }
+  result
 }
 
 pub async fn handle(

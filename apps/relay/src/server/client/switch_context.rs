@@ -68,6 +68,15 @@ impl SwitchContext {
     items.get(track_name).copied()
   }
 
+  /// Every track's status, to put back with `restore` if a switch is abandoned.
+  pub async fn snapshot(&self) -> HashMap<FullTrackName, SwitchStatus> {
+    self.items.read().await.clone()
+  }
+
+  pub async fn restore(&self, items: HashMap<FullTrackName, SwitchStatus>) {
+    *self.items.write().await = items;
+  }
+
   pub async fn get_current(&self) -> Option<FullTrackName> {
     let items = self.items.read().await;
     for (track_name, status) in items.iter() {
