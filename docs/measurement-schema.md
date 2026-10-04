@@ -206,7 +206,13 @@ The headline set and its definitions are those of the table "Metric
 definitions (W1)" in `docs/rebuild-2026-10-04.md`, which is normative: where
 this file or the analyzer disagree with it, the contract wins. The table below
 repeats every row with its exact implementation (per run, last client
-session; `summary.json` path in parentheses). Everything not listed here is a
+session; `summary.json` path in parentheses). The run ends at `RUN_END.ts`
+when the runner wrote one: client records after it (the browser keeps logging
+through teardown) are outside the run, so SAMPLEs (and with them the
+presented / subscribed weighting, time-shift statistics, `playback` and the
+validator's `samples` check), stall and starvation episodes (one starting
+after `RUN_END` is dropped, one spanning it ends there, an open one is counted
+to it) and gap / wedge seeks are clipped to it. Everything not listed here is a
 diagnostic and lives in `summary.json` / the `diagnostics` block of
 `compare.py`.
 
@@ -314,7 +320,7 @@ Other definitions, unchanged:
   stretch, and the longest stretch / total without progress WHILE playable data
   existed (`buffer_s >= 0.5 s` or a later buffered range): a player wedge, i.e.
   an apparatus failure, as opposed to starvation (an outcome). `samples` is the
-  SAMPLE count after STARTUP.
+  SAMPLE count after STARTUP and up to RUN_END.
 - **Delivery integrity** (`delivery`, needs `--log-objects`): objects received
   per group; `short_groups`, `truncated_groups` (cut on the wire),
   `cut_at_relay` / `lost_after_send` with relay OBJECT_SENT. **Discarded**

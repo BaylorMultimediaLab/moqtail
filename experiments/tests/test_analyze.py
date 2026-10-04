@@ -360,6 +360,27 @@ class StallsAndSeeks(TmpRun):
         self.assertEqual(ep["duration_ms"], 2500)
         self.assertEqual(s["starvation"]["total_ms"], 300)   # [9500, 9800) overlaps the starvation episode; before: 0
 
+    def test_client_records_after_run_end_are_clipped(self):
+        # D6: the browser keeps logging after the runner's RUN_END (teardown); those records
+        # were counted in samples, the presented/subscribed weighting, playback and stalls.
+        A, B = R[0], R[4]
+        client = startup(A)
+        client.append(ev("STALL_START", T0 + 58_000, cause="waiting", playhead_ms=58_000, track=A))
+        client.append(ev("STALL_END", T0 + 64_000, cause="waiting", playhead_ms=58_000, duration_ms=6000))
+        client.append(ev("STALL_START", T0 + 66_000, cause="waiting", playhead_ms=60_000, track=B))   # open, after RUN_END
+        client.append(ev("SEEK", T0 + 67_000, reason="gap", from_ms=60_000, to_ms=63_000, gap_ms=3000))
+        client += samples(T0, T0 + 80_000, lambda t: A if t <= T0 + 60_000 else B,
+                          playhead_at=lambda t: (t - T0) if t <= T0 + 58_000 else 58_000 if t <= T0 + 64_000 else (t - T0) - 6000)
+        run = [runner("RUN_END", T0 + 60_000, elapsed_s=61.0)]
+        s = analyze.analyze(write_run(self.dir, client, run, duration_s=61.0))
+        self.assertEqual(s["playback"]["samples"], 241)                       # before: 321 (to T0 + 80 s)
+        self.assertAlmostEqual(s["bitrate"]["sampled_s"], 60.0, places=3)
+        self.assertEqual(s["bitrate"]["subscribed_rung_mean"], 0)              # B only after RUN_END
+        self.assertAlmostEqual(s["bitrate"]["presented_advancing_s"], 58.0, places=3)
+        self.assertEqual((s["stalls"]["count"], s["stalls"]["total_ms"]), (1, 2000))   # before: 2 episodes, 6000 + 14000 ms
+        self.assertFalse(s["stalls"]["open_at_end"])
+        self.assertEqual(s["stalls"]["media_skipped_ms"], 0)
+
     def test_switches_per_minute_over_run_duration(self):
         A, B = R[0], R[4]
         client = startup(A) + switch(1, T0 + 10_000, A, B) + switch(2, T0 + 11_000, B, A)

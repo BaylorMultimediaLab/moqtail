@@ -177,6 +177,21 @@ def seam_hole(fframe: dict | None, tol_ms: float = 100.0) -> float | None:
     return hole if presented - seam > tol_ms else 0
 
 
+def _clip_episodes(episodes: list[dict], end_ts: float | None) -> list[dict]:
+    """Episodes ({ts, duration_ms}) clipped to ``end_ts`` (RUN_END): one starting at or after
+    it is dropped, one spanning it ends there (``clipped_at_run_end``)."""
+    if end_ts is None:
+        return episodes
+    out = []
+    for e in episodes:
+        if e["ts"] >= end_ts:
+            continue
+        if e.get("duration_ms") is not None and e["ts"] + e["duration_ms"] > end_ts:
+            e = dict(e, duration_ms=end_ts - e["ts"], clipped_at_run_end=True)
+        out.append(e)
+    return out
+
+
 def landing_keyframe(first_object: dict | None, applied: dict | None) -> bool | None:
     """landed_on_keyframe of the landing object: SWITCH_FIRST_OBJECT's flag (2026-10), else
     SWITCH_APPLIED's (older bundles carry it there only); None when neither says."""
@@ -726,8 +741,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     }
     win_start = st["ts"] if st else None
     win_end = (st["ts"] + initial_window_s * 1000) if st else None
+    # Client records after the runner's RUN_END (the browser logs on through teardown) are
+    # outside the run: samples, playback, stalls, starvation and seeks are clipped to it.
+    clip_end = run_end["ts"] if run_end else None
+    within = lambda ts: clip_end is None or ts <= clip_end  # noqa: E731
     client_end = max((r["ts"] for r in recs if r.get("src") == "client"), default=None)
-    samples = [s for s in by("SAMPLE") if st is None or s["ts"] >= st["ts"]]
+    if client_end is not None and clip_end is not None:
+        client_end = min(client_end, clip_end)
+    samples = [s for s in by("SAMPLE") if (st is None or s["ts"] >= st["ts"]) and within(s["ts"])]
     # Run duration: first presented frame to RUN_END (or the last SAMPLE when the runner
     # record is missing). The denominator of switches/min and the end of the share windows.
     end_ts = run_end["ts"] if run_end else (samples[-1]["ts"] if samples else client_end)
@@ -752,8 +773,10 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     # A stall still open when the run ended is a stall to the end of the run.
     if open_start is not None:
         last_ts = client_end if client_end is not None else open_start["ts"]
-        episodes.append({"ts": open_start["ts"], "cause": open_start.get("cause"), "duration_ms": last_ts - open_start["ts"],
+        episodes.append({"ts": open_start["ts"], "cause": open_start.get("cause"), "duration_ms": max(0.0, last_ts - open_start["ts"]),
                          "playhead_ms": open_start.get("playhead_ms"), "track": open_start.get("track"), "open_at_end": True})
+    # Clip to RUN_END: an episode starting after it is not part of the run, one spanning it ends there.
+    episodes = _clip_episodes(episodes, clip_end)
     # Only episodes after the first presented frame count; the client already excludes
     # pre-startup `waiting`, this is the analyzer's own guarantee.
     episodes = [e for e in episodes if st is None or e["ts"] >= st["ts"]]
@@ -767,8 +790,8 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         s["_kind"] = SEEK_REASON_NORMAL.get(s.get("reason"), s.get("reason") or "unknown")
     after_window = lambda s: win_end is not None and s["ts"] >= win_end  # noqa: E731
     span = lambda s: max(0.0, (s.get("to_ms") or 0) - (s.get("from_ms") or 0)) if s.get("to_ms") is not None and s.get("from_ms") is not None else (s.get("gap_ms") or 0)  # noqa: E731
-    gap_after = [s for s in seeks if s["_kind"] == "gap" and after_window(s)]
-    wedge_after = [s for s in seeks if s["_kind"] == "wedge" and after_window(s)]
+    gap_after = [s for s in seeks if s["_kind"] == "gap" and after_window(s) and within(s["ts"])]
+    wedge_after = [s for s in seeks if s["_kind"] == "wedge" and after_window(s) and within(s["ts"])]
     out["stalls"] = {
         # Episodes >= STALL_MIN_EPISODE_MS; shorter `waiting` blips (15-30 ms around a gap seek) are counted apart.
         "count": len(major), "total_ms": sum(durations), "max_ms": max(durations) if durations else 0,
@@ -817,6 +840,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         start = open_st["ts"] - (open_st.get("since_last_append_ms") or 0)
         starved.append({"ts": start, "duration_ms": client_end - start, "track": open_st.get("track"),
                         "pending": open_st.get("pending"), "last_group": open_st.get("last_group"), "open_at_end": True})
+    starved = _clip_episodes(starved, clip_end)
     stall_in_starvation = 0.0
     for e in starved:
         a, b = e["ts"], e["ts"] + (e["duration_ms"] or 0)
