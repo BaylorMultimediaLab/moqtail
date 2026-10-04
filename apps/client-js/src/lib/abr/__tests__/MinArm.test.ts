@@ -39,6 +39,9 @@ interface Inputs {
   latencyOlderMeanMs?: number;
   lastLatencyMs?: number;
   playbackRate?: number;
+  /** Playhead (ms) and the seam whose region it has entered (player.getMetrics, F2). */
+  playheadMs?: number;
+  latestSeamPtsMs?: number | null;
 }
 
 interface HarnessOptions {
@@ -103,6 +106,8 @@ function harness(initial: Inputs, opts: HarnessOptions = {}) {
         latencyRecentMeanMs: current.latencyRecentMeanMs,
         latencyOlderMeanMs: current.latencyOlderMeanMs,
         targetShiftMs: current.targetShiftMs,
+        playheadMs: current.playheadMs,
+        latestSeamPtsMs: current.latestSeamPtsMs,
       };
     }),
     switchTrack: vi.fn().mockResolvedValue(undefined),
@@ -335,7 +340,7 @@ describe('min arm: (b) a one-group hole right after landing', () => {
     expect(h.controller.getHistory()).toHaveLength(1);
   });
 
-  it('a seam drop within 2 groups of the landing is not a history drop: repeated seam emergencies never let the veto cap the rung', async () => {
+  it('without seam metrics (legacy player) a seam drop within 2 groups of the landing is not a history drop: repeated seam emergencies never let the veto cap the rung', async () => {
     // Each cycle: climb to 720p after the dwell, then one group after the
     // landing the seam hole empties a live-edge buffer and the emergency
     // sends the client to 360p. With the seam window (2 groups) the history
@@ -620,5 +625,242 @@ describe('grid and baseline keep the total buffer (only min reads the contiguous
     // "empty" (STRONG rung 0) if it saw the contiguous buffer.
     for (let i = 0; i < 4; i++) await h.tick();
     expect(h.switches()).toEqual([]);
+  });
+});
+
+describe('min arm: (i) the live-edge sawtooth is not an emergency (F1)', () => {
+  // A live-edge client's contiguous buffer is a per-group sawtooth: each group
+  // lands as a burst (1.1 s ahead) and drains to its trough (0.35 s or 0.2 s)
+  // before the next one. A time-shifted client sees the same sawtooth 9 s
+  // higher. With a SWMA that fits the active rung by 0.9 but not by 0.7, the
+  // low-buffer branch fired at every trough on the live-edge client only.
+  const sim = async (saw: number[], swma: number, seconds: number) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      const h = harness(
+        { activeTrack: '720p', bandwidthBps: swma, bufferContigSeconds: saw[0]! },
+        { startupGroups: 10 },
+      );
+      for (let k = 0; k < seconds * 4; k++) {
+        if (k % 4 === 0) {
+          // A group completes on the group boundary; a pending switch lands on it.
+          const calls = h.player.switchTrack.mock.calls;
+          const target = calls.length > 0 ? (calls[calls.length - 1]![0] as string) : null;
+          if (target !== null && h.controller.isSwitching()) h.land(target);
+          h.complete();
+        }
+        await h.tick({ bufferContigSeconds: saw[k % 4]! });
+        vi.advanceTimersByTime(250);
+      }
+      return h.switches().length;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+
+  it('SWMA 2.0 Mbps (720p fits by 0.9, not by 0.7): at most 2 switches in 120 s on either client type', async () => {
+    const live = await sim([1.1, 0.85, 0.6, 0.35], 2_000_000, 120);
+    const shifted = await sim([10.1, 9.85, 9.6, 9.35], 2_000_000, 120);
+    expect(live).toBeLessThanOrEqual(2);
+    expect(shifted).toBeLessThanOrEqual(2);
+    expect(live).toBe(shifted);
+  });
+
+  it('trough 0.2 s, SWMA 1.9 Mbps: at most 2 switches in 120 s on either client type', async () => {
+    const live = await sim([1.0, 0.75, 0.45, 0.2], 1_900_000, 120);
+    const shifted = await sim([10.0, 9.75, 9.45, 9.2], 1_900_000, 120);
+    expect(live).toBeLessThanOrEqual(2);
+    expect(shifted).toBeLessThanOrEqual(2);
+  });
+
+  it('a real drain (below 0.5 s for the whole 1250 ms envelope) still drops to the 0.7 x SWMA rung', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      const h = harness({ activeTrack: '720p', bandwidthBps: 2_000_000, bufferContigSeconds: 1.0 });
+      await h.tick();
+      vi.advanceTimersByTime(250);
+      for (const b of [0.48, 0.45, 0.42, 0.39, 0.36]) {
+        await h.tick({ bufferContigSeconds: b });
+        vi.advanceTimersByTime(250);
+      }
+      // 1.0 s left the 1250 ms window only on the last tick.
+      expect(h.switches()).toEqual([]);
+      await h.tick({ bufferContigSeconds: 0.33 });
+      expect(h.switches()).toEqual(['360p']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('min arm: (j) the history exemption is anchored at the presented seam (F2)', () => {
+  // A seam hole reaches the playhead about one group after the landing on a
+  // live-edge client and about shift / GOP groups after it on a time-shifted
+  // one. The exemption must cover the drop the hole causes on both, and no
+  // drop anywhere else on either.
+  const cycles = async (shiftGroups: number, dropAt: 'hole' | 'elsewhere') => {
+    const h = harness({
+      activeTrack: '360p',
+      bandwidthBps: 2_000_000,
+      bufferContigSeconds: 1 + shiftGroups,
+      playheadMs: 100_000,
+      latestSeamPtsMs: null,
+    });
+    let playhead = 100_000;
+    let presentedSeam: number | null = null;
+    for (let c = 0; c < 6; c++) {
+      // Up to 720p; its seam lies one shift ahead of the playhead.
+      await h.tickAndLand({ playheadMs: playhead, latestSeamPtsMs: presentedSeam });
+      const seam = playhead + shiftGroups * 1000;
+      // The playhead plays the source media up to the seam.
+      for (let g = 0; g < shiftGroups; g++) {
+        h.complete();
+        playhead += 1000;
+      }
+      if (dropAt === 'hole') {
+        // The playhead sits at the hole in front of the seam: empty buffer.
+        presentedSeam = seam;
+        await h.tickAndLand({
+          bufferContigSeconds: 0,
+          playheadMs: seam - 20,
+          latestSeamPtsMs: presentedSeam,
+        });
+      } else {
+        // An ordinary drop, 5 s of media away from any seam.
+        await h.tickAndLand({
+          bufferContigSeconds: 0,
+          playheadMs: seam - 5_000,
+          latestSeamPtsMs: presentedSeam,
+        });
+      }
+      playhead = seam + 5_000;
+      await h.tick({ bufferContigSeconds: 1 + shiftGroups, playheadMs: playhead });
+      h.complete(3); // dwell
+    }
+    return h;
+  };
+  const ups = (h: Awaited<ReturnType<typeof cycles>>) =>
+    h.controller.getHistory().filter(e => e.reason === 'auto-upgrade').length;
+
+  it('a hole-induced drop is exempt on both client types (the veto never caps 720p)', async () => {
+    const live = await cycles(1, 'hole');
+    const shifted = await cycles(10, 'hole');
+    expect(ups(live)).toBe(6);
+    expect(ups(shifted)).toBe(6);
+    for (const h of [live, shifted]) {
+      const drops = h.controller.getHistory().filter(e => e.reason === 'auto-emergency');
+      expect(drops).toHaveLength(6);
+      for (const d of drops) expect(d.msPastSeam).toBe(-20);
+    }
+  });
+
+  it('an ordinary drop is counted on both client types (the veto caps 720p after 8 events)', async () => {
+    const live = await cycles(1, 'elsewhere');
+    const shifted = await cycles(10, 'elsewhere');
+    expect(ups(live)).toBe(4);
+    expect(ups(shifted)).toBe(4);
+  });
+});
+
+describe('min arm: (k) a switch that lands after its guard timed out (F7)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('writes history and ABR_DECISION when it lands, even after a later decision was refused', async () => {
+    vi.useFakeTimers();
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    await h.tick();
+    expect(h.switches()).toEqual(['720p']);
+    // The guard times out (3 s) and the cool-down (5 s) passes without a landing.
+    vi.advanceTimersByTime(3_100);
+    await h.tick();
+    vi.advanceTimersByTime(5_100);
+    // A new decision (the link rose) while 720p is still in flight ...
+    await h.tick({ bandwidthBps: 10_000_000 });
+    expect(h.switches()).toEqual(['720p', '1080p']);
+    // ... which the player skips (previous switch not landed): a phantom.
+    h.controller.onTrackSwitched('360p');
+    // Then the first switch lands.
+    h.land('720p');
+    const history = h.controller.getHistory();
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ fromTrack: '360p', toTrack: '720p' });
+    const decisions = emit.mock.calls.filter(c => c[0] === 'ABR_DECISION');
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]![1]).toMatchObject({ from: '360p', to: '720p' });
+    const phantoms = emit.mock.calls.filter(c => c[0] === 'ABR_SWITCH_PHANTOM');
+    expect(phantoms.map(c => (c[1] as Record<string, unknown>).to)).toEqual(['1080p']);
+  });
+});
+
+describe('min arm: (l) ABR_DECISION and ABR_SWITCH_PHANTOM carry the switch_seq (F14)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  /** A player that numbers its switches like Player.switchTrack (lastSwitchSeq, resolved seq). */
+  const numbered = (h: ReturnType<typeof harness>, first = 41) => {
+    let n = first;
+    const p = h.player as unknown as { lastSwitchSeq: number | null };
+    p.lastSwitchSeq = null;
+    h.player.switchTrack.mockImplementation(async () => {
+      p.lastSwitchSeq = ++n;
+      return n;
+    });
+  };
+
+  it('the landing decision and the phantom name the seq of the switch they decided', async () => {
+    vi.useFakeTimers();
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    numbered(h);
+    await h.tick(); // seq 42: 360p -> 720p
+    vi.advanceTimersByTime(3_100);
+    await h.tick(); // guard timeout
+    vi.advanceTimersByTime(5_100);
+    await h.tick({ bandwidthBps: 10_000_000 }); // seq 43: 360p -> 1080p
+    expect(h.switches()).toEqual(['720p', '1080p']);
+    // The player resolves each callback with the switch's seq.
+    h.controller.onTrackSwitched('360p', 43);
+    h.set({ activeTrack: '720p' });
+    h.controller.onTrackSwitched('720p', 42);
+    const phantom = emit.mock.calls.find(c => c[0] === 'ABR_SWITCH_PHANTOM')![1];
+    const decision = emit.mock.calls.find(c => c[0] === 'ABR_DECISION')![1];
+    expect(phantom).toMatchObject({ switch_seq: 43, to: '1080p' });
+    expect(typeof (phantom as Record<string, unknown>).decided_ts).toBe('number');
+    expect(decision).toMatchObject({ switch_seq: 42, to: '720p' });
+    expect(typeof (decision as Record<string, unknown>).decided_ts).toBe('number');
+  });
+
+  it('matches by seq, not by track: a callback for an older switch to the same target resolves that one', async () => {
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    numbered(h);
+    await h.tick(); // seq 42 -> 720p
+    h.controller.onTrackSwitched('360p', 42); // refused
+    await h.tick(); // seq 43 -> 720p again
+    h.set({ activeTrack: '720p' });
+    h.controller.onTrackSwitched('720p', 43);
+    const seqs = (name: string) =>
+      emit.mock.calls
+        .filter(c => c[0] === name)
+        .map(c => (c[1] as Record<string, unknown>).switch_seq);
+    expect(seqs('ABR_SWITCH_PHANTOM')).toEqual([42]);
+    expect(seqs('ABR_DECISION')).toEqual([43]);
+  });
+
+  it('without a numbering player the fields are null', async () => {
+    const emit = vi.spyOn(events, 'emit');
+    const h = harness({ activeTrack: '360p', bandwidthBps: 2_000_000, bufferContigSeconds: 5 });
+    await h.tick();
+    h.land('720p');
+    const decision = emit.mock.calls.find(c => c[0] === 'ABR_DECISION')![1];
+    expect(decision).toMatchObject({ switch_seq: null });
   });
 });

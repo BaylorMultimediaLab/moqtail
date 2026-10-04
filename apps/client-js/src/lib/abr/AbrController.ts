@@ -46,6 +46,8 @@ export interface AbrMetrics {
 }
 
 const MAX_HISTORY = CONTROLLER_CONSTANTS.maxHistory;
+/** Unresolved switch records kept (F7); the guard allows one in flight, so a few suffice. */
+const MAX_PENDING_SWITCHES = 8;
 
 /**
  * The player metrics the controller consumes (`player.getMetrics()`), listed so
@@ -92,6 +94,15 @@ export interface AbrPlayerMetrics {
   latencyOlderMeanMs?: number;
   /** The client's target shift behind live, ms: 0 live-edge, delayGroups × GOP time-shifted (C6). */
   targetShiftMs?: number;
+  /** Playhead (media time), ms. */
+  playheadMs?: number;
+  /**
+   * PTS (ms) of the latest applied switch seam whose region the playhead has
+   * entered (the region begins at the hole in front of the seam), null when
+   * it has entered none. SwitchHistoryRule's seam exemption (F2). Absent on
+   * players that do not track seams.
+   */
+  latestSeamPtsMs?: number | null;
   // Diagnostics copied into AbrMetrics for the UI / SAMPLE log.
   readyState?: number;
   paused?: boolean;
@@ -104,13 +115,22 @@ export interface AbrPlayerMetrics {
 /** What the controller needs from the player. `Player` satisfies it structurally. */
 export interface AbrPlayer {
   getMetrics(): AbrPlayerMetrics;
-  switchTrack(trackName: string): Promise<void>;
+  /** Sends a switch; resolves to its `switch_seq` when the player numbers switches. */
+  switchTrack(trackName: string): Promise<unknown>;
+  /**
+   * `switch_seq` the last switchTrack call allocated, readable synchronously
+   * right after the call (Player sets it before its first await); null or
+   * absent when the player does not number switches (F14).
+   */
+  readonly lastSwitchSeq?: number | null;
   setEmaHalfLives(fastHalfLifeSeconds: number, slowHalfLifeSeconds: number): void;
   probeTrackBandwidth(trackName: string, durationMs: number): Promise<number | ProbeResult>;
 }
 
 /** A switch that has been sent and not yet confirmed by the player (see onTrackSwitched). */
 interface PendingSwitch {
+  /** The player's `switch_seq` for this switch (null when it does not number switches). */
+  switchSeq: number | null;
   fromTrack: string;
   toTrack: string;
   fromIndex: number;
@@ -132,7 +152,18 @@ interface PendingSwitch {
   latencyTrend: number;
   /** Completed groups since the last landing when the decision was taken; null before the first landing. */
   groupsSinceLanding: number | null;
+  /** Playhead minus the seam it was at when the decision was taken (SwitchEvent.msPastSeam). */
+  msPastSeam: number | null | undefined;
   decidedTs: number;
+}
+
+/** SwitchEvent.msPastSeam from the player's metrics at decision time (F2). */
+function msPastSeamOf(
+  m: Pick<AbrPlayerMetrics, 'playheadMs' | 'latestSeamPtsMs'>,
+): number | null | undefined {
+  if (m.latestSeamPtsMs === undefined || typeof m.playheadMs !== 'number') return undefined;
+  if (m.latestSeamPtsMs === null) return null;
+  return m.playheadMs - m.latestSeamPtsMs;
 }
 
 export class AbrController {
@@ -204,12 +235,15 @@ export class AbrController {
   // Recent instantaneous buffer levels for settings.controller.bufferSignal =
   // 'envelope' (see ControllerSettings).
   #bufferSamples: { ts: number; bufferSeconds: number }[] = [];
-  // The switch that has been sent but not confirmed (M17). History, ABR_DECISION,
-  // the up-guard arm and the probe's tracksize are written only when the player
-  // reports (onTrackSwitched) that the landed track is this record's target. A
-  // refused, skipped or failed switch calls back with the old track and leaves
-  // no trace other than ABR_SWITCH_PHANTOM.
-  #pendingSwitch: PendingSwitch | null = null;
+  // Switches that have been sent and not resolved yet, oldest first (M17, F7).
+  // History, ABR_DECISION, the up-guard arm and the probe's tracksize are
+  // written only when the player reports (onTrackSwitched) that a record's
+  // target landed. A refused, skipped or failed switch calls back with the old
+  // track and leaves no trace other than ABR_SWITCH_PHANTOM. A record outlives
+  // its switching guard: the guard may time out (3 s) and a later decision may
+  // be sent, but the record stays until it lands, its own phantom callback
+  // arrives, or a newer switch lands (an older one can no longer land then).
+  #pendingSwitches: PendingSwitch[] = [];
   // activeTrack as of the last tick; a callback with a different track is a
   // landing even when no decision is pending (a switch that landed after its
   // guard timed out).
@@ -283,13 +317,15 @@ export class AbrController {
    *
    * Without an argument (legacy wiring) the landed track is read from
    * `player.getMetrics().activeTrack`, which the player updates before it calls
-   * back.
+   * back. `switchSeq` (the player's `switch_seq` of the switch the callback is
+   * about) picks the pending record exactly; ABR_DECISION and
+   * ABR_SWITCH_PHANTOM carry it as `switch_seq` (F14).
    */
-  onTrackSwitched(landedTrack?: string): void {
+  onTrackSwitched(landedTrack?: string, switchSeq?: number): void {
     const m = this.#player.getMetrics();
     const landed = landedTrack ?? m.activeTrack ?? null;
-    const pending = this.#pendingSwitch;
-    this.#pendingSwitch = null;
+    const pending = this.#resolvePending(landed, switchSeq);
+    const seq = pending?.switchSeq ?? switchSeq ?? null;
     this.#lastSampleCount = m.sampleCount;
     // Defer actually clearing #switching until totalVideoFrames advances past
     // the snapshot — that's when MSE has decoded an actual frame from the new
@@ -302,12 +338,14 @@ export class AbrController {
     if (!isLanding) {
       if (pending) {
         events.emit('ABR_SWITCH_PHANTOM', {
+          switch_seq: seq,
           from: pending.fromTrack,
           to: pending.toTrack,
           landed,
           reason: pending.reason,
           rule_reason: pending.ruleReason,
           decided_ms_ago: Date.now() - pending.decidedTs,
+          decided_ts: pending.decidedTs,
         });
       }
       return;
@@ -322,6 +360,7 @@ export class AbrController {
     if (pending) {
       this.#recordHistory(pending);
       events.emit('ABR_DECISION', {
+        switch_seq: seq,
         from: pending.fromTrack,
         to: pending.toTrack,
         from_index: pending.fromIndex,
@@ -340,6 +379,7 @@ export class AbrController {
         probe_bps: pending.probeBps,
         latency_trend: pending.latencyTrend,
         groups_since_landing: pending.groupsSinceLanding,
+        ms_past_seam: pending.msPastSeam ?? null,
         decided_ts: pending.decidedTs,
         landed_after_ms: Date.now() - pending.decidedTs,
       });
@@ -361,6 +401,58 @@ export class AbrController {
     if (this.#settings.controller?.upGuardRelease !== 'visible') this.#releaseUpGuard('landed');
   }
 
+  /**
+   * The unresolved decision a callback resolves, removed from the pending
+   * list. With the player's `switchSeq` it is the record of that switch (F14);
+   * a seq no record carries is a switch the controller did not decide (null),
+   * unless some records were never numbered, which are then matched by track.
+   * By track: the newest record whose target is `landed` (a landing), else the
+   * newest one (a refusal of the latest switch, ABR_SWITCH_PHANTOM). A landing
+   * also resolves every older record: an older switch can no longer land once
+   * a newer one has. Null when nothing matches.
+   */
+  #resolvePending(landed: string | null, switchSeq?: number): PendingSwitch | null {
+    const list = this.#pendingSwitches;
+    if (switchSeq !== undefined) {
+      const i = list.findIndex(p => p.switchSeq === switchSeq);
+      if (i >= 0) {
+        const rec = list[i]!;
+        if (rec.toTrack === landed) list.splice(0, i + 1);
+        else list.splice(i, 1);
+        return rec;
+      }
+      if (!list.some(p => p.switchSeq === null)) return null;
+    }
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i]!.toTrack === landed) {
+        const rec = list[i]!;
+        list.splice(0, i + 1);
+        return rec;
+      }
+    }
+    return list.pop() ?? null;
+  }
+
+  /**
+   * Sends the switch of `rec` and keeps the record for its callback (bounded;
+   * the oldest is forgotten). The record takes the player's `switch_seq`:
+   * read synchronously (the player may call back before its promise
+   * resolves), else from the resolved value.
+   */
+  #send(rec: PendingSwitch): void {
+    this.#pendingSwitches.push(rec);
+    if (this.#pendingSwitches.length > MAX_PENDING_SWITCHES) this.#pendingSwitches.shift();
+    const sent = this.#player.switchTrack(rec.toTrack);
+    const seq = this.#player.lastSwitchSeq;
+    if (typeof seq === 'number') rec.switchSeq = seq;
+    void Promise.resolve(sent).then(
+      v => {
+        if (rec.switchSeq === null && typeof v === 'number') rec.switchSeq = v;
+      },
+      () => {},
+    );
+  }
+
   /** @deprecated Use onTrackSwitched(trackName); kept for the existing app.tsx wiring. */
   releaseSwitchingGuard(): void {
     this.onTrackSwitched();
@@ -371,13 +463,17 @@ export class AbrController {
    * null before the first landing.
    *
    * With `samplesByTrack` this is exact: the landed track's samples now minus
-   * at the landing. Without it, the total sample count minus one: the player
-   * calls back on the landing object *before* recording it, and recording it
-   * finalises the source's last group (the tracker closes a group when the
-   * next group's first object arrives), so the first sample after a landing is
-   * the old track's. Discounting it keeps "N groups of the new track" true on
-   * that player and errs by one group too many (never too few) on a player
-   * that finalises before calling back.
+   * at the landing (the player keys samples by the group's own track, one per
+   * (track, group), F5). Without it, the total sample count minus one. The
+   * tracker keeps one accumulator per (track, group) and a target object
+   * never closes a source group, so the source's last group, which is usually
+   * still open when the target lands (the landing object is the target's
+   * first), closes after the landing: at its own last object, or after two
+   * group times without one. That sample is the old track's and is in the
+   * total; discounting one for it keeps "N groups of the new track" from
+   * running ahead. On a player whose source group had already closed before
+   * the callback, the discount errs by one group too many (the dwell waits one
+   * group longer), never too few.
    */
   groupsSinceLanding(m: Pick<AbrPlayerMetrics, 'sampleCount' | 'samplesByTrack'>): number | null {
     const landing = this.#landing;
@@ -430,7 +526,8 @@ export class AbrController {
     const fromTrack = m.activeTrack ?? '';
     const fromIndex = this.#tracks.findIndex(t => t.name === fromTrack);
     const toIndex = this.#tracks.findIndex(t => t.name === trackName);
-    this.#pendingSwitch = {
+    this.#send({
+      switchSeq: null,
       fromTrack,
       toTrack: trackName,
       fromIndex,
@@ -449,9 +546,9 @@ export class AbrController {
       probeBps: 0,
       latencyTrend: m.latencyTrendRatio,
       groupsSinceLanding: this.groupsSinceLanding(m),
+      msPastSeam: msPastSeamOf(m),
       decidedTs: Date.now(),
-    };
-    void this.#player.switchTrack(trackName);
+    });
   }
 
   getHistory(): SwitchEvent[] {
@@ -539,9 +636,10 @@ export class AbrController {
     while (this.#bufferSamples.length > 0 && nowTs - this.#bufferSamples[0]!.ts > envelopeMs) {
       this.#bufferSamples.shift();
     }
+    const bufferEnvelopeSeconds = bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs);
     const ruleBufferSeconds =
       this.#settings.controller.bufferSignal === 'envelope'
-        ? bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs)
+        ? bufferEnvelopeSeconds
         : bufferInstantSeconds;
 
     // Once the player signals the init segment landed, hold #switching until
@@ -577,11 +675,11 @@ export class AbrController {
         track: activeTrack,
         held_ms: Date.now() - this.#switchingStartTs,
         cooldown_ms: AbrController.SWITCH_COOLDOWN_MS,
-        pending_to: this.#pendingSwitch?.toTrack ?? null,
+        pending_to: this.#pendingSwitches.at(-1)?.toTrack ?? null,
       });
-      // The switch never confirmed: it is not history (M17). If the target
-      // lands later, onTrackSwitched still sees a landing and starts the dwell.
-      this.#pendingSwitch = null;
+      // The switch has not confirmed, so it is not history yet (M17); its
+      // record stays pending: a landing later than the guard is still this
+      // decision and writes its history and ABR_DECISION then (F7).
       // A switch that never lands must not hold up-switches forever: start the
       // fresh-sample count now.
       this.#releaseUpGuard('timeout');
@@ -643,6 +741,7 @@ export class AbrController {
       activeTrackIndex: currentIdx,
       bufferSeconds: ruleBufferSeconds,
       bufferInstantSeconds,
+      bufferEnvelopeSeconds,
       bufferTotalSeconds: bufferSeconds,
       groupsSinceLanding: this.groupsSinceLanding(raw),
       bandwidthBps,
@@ -800,7 +899,8 @@ export class AbrController {
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
-    this.#pendingSwitch = {
+    this.#send({
+      switchSeq: null,
       fromTrack: activeTrack ?? '',
       toTrack: targetTrack.name,
       fromIndex: currentIdx,
@@ -819,9 +919,9 @@ export class AbrController {
       probeBps: context.probeBandwidthBps,
       latencyTrend: latencyTrendRatio,
       groupsSinceLanding: context.groupsSinceLanding ?? null,
+      msPastSeam: msPastSeamOf(raw),
       decidedTs: Date.now(),
-    };
-    void this.#player.switchTrack(targetTrack.name);
+    });
   }
 
   #updateDynamicStrategy(bufferLevel: number): void {
@@ -866,6 +966,7 @@ export class AbrController {
       bufferAtSwitch: p.bufferSeconds,
       emaBwAtSwitch: p.fastEmaBps,
       groupsSinceLanding: p.groupsSinceLanding ?? undefined,
+      ...(p.msPastSeam !== undefined ? { msPastSeam: p.msPastSeam } : {}),
     };
 
     this.#switchHistory.push(event);

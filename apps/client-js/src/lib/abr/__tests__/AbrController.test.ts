@@ -768,7 +768,7 @@ describe('AbrController', () => {
       expect(controller.getHistory()).toHaveLength(1);
     });
 
-    it('a switch that times out is dropped from the pending record, not written to history', async () => {
+    it('a switch whose guard times out is not history until it lands, and is history when it lands late (F7)', async () => {
       vi.useFakeTimers();
       try {
         const { controller, player } = makeController(
@@ -780,6 +780,12 @@ describe('AbrController', () => {
         vi.advanceTimersByTime(AbrController.SWITCH_TIMEOUT_MS + 1);
         await controller._tick(); // ABR_GUARD_TIMEOUT
         expect(controller.getHistory()).toHaveLength(0);
+        // The target lands 4 s after the decision: still that decision.
+        vi.advanceTimersByTime(1_000);
+        controller.onTrackSwitched('1080p');
+        const h = controller.getHistory();
+        expect(h).toHaveLength(1);
+        expect(h[0]).toMatchObject({ fromTrack: '360p', toTrack: '1080p', reason: 'auto-upgrade' });
       } finally {
         vi.useRealTimers();
       }

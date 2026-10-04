@@ -17,23 +17,39 @@
 /**
  * EmergencyBufferRule — the one buffer rule of the `min` arm.
  *
- * It reads the *instantaneous contiguous* buffer (`RulesContext.
- * bufferInstantSeconds`: the end of the buffered range that contains the
- * playhead minus the playhead; 0 if the playhead is in no range), never the
- * envelope the other rules see and never the total across holes:
+ * It reads the *contiguous* buffer (the end of the buffered range that
+ * contains the playhead minus the playhead; 0 if the playhead is in no range),
+ * never the total across holes, in two forms:
  *
- *   buffer == 0        → rung 0                                  (STRONG)
- *   buffer < lowBufferS → highest rung with bitrate ≤ sf × SWMA   (STRONG)
- *                         when that rung is below the active one
+ *   instantaneous == 0          → rung 0                            (STRONG)
+ *   envelope < lowBufferS       → highest rung with bitrate ≤ sf × SWMA
+ *                                 when that rung is below the active one (STRONG)
  *
- * with `lowBufferS = 0.5 s` and `sf = 0.7` by default. The rule only ever
- * lowers: when the low-buffer rung is at or above the active rung it abstains
- * and ThroughputRule (with the dwell) decides, exactly as on a full buffer. It
- * deliberately does not vote "stay": a STRONG stay would be an up-switch gate
- * on the instantaneous buffer, and at the live edge that buffer is a sawtooth
- * that crosses 0.5 s once per group while a time-shifted client never gets
- * there, i.e. an admission policy for one client type only (the M18 objection
- * to InsufficientBufferRule).
+ * with `lowBufferS = 0.5 s` and `sf = 0.7` by default. The envelope
+ * (`RulesContext.bufferEnvelopeSeconds`) is the maximum of the contiguous
+ * buffer over the last `bufferEnvelopeMs` (1250 ms: one group plus one tick),
+ * so the low branch fires only when the buffer stayed below 0.5 s for that
+ * whole window, i.e. it is draining, not merely at the trough of a group.
+ *
+ * Why the envelope (F1): the publisher sends each group as a burst, so at the
+ * live edge the instantaneous contiguous buffer is a per-group sawtooth
+ * (≈1.1 s after a burst, ≈0.2-0.35 s just before the next) whose trough is
+ * below 0.5 s once per group, while a time-shifted client sees the same
+ * sawtooth 10 s higher. Reading the instantaneous value armed the low branch
+ * once per group on the live-edge client only: with a SWMA in
+ * [bitrate/0.9, bitrate/0.7) it alternated between ThroughputRule's rung and
+ * the 0.7 × SWMA rung (45 switches in 120 s against 0 for the time-shifted
+ * client on identical throughput). The envelope is the level after each burst,
+ * the same quantity on both client types. The empty branch keeps the
+ * instantaneous value: a playhead at a hole or at the end of its data is a
+ * stall now, whatever the last second looked like.
+ *
+ * The rule only ever lowers: when the low-buffer rung is at or above the
+ * active rung it abstains and ThroughputRule (with the dwell) decides, exactly
+ * as on a full buffer. It deliberately does not vote "stay": a STRONG stay
+ * would be an up-switch gate on the buffer level, i.e. an admission policy that
+ * binds on a live-edge client only (the M18 objection to
+ * InsufficientBufferRule).
  *
  * Why only this: InsufficientBufferRule's admission `0.7 × SWMA × buffer`
  * binds on a live-edge client (buffer ≈ 1 s) and is no constraint on a 10 s
@@ -47,8 +63,9 @@
  * type (a time-shifted client waits for its backlog).
  *
  * Reasons contain "emergency", so AbrController labels the switch
- * `auto-emergency` and SwitchHistoryRule counts it as a drop (unless it falls
- * inside the post-landing window, see controller.historyIgnoreGroupsAfterLanding).
+ * `auto-emergency` and SwitchHistoryRule counts it as a drop (unless it is
+ * decided while the playhead is at a seam, see
+ * controller.historyIgnoreGroupsAfterLanding).
  */
 
 import { SwitchRequestPriority, DEFAULT_ABR_SETTINGS } from '../types';
@@ -71,11 +88,13 @@ export class EmergencyBufferRule implements AbrRule {
     if (tracks.length === 0) return null;
     if (totalFrames <= 0) return null; // startup: nothing presented, nothing to stall
 
-    const buffer = context.bufferInstantSeconds ?? context.bufferSeconds;
-
-    if (buffer <= 0) {
+    const instant = context.bufferInstantSeconds ?? context.bufferSeconds;
+    if (instant <= 0) {
       return { representationIndex: 0, priority, reason: 'emergency-buffer-empty' };
     }
+    // The low branch reads the envelope (F1); a caller that has none (unit
+    // contexts) gets the instantaneous value.
+    const buffer = context.bufferEnvelopeSeconds ?? instant;
     if (buffer >= lowBufferS) return null;
 
     const cap = bandwidthBps * safetyFactor;
@@ -87,7 +106,7 @@ export class EmergencyBufferRule implements AbrRule {
     return {
       representationIndex: best,
       priority,
-      reason: `emergency-buffer-low ${buffer.toFixed(2)}s < ${lowBufferS}s, cap ${(cap / 1e6).toFixed(2)}Mbps`,
+      reason: `emergency-buffer-low envelope ${buffer.toFixed(2)}s < ${lowBufferS}s, cap ${(cap / 1e6).toFixed(2)}Mbps`,
     };
   }
 

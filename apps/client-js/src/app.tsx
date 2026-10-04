@@ -524,10 +524,8 @@ export function App() {
         await player.attachMedia(videoRef.current);
         bufferRef.current = new MSEBuffer(videoRef.current, {
           liveEdgeDelay: computeLiveEdgeDelay(clientMode, timeShiftSeconds),
-          gapFillProbe: () => {
-            const front = player.getAppendFrontMs();
-            return { appendFrontS: front !== undefined ? front / 1000 : undefined };
-          },
+          gapFillProbe: q => player.getGapFillState(q),
+          frameDurationProbe: () => player.getFrameDurationMs(),
           gopDurationMs,
         });
         if (videoTrack) await player.addMediaTrack(videoTrack);
@@ -587,8 +585,8 @@ export function App() {
         });
         rulesRef.current = rulesCollection;
         abrRef.current = abr;
-        player.setOnTrackSwitched(trackName => {
-          abrRef.current?.onTrackSwitched(trackName);
+        player.setOnTrackSwitched((trackName, switchSeq) => {
+          abrRef.current?.onTrackSwitched(trackName, switchSeq);
           setSelectedVideo(trackName);
         });
         player.setOnSwitchVisible(() => abrRef.current?.notifySwitchVisible());

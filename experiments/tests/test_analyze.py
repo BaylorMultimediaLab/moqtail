@@ -88,9 +88,10 @@ def samples(start: float, end: float, track_at, playhead_at=None, presented_at=N
 def write_run(tmp: Path, client: list[dict], runner_recs: list[dict] | None = None, profile: str = "step_down_up",
               client_mode: str = "time-shifted", target_shift_ms: int = 10_000, startup_track: str = R[0],
               duration_s: float = 200.0, identity_extra: dict | None = None, validation: dict | None = None,
-              relay_recs: list[dict] | None = None, meta_extra: dict | None = None) -> Path:
+              relay_recs: list[dict] | None = None, meta_extra: dict | None = None, client_meta_extra: dict | None = None) -> Path:
     meta = ev("RUN_META", T0 - 100, client_mode=client_mode, time_shift_s=target_shift_ms / 1000, delay_groups=target_shift_ms // 1000,
-              target_shift_ms=target_shift_ms, gop_duration_ms=1000, startup_track=startup_track, ladder=LADDER)
+              target_shift_ms=target_shift_ms, gop_duration_ms=1000, startup_track=startup_track, ladder=LADDER,
+              **(client_meta_extra or {}))
     recs = [meta] + sorted(client, key=lambda r: r["ts"])
     (tmp / "client-events.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
     (tmp / "runner-events.jsonl").write_text("\n".join(json.dumps(r) for r in (runner_recs or [])) + "\n")
@@ -115,16 +116,31 @@ def startup(track: str = R[0]) -> list[dict]:
             ev("STARTUP", T0, track=track, playhead_ms=0, startup_delay_ms=1200.0)]
 
 
-def switch(seq: int, ts: float, frm: str, to: str, land_after_ms: float | None = 500.0, with_seq: bool = False) -> list[dict]:
+def switch(seq: int, ts: float, frm: str, to: str, land_after_ms: float | None = 500.0, with_seq: bool = False,
+           rule_reason: str = "throughput", decided_before_ms: float = 1.0, decision: str = "landing",
+           decision_seq: bool | None = None) -> list[dict]:
+    """One switch as the player and controller log it. The controller decides at
+    ``ts - decided_before_ms`` and logs ABR_DECISION only when the switch LANDS (at
+    SWITCH_APPLIED, with ``decided_ts`` and ``landed_after_ms``; ``switch_seq`` too when
+    ``decision_seq``, default ``with_seq``). ``decision="legacy"`` reproduces clients
+    before 2026-10-04 (ABR_DECISION at the decision, no decided_ts); ``"none"`` omits it."""
     extra = {"switch_seq": seq} if with_seq else {}
-    out = [ev("ABR_DECISION", ts - 1, **{"from": frm, "to": to, "reason": "auto-upgrade" if R.index(to) > R.index(frm) else "auto-downgrade", "rule_reason": "throughput"}),
-           ev("SWITCH_SENT", ts, **{"from": frm, "to": to, "request_id": seq * 2, "old_request_id": seq * 2 - 2, "playhead_ms": ts - T0}, **extra),
+    reason = "auto-upgrade" if R.index(to) > R.index(frm) else "auto-downgrade"
+    decided = ts - decided_before_ms
+    out = [ev("SWITCH_SENT", ts, **{"from": frm, "to": to, "request_id": seq * 2, "old_request_id": seq * 2 - 2, "playhead_ms": ts - T0}, **extra),
            ev("SWITCH_OK", ts + 50, to=to, request_id=seq * 2, rtt_ms=50, **extra)]
+    if decision == "legacy":
+        out.append(ev("ABR_DECISION", decided, **{"from": frm, "to": to, "reason": reason, "rule_reason": rule_reason}))
     if land_after_ms is not None:
-        out += [ev("SWITCH_FIRST_OBJECT", ts + land_after_ms, **{"from": frm, "to": to, "group": 20 + seq, "object": 0, "since_sent_ms": land_after_ms}, **extra),
+        out += [ev("SWITCH_FIRST_OBJECT", ts + land_after_ms, **{"from": frm, "to": to, "group": 20 + seq, "object": 0, "since_sent_ms": land_after_ms,
+                                                                 "landed_on_keyframe": True}, **extra),
                 ev("SWITCH_APPLIED", ts + land_after_ms + 1, **{"from": frm, "to": to, "group": 20 + seq, "object": 0, "media_seam_gap_ms": 0,
                                                               "seam_ahead_of_playhead_ms": 9000, "landed_on_group_start": True, "landed_on_keyframe": True,
                                                               "since_sent_ms": land_after_ms + 1}, **extra)]
+        if decision == "landing":
+            dseq = {"switch_seq": seq} if (with_seq if decision_seq is None else decision_seq) else {}
+            out.append(ev("ABR_DECISION", ts + land_after_ms + 1, **{"from": frm, "to": to, "reason": reason, "rule_reason": rule_reason,
+                                                                    "decided_ts": decided, "landed_after_ms": ts + land_after_ms + 1 - decided}, **dseq))
     return out
 
 
@@ -209,6 +225,132 @@ class SwitchIdentity(TmpRun):
         self.assertEqual(sum(t.values()), s["switches"]["count"])
         self.assertEqual(t["open"], 1)
         self.assertEqual(s["switches"]["superseded_frac"], 2 / 4)
+
+
+class SkippedAttempts(TmpRun):
+    """D7: SWITCH_SKIPPED is emitted WITHOUT a SWITCH_SENT and with its own switch_seq (an
+    attempt, not a switch); there is no `skipped` terminal."""
+
+    def test_skipped_is_an_attempt_not_a_terminal(self):
+        A, B = R[0], R[4]
+        self.assertNotIn("skipped", analyze.TERMINALS)
+        client = startup(A) + switch(1, T0 + 1000, A, B, with_seq=True)
+        client.append(first_frame(T0 + 3000, A, B, vis_ms=2000.0, seq=1))
+        client.append(ev("SWITCH_SKIPPED", T0 + 1200, switch_seq=2, **{"from": A, "to": R[2]}, reason="previous switch not landed",
+                         pending_request_id=2))
+        # A SKIPPED record that reuses a sent switch's seq (contract violation) still ends nothing.
+        client += switch(3, T0 + 4000, B, A, with_seq=True)
+        client.append(ev("SWITCH_SKIPPED", T0 + 4100, switch_seq=3, **{"from": B, "to": A}, reason="previous switch not landed",
+                         pending_request_id=6))
+        client.append(first_frame(T0 + 6000, B, A, vis_ms=2000.0, seq=3))
+        client += samples(T0, T0 + 8000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switches"]
+        self.assertEqual(sw["count"], 2)
+        self.assertEqual([x["terminal"] for x in sw["list"]], ["first_frame", "first_frame"])   # before: #3 was `skipped`
+        self.assertEqual(set(sw["terminals"]), set(analyze.TERMINALS))
+        self.assertEqual((sw["skipped_not_sent"], sw["skipped_attempts"]), (2, 2))
+
+
+class SeamHole(TmpRun):
+    """D8: buffer_hole_behind_ms was filled from seam_buffer_hole_ms, and the analyzer's 100 ms
+    rule overrode the player's own seam attribution on new bundles."""
+
+    def run_with(self, ff_fields: dict) -> dict:
+        A, B = R[0], R[4]
+        client = startup(A) + switch(1, T0 + 1000, A, B, with_seq=True)
+        ff = first_frame(T0 + 3000, A, B, vis_ms=2000.0, seq=1)
+        ff.update(ff_fields)
+        client.append(ff)
+        client += samples(T0, T0 + 6000, lambda t: A)
+        return analyze.analyze(write_run(self.dir, client))["switches"]["list"][0]
+
+    def test_new_bundle_uses_the_players_attribution(self):
+        x = self.run_with({"seam_buffer_hole_ms": 250, "buffer_hole_behind_ms": 600, "seam_pts_ms": 1000,
+                           "presented_pts_ms": 1040, "seam_behind_playhead": False})
+        self.assertEqual(x["seam_buffer_hole_ms"], 250)     # before: 0 (presented within 100 ms of the seam)
+        self.assertEqual(x["buffer_hole_behind_ms"], 600)   # before: 250 (copied from seam_buffer_hole_ms)
+        self.assertEqual(x["seam_hole_rule"], "player")
+
+    def test_player_attribution_without_seam_behind_playhead(self):
+        # Clients from 2026-10-02 (fresh-grid-v2) already attributed the hole and reported the raw
+        # one as buffer_hole_behind_ms, before seam_behind_playhead existed.
+        x = self.run_with({"seam_buffer_hole_ms": 250, "buffer_hole_behind_ms": 250, "seam_pts_ms": 1000, "presented_pts_ms": 1000})
+        self.assertEqual((x["seam_buffer_hole_ms"], x["seam_hole_rule"]), (250, "player"))   # before: 0
+
+    def test_old_bundle_keeps_the_100_ms_rule(self):
+        x = self.run_with({"seam_buffer_hole_ms": 250, "seam_pts_ms": 1000, "presented_pts_ms": 1040})
+        self.assertEqual(x["seam_buffer_hole_ms"], 0)
+        self.assertEqual(x["buffer_hole_behind_ms"], 250)   # old clients reported the raw hole as seam_buffer_hole_ms
+        self.assertEqual(x["seam_hole_rule"], "analyzer-100ms")
+
+
+class GatedAndPhantom(TmpRun):
+    """D11: ABR_GATED was counted as one number (switches.gated_slow_start = every ABR_GATED);
+    up-dwell vetoes and phantom switches were not counted at all."""
+
+    def test_gated_per_why_and_phantoms(self):
+        A, B = R[0], R[4]
+        client = startup(A)
+        for i, why in enumerate(["slow-start", "slow-start", "post-switch-up-guard", "up-dwell", "up-dwell", "up-dwell", "novel"]):
+            client.append(ev("ABR_GATED", T0 + 100 * (i + 1), why=why, from_index=0, to_index=4))
+        client.append(ev("ABR_GATED", T0 + 900, from_index=0, to_index=4))   # pre-`why` clients: slow-start
+        for i in range(2):
+            client.append(ev("ABR_SWITCH_PHANTOM", T0 + 2000 + i, **{"from": A, "to": B, "landed": A, "reason": "auto-upgrade",
+                                                                    "rule_reason": "throughput", "decided_ms_ago": 10}))
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switching"]
+        self.assertEqual((sw["slow_start_vetoes"], sw["up_guard_vetoes"], sw["up_dwell_vetoes"]), (3, 1, 3))
+        self.assertEqual(sw["other_gated"], {"novel": 1})
+        self.assertEqual(sw["phantom_switches"], 2)
+        self.assertEqual(s["switches"]["gated_slow_start"], 3)        # before: 8 (every ABR_GATED)
+        rows = {name: fn for name, fn, _ in compare.ROWS}
+        self.assertEqual(rows["up-dwell vetoes"](s), 3)
+        self.assertEqual(rows["slow-start vetoes"](s), 3)
+        self.assertEqual(rows["other gated (any other why)"](s), 1)
+        self.assertEqual(rows["phantom switches (never landed)"](s), 2)
+        self.assertEqual(rows["skipped attempts (not sent)"](s), 0)
+
+
+class ClientConnection(TmpRun):
+    """R3-D8: the client's QUIC connection in CONN_STATS was 'the one with the most bytes sent',
+    and its summaries included the relay's 10 s shutdown drain after RUN_END."""
+
+    @staticmethod
+    def conn_stats(conn: int, t: float, *, rtt: float, tx: int, lost: int, sent: int, cwnd: int = 30_000) -> dict:
+        return {"ts": t, "src": "relay", "event": "CONN_STATS", "conn": conn, "rtt_ms": rtt, "cwnd": cwnd, "udp_tx_bytes": tx,
+                "udp_tx_datagrams": sent, "udp_tx_ios": sent, "lost_packets": lost, "sent_packets": sent, "congestion_events": lost,
+                "pacer_rate_bps": cwnd * 8 * 1.25 / (rtt / 1000)}
+
+    def test_client_conn_by_id_and_run_window(self):
+        client = startup() + samples(T0, T0 + 60_000, lambda t: R[0])
+        relay = [{"ts": T0 - 1000, "src": "relay", "event": "SUBSCRIBE_RECV", "conn": 11, "request_id": 2, "track": "moqtail/" + R[0]},
+                 {"ts": T0 - 1500, "src": "relay", "event": "SUBSCRIBE_RECV", "conn": 11, "request_id": 0, "track": "moqtail/catalog"}]
+        for i in range(-3, 71):
+            t = T0 + i * 1000
+            phase = "pre" if i < 0 else "run" if t <= T0 + 60_000 else "drain"
+            # conn 11 (the client): 100 sent / 5 lost before STARTUP, then 1000 sent / 10 lost in the run,
+            # then the drain with a 400 ms RTT and heavy loss.
+            sent = {"pre": 100, "run": 100 + 1000 * i // 60, "drain": 1100 + 10 * (i - 60)}[phase]
+            lost = {"pre": 5, "run": 5 + 10 * i // 60, "drain": 15 + 10 * (i - 60)}[phase]
+            relay.append(self.conn_stats(11, t, rtt={"pre": 40.0, "run": 40.0, "drain": 400.0}[phase], tx=sent * 1200, lost=lost, sent=sent))
+            # conn 12 (not the client: the publisher's connection in this test) sends more bytes.
+            relay.append(self.conn_stats(12, t, rtt=2.0, tx=10_000_000 + i, lost=0, sent=10_000 + i))
+        run = [runner("RUN_END", T0 + 60_000, elapsed_s=61.0)]
+        s = analyze.analyze(write_run(self.dir, client, run, duration_s=61.0, relay_recs=relay))
+        c = s["conn"]
+        self.assertEqual((c["conn_id"], c["conn_source"]), (11, "relay_records"))    # before: conn 12 (most bytes)
+        self.assertEqual(c["rtt_ms"]["max"], 40.0)                                   # the drain's 400 ms excluded
+        self.assertEqual((c["lost_packets"], c["sent_packets"]), (10, 1000))         # within [STARTUP, RUN_END]
+        self.assertAlmostEqual(c["loss_rate"], 0.01)
+
+    def test_old_bundle_falls_back_to_most_bytes(self):
+        client = startup() + samples(T0, T0 + 10_000, lambda t: R[0])
+        relay = [self.conn_stats(c, T0 + i * 1000, rtt=40.0, tx=(i + 1) * (1000 if c == 12 else 10), lost=0, sent=i + 1)
+                 for i in range(10) for c in (11, 12)]
+        s = analyze.analyze(write_run(self.dir, client, relay_recs=relay))
+        self.assertEqual((s["conn"]["conn_id"], s["conn"]["conn_source"]), (12, "most_bytes"))
 
 
 class Censoring(unittest.TestCase):
@@ -329,6 +471,57 @@ class StallsAndSeeks(TmpRun):
         self.assertEqual((st["blips"], st["blips_ms"]), (2, 50))
         self.assertEqual(st["all_count"], 3)   # the pre-startup episode is excluded
         self.assertEqual(s["starvation"]["subset_of"], "stalls.total_ms")
+
+    def test_frozen_stall_starts_at_end_minus_duration(self):
+        # D5: the player backdates a `frozen` stall to the first frozen watchdog tick, so its
+        # STALL_START is logged ~0.5-1 s after the stall began; STALL_END.duration_ms is exact.
+        client = startup()
+        client.append(ev("DATA_STARVED", T0 + 9000, since_last_append_ms=4000, track=R[0]))
+        client.append(ev("DATA_RESUMED", T0 + 9800, starved_ms=4800))
+        client.append(ev("STALL_START", T0 + 10_000, cause="frozen", playhead_ms=9500, track=R[0]))
+        client.append(ev("STALL_END", T0 + 12_000, cause="frozen", playhead_ms=9500, duration_ms=2500))
+        client += samples(T0, T0 + 20_000, lambda t: R[0])
+        s = analyze.analyze(write_run(self.dir, client))
+        ep = s["stalls"]["episodes"][0]
+        self.assertEqual(ep["ts"], T0 + 9500)            # before: T0 + 10_000 (STALL_START.ts)
+        self.assertEqual(ep["duration_ms"], 2500)
+        self.assertEqual(s["starvation"]["total_ms"], 300)   # [9500, 9800) overlaps the starvation episode; before: 0
+
+    def test_reopened_frozen_stall_is_not_counted_twice(self):
+        # D5 follow-up (fresh-grid-v2 pr1378 shift10s r0): `playing` closed a frozen stall while
+        # the watchdog still counted frozen ticks, which reopened it backdated to the original
+        # freeze start. The two episodes overlap; the stalled time is their union (7.0 s, not 13.5 s).
+        client = startup()
+        client.append(ev("STALL_START", T0 + 10_000, cause="frozen", playhead_ms=9000, track=R[0]))
+        client.append(ev("STALL_END", T0 + 16_000, cause="frozen", playhead_ms=9000, duration_ms=6500))
+        client.append(ev("STALL_START", T0 + 16_050, cause="frozen", playhead_ms=9000, track=R[0]))
+        client.append(ev("STALL_END", T0 + 16_500, cause="frozen", playhead_ms=9000, duration_ms=7000))
+        client += samples(T0, T0 + 20_000, lambda t: R[0])
+        s = analyze.analyze(write_run(self.dir, client))
+        st = s["stalls"]
+        self.assertEqual((st["count"], st["total_ms"], st["max_ms"]), (1, 7000, 7000))
+        self.assertEqual(st["overlapping_merged"], 1)
+
+    def test_client_records_after_run_end_are_clipped(self):
+        # D6: the browser keeps logging after the runner's RUN_END (teardown); those records
+        # were counted in samples, the presented/subscribed weighting, playback and stalls.
+        A, B = R[0], R[4]
+        client = startup(A)
+        client.append(ev("STALL_START", T0 + 58_000, cause="waiting", playhead_ms=58_000, track=A))
+        client.append(ev("STALL_END", T0 + 64_000, cause="waiting", playhead_ms=58_000, duration_ms=6000))
+        client.append(ev("STALL_START", T0 + 66_000, cause="waiting", playhead_ms=60_000, track=B))   # open, after RUN_END
+        client.append(ev("SEEK", T0 + 67_000, reason="gap", from_ms=60_000, to_ms=63_000, gap_ms=3000))
+        client += samples(T0, T0 + 80_000, lambda t: A if t <= T0 + 60_000 else B,
+                          playhead_at=lambda t: (t - T0) if t <= T0 + 58_000 else 58_000 if t <= T0 + 64_000 else (t - T0) - 6000)
+        run = [runner("RUN_END", T0 + 60_000, elapsed_s=61.0)]
+        s = analyze.analyze(write_run(self.dir, client, run, duration_s=61.0))
+        self.assertEqual(s["playback"]["samples"], 241)                       # before: 321 (to T0 + 80 s)
+        self.assertAlmostEqual(s["bitrate"]["sampled_s"], 60.0, places=3)
+        self.assertEqual(s["bitrate"]["subscribed_rung_mean"], 0)              # B only after RUN_END
+        self.assertAlmostEqual(s["bitrate"]["presented_advancing_s"], 58.0, places=3)
+        self.assertEqual((s["stalls"]["count"], s["stalls"]["total_ms"]), (1, 2000))   # before: 2 episodes, 6000 + 14000 ms
+        self.assertFalse(s["stalls"]["open_at_end"])
+        self.assertEqual(s["stalls"]["media_skipped_ms"], 0)
 
     def test_switches_per_minute_over_run_duration(self):
         A, B = R[0], R[4]
@@ -484,6 +677,128 @@ class SwitchIdentityEdges(TmpRun):
         self.assertEqual([(x["terminal"], x["terminal_source"]) for x in sw], [("superseded", "inferred"), ("first_frame", "record")])
 
 
+class DecisionJoin(TmpRun):
+    """D1 (review 2026-10-04): ABR_DECISION is emitted at the LANDING with decided_ts, and was
+    joined as "the last decision with ts <= SENT + 5 ms and the same target"."""
+
+    def test_decision_logged_at_landing_joins_its_own_switch(self):
+        A, B = R[0], R[4]
+        for with_seq in (False, True):
+            with self.subTest(with_seq=with_seq):
+                client = startup(A)
+                client += switch(1, T0 + 1000, A, B, rule_reason="probe bwe", decided_before_ms=2, with_seq=with_seq)
+                client += switch(2, T0 + 2000, B, A, rule_reason="buffer-drain", with_seq=with_seq)
+                client += switch(3, T0 + 3000, A, B, rule_reason="throughput", decided_before_ms=3, with_seq=with_seq)
+                client.append(first_frame(T0 + 5000, A, B, vis_ms=2000.0, seq=3 if with_seq else None))
+                client += samples(T0, T0 + 8000, lambda t: A)
+                s = analyze.analyze(write_run(self.dir, client))
+                sw = s["switches"]["list"]
+                # Before the fix: #1 and #2 had no decision (theirs is logged after SENT) and #3
+                # took #1's decision (logged at #1's landing, 1500 ms before #3 was sent).
+                self.assertEqual([x["rule_reason"] for x in sw], ["probe bwe", "buffer-drain", "throughput"])
+                self.assertEqual([x["t2_decision_ms"] for x in sw], [2, 1, 3])
+                self.assertEqual([x["decision_source"] for x in sw], ["switch_seq" if with_seq else "decided_ts"] * 3)
+                self.assertEqual(s["switching"]["switches_by_rule"], {"probe bwe": 1, "buffer-drain": 1, "throughput": 1})
+
+    def test_decided_ts_join_requires_matching_pair_and_bound(self):
+        A, B = R[0], R[4]
+        client = startup(A)
+        # Decided 1.5 s before it was sent: outside [0, 1000] ms, so it is not this switch's decision.
+        client += switch(1, T0 + 2000, A, B, decided_before_ms=1500)
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        self.assertIsNone(s["switches"]["list"][0]["t2_decision_ms"])
+        self.assertIsNone(s["switches"]["list"][0]["decision_source"])
+        self.assertEqual(s["switches"]["decision_join"]["unjoined_decisions"], 1)
+        self.assertEqual(s["switches"]["join"]["unjoined"], {})   # the switch join (terminals check) is unaffected
+
+    def test_switch_that_never_lands_from_phantom_or_tick(self):
+        A, B, C = R[0], R[2], R[4]
+        client = startup(A)
+        # #1 never lands and the controller logged a phantom; #2 never lands, no phantom:
+        # the last ABR_TICK at or before its SWITCH_SENT whose chosen index is the target.
+        client += switch(1, T0 + 1000, A, C, land_after_ms=None)
+        client.append(ev("ABR_SWITCH_PHANTOM", T0 + 1500, **{"from": A, "to": C, "landed": A, "reason": "auto-upgrade",
+                                                            "rule_reason": "probe bwe", "decided_ms_ago": 501}))
+        client.append(ev("ABR_TICK", T0 + 2500, track=A, active_index=0, chosen={"index": 3, "reason": "throughput", "rule": "ThroughputRule"}))
+        client.append(ev("ABR_TICK", T0 + 2750, track=A, active_index=0, chosen={"index": 2, "reason": "latency trend 150% > 120%",
+                                                                                 "rule": "LatencyTrendRule"}))
+        client.append(ev("ABR_TICK", T0 + 2900, track=A, active_index=0, chosen=None))
+        client += switch(2, T0 + 3000, A, B, land_after_ms=None)
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switches"]["list"]
+        self.assertEqual([x["decision_source"] for x in sw], ["phantom", "tick"])
+        self.assertEqual([x["rule_reason"] for x in sw], ["probe bwe", "latency trend 150% > 120%"])
+        self.assertEqual(sw[0]["t2_decision_ms"], 1)      # decided at 1500 - 501 ms, sent at 1000
+        self.assertEqual(sw[1]["t2_decision_ms"], 250)
+        self.assertEqual(sw[1]["reason"], "auto-upgrade")
+        self.assertEqual(s["switching"]["switches_by_rule"], {"probe bwe": 1, "latency trend": 1})
+        self.assertEqual(s["switching"]["decision_sources"], {"phantom": 1, "tick": 1})
+
+    def test_legacy_decision_before_sent(self):
+        A, B = R[0], R[4]
+        client = startup(A) + switch(1, T0 + 1000, A, B, decision="legacy", rule_reason="latency trend 130% > 120%")
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        x = s["switches"]["list"][0]
+        self.assertEqual((x["decision_source"], x["t2_decision_ms"], x["rule_reason"]), ("legacy_ts", 1, "latency trend 130% > 120%"))
+
+    def test_detection_t2_and_quiet_before_use_decided_ts(self):
+        A, B = R[4], R[2]
+        net = [runner("NET_CHANGE", T0 - 5000, rate_mbps=6, at_s=0, applied=True),
+               runner("NET_CHANGE", T0 + 60_000, rate_mbps=0.8, at_s=60, applied=True),
+               runner("NET_CHANGE", T0 + 120_000, rate_mbps=6, at_s=120, applied=True),
+               runner("RUN_END", T0 + 200_000, elapsed_s=200.0)]
+        client = startup(A)
+        # A switch decided 6 s before the drop that LANDS 1 s before it: the controller was
+        # quiet in the 5 s before t0 (before the fix its landing-time record made it "not quiet").
+        client += switch(1, T0 + 53_900, A, R[3], land_after_ms=5000, decided_before_ms=100)
+        # Reaction: decided at t0 + 1000, sent at t0 + 1010, landed at t0 + 3010.
+        client += switch(2, T0 + 61_010, R[3], B, land_after_ms=2000, decided_before_ms=10)
+        client += samples(T0, T0 + 199_000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client, net, profile="detect_step", startup_track=A))
+        d = s["detection"][0]
+        self.assertTrue(d["quiet_before"])
+        self.assertEqual(d["t2_ms"], 1000)              # before the fix: 2011 (the landing)
+        self.assertEqual(d["t3_ms"], 1010)
+
+
+def landed_off_keyframe_then_superseded(seq: int, ts: float, frm: str, to: str, by: int) -> list[dict]:
+    """A switch whose landing object is not a keyframe and that a newer switch supersedes
+    before the keyframe gate let anything in: SWITCH_FIRST_OBJECT, no SWITCH_APPLIED."""
+    return switch(seq, ts, frm, to, land_after_ms=None, with_seq=True) + [
+        ev("SWITCH_FIRST_OBJECT", ts + 300, **{"from": frm, "to": to, "group": 40, "object": 7, "since_sent_ms": 300,
+                                               "landed_on_keyframe": False}, switch_seq=seq),
+        ev("SWITCH_SUPERSEDED", ts + 900, switch_seq=seq, by_switch_seq=by, playhead_ms=ts - T0, landed=True)]
+
+
+class KeyframeLandings(TmpRun):
+    """D3: landed_on_keyframe was read from SWITCH_APPLIED only, so a switch that landed on a
+    non-keyframe and was superseded before any append left the denominator."""
+
+    def test_landing_flag_from_first_object(self):
+        A, B = R[0], R[4]
+        client = startup(A) + landed_off_keyframe_then_superseded(1, T0 + 1000, A, B, by=2)
+        client += switch(2, T0 + 1500, A, R[2], with_seq=True)
+        client.append(first_frame(T0 + 4000, A, R[2], vis_ms=2500.0, seq=2))
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        sw = s["switches"]
+        self.assertEqual([x["landed_on_keyframe"] for x in sw["list"]], [False, True])
+        self.assertEqual((sw["landed_on_keyframe"], sw["landed_on_keyframe_known"]), (1, 2))   # before: 1 of 1
+
+    def test_applied_flag_is_the_fallback(self):
+        A, B = R[0], R[4]
+        client = startup(A) + switch(1, T0 + 1000, A, B)
+        for r in client:
+            if r["event"] == "SWITCH_FIRST_OBJECT":
+                del r["landed_on_keyframe"]          # bundles before 2026-10: the flag is on SWITCH_APPLIED only
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        self.assertEqual((s["switches"]["landed_on_keyframe"], s["switches"]["landed_on_keyframe_known"]), (1, 1))
+
+
 class Starvation(TmpRun):
     """M19: starvation is reported as a subset of stall time."""
 
@@ -509,7 +824,9 @@ class ValidateScript(TmpRun):
 
     def complete_run(self, *, run_end: bool = True, applied: bool = True, promoted: bool = True, with_seq: bool = False,
                      superseded_record: bool = True, validation: dict | None = None, mechanism_mode: str | None = None,
-                     rates: tuple = (6, 1.5), net_fields: dict | None = None, meta_extra: dict | None = None) -> Path:
+                     rates: tuple = (6, 1.5), net_fields: dict | None = None, meta_extra: dict | None = None,
+                     extra_client: list[dict] | None = None, identity_extra: dict | None = None,
+                     client_meta_extra: dict | None = None) -> Path:
         A, B = R[0], R[4]
         client = startup(A) + [ev("CLOCK_MAP", T0 - 1100, user_agent="Mozilla/5.0 Firefox/157.0")]
         client += switch(1, T0 + 1000, A, B, with_seq=with_seq) + switch(2, T0 + 2000, B, A, with_seq=with_seq)
@@ -517,6 +834,7 @@ class ValidateScript(TmpRun):
         if with_seq and superseded_record:
             client.append(ev("SWITCH_SUPERSEDED", T0 + 2500, switch_seq=1, by_switch_seq=2, playhead_ms=2500))
         client += samples(T0, T0 + 60_000, lambda t: A)
+        client += extra_client or []
         runner_recs = [runner("NET_CHANGE", T0 - 5000, rate_mbps=rates[0], at_s=0, applied=True, **(net_fields or {})),
                        runner("NET_CHANGE", T0 + 30_000, rate_mbps=rates[1], at_s=30, applied=applied, **(net_fields or {}))]
         if run_end:
@@ -527,7 +845,8 @@ class ValidateScript(TmpRun):
             if promoted:
                 relay.append({"ts": ts + 21, "src": "relay", "event": "SWITCH_PROMOTED", "track": "moqtail/" + to, "start_group": 20 + seq})
         return write_run(self.dir, client, runner_recs, duration_s=60.0, validation=validation, relay_recs=relay,
-                         identity_extra={"mechanism_mode": mechanism_mode}, meta_extra=meta_extra)
+                         identity_extra={"mechanism_mode": mechanism_mode, **(identity_extra or {})}, meta_extra=meta_extra,
+                         client_meta_extra=client_meta_extra)
 
     def validate(self, run: Path, *extra: str) -> tuple[int, dict[str, str]]:
         p = subprocess.run([sys.executable, str(EXPERIMENTS / "validate.py"), str(run), "--no-write", *extra],
@@ -544,6 +863,20 @@ class ValidateScript(TmpRun):
         self.assertEqual(code, 0, st)
         for k in ("completed", "samples", "net-applied", "terminals", "relay-stamps", "aborted"):
             self.assertEqual(st[k], "PASS", k)
+
+    def test_identity_controller_arm_matches_client(self):
+        # D10: the arm the client ran (RUN_META.controller_arm) must be the arm the runner recorded
+        # (identity.controller_family; identity.controller when the family is absent).
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "grid-noprobe", "controller_family": "grid"},
+                                                client_meta_extra={"controller_arm": "grid"}))
+        self.assertEqual(st["identity"], "PASS")
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "grid", "controller_family": "grid"},
+                                                client_meta_extra={"controller_arm": "min"}))
+        self.assertEqual(st["identity"], "FAIL")      # before the fix: PASS
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "min"}, client_meta_extra={"controller_arm": "baseline"}))
+        self.assertEqual(st["identity"], "FAIL")
+        _, st = self.validate(self.complete_run(identity_extra={"controller": "min"}))   # old client: no controller_arm
+        self.assertEqual(st["identity"], "PASS")
 
     def test_aborted_marker_fails(self):
         code, st = self.validate(self.complete_run(validation={"passed": False, "failed": ["aborted"]}))
@@ -589,6 +922,24 @@ class ValidateScript(TmpRun):
         self.assertEqual((st["pf-qdisc"], st["pf-gso"]), ("PASS", "SKIP"))
         self.assertEqual((st["pf-warmup"], st["pf-offloads"]), ("INFO", "INFO"))
 
+    def test_preflight_gso_read_from_the_leaf(self):
+        # D2: the runner writes gso_at_qdisc inside qdisc_stats.leaf (net.leaf_stats), not at the
+        # top level of NET_CHANGE; before the fix pf-gso saw "unknown" on every runner record.
+        shaped_tc = ["tc qdisc add dev veth-moqh root handle 1: netem delay 20ms limit 10000",
+                     "tc class add dev veth-moqh parent 1: classid 1:10 htb rate 6mbit ceil 6mbit",
+                     "tc qdisc add dev veth-moqh parent 1:10 handle 10: bfifo limit 150000"]
+        leaf = {"kind": "bfifo", "sent_bytes": 1, "sent_pkts": 1, "dropped": 0, "backlog_bytes": 0, "backlog_pkts": 0,
+                "max_skb_bytes": None, "backlog_bytes_per_skb": None}
+        _, st = self.validate(self.complete_run(net_fields={"tc": shaped_tc, "qdisc_stats": {"leaf": dict(leaf, gso_at_qdisc=True)}}),
+                              "--preflight")
+        self.assertEqual(st["pf-gso"], "FAIL")
+        _, st = self.validate(self.complete_run(net_fields={"tc": shaped_tc, "qdisc_stats": {"leaf": dict(leaf, gso_at_qdisc=False, maxpacket=1514)}}),
+                              "--preflight")
+        self.assertEqual(st["pf-gso"], "PASS")
+        _, st = self.validate(self.complete_run(net_fields={"tc": shaped_tc, "qdisc_stats": {"leaf": dict(leaf, gso_at_qdisc=None)}}),
+                              "--preflight")
+        self.assertEqual(st["pf-gso"], "INFO")
+
     def test_preflight_relay_gso_from_conn_stats(self):
         # C5: the relay must send one UDP datagram per I/O to the client (no GSO batches).
         def with_conn(datagrams, ios):
@@ -608,6 +959,12 @@ class ValidateScript(TmpRun):
         self.assertEqual(st["pf-relay-gso"], "FAIL")
         _, st = self.validate(self.complete_run(), "--preflight")
         self.assertEqual(st["pf-relay-gso"], "SKIP")
+
+    def test_preflight_keyframe_counts_landings_superseded_before_append(self):
+        # D3: the off-keyframe landing has no SWITCH_APPLIED; pf-keyframe passed (2 of 2) before the fix.
+        extra = landed_off_keyframe_then_superseded(3, T0 + 5000, R[0], R[4], by=4) + switch(4, T0 + 5500, R[0], R[2], with_seq=True)
+        _, st = self.validate(self.complete_run(with_seq=True, mechanism_mode="forward-trigger", extra_client=extra), "--preflight")
+        self.assertEqual(st["pf-keyframe"], "FAIL")
 
     def test_preflight_requires_superseded_records_with_switch_seq(self):
         _, st = self.validate(self.complete_run(with_seq=True), "--preflight")
