@@ -27,8 +27,9 @@ export class AbrRulesCollection {
     // caller passes the same raw settings it gives AbrController.
     const settings = resolveControllerSettings(rawSettings);
     // Registration order is also the tie-break order of the arbiter (see
-    // getMinSwitchRequest): earlier rules win attribution at equal index and
-    // priority. New rules go last so the record of the earlier arms is stable.
+    // arbitrate): at equal priority and equal index the earlier rule is
+    // `chosenBy` and the others are listed in `tied`. The order is part of the
+    // record of the earlier arms, so new rules go last.
     const allRules: AbrRule[] = [
       new ThroughputRule(),
       new BolaRule(),
@@ -86,7 +87,7 @@ export class AbrRulesCollection {
   evaluate(context: RulesContext): RulesEvaluation {
     const isLowLatencyMode = this.isRuleActive('L2ARule') || this.isRuleActive('LoLPRule');
 
-    const requests: SwitchRequest[] = [];
+    const requests: NamedRequest[] = [];
     const byRule: Record<string, SwitchRequest | null> = {};
     const skipped: string[] = [];
 
@@ -111,11 +112,11 @@ export class AbrRulesCollection {
       const req = entry.rule.getMaxIndex(context);
       byRule[name] = req;
       if (req !== null) {
-        requests.push(req);
+        requests.push({ rule: name, req });
       }
     }
 
-    return { byRule, skipped, chosen: getMinSwitchRequest(requests) };
+    return { byRule, skipped, ...arbitrate(requests) };
   }
 }
 
@@ -125,20 +126,48 @@ export interface RulesEvaluation {
   /** Active rules skipped by the BOLA/throughput exclusivity. */
   skipped: string[];
   chosen: SwitchRequest | null;
+  /** The rule whose request is `chosen` (null when no rule asked for anything). */
+  chosenBy: string | null;
+  /**
+   * The other rules that asked for the same index at the same priority as
+   * `chosen` (registration order). Empty when the choice was unique.
+   */
+  tied: string[];
 }
 
-function getMinSwitchRequest(requests: SwitchRequest[]): SwitchRequest | null {
-  if (requests.length === 0) return null;
+interface NamedRequest {
+  rule: string;
+  req: SwitchRequest;
+}
+
+/**
+ * The dash.js arbiter: from the highest priority tier that has any request
+ * (STRONG > DEFAULT > WEAK), the lowest representation index.
+ *
+ * Tie-break: requests for the same index at the same priority are equivalent
+ * for the decision (the index is all the controller acts on); the first one in
+ * rule registration order (ThroughputRule, BolaRule, ProbeRule,
+ * InsufficientBufferRule, BufferDrainRateRule, LatencyTrendRule,
+ * SwitchHistoryRule, DroppedFramesRule, AbandonRequestsRule, L2ARule,
+ * LoLPRule, EmergencyBufferRule) supplies `chosen.reason` and `chosenBy`, and
+ * the rest are named in `tied`, so attribution statistics can count a tie as
+ * a tie rather than crediting the earlier rule. In the min arm a tie can only
+ * occur in the DEFAULT tier between ThroughputRule and SwitchHistoryRule's
+ * veto, and then the index equals the throughput rung, i.e. the veto did not
+ * bind.
+ */
+function arbitrate(requests: NamedRequest[]): Omit<RulesEvaluation, 'byRule' | 'skipped'> {
+  if (requests.length === 0) return { chosen: null, chosenBy: null, tied: [] };
 
   // Group by priority tier
-  const tiers = new Map<SwitchRequestPriority, SwitchRequest[]>();
+  const tiers = new Map<SwitchRequestPriority, NamedRequest[]>();
 
-  for (const req of requests) {
-    const bucket = tiers.get(req.priority);
+  for (const r of requests) {
+    const bucket = tiers.get(r.req.priority);
     if (bucket) {
-      bucket.push(req);
+      bucket.push(r);
     } else {
-      tiers.set(req.priority, [req]);
+      tiers.set(r.req.priority, [r]);
     }
   }
 
@@ -153,15 +182,19 @@ function getMinSwitchRequest(requests: SwitchRequest[]): SwitchRequest | null {
     const bucket = tiers.get(priority);
     if (!bucket || bucket.length === 0) continue;
 
-    // Pick the request with the lowest representationIndex within this tier
+    // Pick the request with the lowest representationIndex within this tier;
+    // the first in registration order among equals.
     let best = bucket[0]!;
     for (let i = 1; i < bucket.length; i++) {
-      if (bucket[i]!.representationIndex < best.representationIndex) {
+      if (bucket[i]!.req.representationIndex < best.req.representationIndex) {
         best = bucket[i]!;
       }
     }
-    return best;
+    const tied = bucket
+      .filter(r => r !== best && r.req.representationIndex === best.req.representationIndex)
+      .map(r => r.rule);
+    return { chosen: best.req, chosenBy: best.rule, tied };
   }
 
-  return null;
+  return { chosen: null, chosenBy: null, tied: [] };
 }

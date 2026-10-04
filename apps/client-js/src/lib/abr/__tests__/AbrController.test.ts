@@ -875,4 +875,80 @@ describe('AbrController', () => {
       expect(player.switchTrack).toHaveBeenCalledWith('360p');
     });
   });
+
+  describe('minor: segmentDurationS from the catalog GOP, attribution of ties, auto-emergency', () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it('passes controller.segmentDurationS to the rules (1 s by default and when not positive)', async () => {
+      const ctxSeen = async (segmentDurationS?: number) => {
+        const { controller, collection } = makeController(
+          { bufferSeconds: 5, activeTrack: '1080p' },
+          {
+            videoAutoSwitch: true,
+            controller:
+              segmentDurationS === undefined
+                ? DEFAULT_ABR_SETTINGS.controller
+                : { ...DEFAULT_ABR_SETTINGS.controller, segmentDurationS },
+          },
+        );
+        const evaluate = vi.spyOn(collection, 'evaluate');
+        await controller._tick();
+        return evaluate.mock.calls[0]![0].segmentDurationS;
+      };
+      expect(await ctxSeen()).toBe(1);
+      expect(await ctxSeen(2)).toBe(2);
+      expect(await ctxSeen(0)).toBe(1);
+    });
+
+    it('ABR_DECISION names the rule that produced the choice and the rules tied with it', async () => {
+      const emit = vi.spyOn(events, 'emit') as unknown as AnyMock;
+      vi.spyOn(events, 'active', 'get').mockReturnValue(true); // ABR_TICK is built only when logging
+      // Baseline: ThroughputRule and InsufficientBufferRule both want 1080p at
+      // DEFAULT after the latter's two warm-up ticks.
+      const { controller, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '360p', bandwidthBps: 10_000_000, sampleCount: 1 },
+        { videoAutoSwitch: true },
+      );
+      await controller._tick(); // slow-start gated (1 sample)
+      await controller._tick();
+      player.getMetrics.mockReturnValue(
+        makePlayerMetrics({ bufferSeconds: 5, activeTrack: '360p', sampleCount: 10 }),
+      );
+      await controller._tick();
+      expect(player.switchTrack).toHaveBeenCalledWith('1080p');
+      controller.onTrackSwitched('1080p');
+      const d = emit.mock.calls
+        .filter(c => c[0] === 'ABR_DECISION')
+        .map(c => c[1] as Record<string, unknown>);
+      expect(d).toHaveLength(1);
+      expect(d[0]!.rule).toBe('ThroughputRule');
+      expect(d[0]!.tied_rules).toEqual(['InsufficientBufferRule']);
+      const tick = emit.mock.calls
+        .filter(c => c[0] === 'ABR_TICK')
+        .map(c => c[1] as { chosen: Record<string, unknown> | null })
+        .at(-1)!;
+      expect(tick.chosen?.rule).toBe('ThroughputRule');
+      expect(tick.chosen?.tied).toEqual(['InsufficientBufferRule']);
+    });
+
+    it('auto-emergency is decided by the chosen rule, not by the word in its reason', async () => {
+      const { controller, collection, player } = makeController(
+        { bufferSeconds: 5, activeTrack: '1080p' },
+        { videoAutoSwitch: true },
+      );
+      // A non-emergency rule whose reason happens to contain "emergency"
+      // (LoLP's 'lolp-emergency-low-buffer'): auto-downgrade.
+      vi.spyOn(collection, 'evaluate').mockReturnValue({
+        byRule: {},
+        skipped: [],
+        chosen: { representationIndex: 0, priority: 1, reason: 'lolp-emergency-low-buffer' },
+        chosenBy: 'LoLPRule',
+        tied: [],
+      });
+      await controller._tick();
+      controller.onTrackSwitched('360p');
+      expect(controller.getHistory()[0]!.reason).toBe('auto-downgrade');
+      void player;
+    });
+  });
 });

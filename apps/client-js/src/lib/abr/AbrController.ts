@@ -7,7 +7,9 @@ import {
   type SwitchEvent,
   type SwitchReason,
   type Track,
+  CONTROLLER_CONSTANTS,
   bufferEnvelope,
+  effectiveSegmentDurationS,
   resolveControllerSettings,
 } from './types';
 
@@ -43,7 +45,7 @@ export interface AbrMetrics {
   lastLatencyMs: number;
 }
 
-const MAX_HISTORY = 60;
+const MAX_HISTORY = CONTROLLER_CONSTANTS.maxHistory;
 
 /**
  * The player metrics the controller consumes (`player.getMetrics()`), listed so
@@ -117,6 +119,10 @@ interface PendingSwitch {
   toBitrate: number;
   reason: SwitchReason;
   ruleReason: string;
+  /** The rule whose request was chosen (null for a manual switch). */
+  rule: string | null;
+  /** Rules that asked for the same index at the same priority (see AbrRulesCollection arbitrate). */
+  tiedRules: string[];
   priority: number | null;
   bufferSeconds: number;
   bandwidthBps: number;
@@ -163,20 +169,20 @@ export class AbrController {
   // enough to cover normal switch landing under healthy conditions
   // (typically < 1 GOP duration), short enough that ABR can re-evaluate
   // before buffer fully drains.
-  static readonly SWITCH_TIMEOUT_MS = 3000;
+  static readonly SWITCH_TIMEOUT_MS = CONTROLLER_CONSTANTS.switchTimeoutMs;
   // After a switch times out (init segment never arrived — typical under severe
   // packet loss or a fleeting bandwidth spike), hold off this long before
   // running rules again. Without the cooldown the ABR re-fires the same
   // switch every SWITCH_TIMEOUT_MS, generating unbounded downswitch events
   // while activeTrack never changes.
-  static readonly SWITCH_COOLDOWN_MS = 5_000;
+  static readonly SWITCH_COOLDOWN_MS = CONTROLLER_CONSTANTS.switchCooldownMs;
   // Minimum number of real per-group throughput samples before an *upswitch*
   // is allowed. The startup throughput signal (handshake burst, first backlog
   // GOP, or a not-yet-shaped link) over-reads the sustainable rate; gating
   // upswitches on a few sustained samples is a config-agnostic slow-start that
   // stops a single startup burst from green-lighting a multi-tier climb.
   // Downswitches are never gated — an emergency drop must always be allowed.
-  static readonly MIN_STARTUP_SAMPLES = 3;
+  static readonly MIN_STARTUP_SAMPLES = CONTROLLER_CONSTANTS.minStartupSamples;
   // Carry-over bitrate delta from the most recent switch. Used in the
   // thesis Algorithm 1 probe_size formula: probe_size = t · (b[i+1] - b[i]
   // + tracksize). Initialized to 0; updated whenever a switch fires.
@@ -185,7 +191,7 @@ export class AbrController {
   // payload to match. Our relay sends the synthesized payload as fast as
   // the link allows, so this is "the bitrate window the probe is supposed
   // to test", not the actual on-wire duration.
-  #probeHorizonSec = 2;
+  #probeHorizonSec = CONTROLLER_CONSTANTS.probeHorizonS;
   // Post-switch up-guard (settings.controller.upGuardSamples > 0). Armed by
   // every switch; an up-switch is held until the switch has been released
   // (landed or visible, per settings.controller.upGuardRelease) and
@@ -229,6 +235,9 @@ export class AbrController {
     this.#settings = resolveControllerSettings(settings);
     this.#onMetricsUpdate = onMetricsUpdate;
     this.#probeManager = new ProbeManager(this.#player, {
+      intervalMs: CONTROLLER_CONSTANTS.probeIntervalMs,
+      durationMs: CONTROLLER_CONSTANTS.probeDurationMs,
+      freshnessMs: CONTROLLER_CONSTANTS.probeFreshnessMs,
       minDurationMs: this.#settings.controller.probeMinDurationMs,
     });
     this.#player.setEmaHalfLives(
@@ -244,7 +253,7 @@ export class AbrController {
 
   start(): void {
     if (this.#intervalId !== null) return;
-    this.#intervalId = setInterval(() => void this._tick(), 250);
+    this.#intervalId = setInterval(() => void this._tick(), CONTROLLER_CONSTANTS.tickMs);
   }
 
   stop(): void {
@@ -321,6 +330,8 @@ export class AbrController {
         to_bitrate: pending.toBitrate,
         reason: pending.reason,
         rule_reason: pending.ruleReason,
+        rule: pending.rule,
+        tied_rules: pending.tiedRules,
         priority: pending.priority,
         buffer_s: pending.bufferSeconds,
         bandwidth_bps: pending.bandwidthBps,
@@ -428,6 +439,8 @@ export class AbrController {
       toBitrate: this.#tracks[toIndex]?.bitrate ?? 0,
       reason: 'manual',
       ruleReason: 'manual',
+      rule: null,
+      tiedRules: [],
       priority: null,
       bufferSeconds: m.bufferSeconds,
       bandwidthBps: m.bandwidthBps,
@@ -637,7 +650,7 @@ export class AbrController {
       slowEmaBps,
       droppedFrames,
       totalFrames,
-      segmentDurationS: 1,
+      segmentDurationS: effectiveSegmentDurationS(this.#settings.controller),
       isLowLatency: false,
       playbackRate,
       switchHistory: [...this.#switchHistory],
@@ -692,6 +705,8 @@ export class AbrController {
                 index: switchRequest.representationIndex,
                 priority: switchRequest.priority,
                 reason: switchRequest.reason,
+                rule: evaluation.chosenBy,
+                tied: evaluation.tied,
               },
       });
     }
@@ -768,11 +783,13 @@ export class AbrController {
     const currentBitrate =
       activeTrackIndex >= 0 ? (this.#tracks[activeTrackIndex]?.bitrate ?? 0) : 0;
     const targetBitrate = targetTrack.bitrate ?? 0;
+    // auto-emergency is the label of a down-switch chosen from
+    // EmergencyBufferRule's request (by rule identity, not by reason text; no
+    // other rule produces it). SwitchHistoryRule counts it as a drop like
+    // auto-downgrade.
     let reason: SwitchReason;
     if (targetBitrate < currentBitrate) {
-      reason = switchRequest.reason.toLowerCase().includes('emergency')
-        ? 'auto-emergency'
-        : 'auto-downgrade';
+      reason = evaluation.chosenBy === 'EmergencyBufferRule' ? 'auto-emergency' : 'auto-downgrade';
     } else {
       reason = 'auto-upgrade';
     }
@@ -792,6 +809,8 @@ export class AbrController {
       toBitrate: targetBitrate,
       reason,
       ruleReason: switchRequest.reason,
+      rule: evaluation.chosenBy,
+      tiedRules: evaluation.tied,
       priority: switchRequest.priority,
       bufferSeconds: bufferInstantSeconds,
       bandwidthBps,
