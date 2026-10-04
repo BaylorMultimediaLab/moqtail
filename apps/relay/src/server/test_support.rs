@@ -143,6 +143,13 @@ pub(crate) fn test_config() -> &'static AppConfig {
   CONFIG.get_or_init(|| AppConfig::from_cli(Cli::parse_from(["relay"])))
 }
 
+/// A configuration from the given relay arguments (CLI defaults otherwise), leaked
+/// so tracks and subscriptions can hold it as `&'static`.
+pub(crate) fn leaked_config(args: &[&str]) -> &'static AppConfig {
+  let argv = std::iter::once("relay").chain(args.iter().copied());
+  Box::leak(Box::new(AppConfig::from_cli(Cli::parse_from(argv))))
+}
+
 pub(crate) const TEST_NAMESPACE: &str = "/moqtail";
 /// Publisher priority the test publisher writes in its subgroup headers.
 pub(crate) const TEST_PUBLISHER_PRIORITY: u8 = 128;
@@ -157,10 +164,19 @@ pub(crate) fn full_track_name(track: &str) -> FullTrackName {
 /// A confirmed track whose objects arrive through `publish`, as a publisher's
 /// PUBLISH would set it up.
 pub(crate) fn test_track(relay_track_id: u64, track: &str) -> Track {
+  test_track_with_config(relay_track_id, track, test_config())
+}
+
+/// As `test_track`, with the relay running on `config`.
+pub(crate) fn test_track_with_config(
+  relay_track_id: u64,
+  track: &str,
+  config: &'static AppConfig,
+) -> Track {
   Track::new(
     relay_track_id,
     full_track_name(track),
-    test_config(),
+    config,
     TrackStatus::Confirmed {
       upstream_parameters: vec![],
     },

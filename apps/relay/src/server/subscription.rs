@@ -102,6 +102,11 @@ pub struct SubscriptionState {
   /// watermark, so a late object of an earlier group (streams are ingested
   /// concurrently) is not mistaken for a duplicate.
   pub replayed_through: HashMap<StreamId, u64>,
+  /// Upper bound for the next joining replay, overriding
+  /// `last_received_object_location`. Set by a promotion that forwarded its
+  /// trigger (--forward-promotion-trigger): the replay must end before the
+  /// trigger's group, which the live path is already delivering.
+  pub joining_replay_end: Option<Location>,
 }
 
 impl SubscriptionState {
@@ -223,6 +228,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           // without it those cached objects are silently dropped.
           is_joining,
           replayed_through: HashMap::new(),
+          joining_replay_end: None,
         }
       }
       SubscriptionOrigin::Publish(publish) => {
@@ -291,6 +297,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           last_received_object_location: None,
           is_joining: false,
           replayed_through: HashMap::new(),
+          joining_replay_end: None,
         }
       }
     }
@@ -332,6 +339,31 @@ pub(crate) fn probe_stream_priority() -> i32 {
   compute_stream_priority(255, 255, GroupOrder::Ascending, u64::MAX)
 }
 
+/// SWITCH_PROMOTED for a promotion whose trigger was handed on for forwarding,
+/// emitted when dropped, i.e. on every way out of handling the trigger, with
+/// `trigger_forwarded` set to whether its write succeeded.
+struct PromotionRecord {
+  record: serde_json::Value,
+  written: bool,
+}
+
+impl PromotionRecord {
+  fn new(record: serde_json::Value) -> Self {
+    Self {
+      record,
+      written: false,
+    }
+  }
+}
+
+impl Drop for PromotionRecord {
+  fn drop(&mut self) {
+    let mut record = std::mem::take(&mut self.record);
+    record["trigger_forwarded"] = serde_json::Value::Bool(self.written);
+    events::emit("SWITCH_PROMOTED", record);
+  }
+}
+
 /// Per-subscription counters of what the forwarding path did, for tests and
 /// diagnostics. Not reset.
 #[derive(Debug, Default)]
@@ -364,6 +396,10 @@ pub struct Subscription {
   object_logger: ObjectLogger,
   config: &'static AppConfig,
   check_switch_context_on_next_object: Arc<AtomicBool>,
+  /// SWITCH_PROMOTED fields of a promotion whose trigger was handed on for
+  /// forwarding; emitted by handle_track_event once the trigger's write is known,
+  /// so `trigger_forwarded` reports the write, not the decision.
+  pending_promotion: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
   /// Subgroup header cached while forward=false. Cleared when forward becomes true (stream opened)
   /// or when a new group starts (old group ended without forward ever becoming true).
   pending_header: Arc<Mutex<Option<(StreamId, HeaderInfo)>>>,
@@ -410,6 +446,7 @@ impl Subscription {
       object_logger: ObjectLogger::new(log_folder),
       config,
       check_switch_context_on_next_object: Arc::new(AtomicBool::new(false)),
+      pending_promotion: Arc::new(std::sync::Mutex::new(None)),
       pending_header: Arc::new(Mutex::new(None)),
       active_subgroup_headers,
       alias_announced: Arc::new(AtomicBool::new(false)),
@@ -491,9 +528,12 @@ impl Subscription {
 
         // Handle joining state
         {
-          let state = instance.subscription_state.read().await;
+          let mut state = instance.subscription_state.write().await;
           let start_location = state.start_location.clone();
-          let last_received_object_location_opt = state.last_received_object_location.clone();
+          let last_received_object_location_opt = state
+            .joining_replay_end
+            .take()
+            .or_else(|| state.last_received_object_location.clone());
           let is_joining = state.is_joining;
           drop(state);
           if is_joining && start_location.is_some() {
@@ -938,21 +978,47 @@ impl Subscription {
           // the next group"), but when the target variant's group g reached the
           // relay before the source's group g, the trigger IS object 0 of the start
           // group, and dropping it makes the client land on object 1 and discard the
-          // whole group to the next keyframe. With --forward-promotion-trigger the
-          // trigger is forwarded whenever it is at or after the start location.
-          forward_trigger = self.config.forward_promotion_trigger
-            && state
+          // whole group to the next keyframe. With --forward-promotion-trigger:
+          //  - a trigger that is object 0 at or after the start location is
+          //    forwarded (a keyframe landing), and the joining replay stops before
+          //    its group, which the live path is now delivering (M7: the replay used
+          //    to deliver that group a second time when the target was >= 2 groups
+          //    ahead);
+          //  - any other trigger is not forwarded and the switch starts at the group
+          //    after it (M7: a mid-group trigger at/after the start was forwarded as
+          //    the first object, a non-keyframe landing; and the group it belongs to
+          //    is already partly past).
+          // Without the flag nothing here changes (as shipped).
+          if self.config.forward_promotion_trigger {
+            let at_or_after_start = state
               .start_location
               .as_ref()
               .is_some_and(|start| object_location >= start);
+            forward_trigger = at_or_after_start && object_location.object == 0;
+            if forward_trigger {
+              state.joining_replay_end = object_location.group.checked_sub(1).map(|g| Location {
+                group: g,
+                object: u64::MAX,
+              });
+            } else {
+              let next_group = Location::new(object_location.group + 1, 0);
+              if state
+                .start_location
+                .as_ref()
+                .is_none_or(|s| *s < next_group)
+              {
+                state.start_location = Some(next_group);
+              }
+            }
+          }
 
           // old_track / old_last_sent_group: the track this one replaces and the
-          // group its last accepted write belonged to (the seam's anchor: start_group
-          // is that + 1). trigger_forwarded: whether the trigger is forwarded (false
-          // as shipped, i.e. without --forward-promotion-trigger).
-          events::emit(
-            "SWITCH_PROMOTED",
-            serde_json::json!({
+          // group its last accepted write belonged to (the seam's anchor: without the
+          // flag start_group is that + 1). trigger_forwarded: whether the trigger was
+          // written (false as shipped, i.e. without --forward-promotion-trigger); for
+          // a trigger handed on for forwarding the record is emitted once its write
+          // is known (handle_track_event).
+          let record = serde_json::json!({
               "conn": self.client_connection_id,
               "relay_track_id": self.relay_track_id,
               "track": events::track_name_string(&self.full_track_name),
@@ -961,9 +1027,13 @@ impl Subscription {
               "start_group": state.start_location.as_ref().map(|l| l.group),
               "old_track": current_track_name.as_ref().map(events::track_name_string),
               "old_last_sent_group": old_last_sent_max.as_ref().map(|l| l.group),
-              "trigger_forwarded": forward_trigger,
-            }),
-          );
+              "trigger_forwarded": false,
+          });
+          if forward_trigger {
+            *self.pending_promotion.lock().unwrap() = Some(record);
+          } else {
+            events::emit("SWITCH_PROMOTED", record);
+          }
 
           info!(
             "check_switch_context: Will forward objects for subscriber={} relay_track_id={} starting from group: {}",
@@ -1196,6 +1266,14 @@ impl Subscription {
             return;
           }
         }
+        // A promotion whose trigger is this object: SWITCH_PROMOTED goes out when
+        // this event is done, with trigger_forwarded = whether the write succeeded.
+        let mut promotion = self
+          .pending_promotion
+          .lock()
+          .unwrap()
+          .take()
+          .map(PromotionRecord::new);
 
         let object_received_time = utils::passed_time_since_start();
 
@@ -1336,6 +1414,9 @@ impl Subscription {
             )
             .await;
           let send_status = write_result.is_ok();
+          if let Some(promotion) = promotion.as_mut() {
+            promotion.written = send_status;
+          }
           if send_status {
             self
               .counters
@@ -2257,5 +2338,246 @@ mod tests_native_switch {
     .await;
     assert!(res.is_err());
     assert_eq!(ctx.snapshot().await, before);
+  }
+}
+
+/// M7 (native-ft): `--forward-promotion-trigger` forwards the object that triggers a
+/// native promotion only when it is object 0 at or after the start location; a
+/// forwarded trigger's group is left out of the joining replay; without the flag
+/// the as-shipped behaviour (trigger dropped) is unchanged.
+#[cfg(test)]
+mod tests_forward_promotion_trigger {
+  use super::*;
+  use crate::server::message_handlers::subscribe_handler::with_native_switch_statuses;
+  use crate::server::test_support::{
+    Received, TEST_NAMESPACE, collect_streams, leaked_config, publish, quic_pair, relay_client,
+    subscribe, test_track_with_config, wait_until,
+  };
+  use crate::server::track::Track;
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use std::collections::BTreeMap;
+  use std::time::Duration;
+
+  const OLD: u64 = 1;
+  const NEW: u64 = 2;
+  /// The source track's last sent group (g_s).
+  const GS: u64 = 5;
+
+  fn latest(request_id: u64, track: &str) -> Subscribe {
+    Subscribe::new_latest_object(
+      request_id,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8(track),
+      vec![MessageParameter::new_forward(true)],
+    )
+  }
+
+  struct Fixture {
+    conn: usize,
+    client: Arc<MOQTClient>,
+    received: Received,
+    /// Held so the source subscription (owned by its track) stays alive.
+    _old: Track,
+    new: Track,
+    new_sub: Arc<RwLock<Subscription>>,
+  }
+
+  /// The source track has delivered (g_s, 0..5); the target track has published
+  /// `target_before` (before the SWITCH, so cache only). Then the native SWITCH:
+  /// statuses first, the target subscription (one-shot check armed), alias
+  /// announced. The next target object published is the trigger.
+  async fn switched(conn: usize, flag: bool, target_before: &[(u64, u64)]) -> Fixture {
+    let config = leaked_config(if flag {
+      &["--forward-promotion-trigger"]
+    } else {
+      &[]
+    });
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(conn, server);
+    let received = collect_streams(peer);
+    let old = test_track_with_config(OLD, "video-360p", config);
+    let new = test_track_with_config(NEW, "video-720p", config);
+    let old_sub = subscribe(&old, &client, latest(1, "video-360p"), false).await;
+    old_sub.read().await.mark_alias_announced();
+    for o in 0..5 {
+      publish(&old, GS, o).await;
+    }
+    assert!(wait_for(&received, OLD, (GS, 4)).await);
+    for (g, o) in target_before {
+      publish(&new, *g, *o).await;
+    }
+    let mut new_sub = None;
+    with_native_switch_statuses(
+      &client.switch_context,
+      new.full_track_name.clone(),
+      old.full_track_name.clone(),
+      async {
+        let sub = subscribe(&new, &client, latest(3, "video-720p"), true).await;
+        sub.read().await.mark_alias_announced();
+        new_sub = Some(sub);
+        Ok(())
+      },
+    )
+    .await
+    .unwrap();
+    Fixture {
+      conn,
+      client,
+      received,
+      _old: old,
+      new,
+      new_sub: new_sub.unwrap(),
+    }
+  }
+
+  async fn wait_for(received: &Received, alias: u64, loc: (u64, u64)) -> bool {
+    wait_until(Duration::from_secs(5), || {
+      let received = received.clone();
+      async move { received.objects(alias).contains(&loc) }
+    })
+    .await
+  }
+
+  /// Lets anything in flight land, then returns the target's delivered objects.
+  async fn settled(f: &Fixture) -> BTreeMap<(u64, u64), usize> {
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    f.received.counts(NEW)
+  }
+
+  fn promoted(conn: usize) -> serde_json::Value {
+    let records = crate::server::events::test_capture::records("SWITCH_PROMOTED", conn);
+    assert_eq!(records.len(), 1, "{records:?}");
+    records[0].clone()
+  }
+
+  fn group(g: u64, objects: std::ops::Range<u64>) -> Vec<(u64, u64)> {
+    objects.map(|o| (g, o)).collect()
+  }
+
+  async fn start_location(f: &Fixture) -> Option<Location> {
+    let sub = f.new_sub.read().await;
+    sub.subscription_state.read().await.start_location.clone()
+  }
+
+  /// Trigger (g_s+1, 0): object 0 of the start group, forwarded exactly once.
+  #[tokio::test]
+  async fn trigger_at_start_group_object_0_is_forwarded_once() {
+    let f = switched(41, true, &group(GS, 0..3)).await;
+    for o in 0..3 {
+      publish(&f.new, GS + 1, o).await;
+    }
+    assert!(wait_for(&f.received, NEW, (GS + 1, 2)).await);
+    let counts = settled(&f).await;
+    assert_eq!(
+      counts.into_iter().collect::<Vec<_>>(),
+      group(GS + 1, 0..3)
+        .into_iter()
+        .map(|l| (l, 1))
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(f.received.streams_for(NEW, GS + 1), 1);
+    let p = promoted(f.conn);
+    assert_eq!(p["trigger_group"], GS + 1);
+    assert_eq!(p["trigger_object"], 0);
+    assert_eq!(p["start_group"], GS + 1);
+    assert_eq!(p["trigger_forwarded"], true);
+  }
+
+  /// Trigger (g_s+1, 5): mid-group, so not forwarded, and the switch starts at the
+  /// next group (g_s+2, 0) instead of landing on a non-keyframe.
+  #[tokio::test]
+  async fn mid_group_trigger_is_not_forwarded_and_moves_the_start_to_the_next_group() {
+    let mut before = group(GS, 0..3);
+    before.extend(group(GS + 1, 0..5));
+    let f = switched(42, true, &before).await;
+    publish(&f.new, GS + 1, 5).await;
+    publish(&f.new, GS + 1, 6).await;
+    for o in 0..3 {
+      publish(&f.new, GS + 2, o).await;
+    }
+    assert!(wait_for(&f.received, NEW, (GS + 2, 2)).await);
+    let counts = settled(&f).await;
+    assert_eq!(
+      counts.keys().copied().collect::<Vec<_>>(),
+      group(GS + 2, 0..3),
+      "nothing of group g_s+1"
+    );
+    assert!(counts.values().all(|n| *n == 1));
+    assert_eq!(
+      start_location(&f).await,
+      Some(Location::new(GS + 2, 0)),
+      "start = (g_s+2, 0)"
+    );
+    let p = promoted(f.conn);
+    assert_eq!(p["trigger_object"], 5);
+    assert_eq!(p["start_group"], GS + 2);
+    assert_eq!(p["trigger_forwarded"], false);
+  }
+
+  /// Trigger (g_s+2, 0): forwarded once; the joining replay covers g_s+1 only and
+  /// does not deliver the trigger's group a second time.
+  #[tokio::test]
+  async fn trigger_two_groups_ahead_is_forwarded_once_and_not_replayed() {
+    let mut before = group(GS, 0..3);
+    before.extend(group(GS + 1, 0..6));
+    let f = switched(43, true, &before).await;
+    for o in 0..3 {
+      publish(&f.new, GS + 2, o).await;
+    }
+    assert!(wait_for(&f.received, NEW, (GS + 2, 2)).await);
+    assert!(wait_for(&f.received, NEW, (GS + 1, 5)).await);
+    let counts = settled(&f).await;
+    let duplicated: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(duplicated.is_empty(), "delivered twice: {duplicated:?}");
+    let mut expected = group(GS + 1, 0..6);
+    expected.extend(group(GS + 2, 0..3));
+    assert_eq!(counts.keys().copied().collect::<Vec<_>>(), expected);
+    assert_eq!(f.received.streams_for(NEW, GS + 2), 1);
+    let counters = f.new_sub.read().await.counters.clone();
+    assert_eq!(counters.write_failures.load(Ordering::Relaxed), 0);
+    let p = promoted(f.conn);
+    assert_eq!(p["trigger_group"], GS + 2);
+    assert_eq!(p["start_group"], GS + 1);
+    assert_eq!(p["trigger_forwarded"], true);
+  }
+
+  /// trigger_forwarded reports the write, not the decision: a trigger chosen for
+  /// forwarding whose write fails (here the connection is gone) is recorded false.
+  #[tokio::test]
+  async fn trigger_forwarded_reports_the_write() {
+    let f = switched(45, true, &group(GS, 0..3)).await;
+    f.client.connection.close(0, b"gone");
+    f.client.connection.closed().await;
+    publish(&f.new, GS + 1, 0).await;
+    assert!(
+      wait_until(Duration::from_secs(5), || async {
+        !crate::server::events::test_capture::records("SWITCH_PROMOTED", 45).is_empty()
+      })
+      .await
+    );
+    let p = promoted(f.conn);
+    assert_eq!(p["trigger_object"], 0);
+    assert_eq!(p["start_group"], GS + 1);
+    assert_eq!(p["trigger_forwarded"], false, "decided, but not written");
+  }
+
+  /// Flag off (as shipped): the trigger (g_s+1, 0) is dropped and the target lands
+  /// on object 1.
+  #[tokio::test]
+  async fn without_the_flag_the_trigger_is_dropped() {
+    let f = switched(44, false, &group(GS, 0..3)).await;
+    for o in 0..3 {
+      publish(&f.new, GS + 1, o).await;
+    }
+    assert!(wait_for(&f.received, NEW, (GS + 1, 2)).await);
+    let counts = settled(&f).await;
+    assert_eq!(
+      counts.keys().copied().collect::<Vec<_>>(),
+      group(GS + 1, 1..3)
+    );
+    assert_eq!(start_location(&f).await, Some(Location::new(GS + 1, 0)));
+    let p = promoted(f.conn);
+    assert_eq!(p["trigger_object"], 0);
+    assert_eq!(p["trigger_forwarded"], false);
   }
 }
