@@ -94,9 +94,33 @@ pub struct SubscriptionState {
   pub last_sent_max_location: Option<Location>,
   pub last_received_object_location: Option<Location>,
   pub is_joining: bool,
+  /// Highest object id the cache replay wrote on each data stream (keyed by the
+  /// relay-side StreamId: track, group, subgroup). An object of the newest group
+  /// that arrived between this subscription's registration and the replay's read
+  /// of that group is both in the cache and in the live queue; the live copy is
+  /// dropped when it is at or below this mark. Per stream rather than one
+  /// watermark, so a late object of an earlier group (streams are ingested
+  /// concurrently) is not mistaken for a duplicate.
+  pub replayed_through: HashMap<StreamId, u64>,
 }
 
 impl SubscriptionState {
+  /// Whether `object_id` on `stream_id` was already delivered by the cache replay.
+  pub fn covered_by_replay(&self, stream_id: &StreamId, object_id: u64) -> bool {
+    self
+      .replayed_through
+      .get(stream_id)
+      .is_some_and(|max| object_id <= *max)
+  }
+
+  fn record_replayed(&mut self, stream_id: StreamId, object_id: u64) {
+    self
+      .replayed_through
+      .entry(stream_id)
+      .and_modify(|max| *max = (*max).max(object_id))
+      .or_insert(object_id);
+  }
+
   pub fn update_last_sent_max_location(&mut self, location: Location) {
     match &self.last_sent_max_location {
       Some(current_max) => {
@@ -198,6 +222,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           // live objects flow. The replay path below is gated on `is_joining`;
           // without it those cached objects are silently dropped.
           is_joining,
+          replayed_through: HashMap::new(),
         }
       }
       SubscriptionOrigin::Publish(publish) => {
@@ -265,6 +290,7 @@ impl From<SubscriptionOrigin> for SubscriptionState {
           last_sent_max_location: None,
           last_received_object_location: None,
           is_joining: false,
+          replayed_through: HashMap::new(),
         }
       }
     }
@@ -306,12 +332,25 @@ pub(crate) fn probe_stream_priority() -> i32 {
   compute_stream_priority(255, 255, GroupOrder::Ascending, u64::MAX)
 }
 
+/// Per-subscription counters of what the forwarding path did, for tests and
+/// diagnostics. Not reset.
+#[derive(Debug, Default)]
+pub(crate) struct SubscriptionCounters {
+  /// Objects QUIC accepted (OBJECT_SENT.sent = true), replayed or live.
+  pub objects_written: AtomicU64,
+  /// Objects whose serialize or write failed (OBJECT_SENT.sent = false).
+  pub write_failures: AtomicU64,
+  /// Live objects dropped because the cache replay had already delivered them.
+  pub live_duplicates_dropped: AtomicU64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Subscription {
   pub request_id: u64,
   relay_track_id: u64,
   pub full_track_name: FullTrackName,
   pub subscription_state: Arc<RwLock<SubscriptionState>>,
+  pub(crate) counters: Arc<SubscriptionCounters>,
   subscriber: Arc<MOQTClient>,
   event_rx: Arc<Mutex<Option<UnboundedReceiver<TrackEvent>>>>,
   send_stream_last_object_ids: Arc<RwLock<HashMap<StreamId, Option<u64>>>>,
@@ -360,6 +399,7 @@ impl Subscription {
       full_track_name,
       request_id,
       subscription_state: Arc::new(RwLock::new(origin_message.into())),
+      counters: Arc::new(SubscriptionCounters::default()),
       subscriber,
       event_rx,
       send_stream_last_object_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -539,6 +579,8 @@ impl Subscription {
                           (None, last_stream_id.clone())
                         };
 
+                        let replay_stream_id = stream_id.clone().unwrap();
+                        let replayed_object_id = object.object_id;
                         let the_object = Object::try_from_fetch(object, relay_track_id).unwrap();
 
                         let track_event = TrackEvent::SubgroupObject {
@@ -551,6 +593,13 @@ impl Subscription {
                           instance.client_connection_id, relay_track_id, track_event
                         );
                         instance.handle_track_event(track_event).await;
+                        // Whatever the write did, the live copy of this object (if one
+                        // is queued) must not be written on the same stream again.
+                        instance
+                          .subscription_state
+                          .write()
+                          .await
+                          .record_replayed(replay_stream_id, replayed_object_id);
                       }
                       CacheConsumeEvent::EndLocation => {}
                     },
@@ -561,9 +610,8 @@ impl Subscription {
                   }
                 }
               }
-              // Record what was replayed up to so the live-forward path knows where
-              // to resume; live objects in [start_location, end] that arrive after
-              // the snapshot would otherwise be duplicates.
+              // The live path's duplicate filter is `replayed_through` (per stream,
+              // recorded above as each object is replayed), not this location.
               let mut state = instance.subscription_state.write().await;
               state.last_received_object_location = Some(end);
               drop(state);
@@ -973,6 +1021,9 @@ impl Subscription {
     match recv_result {
       Some(event) if !self.finished.load(Ordering::Relaxed) => {
         drop(event_rx_guard);
+        if self.live_event_covered_by_replay(&event).await {
+          return;
+        }
         self.handle_track_event(event).await;
       }
       Some(_) => {
@@ -987,6 +1038,52 @@ impl Subscription {
         event_rx_guard.take();
         drop(event_rx_guard);
       }
+    }
+  }
+
+  /// Live path only: whether this queued event repeats an object the cache replay
+  /// already handed to the serializer, in which case it is dropped and counted.
+  ///
+  /// An object that arrived between this subscription's registration (from when the
+  /// track fans live objects into its queue) and the replay's read of its group is in
+  /// both. Written again it would follow itself on the same stream, and the object-id
+  /// delta cannot encode that ("Error in serializing object", OBJECT_SENT.sent =
+  /// false); if it carries the subgroup header it would open a second stream for the
+  /// group and deliver the replayed objects twice. Per (group, subgroup) stream, at or
+  /// below the highest object id the replay wrote there.
+  ///
+  /// A StreamClosed for a replayed stream retires its mark: the publisher's stream has
+  /// ended, so nothing more of it can be queued.
+  async fn live_event_covered_by_replay(&self, event: &TrackEvent) -> bool {
+    match event {
+      TrackEvent::SubgroupObject {
+        stream_id, object, ..
+      } => {
+        let covered = self
+          .subscription_state
+          .read()
+          .await
+          .covered_by_replay(stream_id, object.location.object);
+        if covered {
+          self
+            .counters
+            .live_duplicates_dropped
+            .fetch_add(1, Ordering::Relaxed);
+          debug!(
+            "Dropping live copy of replayed object for subscriber={} relay_track_id={} stream_id={} location: {:?}",
+            self.client_connection_id, self.relay_track_id, stream_id, object.location
+          );
+        }
+        covered
+      }
+      TrackEvent::StreamClosed { stream_id } => {
+        let mut state = self.subscription_state.write().await;
+        if !state.replayed_through.is_empty() {
+          state.replayed_through.remove(stream_id);
+        }
+        false
+      }
+      _ => false,
     }
   }
 
@@ -1198,6 +1295,14 @@ impl Subscription {
             )
             .await;
           let send_status = write_result.is_ok();
+          if send_status {
+            self
+              .counters
+              .objects_written
+              .fetch_add(1, Ordering::Relaxed);
+          } else {
+            self.counters.write_failures.fetch_add(1, Ordering::Relaxed);
+          }
 
           // Update the last object ID for this stream if successful
           if send_status {
@@ -1775,5 +1880,141 @@ mod tests_from_subscribe_is_joining {
     let state = SubscriptionState::from(SubscriptionOrigin::from(sub));
     assert_eq!(state.start_location, None);
     assert!(!state.is_joining);
+  }
+}
+
+/// Replay/live overlap (Report 5, Major): a joining subscription replays the cache
+/// while live objects queue behind it; an object of the newest group that arrived in
+/// between is in both.
+#[cfg(test)]
+mod tests_replay_live_overlap {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, collect_streams, publish, quic_pair, relay_client, subscribe, test_track,
+    wait_until,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use std::time::Duration;
+
+  const TRACK: u64 = 1;
+
+  /// The mark is per stream: a late object of an earlier group the replay did not
+  /// reach is not mistaken for a duplicate, as one watermark location would.
+  #[test]
+  fn replay_marks_are_per_stream() {
+    let sub = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![],
+    );
+    let mut state = SubscriptionState::from(SubscriptionOrigin::from(sub));
+    let g11 = StreamId::new_subgroup(TRACK, 11, Some(0));
+    let g12 = StreamId::new_subgroup(TRACK, 12, Some(0));
+    state.record_replayed(g11.clone(), 3);
+    state.record_replayed(g12.clone(), 0);
+    state.record_replayed(g12.clone(), 4);
+    assert!(state.covered_by_replay(&g11, 3));
+    assert!(!state.covered_by_replay(&g11, 4), "late object of group 11");
+    assert!(state.covered_by_replay(&g12, 0));
+    assert!(state.covered_by_replay(&g12, 4));
+    assert!(!state.covered_by_replay(&g12, 5));
+    let g13 = StreamId::new_subgroup(TRACK, 13, Some(0));
+    assert!(!state.covered_by_replay(&g13, 0), "never replayed");
+  }
+
+  #[tokio::test]
+  async fn a_joining_replay_and_the_live_queue_deliver_each_object_once() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(7, server);
+    let received = collect_streams(peer);
+    let track = test_track(TRACK, "video-720p");
+
+    // Before the SUBSCRIBE: groups 10 and 11 whole, group 12 objects 0..3. Cache only.
+    for g in 10..=11 {
+      for o in 0..6 {
+        publish(&track, g, o).await;
+      }
+    }
+    for o in 0..3 {
+      publish(&track, 12, o).await;
+    }
+
+    let subscription = subscribe(
+      &track,
+      &client,
+      Subscribe::new_absolute_start(
+        1,
+        Tuple::from_utf8_path(TEST_NAMESPACE),
+        TupleField::from_utf8("video-720p"),
+        Location::new(10, 0),
+        vec![],
+      ),
+      false,
+    )
+    .await;
+
+    // Registered but not yet forwarding: these are queued AND cached, so the replay
+    // (which reads the cache once forwarding is released) delivers them as well.
+    for o in 3..6 {
+      publish(&track, 12, o).await;
+    }
+    for o in 0..3 {
+      publish(&track, 13, o).await;
+    }
+
+    let (counters, sub) = {
+      let s = subscription.read().await;
+      (s.counters.clone(), s.clone())
+    };
+    sub.mark_alias_announced();
+
+    // 10, 11, 12 whole and 13/0..3, each once.
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let received = received.clone();
+        async move { received.objects(TRACK).len() >= 21 }
+      })
+      .await,
+      "replay + live delivered {:?}",
+      received.objects(TRACK)
+    );
+
+    // Purely live from here.
+    for o in 3..6 {
+      publish(&track, 13, o).await;
+    }
+    for o in 0..6 {
+      publish(&track, 14, o).await;
+    }
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let received = received.clone();
+        async move { received.objects(TRACK).len() >= 30 }
+      })
+      .await,
+      "live delivered {:?}",
+      received.objects(TRACK)
+    );
+    // Anything still in flight would show up as an extra object.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let counts = received.counts(TRACK);
+    let duplicated: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(duplicated.is_empty(), "delivered twice: {duplicated:?}");
+    let expected: Vec<(u64, u64)> = (10..=14)
+      .flat_map(|g| (0..6).map(move |o| (g, o)))
+      .collect();
+    assert_eq!(counts.keys().copied().collect::<Vec<_>>(), expected);
+    for g in 10..=14 {
+      assert_eq!(received.streams_for(TRACK, g), 1, "group {g} on one stream");
+    }
+    assert_eq!(counters.write_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(counters.objects_written.load(Ordering::Relaxed), 30);
+    assert_eq!(
+      counters.live_duplicates_dropped.load(Ordering::Relaxed),
+      6,
+      "12/3..6 and 13/0..3 were replayed and queued"
+    );
   }
 }
