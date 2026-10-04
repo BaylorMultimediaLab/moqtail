@@ -20,7 +20,8 @@ Figures (one file per metric or facet; `--facet` picks what becomes a panel):
   traj_live_edge_*     live-edge distance vs time since first frame, one thin
                        line per repetition and a thick median trajectory per
                        condition; vertical lines mark NET_CHANGE events
-  traj_rung_*          played ladder rung vs time (same layout)
+  traj_rung_*          presented ladder rung vs time (SAMPLE.presented_track;
+                       the subscribed track on bundles without it)
   traj_buffer_*        buffer level vs time (same layout)
   seam_*               ECDFs of per-switch seam costs (viewer pause, buffer
                        hole, visibility delay) over switches with their own
@@ -142,7 +143,8 @@ def presented_switch(sw: dict) -> bool:
 
 def trajectory(run: dict, field: str) -> tuple[list[float], list[float], list[float]]:
     """(t_s, value, net_change_t_s) for one run; t = 0 at the first presented frame of the
-    last client session. Rung index is resolved from the RUN_META ladder."""
+    last client session. Rung index is resolved from the RUN_META ladder; the rung is the
+    presented track when SAMPLE carries `presented_track`, else the subscribed track."""
     ev = events(run["_dir"], "client-events.jsonl", {"SAMPLE", "STARTUP", "RUN_META"})
     sessions = {e.get("session") for e in ev if e.get("event") == "SAMPLE"}
     if not sessions:
@@ -155,10 +157,11 @@ def trajectory(run: dict, field: str) -> tuple[list[float], list[float], list[fl
     meta = next((e for e in ev if e["event"] == "RUN_META"), None) or {}
     ladder = sorted(meta.get("ladder", []), key=lambda t: t.get("bitrate") or 0)
     rung = {t["track"]: i for i, t in enumerate(ladder)}
+    has_presented = any(e.get("presented_track") is not None for e in samples)
     ts, vs = [], []
     for e in samples:
         if field == "rung":
-            v = rung.get(e.get("track"))
+            v = rung.get(e.get("presented_track") if has_presented else e.get("track"))
         else:
             v = e.get(field)
         if v is None:
@@ -434,7 +437,7 @@ def main() -> int:
               name="summary", note="headline metrics, one row per metric")
     make_trajectories(plt, runs, "live_edge_distance_ms", "live-edge distance (ms)", "traj_live_edge",
                       args.x, facet + ["client"], args.out, formats, index)
-    make_trajectories(plt, runs, "rung", "played rung index", "traj_rung",
+    make_trajectories(plt, runs, "rung", "presented rung index", "traj_rung",
                       args.x, facet + ["client"], args.out, formats, index)
     make_trajectories(plt, runs, "buffer_s", "buffer (s)", "traj_buffer",
                       args.x, facet + ["client"], args.out, formats, index)

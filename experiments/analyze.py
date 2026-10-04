@@ -284,6 +284,69 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
     return joined, diag
 
 
+# Presented track -------------------------------------------------------------------
+
+class PresentedSeries:
+    """The track the viewer sees at a given time. Source ``sample`` when SAMPLE carries
+    ``presented_track`` (clients from 2026-10-04 on); otherwise ``first_frame``: the
+    startup track until the first own SWITCH_FIRST_FRAME, then that switch's target until
+    the next own first frame. Superseded, failed and open switches never become visible
+    and do not appear in the series."""
+
+    def __init__(self, samples: list[dict], switches: list[dict], startup_track: str | None):
+        self.source = "sample" if any(s.get("presented_track") is not None for s in samples) else "first_frame"
+        self.samples = samples
+        self.transitions = sorted((sw["first_frame_ts"], sw["to"]) for sw in switches
+                                  if sw.get("terminal") == "first_frame" and sw.get("first_frame_ts") is not None)
+        self.startup_track = startup_track
+
+    def track_at(self, ts: float, sample: dict | None = None) -> str | None:
+        if self.source == "sample":
+            if sample is not None:
+                return sample.get("presented_track")
+            prev = None
+            for s in self.samples:
+                if s["ts"] > ts:
+                    break
+                prev = s
+            return prev.get("presented_track") if prev else None
+        cur = self.startup_track
+        for t, tr in self.transitions:
+            if t <= ts:
+                cur = tr
+            else:
+                break
+        return cur
+
+
+def advancing_intervals(samples: list[dict], series: PresentedSeries) -> list[tuple[float, float, str | None]]:
+    """(start_ts, end_ts, presented_track) for every SAMPLE interval in which the playhead
+    advanced by more than 1 ms. Stalled intervals carry no presented media and are excluded."""
+    out = []
+    for a, b in zip(samples, samples[1:]):
+        if (b.get("playhead_ms") or 0) > (a.get("playhead_ms") or 0) + 1:
+            out.append((a["ts"], b["ts"], series.track_at(a["ts"], a)))
+    return out
+
+
+def weighted_rung(intervals, index_of: dict, bitrate_of: dict, t0: float = -math.inf, t1: float = math.inf) -> dict:
+    total, rung_t, kbps_t = 0.0, 0.0, 0.0
+    share: dict[str, float] = {}
+    for a, b, track in intervals:
+        dt = max(0.0, min(b, t1) - max(a, t0))
+        if dt <= 0 or track not in index_of:
+            continue
+        total += dt
+        rung_t += index_of[track] * dt
+        kbps_t += (bitrate_of.get(track) or 0) / 1000 * dt
+        share[track] = share.get(track, 0.0) + dt
+    if total <= 0:
+        return {"rung_mean": None, "kbps": None, "rung_share": {}, "advancing_s": 0.0}
+    return {"rung_mean": rung_t / total, "kbps": kbps_t / total,
+            "rung_share": {str(index_of[k]): v / total for k, v in sorted(share.items(), key=lambda kv: index_of[kv[0]])},
+            "advancing_s": total / 1000}
+
+
 def switching_diagnostics(switches: list[dict], by, window_s: float) -> dict:
     """Behavioural diagnostics of the switch sequence itself. A run with
     A->B->A->B is different from four monotonic adaptations even at equal
@@ -406,6 +469,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     # Startup ---------------------------------------------------------------
     st = first(recs, "STARTUP")
     fo = first(recs, "FIRST_OBJECT")
+    startup_track = (st or {}).get("track") or client_meta.get("startup_track")
     out["startup"] = {
         "startup_delay_ms": st.get("startup_delay_ms") if st else None,
         "connect_to_first_object_ms": st.get("connect_to_first_object_ms") if st else None,
@@ -413,7 +477,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "first_group": fo.get("group") if fo else None,
         "expected_start_group": fo.get("expected_start_group") if fo else None,
         "clamped_by_relay": fo.get("clamped") if fo else None,
-        "startup_track": st.get("track") if st else None,
+        "startup_track": startup_track,
     }
 
     # Stalls and seeks -------------------------------------------------------
@@ -634,6 +698,7 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "target_shift_ms": client_meta.get("target_shift_ms"),
         },
         "buffer_s": stats([s.get("buffer_s") for s in samples]),
+        "buffer_contig_s": stats([s.get("buffer_contig_s") for s in samples]),
         # Shift retained: mean live-edge distance over the last 60 s of the run (after
         # the profile's events), and the closest the client came to live at any point.
         "retained_live_edge_ms": statistics.fmean([s["live_edge_distance_ms"] for s in samples[-240:]
@@ -642,6 +707,9 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "playback_rate": stats([s.get("playback_rate") for s in samples]),
         "latency_ms": stats([s.get("last_latency_ms") for s in samples if s.get("last_latency_ms")]),
     }
+    series = PresentedSeries(samples, switches, startup_track)
+    adv = advancing_intervals(samples, series)
+    presented_w = weighted_rung(adv, index_of, bitrate_of)
     if len(samples) >= 2:
         weighted = 0.0
         share: dict[str, float] = {}
@@ -650,21 +718,36 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             weighted += (a.get("bitrate_kbps") or 0) * dt
             share[a.get("track") or "?"] = share.get(a.get("track") or "?", 0.0) + dt
         total = sum(share.values()) or 1.0
-        # Time-weighted mean played rung (0 = lowest) and the share of time on
-        # each rung: whether the controller climbs at all, independent of the
-        # ladder's bitrate spacing.
         rung_time = sum(index_of.get(k, 0) * v for k, v in share.items() if k in index_of)
-        out["bitrate"] = {
-            "time_weighted_mean_kbps": weighted / total,
-            "mean_rung_index": rung_time / total,
-            "rung_share": {str(index_of[k]): v / total for k, v in sorted(share.items(), key=lambda kv: index_of.get(kv[0], -1)) if k in index_of},
-            "track_share": {k: v / total for k, v in share.items()},
-            "played_s": total,
-            "dropped_frames": samples[-1].get("dropped_frames"),
-            "total_frames": samples[-1].get("total_frames"),
+        subscribed = {
+            "subscribed_rung_mean": rung_time / total,
+            "subscribed_kbps": weighted / total,
+            "subscribed_rung_share": {str(index_of[k]): v / total for k, v in sorted(share.items(), key=lambda kv: index_of.get(kv[0], -1)) if k in index_of},
+            "subscribed_track_share": {k: v / total for k, v in share.items()},
+            "sampled_s": total,
         }
     else:
-        out["bitrate"] = {}
+        subscribed = {"subscribed_rung_mean": None, "subscribed_kbps": None, "subscribed_rung_share": {},
+                      "subscribed_track_share": {}, "sampled_s": 0.0}
+    out["bitrate"] = {
+        # Headline: what the viewer saw, weighted by the time the playhead advanced.
+        "presented_rung_mean": presented_w["rung_mean"],
+        "presented_kbps": presented_w["kbps"],
+        "presented_rung_share": presented_w["rung_share"],
+        "presented_advancing_s": presented_w["advancing_s"],
+        "presented_source": series.source,
+        # Diagnostic: the subscribed track (SAMPLE.track changes at landing, not at
+        # visibility), wall-time weighted including stalled intervals: the old
+        # `mean_rung_index` / `time_weighted_mean_kbps`.
+        **subscribed,
+        "mean_rung_index": subscribed["subscribed_rung_mean"],
+        "time_weighted_mean_kbps": subscribed["subscribed_kbps"],
+        "rung_share": subscribed["subscribed_rung_share"],
+        "track_share": subscribed["subscribed_track_share"],
+        "played_s": subscribed["sampled_s"],
+        "dropped_frames": samples[-1].get("dropped_frames") if samples else None,
+        "total_frames": samples[-1].get("total_frames") if samples else None,
+    }
 
     # Detection timelines per NET_CHANGE ------------------------------------
     detections = []
