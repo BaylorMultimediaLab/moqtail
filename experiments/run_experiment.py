@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -66,15 +67,19 @@ MECHANISM_URL_PARAM = {"native": None, "pr1378": "switchFloor", "switch-from": "
 # can attribute effects (docs/abr-controller.md, section 9).
 GUARD = {"upGuardSamples": 3, "upGuardRelease": "landed"}
 PROBE = {"probeMinBytes": 250000, "probeMinDurationMs": 300}
-# The paper controller `min` (docs/rebuild-2026-10-04.md, "Controller min") is
-# selected by one URL parameter; its constants live in the client (W5) and are
-# logged in RUN_META.controller. The name is kept here, in one place, so a
-# rename in W5's spec is a one-line change.
+# The controller family is selected by one URL parameter, `controllerArm`, with
+# the values min | grid | baseline (the player reads that name). `min` is the
+# paper controller (docs/rebuild-2026-10-04.md, "Controller min"); its constants
+# live in the client (W5) and are logged in RUN_META.controller. Every arm
+# passes the parameter explicitly, so no arm depends on the player's default;
+# the ablation arms below are knobs on the shipped controller (baseline) and
+# the grid-* arms are the frozen grid controller with one knob changed.
 CONTROLLER_ARM_PARAM = "controllerArm"
+CONTROLLER_ARMS = ("min", "grid", "baseline")
 DEFAULT_CONTROLLER = "min"
-CONTROLLER_PARAMS = {
+CONTROLLER_KNOBS = {
     "baseline": {},
-    "min": {CONTROLLER_ARM_PARAM: "min"},
+    "min": {},
     "probe": PROBE,
     "guard": GUARD,
     "both": {**PROBE, **GUARD},
@@ -115,6 +120,19 @@ CONTROLLER_PARAMS = {
 }
 
 
+def controller_family(arm: str) -> str:
+    """The `controllerArm` value for a runner arm: min, grid (grid and grid-*)
+    or baseline (the shipped controller and its ablation knobs)."""
+    if arm in CONTROLLER_ARMS:
+        return arm
+    return "grid" if arm.startswith("grid-") else "baseline"
+
+
+# Runner arm -> player URL parameters: the family first, then the arm's knobs.
+CONTROLLER_PARAMS = {arm: {CONTROLLER_ARM_PARAM: controller_family(arm), **knobs}
+                     for arm, knobs in CONTROLLER_KNOBS.items()}
+
+
 def controller_params(args) -> dict:
     """URL parameters for the selected arm plus --controller-param overrides
     (numeric values become numbers, anything else stays a string)."""
@@ -125,9 +143,15 @@ def controller_params(args) -> dict:
             sys.exit(f"--controller-param expects KEY=VALUE, got {kv!r}")
         try:
             num = float(v)
-            params[k] = int(num) if num == int(num) else num
         except ValueError:
             params[k] = v
+            continue
+        if not math.isfinite(num):
+            params[k] = v  # 'inf', 'nan': passed through as written
+        else:
+            params[k] = int(num) if num == int(num) else num
+    if params.get(CONTROLLER_ARM_PARAM) not in CONTROLLER_ARMS:
+        sys.exit(f"{CONTROLLER_ARM_PARAM} must be one of {CONTROLLER_ARMS}, got {params.get(CONTROLLER_ARM_PARAM)!r}")
     return params
 
 
@@ -191,8 +215,10 @@ RELAY_PINNED = {
     "--publish-done-stream-timeout-ms": "2000",
 }
 # Flags only some relays know; passed when `--help` lists them, else skipped
-# (recorded as skipped in run_meta).
+# (recorded as skipped in run_meta). A mechanism that needs one makes it
+# required (RELAY_REQUIRED_BY_MECHANISM).
 RELAY_BRANCH_OPTIONAL = {"--t-switch-ms": "3000"}
+RELAY_REQUIRED_BY_MECHANISM = {"pr1378": ("--t-switch-ms",)}
 # Relay flags the contract requires (W4 adds them); their absence is an error
 # unless --allow-missing-relay-flags, and a --final run never allows it.
 RELAY_REQUIRED_NEW = ("--congestion-controller",)
@@ -219,6 +245,26 @@ def check_cache_length(duration: float, warmup: float, gops: int | None, margin:
     return None
 
 
+def warmup_gate(first_group_ts_ms: float | None, warmup_s: float, seen_at_s: float) -> float:
+    """Epoch seconds at which the browser may start: the publisher's first
+    GROUP_EMIT (its own `ts`, ms, same host clock) plus the warm-up. Without a
+    usable `ts`, from when the runner saw the record."""
+    try:
+        anchor = float(first_group_ts_ms) / 1000.0
+    except (TypeError, ValueError):
+        anchor = seen_at_s
+    if not (0 < anchor <= seen_at_s + 5):  # a ts from the future is not a clock we share
+        anchor = seen_at_s
+    return anchor + warmup_s
+
+
+def measured_warmup(first_group_ts_ms: float | None, spawned_at_s: float) -> float | None:
+    try:
+        return round(spawned_at_s - float(first_group_ts_ms) / 1000.0, 3)
+    except (TypeError, ValueError):
+        return None
+
+
 def aborted_validation(final: bool) -> dict:
     """validation.json for a run that did not complete; analyze/compare exclude it (M20)."""
     return {"passed": False, "final": final, "failed": ["aborted"], "checks": []}
@@ -234,20 +280,33 @@ def binary_flags(binary: Path) -> set[str]:
     return set(re.findall(r"(?m)^\s*(?:-\w, )?(--[a-z0-9][a-z0-9-]*)", out.stdout + out.stderr))
 
 
-def pinned_relay_args(flags: set[str], cc: str, cache_size: int, allow_missing: bool) -> tuple[list[str], dict]:
-    """Relay argv additions and a record of what was pinned/skipped/missing."""
-    argv: list[str] = ["--cache-size", str(cache_size)]
-    record = {"pinned": {"--cache-size": str(cache_size)}, "skipped": [], "missing": []}
-    for flag, value in RELAY_PINNED.items():
+def _no_help(binary: str, flags: set[str]) -> None:
+    if not flags:
+        raise SystemExit(f"could not read any option from `{binary} --help` (binary missing, not executable, or not "
+                         "a clap binary); rebuild it with `cargo build --release -p relay -p publisher`")
+
+
+def pinned_relay_args(flags: set[str], cc: str, cache_size: int, allow_missing: bool,
+                      mechanism: str | None = None) -> tuple[list[str], dict]:
+    """Relay argv additions and a record of what was pinned/skipped/missing.
+    Every flag passed is one `relay --help` lists; a contract flag the binary
+    lacks is a clear error (never a clap usage failure after the start)."""
+    _no_help("relay", flags)
+    argv: list[str] = []
+    record: dict = {"pinned": {}, "skipped": [], "missing": []}
+    for flag, value in {"--cache-size": str(cache_size), **RELAY_PINNED}.items():
         if flag in flags:
             argv += [flag, value]
             record["pinned"][flag] = value
         else:
             record["missing"].append(flag)
+    required_here = RELAY_REQUIRED_BY_MECHANISM.get(mechanism or "", ())
     for flag, value in RELAY_BRANCH_OPTIONAL.items():
         if flag in flags:
             argv += [flag, value]
             record["pinned"][flag] = value
+        elif flag in required_here:
+            record["missing"].append(flag)
         else:
             record["skipped"].append(flag)
     if "--congestion-controller" in flags:
@@ -265,6 +324,7 @@ def pinned_relay_args(flags: set[str], cc: str, cache_size: int, allow_missing: 
 
 
 def pinned_publisher_args(flags: set[str], allow_missing: bool) -> tuple[list[str], dict]:
+    _no_help("publisher", flags)
     argv: list[str] = []
     record = {"pinned": {}, "missing": []}
     for flag, value in PUBLISHER_REQUIRED_NEW.items():
@@ -279,6 +339,95 @@ def pinned_publisher_args(flags: set[str], allow_missing: bool) -> tuple[list[st
             "The contract requires one priority for all variants, passed explicitly. Rebuild the publisher from a\n"
             "branch that has W4's flag, or pass --allow-missing-relay-flags for a smoke test (refused with --final).")
     return argv, record
+
+
+# Flags the runner always passes to the binaries, independent of the pins.
+RELAY_BASE_FLAGS = ("--port", "--host", "--cert-file", "--key-file", "--log-folder", "--event-log")
+PUBLISHER_BASE_FLAGS = ("--encoded-dir", "--max-variants", "--ladder-spec", "--no-loop", "--event-log")
+
+
+def check_base_flags(binary: str, flags: set[str], needed: tuple[str, ...]) -> None:
+    missing = [f for f in needed if f not in flags]
+    if missing:
+        raise SystemExit(f"`{binary} --help` does not list {', '.join(missing)}, which the runner passes on every run; "
+                         "this binary is not one the runner supports")
+
+
+def relay_reported_cc(rec: dict | None) -> str | None:
+    """`congestion_controller` from a RELAY_CONFIG record, top level or under
+    `config`."""
+    if not rec:
+        return None
+    cc = rec.get("congestion_controller")
+    if cc is None and isinstance(rec.get("config"), dict):
+        cc = rec["config"].get("congestion_controller")
+    return str(cc).lower() if cc is not None else None
+
+
+def check_relay_config(rec: dict | None, cc: str, allow_missing: bool) -> str | None:
+    """Error text unless the relay's own RELAY_CONFIG confirms the requested
+    congestion controller (smoke tests may run a relay without the record)."""
+    if rec is None:
+        return None if allow_missing else (
+            "relay emitted no RELAY_CONFIG within 5 s of start; this relay predates the contract "
+            "(docs/rebuild-2026-10-04.md). Rebuild it, or --allow-missing-relay-flags for a smoke test")
+    got = relay_reported_cc(rec)
+    if got is None:
+        return None if allow_missing else "relay RELAY_CONFIG has no congestion_controller field"
+    if got != cc:
+        return f"relay reports congestion_controller={got!r}, runner asked for {cc!r}"
+    return None
+
+
+IDENTITY_PROBES = ("git_sha", "branch", "dirty_worktree", "delay_groups", "gop_duration_ms", "ladder_id",
+                   "cache_meta_hash", "kernel", "tc_version")
+
+
+def build_identity(args, *, run_id: str, repeat_index: int, stamp: str, profile: dict, net_backend: str,
+                   offloads: dict | None, relay_config: dict | None, warmup_s: float, browser: str | None,
+                   probes: dict) -> dict:
+    """run_meta.json `identity` (docs/rebuild-2026-10-04.md, "Identity"). Pure:
+    everything read from the host, git, the cache or the client log comes in
+    through `probes` (keys IDENTITY_PROBES)."""
+    missing = [k for k in IDENTITY_PROBES if k not in probes]
+    if missing:
+        raise ValueError(f"identity probes missing: {missing}")
+    shaped = net_backend != "none"
+    return {
+        "run_id": run_id,
+        "git_sha": probes["git_sha"],
+        "branch": probes["branch"],
+        "mechanism": args.mechanism,
+        "mechanism_mode": args.mechanism_mode,
+        "controller": args.controller,
+        "controller_family": controller_family(args.controller),
+        "controller_params": controller_params(args),
+        "client_type": args.client_mode,
+        "time_shift_s": args.time_shift if args.client_mode == "time-shifted" else 0,
+        "delay_groups": probes["delay_groups"],
+        "gop_duration_ms": probes["gop_duration_ms"],
+        "ladder_id": probes["ladder_id"],
+        "network_profile": profile["name"],
+        "trace_id": Path(profile["trace_file"]).stem if profile.get("trace_file") else None,
+        "qdisc": profile["queue"] if shaped else "none",
+        "background_flows": args.bg_flows,
+        "background_pattern": args.bg_pattern if args.bg_flows else None,
+        "repeat_index": repeat_index,
+        "timestamp_start": stamp,
+        "dirty_worktree": probes["dirty_worktree"],
+        "final": args.final,
+        "duration_s": args.duration,
+        "abr_overrides": args.abr or None,
+        "browser": browser,
+        # Transport and apparatus identity (rebuild contract, "Identity").
+        "congestion_controller": args.cc,
+        "relay_config": relay_config,
+        "cache_meta_hash": probes["cache_meta_hash"],
+        "kernel": probes["kernel"],
+        "tc_version": probes["tc_version"],
+        "offloads_disabled": bool((offloads or {}).get("all_off")) if shaped else None,
+        "warmup_s": warmup_s,
+    }
 
 
 def find_record(path: Path, event: str) -> dict | None:
@@ -470,7 +619,10 @@ class Vite:
     same arm (it is mechanism-agnostic within a branch) and `warm_vite` runs
     once, saving the dependency-optimisation reload per run. When shared it
     binds 0.0.0.0 so the listener survives the veth being recreated between
-    repetitions; the page URL still uses the namespace-facing address."""
+    repetitions; the page URL still uses the namespace-facing address. A
+    shared Vite starts before the first run has created the veth, so its
+    readiness probe and warm-up go through the loopback address (dependency
+    optimisation does not depend on the address the page is requested on)."""
 
     def __init__(self, page_host: str, port: int, log: Path, shared: bool) -> None:
         self.page_host, self.port, self.log, self.shared = page_host, port, log, shared
@@ -480,16 +632,23 @@ class Vite:
     def base_url(self) -> str:
         return f"http://{self.page_host}:{self.port}"
 
+    def bind_and_probe_hosts(self) -> tuple[str, str]:
+        """(address Vite binds, address the runner probes and warms it on)."""
+        if self.page_host in ("localhost", "127.0.0.1"):
+            return self.page_host, "127.0.0.1"
+        if self.shared:
+            return "0.0.0.0", "127.0.0.1"
+        return self.page_host, self.page_host
+
     def start(self) -> None:
-        bind = "0.0.0.0" if self.shared and self.page_host != "localhost" else self.page_host
+        bind, probe_host = self.bind_and_probe_hosts()
         self.proc = spawn([
             "npm", "run", "--prefix", str(ROOT / "apps/client-js"), "dev", "--",
             "--host", bind, "--port", str(self.port), "--strictPort",
         ], self.log, env=dict(os.environ))
-        probe_host = "127.0.0.1" if self.page_host == "localhost" else self.page_host
         if not wait_port(probe_host, self.port, 60):
-            raise SystemExit(f"vite did not come up; see {self.log}")
-        warm_vite(self.base_url)
+            raise SystemExit(f"vite did not come up on {probe_host}:{self.port}; see {self.log}")
+        warm_vite(f"http://{probe_host}:{self.port}")
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -681,6 +840,8 @@ def main() -> int:
     if branch != expected_branch:
         ap.error(f"--mechanism {args.mechanism} runs on branch {expected_branch}, but HEAD is {branch}")
 
+    controller_params(args)  # a malformed --controller-param fails here, before any run directory exists
+
     if args.repeat_index is not None:
         if args.repeat != 1 or args.repeat_start != 0:
             ap.error("--repeat-index excludes --repeat and --repeat-start")
@@ -724,6 +885,8 @@ def run_id_for(args, profile_name: str, repeat_index: int, stamp: str | None) ->
 
 def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
     profile = load_profile(args.profile)
+    topo = profile_topology(profile, offloads=tuple(f for f in args.offloads.split(",") if f))
+    shapes = profile_shapes(profile)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = run_id_for(args, profile["name"], repeat_index, None if args.repeat_index is not None else stamp)
     out = args.results / run_id
@@ -733,25 +896,11 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
     out.mkdir(parents=True, exist_ok=False)
     print(f"[run] run_id={run_id}\n[run] out={out}")
 
-    if not args.no_lib_build:
-        # The player imports the built library (libs/moqtail-ts/dist); a checkout
-        # of another mechanism branch leaves a dist that no longer matches.
-        print("[run] building libs/moqtail-ts")
-        subprocess.run(["npm", "run", "--prefix", str(ROOT / "libs/moqtail-ts"), "build"], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    if not args.no_rust_build:
-        # The relay differs per mechanism branch and a stale target/release binary
-        # silently runs the wrong mechanism; an up-to-date build is a no-op.
-        print("[run] cargo build --release (relay, publisher)")
-        subprocess.run(["cargo", "build", "--release", "-p", "relay", "-p", "publisher"], check=True, cwd=ROOT,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-
+    # From here on the run directory exists, so every failure (a build, the
+    # namespace setup, a readiness gate, Ctrl-C) must leave an invalid
+    # validation.json behind: all of it runs inside the try below (M20).
     rlog = RunnerLog(out / "runner-events.jsonl")
     backend = make_backend(args.net)
-    topo = profile_topology(profile, offloads=tuple(f for f in args.offloads.split(",") if f))
-    shapes = profile_shapes(profile)
-    backend.setup(topo)
-
     procs: dict[str, subprocess.Popen] = {}
     browser: str | None = None
     browser_pattern: str | None = None
@@ -762,6 +911,20 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
     bg = BackgroundFlows(backend, args.bg_flows, args.bg_pattern, cc=args.bg_cc, log=rlog.emit)
     exit_code = 0
     try:
+        if not args.no_lib_build:
+            # The player imports the built library (libs/moqtail-ts/dist); a checkout
+            # of another mechanism branch leaves a dist that no longer matches.
+            print("[run] building libs/moqtail-ts")
+            subprocess.run(["npm", "run", "--prefix", str(ROOT / "libs/moqtail-ts"), "build"], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        if not args.no_rust_build:
+            # The relay differs per mechanism branch and a stale target/release binary
+            # silently runs the wrong mechanism; an up-to-date build is a no-op.
+            print("[run] cargo build --release (relay, publisher)")
+            subprocess.run(["cargo", "build", "--release", "-p", "relay", "-p", "publisher"], check=True, cwd=ROOT,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        backend.setup(topo)
+
         # Relay ------------------------------------------------------------
         relay_bin = ROOT / "target/release/relay"
         publisher_bin = ROOT / "target/release/publisher"
@@ -774,9 +937,12 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         # from its --help so a missing flag is a clear error, not a clap failure.
         relay_flags = binary_flags(relay_bin)
         relay_pin_argv, relay_pins = pinned_relay_args(relay_flags, args.cc, args.cache_size,
-                                                       args.allow_missing_relay_flags)
+                                                       args.allow_missing_relay_flags, args.mechanism)
+        check_base_flags("relay", relay_flags,
+                         RELAY_BASE_FLAGS + (("--enable-object-logging",) if args.log_objects else ()))
         publisher_flags = binary_flags(publisher_bin)
         publisher_pin_argv, publisher_pins = pinned_publisher_args(publisher_flags, args.allow_missing_relay_flags)
+        check_base_flags("publisher", publisher_flags, PUBLISHER_BASE_FLAGS)
         if args.mechanism == "native" and args.mechanism_mode == "forward-trigger" \
                 and "--forward-promotion-trigger" not in relay_flags:
             raise SystemExit("this relay has no --forward-promotion-trigger; build it from switch/native")
@@ -801,12 +967,22 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         # The relay's own view of its configuration (RELAY_CONFIG, W4) is the
         # record of what actually ran; kept in run_meta as `relay_config`.
         relay_config = wait_record(out / "relay-events.jsonl", "RELAY_CONFIG", 5.0, procs["relay"], "relay")
-        if relay_config is None and not args.allow_missing_relay_flags:
-            raise SystemExit("relay emitted no RELAY_CONFIG within 5 s of start; this relay predates the contract "
-                             "(docs/rebuild-2026-10-04.md). Rebuild it, or --allow-missing-relay-flags for a smoke test")
-        if relay_config is not None and relay_config.get("congestion_controller") not in (None, args.cc):
-            raise SystemExit(f"relay reports congestion_controller={relay_config.get('congestion_controller')!r}, "
-                             f"runner asked for {args.cc!r}")
+        err = check_relay_config(relay_config, args.cc, args.allow_missing_relay_flags)
+        if err:
+            raise SystemExit(err)
+
+        # Vite dev server (serves the player and receives client events). It
+        # starts before the publisher so its start-up time (up to ~25 s with
+        # the dependency warm-up) cannot stretch the warm-up below. ----------
+        if shared_vite is not None:
+            if not shared_vite.alive():
+                raise SystemExit(f"the shared vite exited; see {shared_vite.log}")
+            vite = shared_vite
+            (out / "vite.log").write_text(f"shared vite (--keep-vite); log: {shared_vite.log}\n")
+        else:
+            vite = Vite(backend.vite_host, args.vite_port, out / "vite.log", shared=False)
+            vite.start()
+        procs["vite"] = vite.proc
 
         # Publisher (replay from the prepared cache, no loop so the media
         # timeline never wraps inside a run; cache presence and length were
@@ -819,45 +995,44 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             *publisher_pin_argv,
         ], out / "publisher.log")
 
-        # Vite dev server (serves the player and receives client events) -----
-        if shared_vite is not None:
-            if not shared_vite.alive():
-                raise SystemExit(f"the shared vite exited; see {shared_vite.log}")
-            vite = shared_vite
-            (out / "vite.log").write_text(f"shared vite (--keep-vite); log: {shared_vite.log}\n")
-        else:
-            vite = Vite(backend.vite_host, args.vite_port, out / "vite.log", shared=False)
-            vite.start()
-        procs["vite"] = vite.proc
-
         # Browser start is gated on the publisher's first GROUP_EMIT plus a fixed
         # warm-up, the same for both client types, so the media second at which
         # a profile step hits does not depend on the client type or on how long
-        # vite took (audit report 4, "live-edge offset at client join").
+        # anything else took (audit report 4, "live-edge offset at client join").
+        # The gate is anchored to the record's own `ts`, not to when the runner
+        # read it, and the shaping tree is built inside the warm-up.
         first_group = wait_record(out / "publisher-events.jsonl", "GROUP_EMIT", PUBLISHER_READY_TIMEOUT_S,
                                   procs["publisher"], "publisher")
         if first_group is None:
             raise SystemExit(f"publisher emitted no GROUP_EMIT within {PUBLISHER_READY_TIMEOUT_S:g} s; "
                              f"see {out / 'publisher.log'}")
-        first_group_seen = time.time()
         warmup = args.warmup
-        rlog.emit("PUBLISHER_READY", {"first_group_emit_ts": first_group.get("ts"), "warmup_s": warmup})
+        gate = warmup_gate(first_group.get("ts"), warmup, time.time())
+        rlog.emit("PUBLISHER_READY", {"first_group_emit_ts": first_group.get("ts"), "warmup_s": warmup,
+                                      "browser_gate_ts": gate * 1000.0})
         print(f"[run] first GROUP_EMIT seen; warming up for {warmup:g}s")
-        time.sleep(max(0.0, first_group_seen + warmup - time.time()))
 
         # Initial network state, then background flows -----------------------
         steps = profile["steps"]
+        t0: float | None = None  # browser spawn; profile steps are scheduled from it
 
         def apply_step(idx: int) -> None:
             """Apply profile step `idx` (the first call builds and verifies the
             tree, later ones change it in place) and record the resolved
             commands, the leaf's `tc -s` counters and the offload state (C5, M1)."""
             shape = shapes[idx]
+            started = now_ms()
             res = backend.apply(shape)
-            rlog.emit("NET_CHANGE", {**step_record(shape, topo), "at_s": steps[idx]["at_s"], "step_index": idx,
+            applied = now_ms()
+            # `ts` is when the last tc command returned (the change is in force);
+            # the `tc -s` read below takes a few ms more and must not delay it.
+            rlog.emit("NET_CHANGE", {**step_record(shape, topo), "ts": applied, "apply_started_ts": started,
+                                     "at_s": steps[idx]["at_s"], "step_index": idx,
+                                     "elapsed_s": round(time.time() - t0, 3) if t0 is not None else None,
                                      "applied": bool(res.get("applied")), "tc": res.get("tc", []),
                                      "qdisc_stats": backend.stats(), "offloads": backend.offloads or None})
         apply_step(0)
+        time.sleep(max(0.0, gate - time.time()))
         bg.start(args.duration + 30)
 
         # Browser ------------------------------------------------------------
@@ -895,7 +1070,8 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
                                  out / "browser.log",
                                  new_session=not backend.detaches_itself)
         rlog.emit("BROWSER_START", {"url": url, "binary": browser, "kind": browser_kind(browser),
-                                    "headless": not args.headed, "cert_pinned": hash_file.exists()})
+                                    "headless": not args.headed, "cert_pinned": hash_file.exists(),
+                                    "warmup_measured_s": measured_warmup(first_group.get("ts"), time.time())})
 
         # Main loop: apply steps on schedule, sample process stats -----------
         t0 = time.time()
@@ -959,47 +1135,29 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         # Immutable identity of this experiment instance. Every raw record lives
         # under results/<run_id>/, so a row of any aggregate can be rebuilt from
         # the raw logs plus this block alone.
-        identity = {
-            "run_id": run_id,
-            "git_sha": git("rev-parse", "HEAD"),
-            "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
-            "mechanism": args.mechanism,
-            "mechanism_mode": args.mechanism_mode,
-            "controller": args.controller,
-            "controller_params": controller_params(args),
-            "client_type": args.client_mode,
-            "time_shift_s": args.time_shift if args.client_mode == "time-shifted" else 0,
-            "delay_groups": client_delay_groups(out),
-            "gop_duration_ms": client_gop_duration_ms(out),
-            "ladder_id": ladder_id(args.encoded_dir, args.ladder_spec),
-            "network_profile": profile["name"],
-            "trace_id": Path(profile["trace_file"]).stem if profile.get("trace_file") else None,
-            "qdisc": profile["queue"] if backend.name != "none" else "none",
-            "background_flows": args.bg_flows,
-            "background_pattern": args.bg_pattern if args.bg_flows else None,
-            "repeat_index": repeat_index,
-            "timestamp_start": stamp,
-            "dirty_worktree": worktree_dirty(),
-            "final": args.final,
-            "duration_s": args.duration,
-            "abr_overrides": args.abr or None,
-            "browser": browser_kind(browser) if browser else None,
-            # Transport and apparatus identity (rebuild contract, "Identity").
-            "congestion_controller": args.cc,
-            "relay_config": relay_config,
-            "cache_meta_hash": cache_meta_hash(args.encoded_dir),
-            "kernel": os.uname().release,
-            "tc_version": tc_version(),
-            "offloads_disabled": bool((backend.offloads or {}).get("all_off")) if backend.name != "none" else None,
-            "warmup_s": warmup,
-        }
+        identity = build_identity(
+            args, run_id=run_id, repeat_index=repeat_index, stamp=stamp, profile=profile,
+            net_backend=backend.name, offloads=backend.offloads, relay_config=relay_config, warmup_s=warmup,
+            browser=browser_kind(browser) if browser else None,
+            probes={
+                "git_sha": git("rev-parse", "HEAD"),
+                "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+                "dirty_worktree": worktree_dirty(),
+                "delay_groups": client_delay_groups(out),
+                "gop_duration_ms": client_gop_duration_ms(out),
+                "ladder_id": ladder_id(args.encoded_dir, args.ladder_spec),
+                "cache_meta_hash": cache_meta_hash(args.encoded_dir),
+                "kernel": os.uname().release,
+                "tc_version": tc_version(),
+            })
         meta = {
             "identity": identity,
             "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             "profile": profile, "host": os.uname().nodename, "platform": sys.platform,
             "net_backend": backend.name,
             "net": {"topology": {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(topo).items()},
-                    "offloads": backend.offloads or None, "kernel": os.uname().release, "tc_version": tc_version()},
+                    "offloads": backend.offloads or None, "kernel": identity["kernel"],
+                    "tc_version": identity["tc_version"]},
             "relay_config": relay_config,
             "publisher_config": find_record(out / "publisher-events.jsonl", "PUBLISHER_CONFIG"),
             "relay_flags": relay_pins, "publisher_flags": publisher_pins,

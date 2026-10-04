@@ -36,8 +36,22 @@ Capacity steps are applied in place (``tc class change`` for the rate,
 ``tc qdisc change`` for the leaf and the netem delay/loss); the tree is built
 once per run and never deleted between steps, so nothing queued is dropped at
 a step. Before any qdisc is added the offloads (GSO, TSO, GRO, UDP GSO, UDP
-GRO forwarding) are disabled on both veth ends so the queue counts
-wire-sized packets, and ``ethtool -k`` is recorded.
+GRO forwarding) are disabled on both veth ends, and ``ethtool -k`` is
+recorded.
+
+What turning offloads off does *not* do: an application that builds UDP GSO
+batches itself (``UDP_SEGMENT``, which quinn-udp uses on Linux) hands the
+qdisc one skb per batch whatever the device features say; the kernel
+segments it only after the qdisc, in ``validate_xmit_skb``. The leaf is
+therefore a ``bfifo`` sized in bytes (its limit is right whatever the skb
+size), but HTB still releases a batch as one unit, and ``tc -s`` counts a
+batch as ``gso_segs`` packets, so bytes/packets cannot reveal it. What can:
+fq_codel's ``maxpacket`` (largest skb seen) and the bytes per queued skb in
+``backlog``; ``leaf_stats`` reports both as ``gso_at_qdisc``. The fix, if
+the preflight finds batches at the qdisc, is in the relay (quinn
+``TransportConfig::enable_segmentation_offload(false)``) or, untested,
+``--offloads ...,tx`` (no checksum offload on the route device makes the
+kernel refuse UDP GSO with EIO, after which quinn-udp stops batching).
 
 Everything that builds a command line is a pure function of the profile and
 is unit-tested in ``experiments/tests/test_net.py``. ``--dry-run`` prints the
@@ -187,9 +201,15 @@ def offload_commands(topo: Topology) -> list[Cmd]:
         cmds.append(Cmd(f"ethtool -K {topo.host_if} {feat} off", check=False, why="offload host end"))
     for feat in topo.offloads:
         cmds.append(Cmd(ns_exec(topo, f"ethtool -K {topo.ns_if} {feat} off"), check=False, why="offload ns end"))
-    cmds.append(Cmd(f"ethtool -k {topo.host_if}", why="record offloads host end"))
-    cmds.append(Cmd(ns_exec(topo, f"ethtool -k {topo.ns_if}"), why="record offloads ns end"))
+    host_k, ns_k = readback_commands(topo)
+    cmds.append(Cmd(host_k, why="record offloads host end"))
+    cmds.append(Cmd(ns_k, why="record offloads ns end"))
     return cmds
+
+
+def readback_commands(topo: Topology) -> tuple[str, str]:
+    """`ethtool -k` on the host end and on the namespace end, in that order."""
+    return f"ethtool -k {topo.host_if}", ns_exec(topo, f"ethtool -k {topo.ns_if}")
 
 
 def setup_commands(shape: Shape, topo: Topology) -> list[Cmd]:
@@ -262,13 +282,28 @@ def expected_tree(shape: Shape, topo: Topology) -> list[tuple[str, str, str]]:
 
 _QDISC_HEAD = re.compile(r"^qdisc (?P<kind>\S+) (?P<handle>\S+) (?:(?P<root>root)|parent (?P<parent>\S+))(?P<opts>.*)$")
 _SENT = re.compile(r"Sent (?P<bytes>\d+) bytes (?P<pkts>\d+) pkt \(dropped (?P<dropped>\d+), overlimits (?P<over>\d+) requeues (?P<req>\d+)\)")
-_BACKLOG = re.compile(r"backlog (?P<bytes>\d+)b (?P<pkts>\d+)p")
+# tc prints sizes with sprint_size(): plain bytes, or "<n>Kb"/"<n>Mb" when the
+# value is within a few bytes of a multiple of 1024 (e.g. "backlog 3Kb 2p").
+_BACKLOG = re.compile(r"backlog (?P<num>\d+(?:\.\d+)?)(?P<unit>[KM]?)b (?P<pkts>\d+)p")
+# fq_codel extended stats (`tc -s`): maxpacket is the largest skb seen, the
+# direct evidence of GSO batches at the qdisc; ecn_mark counts CE marks, which
+# are congestion signals that never show up as drops.
+_XSTAT = re.compile(r"\b(?P<name>maxpacket|drop_overlimit|new_flow_count|ecn_mark) (?P<val>\d+)")
+_UNIT = {"": 1, "K": 1024, "M": 1024 * 1024}
+
+
+def _size(num: str, unit: str) -> int:
+    return int(round(float(num) * _UNIT[unit]))
 
 
 def parse_qdisc_show(text: str) -> list[dict]:
     """Parse `tc [-s] qdisc show dev X` into one dict per qdisc: kind, handle,
     parent ('root' for the root), options, and when `-s` was given sent_bytes,
-    sent_pkts, dropped, overlimits, requeues, backlog_bytes, backlog_pkts."""
+    sent_pkts, dropped, overlimits, requeues, backlog_bytes, backlog_pkts, and
+    fq_codel's maxpacket/drop_overlimit/new_flow_count/ecn_mark.
+
+    `sent_pkts` counts GSO segments (the kernel adds gso_segs per skb), while
+    `backlog_pkts` and `dropped` count skbs."""
     out: list[dict] = []
     cur: dict | None = None
     for raw in text.splitlines():
@@ -288,7 +323,9 @@ def parse_qdisc_show(text: str) -> list[dict]:
             continue
         m = _BACKLOG.search(line)
         if m:
-            cur.update(backlog_bytes=int(m["bytes"]), backlog_pkts=int(m["pkts"]))
+            cur.update(backlog_bytes=_size(m["num"], m["unit"]), backlog_pkts=int(m["pkts"]))
+        for m in _XSTAT.finditer(line):
+            cur[m["name"]] = int(m["val"])
     return out
 
 
@@ -315,21 +352,42 @@ def verify_tree(show_text: str, shape: Shape, topo: Topology) -> list[str]:
     return errors
 
 
+# qdisc_pkt_len of one wire packet on a veth: MTU + Ethernet header. A skb
+# larger than twice that can only be a GSO batch.
+L2_HEADER_BYTES = 14
+
+
+def gso_evidence(leaf: dict, mtu: int = MTU_BYTES) -> dict:
+    """Whether GSO batches reached the leaf, from what `tc -s` can show.
+
+    `sent_bytes / sent_pkts` cannot tell (packets are counted per segment), so
+    the evidence is fq_codel's `maxpacket` (largest skb ever seen, run-wide)
+    and the bytes per queued skb in the `backlog` snapshot. `gso_at_qdisc` is
+    True when either exceeds two wire packets, False only when fq_codel saw
+    traffic and its largest skb was one wire packet, None otherwise (bfifo
+    with an empty or small-packet backlog proves nothing)."""
+    wire = mtu + L2_HEADER_BYTES
+    bq, pq = leaf.get("backlog_bytes"), leaf.get("backlog_pkts")
+    per_skb = (bq / pq) if pq else None
+    maxpkt = leaf.get("maxpacket")
+    verdict: bool | None = None
+    if (maxpkt is not None and maxpkt > 2 * wire) or (per_skb is not None and per_skb > 2 * wire):
+        verdict = True
+    elif maxpkt is not None and leaf.get("sent_pkts") and maxpkt <= wire:
+        verdict = False
+    return {"max_skb_bytes": maxpkt, "backlog_bytes_per_skb": per_skb, "gso_at_qdisc": verdict}
+
+
 def leaf_stats(show_text: str, shape: Shape, topo: Topology) -> dict:
-    """The bottleneck leaf's counters from `tc -s qdisc show dev <host_if>`, plus
-    the whole parsed tree and the raw text. `mean_pkt_bytes` lets the preflight
-    see whether the queue counted wire packets (about 1.5 KB) or GSO
-    super-packets (tens of KB)."""
+    """The bottleneck leaf's counters from `tc -s qdisc show dev <host_if>`
+    (bytes, packets, drops, backlog, plus fq_codel's extended stats), the GSO
+    evidence of `gso_evidence`, the whole parsed tree and the raw text."""
     tree = parse_qdisc_show(show_text)
     leaf_handle = LEAF_HANDLE if shape.rate_mbps is not None else NETEM_HANDLE
     leaf = next((q for q in tree if q["handle"] == leaf_handle), None)
     stats = {"leaf": None, "tree": tree, "raw": show_text.strip()}
     if leaf is not None:
-        pk, by = leaf.get("sent_pkts"), leaf.get("sent_bytes")
-        stats["leaf"] = {
-            **leaf,
-            "mean_pkt_bytes": (by / pk) if pk else None,
-        }
+        stats["leaf"] = {**leaf, **gso_evidence(leaf, topo.mtu)}
     return stats
 
 
@@ -442,7 +500,8 @@ def run_cmds(cmds: list[Cmd]) -> list[dict]:
     results = []
     for c in cmds:
         r = _run(c.argv, check=False)
-        results.append({"cmd": c.argv, "rc": r.returncode, "stderr": r.stderr.strip()[:500]})
+        results.append({"cmd": c.argv, "rc": r.returncode, "stderr": r.stderr.strip()[:500],
+                        "stdout": r.stdout[:20000]})
         if c.check and r.returncode != 0:
             raise SystemExit(f"[net] command failed ({r.returncode}): {c.argv}\n{r.stderr.strip()}")
     return results
@@ -538,13 +597,13 @@ class NetnsBackend:
         _run(f"ip netns exec {self.ns} ip route add default via {self.host_ip}")
         # Offloads off on both ends before any qdisc exists (C5).
         results = run_cmds(offload_commands(self.topo))
-        host_k = _run(f"ethtool -k {self.host_if}", check=False, quiet=True).stdout
-        ns_k = _run(f"ip netns exec {self.ns} ethtool -k {self.ns_if}", check=False, quiet=True).stdout
+        host_k, ns_k = (next(r["stdout"] for r in results if r["cmd"] == cmd)
+                        for cmd in readback_commands(self.topo))
         self.offloads = {
             "requested": list(self.topo.offloads),
             "host": offload_summary(self.topo.offloads, host_k),
             "ns": offload_summary(self.topo.offloads, ns_k),
-            "ethtool_K": [r for r in results if " -K " in r["cmd"]],
+            "ethtool_K": [{k: v for k, v in r.items() if k != "stdout"} for r in results if " -K " in r["cmd"]],
         }
         self.offloads["all_off"] = self.offloads["host"]["all_off"] and self.offloads["ns"]["all_off"]
         print(f"[net] offloads host={self.offloads['host']['features']} ns={self.offloads['ns']['features']}")
