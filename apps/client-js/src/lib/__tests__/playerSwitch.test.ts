@@ -153,3 +153,57 @@ describe('Player.switchTrack: a target object that arrives before switch() resol
     expect(player.hasSwitchInFlight()).toBe(false);
   });
 });
+
+describe('Player.probeTrackBandwidth: PROBE object timestamps (F13)', () => {
+  let probes: Array<Record<string, unknown>>;
+  beforeEach(() => {
+    probes = [];
+    vi.spyOn(events, 'emit').mockImplementation((e, f) => {
+      if (e === 'PROBE') probes.push((f ?? {}) as Record<string, unknown>);
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  const probeStream = (objects: number, gapMs: number) =>
+    new ReadableStream({
+      async start(c) {
+        for (let i = 0; i < objects; i++) {
+          if (i > 0) await new Promise(r => setTimeout(r, gapMs));
+          c.enqueue({ isEndOfGroup: () => false, payload: new Uint8Array(1000) });
+        }
+        c.close();
+      },
+    });
+
+  it('carries first_object_ms and last_object_ms (epoch ms) of the probe objects; dt_ms keeps its meaning', async () => {
+    const { player, client } = await makePlayer();
+    client.subscribe.mockResolvedValueOnce({
+      requestId: 99n,
+      stream: probeStream(3, 30),
+      largestLocation: undefined,
+    });
+    const before = Date.now();
+    await player.probeTrackBandwidth('.probe:3000:0', 500);
+    const after = Date.now();
+    expect(probes).toHaveLength(1);
+    const p = probes[0]!;
+    const first = p.first_object_ms as number;
+    const last = p.last_object_ms as number;
+    expect(typeof first).toBe('number');
+    expect(first).toBeGreaterThanOrEqual(before);
+    expect(last).toBeLessThanOrEqual(after);
+    expect(last - first).toBeGreaterThanOrEqual(50);
+    expect(p.dt_ms as number).toBeGreaterThanOrEqual(last - first);
+  });
+
+  it('null timestamps when no probe object arrived', async () => {
+    const { player, client } = await makePlayer();
+    client.subscribe.mockResolvedValueOnce({
+      requestId: 99n,
+      stream: probeStream(0, 0),
+      largestLocation: undefined,
+    });
+    await player.probeTrackBandwidth('.probe:3000:0', 500);
+    expect(probes[0]).toMatchObject({ first_object_ms: null, last_object_ms: null });
+  });
+});

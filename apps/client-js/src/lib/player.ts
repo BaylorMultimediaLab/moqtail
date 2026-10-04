@@ -1631,6 +1631,10 @@ export class Player {
     const capMs = Math.max(durationMs * 10, 5000);
     let streamDone = false;
     let lastObjectAt = tStart;
+    // Date.now() of the first and last probe object received (F13): the
+    // burst's own span, without the subscribe RTT before it and the idle wait
+    // after it that dt_ms includes.
+    let firstObjectAt: number | null = null;
 
     try {
       for (;;) {
@@ -1660,6 +1664,7 @@ export class Player {
         pBytes += len;
         count++;
         lastObjectAt = Date.now();
+        if (firstObjectAt === null) firstObjectAt = lastObjectAt;
       }
     } catch {
       /* swallow — return what we have */
@@ -1682,6 +1687,8 @@ export class Player {
         p_bytes: pBytes,
         objects: count,
         dt_ms: tEnd - tStart,
+        first_object_ms: firstObjectAt,
+        last_object_ms: count > 0 ? lastObjectAt : null,
         bps: 0,
       });
       return { bps: 0, dtMs: tEnd - tStart };
@@ -1697,7 +1704,11 @@ export class Player {
       p_bytes: pBytes,
       v_bytes: vBytes,
       objects: count,
+      // Subscribe sent to the end of the read (RTT and idle wait included).
       dt_ms: tEnd - tStart,
+      // Epoch ms (Date.now) of the first and last probe object received.
+      first_object_ms: firstObjectAt,
+      last_object_ms: lastObjectAt,
       stream_done: streamDone,
       bps,
     });
