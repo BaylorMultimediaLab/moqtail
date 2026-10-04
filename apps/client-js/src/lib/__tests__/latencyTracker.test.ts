@@ -62,4 +62,15 @@ describe('LatencyTracker', () => {
     t.record(77);
     expect(t.getLastLatencyMs()).toBe(77);
   });
+
+  // C6 (W5): the rule compares the two half-window means net of the target shift.
+  it('exposes the half-window means once the window is full', () => {
+    const t = new LatencyTracker(4);
+    t.record(100);
+    t.record(100);
+    t.record(100);
+    expect(t.getHalfMeans()).toBeUndefined();
+    t.record(300);
+    expect(t.getHalfMeans()).toEqual({ olderMs: 100, recentMs: 200 });
+  });
 });

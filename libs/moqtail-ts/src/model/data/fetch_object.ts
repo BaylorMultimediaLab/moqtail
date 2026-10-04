@@ -67,6 +67,8 @@ export enum EndOfRangeKind {
 export class FetchObject {
   public readonly location: Location
   public readonly subgroupId: bigint
+  /** `performance.now()` when the receiving data stream parsed this object; see SubgroupObject.recvAt. */
+  public recvAt: number | undefined
 
   private constructor(
     public readonly kind: 'object' | 'end_of_range',

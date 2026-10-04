@@ -134,6 +134,29 @@ describe('ProbeManager', () => {
     expect(pm.getFreshBandwidthBps()).toBe(5_000_000);
   });
 
+  // M18 contract: the player's probeTrackBandwidth returns
+  // bps = p * 8 / (lastObjectAt - firstObjectAt) and dtMs = that span; a probe
+  // with fewer than two objects has no span and reports bps 0.
+  it('discards a reading whose bps is not a positive finite number (single-object probe)', async () => {
+    const player = {
+      probeTrackBandwidth: vi
+        .fn()
+        .mockResolvedValueOnce({ bps: 5_000_000, dtMs: 400 })
+        .mockResolvedValueOnce({ bps: Number.POSITIVE_INFINITY, dtMs: 0 })
+        .mockResolvedValueOnce({ bps: Number.NaN, dtMs: 0 }),
+    };
+    const pm = new ProbeManager(player, { intervalMs: 0 });
+    pm.maybeProbe('720p');
+    await vi.runAllTimersAsync();
+    expect(pm.getFreshBandwidthBps()).toBe(5_000_000);
+    pm.maybeProbe('720p');
+    await vi.runAllTimersAsync();
+    expect(pm.getFreshBandwidthBps()).toBe(5_000_000);
+    pm.maybeProbe('720p');
+    await vi.runAllTimersAsync();
+    expect(pm.getFreshBandwidthBps()).toBe(5_000_000);
+  });
+
   it('keeps every structured reading when minDurationMs is 0', async () => {
     const player = {
       probeTrackBandwidth: vi.fn().mockResolvedValue({ bps: 250_000_000, dtMs: 12 }),

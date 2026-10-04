@@ -1,0 +1,7 @@
+{
+  "name": "unshaped",
+  "description": "Preflight profile: 40 ms RTT through the namespace, no rate limit (netem only, no HTB/leaf). Used for the CONN_STATS loss-rate check; every mechanism must show < 0.1 % loss here.",
+  "queue": "tail-drop",
+  "queue_pkts": 100,
+  "steps": [{ "at_s": 0, "delay_ms": 40, "loss_pct": 0 }]
+}

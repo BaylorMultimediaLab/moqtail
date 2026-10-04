@@ -338,7 +338,7 @@ async fn upstream_subscribe_exchange(
   new_sub: Subscribe,
   context: Arc<SessionContext>,
 ) {
-  let (send, recv) = match publisher.connection.open_bi().await {
+  let (send, recv) = match publisher.connection.open_request_stream().await {
     Ok(streams) => streams,
     Err(e) => {
       error!("Failed to open upstream subscribe stream: {:?}", e);
@@ -1633,6 +1633,7 @@ async fn handle_switch_message(
     &client.switch_context,
     new_full_track_name,
     switch_from_track.full_track_name.clone(),
+    context.server_config.native_status_before_subscribe,
     handle_subscribe_message(
       client.clone(),
       stream_handler,
@@ -1649,29 +1650,47 @@ async fn handle_switch_message(
   result
 }
 
-/// Runs the SUBSCRIBE a native SWITCH is turned into with the switch context already
-/// saying target = Next, source = Current.
+/// Runs the SUBSCRIBE a native SWITCH is turned into and sets the switch context to
+/// target = Next, source = Current, in the order `status_before_subscribe` selects.
 ///
-/// The statuses used to be set only after the SUBSCRIBE had been handled, i.e. after
-/// SUBSCRIBE_OK went out and `mark_alias_announced` released the switched
-/// subscription's forwarding. An object it dequeued in that window found no status
-/// for its track and was forwarded ungated (`check_switch_context`: "not in a switch
-/// context, always forward"), possibly mid-group, while the source track was never
-/// demoted for it; the one-shot `notify_switch` check was spent on it as well (Report
-/// 5, Minor: promotion race). With the statuses in place first, every object the
-/// switched subscription can see is gated by the Next branch.
+/// `false` (default, `--native-status-before-subscribe` absent) is upstream's order:
+/// the SUBSCRIBE runs first, and the statuses are set only once it has succeeded
+/// (nothing is set if it fails). The as-shipped native arm keeps this, with its
+/// window: SUBSCRIBE_OK goes out and `mark_alias_announced` releases the switched
+/// subscription's forwarding before the statuses exist, so an object it dequeues in
+/// between finds no status for its track and is forwarded ungated
+/// (`check_switch_context`: "not in a switch context, always forward"), possibly
+/// mid-group, while the source track is not demoted for it; the one-shot
+/// `notify_switch` check is spent on it as well (Report 5, Minor: promotion race).
 ///
-/// If the SUBSCRIBE fails and the target has not been promoted meanwhile, the
-/// statuses are put back as they were.
+/// `true` (`--native-status-before-subscribe`, the corrected native arm together
+/// with `--forward-promotion-trigger`): the statuses are in place before the
+/// SUBSCRIBE runs, so every object the switched subscription can see is gated by the
+/// Next branch; if the SUBSCRIBE fails and the target has not been promoted
+/// meanwhile, the statuses are put back as they were (R3-D4).
 pub(crate) async fn with_native_switch_statuses<F>(
   switch_context: &SwitchContext,
   target: FullTrackName,
   source: FullTrackName,
+  status_before_subscribe: bool,
   subscribe: F,
 ) -> Result<(), TerminationCode>
 where
   F: std::future::Future<Output = Result<(), TerminationCode>>,
 {
+  if !status_before_subscribe {
+    let result = subscribe.await;
+    if result.is_ok() {
+      switch_context
+        .add_or_update_switch_item(target, SwitchStatus::Next)
+        .await;
+      switch_context
+        .add_or_update_switch_item(source, SwitchStatus::Current)
+        .await;
+    }
+    return result;
+  }
+
   let before = switch_context.snapshot().await;
   switch_context
     .add_or_update_switch_item(target.clone(), SwitchStatus::Next)

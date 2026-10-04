@@ -31,7 +31,30 @@ import { events } from '@/lib/events/EventLog';
  * dependency is a `probeTrackBandwidth(name, durationMs)` callable.
  */
 
-/** A probe measurement: link estimate plus how long the burst was on the wire. */
+/**
+ * A probe measurement (M18 contract between the player and the controller).
+ *
+ * The player subscribes to the relay's synthetic `.probe:<bytes>:0` track and
+ * reads the burst until the stream ends (or goes idle). It reports
+ *
+ *   bps  = p · 8 / (lastObjectAt − firstObjectAt)
+ *   dtMs = lastObjectAt − firstObjectAt
+ *
+ * where `p` is the probe payload in bytes and the timestamps are the arrival
+ * times (`recvAt`, stamped at enqueue) of the first and last probe object. The
+ * span is the burst's time on the wire only: it excludes the subscribe round
+ * trip, the wait for the first object and the fixed idle timeout after the
+ * last one, each of which the shipped formula `(v + p)·8/(tEnd − tStart)`
+ * folded into the denominator (with a 64 KB cap and a 250 ms idle, BWE could
+ * not exceed about 2.7 Mbps whatever the link). Concurrent video bytes are not
+ * added: within the burst the probe shares the link with the video, so the
+ * burst rate under-reads the link by at most the video's share, which the
+ * safety factor absorbs. A probe with fewer than two objects has no span and
+ * reports `bps = 0`; the manager discards it.
+ *
+ * `bps` is a link-rate certificate for {@link ProbeRule}'s veto, not a
+ * throughput estimate: it is never mixed into the SWMA.
+ */
 export interface ProbeResult {
   bps: number;
   dtMs: number;
@@ -99,7 +122,9 @@ export class ProbeManager {
       .then(result => {
         const bps = typeof result === 'number' ? result : result.bps;
         const dtMs = typeof result === 'number' ? undefined : result.dtMs;
-        if (bps <= 0) return;
+        // A probe with no span (fewer than two objects) or a bad reading
+        // leaves the cache alone.
+        if (!Number.isFinite(bps) || bps <= 0) return;
         if (this.#minDurationMs > 0 && dtMs !== undefined && dtMs < this.#minDurationMs) {
           events.emit('PROBE_DISCARDED', {
             track: trackName,

@@ -41,13 +41,32 @@ export class ThroughputRule implements AbrRule {
       bestIndex = i;
     }
 
-    if (bestIndex === -1) {
-      return null;
-    }
-
     const rulePriority =
       abrSettings.rules['ThroughputRule']?.priority ??
       DEFAULT_ABR_SETTINGS.rules['ThroughputRule'].priority;
+
+    if (bestIndex === -1) {
+      // Nothing fits. The shipped rule abstains (grid, baseline); with
+      // parameters.downToLowest (the min arm) it asks for the lowest rung the
+      // clamps allow, so a collapse below the ladder is a down-switch and does
+      // not wait for the buffer to drain into the emergency.
+      if (!abrSettings.rules['ThroughputRule']?.parameters?.['downToLowest']) {
+        return null;
+      }
+      let lowest = 0;
+      for (let i = 0; i < tracks.length; i++) {
+        const bitrate = tracks[i]?.bitrate ?? 0;
+        if (minBitrate !== -1 && bitrate < minBitrate) continue;
+        if (maxBitrate !== -1 && bitrate > maxBitrate) continue;
+        lowest = i;
+        break;
+      }
+      return {
+        representationIndex: lowest,
+        priority: rulePriority ?? SwitchRequestPriority.DEFAULT,
+        reason: 'throughput below the lowest rung',
+      };
+    }
 
     return {
       representationIndex: bestIndex,

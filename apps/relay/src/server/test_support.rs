@@ -56,6 +56,15 @@ pub(crate) async fn quic_pair() -> (TransportConnection, TransportConnection) {
 pub(crate) async fn quic_pair_with_server_transport(
   transport: Option<quinn::TransportConfig>,
 ) -> (TransportConnection, TransportConnection) {
+  quic_pair_with_transports(transport, None).await
+}
+
+/// As `quic_pair`, with either end on its own transport config (e.g. a subscriber
+/// that grants the relay only a few uni streams).
+pub(crate) async fn quic_pair_with_transports(
+  transport: Option<quinn::TransportConfig>,
+  client_transport: Option<quinn::TransportConfig>,
+) -> (TransportConnection, TransportConnection) {
   let server_identity =
     wtransport::Identity::self_signed(std::iter::once("localhost")).expect("self-signed identity");
 
@@ -87,7 +96,10 @@ pub(crate) async fn quic_pair_with_server_transport(
   client_tls.alpn_protocols = vec![TEST_ALPN.to_vec()];
   let quic_client_config =
     quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).expect("client crypto");
-  let client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+  let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+  if let Some(client_transport) = client_transport {
+    client_config.transport_config(Arc::new(client_transport));
+  }
 
   let client_endpoint =
     quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");

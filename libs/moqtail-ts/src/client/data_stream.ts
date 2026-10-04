@@ -118,16 +118,26 @@ export class RecvStream {
   readonly #internalBuffer: ByteBuffer
   readonly #groupOrder: GroupOrder
   readonly onDataReceived?: (data: SubgroupObject | SubgroupHeader | FetchObject | FetchHeader) => void
+  /**
+   * Bytes read from the transport on this stream so far, header included. What a
+   * stream cost the link up to the moment it was dropped (see
+   * {@link MOQtailClient.onStreamDiscarded}), independent of what was parsed.
+   */
+  #bytesReceived: number
+  /** This side asked the peer to stop (stopSending): the stream ends here by choice. */
+  #stopped = false
   private constructor(
     readonly header: Header,
     reader: ReadableStreamDefaultReader<Uint8Array>,
     internalBuffer: ByteBuffer,
+    bytesReceived: number,
     partialDataTimeout?: number,
     onDataReceived?: (data: SubgroupObject | SubgroupHeader | FetchObject | FetchHeader) => void,
     groupOrder: GroupOrder = GroupOrder.Original,
   ) {
     this.#reader = reader
     this.#internalBuffer = internalBuffer
+    this.#bytesReceived = bytesReceived
     this.#partialDataTimeout = partialDataTimeout
     this.#groupOrder = groupOrder
     if (onDataReceived) this.onDataReceived = onDataReceived
@@ -150,6 +160,7 @@ export class RecvStream {
   ): Promise<RecvStream> {
     const reader = readStream.getReader()
     const internalBuffer = new ByteBuffer()
+    let bytesReceived = 0
     let headerInstance: Header
     try {
       while (true) {
@@ -176,6 +187,7 @@ export class RecvStream {
         }
         if (value) {
           internalBuffer.putBytes(value)
+          bytesReceived += value.byteLength
         }
         try {
           internalBuffer.checkpoint()
@@ -202,7 +214,20 @@ export class RecvStream {
     // Resolved before the ingest loop starts: the first object may already be buffered.
     const groupOrder =
       Header.isFetch(headerInstance) && resolveGroupOrder ? resolveGroupOrder(headerInstance) : GroupOrder.Original
-    return new RecvStream(headerInstance, reader, internalBuffer, partialDataTimeout, onDataReceived, groupOrder)
+    return new RecvStream(
+      headerInstance,
+      reader,
+      internalBuffer,
+      bytesReceived,
+      partialDataTimeout,
+      onDataReceived,
+      groupOrder,
+    )
+  }
+
+  /** Bytes read from the transport on this stream so far (header included). */
+  get bytesReceived(): number {
+    return this.#bytesReceived
   }
 
   async #ingestLoop(controller: ReadableStreamDefaultController<FetchObject | SubgroupObject>) {
@@ -232,6 +257,9 @@ export class RecvStream {
               previousObjectId = object.objectId
             }
             this.#internalBuffer.commit()
+            // Receive stamp (M11): taken here, where the object leaves the wire, so
+            // that arrival spacing is independent of how fast the consumer reads.
+            object.recvAt = performance.now()
             controller.enqueue(object)
             if (this.onDataReceived) this.onDataReceived(object)
             continue
@@ -259,7 +287,11 @@ export class RecvStream {
 
         const { done, value } = readResult
         if (done) {
-          if (this.#internalBuffer.remaining > 0) {
+          if (this.#stopped) {
+            // A partial object left over is expected: we cut the stream ourselves.
+            logger.debug('data_stream', `RecvStream stopped type=${this.header.type}`)
+            controller.close()
+          } else if (this.#internalBuffer.remaining > 0) {
             logger.error(
               'data_stream',
               `RecvStream closed with incomplete data remaining=${this.#internalBuffer.remaining}`,
@@ -278,6 +310,7 @@ export class RecvStream {
         }
         if (value) {
           this.#internalBuffer.putBytes(value)
+          this.#bytesReceived += value.byteLength
         }
       }
     } catch (error) {
@@ -301,6 +334,7 @@ export class RecvStream {
   /** Asks the peer to stop sending on this stream, reporting `code` (§3.3.3). */
   async stopSending(code: StreamResetCode): Promise<void> {
     logger.debug('data_stream', `RecvStream stopSending type=${this.header.type} code=${code}`)
+    this.#stopped = true
     await this.#reader.cancel(streamResetReason(code)).catch(() => {})
   }
 }
@@ -384,7 +418,35 @@ if (import.meta.vitest) {
         const receivePromise = reader.read()
         await sendStream.write(fetchObject)
         const { value: receivedObject } = await receivePromise
-        expect(receivedObject).toEqual(fetchObject)
+        expect(receivedObject).toBeInstanceOf(SubgroupObject)
+        const received = receivedObject as SubgroupObject
+        expect(received.objectId).toEqual(fetchObject.objectId)
+        expect(received.properties).toEqual(fetchObject.properties)
+        expect(received.objectStatus).toEqual(fetchObject.objectStatus)
+        expect(received.payload).toEqual(fetchObject.payload)
+        reader.releaseLock()
+      })
+
+      // M11: the receive time is taken where the object leaves the wire, not where
+      // the application consumes it, so a consumer that appends into MSE between
+      // reads does not stretch the measured arrival spacing.
+      test('stamps recvAt (performance.now()) on each object as it is parsed', async () => {
+        const reader = recvStream.stream.getReader()
+        const before = performance.now()
+        await sendStream.write(SubgroupObject.newWithPayload(1, null, new Uint8Array([1])))
+        const { value: first } = await reader.read()
+        const afterFirst = performance.now()
+        expect(typeof (first as SubgroupObject).recvAt).toBe('number')
+        expect((first as SubgroupObject).recvAt!).toBeGreaterThanOrEqual(before)
+        expect((first as SubgroupObject).recvAt!).toBeLessThanOrEqual(afterFirst)
+
+        // A consumer that is slow to read does not move the stamp: the second
+        // object is parsed as soon as its bytes arrive.
+        await sendStream.write(SubgroupObject.newWithPayload(2, null, new Uint8Array([2])))
+        await new Promise((r) => setTimeout(r, 30))
+        const slowReadAt = performance.now()
+        const { value: second } = await reader.read()
+        expect((second as SubgroupObject).recvAt!).toBeLessThan(slowReadAt - 20)
         reader.releaseLock()
       })
     })
@@ -392,7 +454,7 @@ if (import.meta.vitest) {
 }
 
 if (import.meta.vitest) {
-  const { describe, test, expect } = import.meta.vitest
+  const { describe, test, expect, vi } = import.meta.vitest
 
   describe('SendStream', () => {
     test('write cleanly rejects out-of-order objects', async () => {
@@ -462,6 +524,28 @@ if (import.meta.vitest) {
       const { recv, reason } = await receiver()
       await recv.stopSending(StreamResetCode.TooFarBehind)
       expect(streamResetCodeOf(reason())).toBe(StreamResetCode.TooFarBehind)
+    })
+
+    // M15 follow-up: the client stops an unrouted stream mid-object. That is this
+    // side's own decision, not a truncated stream: the object stream ends
+    // quietly instead of erroring with "incomplete object data" (and logging it
+    // as an error) for every discarded stream.
+    test('stopSending mid-object ends the object stream without a truncation error', async () => {
+      const head = header().serialize().toUint8Array()
+      const partial = FetchObject.newObject(1, 0, 2, 0, ObjectForwardingPreference.Subgroup, null, new Uint8Array(100))
+        .serialize()
+        .toUint8Array()
+      const bytes = new Uint8Array(head.length + 10)
+      bytes.set(head)
+      bytes.set(partial.subarray(0, 10), head.length)
+      const readable = new ReadableStream<Uint8Array>({ start: (c) => c.enqueue(bytes) })
+      const recv = await RecvStream.new(readable)
+      const errors = vi.spyOn(logger, 'error')
+      const reader = recv.stream.getReader()
+      await recv.stopSending(StreamResetCode.Cancelled)
+      await expect(reader.read()).resolves.toEqual({ done: true, value: undefined })
+      expect(errors).not.toHaveBeenCalled()
+      errors.mockRestore()
     })
 
     test('cancelling the object stream forwards the code to the transport', async () => {

@@ -43,7 +43,7 @@ use moqtail::model::error::StreamResetCode;
 use moqtail::model::parameter::message_parameter::{
   MessageParameter, apply_message_parameter_update,
 };
-use moqtail::transport::connection::TransportSendStream;
+use moqtail::transport::connection::{TransportSendStream, TransportWriteError};
 use moqtail::transport::data_stream_handler::HeaderInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -310,6 +310,8 @@ impl From<SubscriptionOrigin> for SubscriptionState {
 /// Within each band, group_id determines relative position according to group_order:
 ///   Ascending / Original – lower group_id = higher priority (counts down from band_max)
 ///   Descending            – higher group_id = higher priority (counts up from band_min)
+/// The result is shifted down by one (saturating at i32::MIN) so it is always below
+/// `CONTROL_STREAM_PRIORITY`: control and request streams go first.
 pub(crate) fn compute_stream_priority(
   sub_prio: u8,
   pub_prio: u8,
@@ -320,10 +322,16 @@ pub(crate) fn compute_stream_priority(
   let priority_index = (255 - sub_prio as i64) * 256 + (255 - pub_prio as i64);
   let band_min = i32::MIN as i64 + priority_index * BAND_SIZE;
   let group_slot = (group_id % BAND_SIZE as u64) as i64;
-  match group_order {
-    GroupOrder::Ascending | GroupOrder::Original => (band_min + BAND_SIZE - 1 - group_slot) as i32,
-    GroupOrder::Descending => (band_min + group_slot) as i32,
-  }
+  let priority = match group_order {
+    GroupOrder::Ascending | GroupOrder::Original => band_min + BAND_SIZE - 1 - group_slot,
+    GroupOrder::Descending => band_min + group_slot,
+  };
+  // The bands fill the whole i32 range, so the top slot of the top band (sub 0,
+  // pub 0) would be i32::MAX, the priority of control and request streams. Every
+  // slot moves down by one so data stays strictly below them (R3-D2); the bottom
+  // slot saturates, so the two lowest slots of the (255, 255) band share i32::MIN
+  // (where the probe sits). Relative order is otherwise unchanged.
+  (priority - 1).max(i32::MIN as i64) as i32
 }
 
 /// QUIC stream priority of the relay's synthetic `.probe:` streams (M3).
@@ -374,6 +382,8 @@ pub(crate) struct SubscriptionCounters {
   pub write_failures: AtomicU64,
   /// Live objects dropped because the cache replay had already delivered them.
   pub live_duplicates_dropped: AtomicU64,
+  /// Objects dropped because the subscriber had stopped (STOP_SENDING) their stream.
+  pub stopped_stream_objects_dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +396,11 @@ pub struct Subscription {
   subscriber: Arc<MOQTClient>,
   event_rx: Arc<Mutex<Option<UnboundedReceiver<TrackEvent>>>>,
   send_stream_last_object_ids: Arc<RwLock<HashMap<StreamId, Option<u64>>>>,
+  /// Data streams the subscriber stopped (STOP_SENDING, seen as a write that failed
+  /// with ClosedOrStopped). The rest of such a subgroup is dropped rather than sent
+  /// on a reopened stream (R3-D3). An entry is retired when the publisher's stream
+  /// for it closes, after which nothing more of that subgroup can be queued.
+  stopped_streams: Arc<RwLock<std::collections::HashSet<StreamId>>>,
   /// Monotonic count of data streams opened for this subscription, including
   /// empty subgroups. Reported as PUBLISH_DONE Stream Count.
   opened_stream_count: Arc<AtomicU64>,
@@ -439,6 +454,7 @@ impl Subscription {
       subscriber,
       event_rx,
       send_stream_last_object_ids: Arc::new(RwLock::new(HashMap::new())),
+      stopped_streams: Arc::new(RwLock::new(std::collections::HashSet::new())),
       opened_stream_count: Arc::new(AtomicU64::new(0)),
       finished: Arc::new(AtomicBool::new(false)),
       cache,
@@ -610,6 +626,12 @@ impl Subscription {
                             "FROM CACHE: Joining state - subscriber={} relay_track_id={} sending subgroup header: {:?}",
                             instance.client_connection_id, relay_track_id, subgroup_header
                           );
+                          // The previous group's replay is over (R3-D5).
+                          if let Some(previous) = last_stream_id.take() {
+                            instance
+                              .finish_replayed_stream_if_complete(&cache, &previous)
+                              .await;
+                          }
                           last_group = object.group_id;
                           let stream_id = instance.get_stream_id(&subgroup_header);
                           last_stream_id = Some(stream_id);
@@ -648,6 +670,13 @@ impl Subscription {
                       break;
                     }
                   }
+                }
+                // The last replayed group: finished only if the publisher is done
+                // with it too; the newest group normally is not, and continues live.
+                if let Some(last) = last_stream_id.take() {
+                  instance
+                    .finish_replayed_stream_if_complete(&cache, &last)
+                    .await;
                 }
               }
               // The live path's duplicate filter is `replayed_through` (per stream,
@@ -1315,6 +1344,20 @@ impl Subscription {
           pending.take();
         }
 
+        // The subscriber stopped this subgroup's stream: the rest of the subgroup is
+        // not wanted, and must not go out on a reopened stream (R3-D3).
+        if self.stopped_streams.read().await.contains(&stream_id) {
+          self
+            .counters
+            .stopped_stream_objects_dropped
+            .fetch_add(1, Ordering::Relaxed);
+          debug!(
+            "Dropping object of a stream the subscriber stopped: subscriber={} stream_id={} relay_track_id={} location: {:?}",
+            self.client_connection_id, stream_id, self.relay_track_id, object.location
+          );
+          return;
+        }
+
         // Handle header info if this is the first object
         let send_stream = if let Some(header) = header_info {
           if let HeaderInfo::Subgroup { header: _ } = header {
@@ -1371,11 +1414,20 @@ impl Subscription {
                   "mid-subgroup join: opening stream from cached header for subscriber={} relay_track_id={} stream_id={}",
                   self.client_connection_id, self.relay_track_id, stream_id
                 );
-                self
-                  .handle_header(h)
-                  .await
-                  .ok()
-                  .map(|(_, send_stream)| send_stream)
+                // A new stream: its first object is encoded from scratch, not as a
+                // delta from whatever an earlier stream for this id last carried
+                // (R3-D3).
+                match self.handle_header(h).await {
+                  Ok((opened_id, send_stream)) => {
+                    self
+                      .send_stream_last_object_ids
+                      .write()
+                      .await
+                      .insert(opened_id, None);
+                    Some(send_stream)
+                  }
+                  Err(_) => None,
+                }
               } else {
                 None
               }
@@ -1416,6 +1468,25 @@ impl Subscription {
           let send_status = write_result.is_ok();
           if let Some(promotion) = promotion.as_mut() {
             promotion.written = send_status;
+          }
+          if let Err(e) = &write_result
+            && e
+              .downcast_ref::<TransportWriteError>()
+              .is_some_and(|e| matches!(e, TransportWriteError::ClosedOrStopped))
+          {
+            // The subscriber stopped this stream (the client already dropped it
+            // from its send-stream map). Remember it so the rest of the subgroup is
+            // dropped instead of reopening the stream (R3-D3).
+            info!(
+              "Subscriber stopped stream: subscriber={} stream_id={} relay_track_id={}; dropping the rest of the subgroup",
+              self.client_connection_id, stream_id, self.relay_track_id
+            );
+            self.stopped_streams.write().await.insert(stream_id.clone());
+            self
+              .send_stream_last_object_ids
+              .write()
+              .await
+              .remove(&stream_id);
           }
           if send_status {
             self
@@ -1706,9 +1777,65 @@ impl Subscription {
     }
   }
 
+  /// Called by the joining replay when it has written the last cached object of the
+  /// group on `stream_id` (R3-D5). If the publisher's stream for that subgroup has
+  /// already closed and the replay wrote everything the cache holds of it, the
+  /// subgroup is complete and its stream is finished here: a subscription
+  /// registered after the publisher's stream closed never receives the StreamClosed
+  /// that would otherwise finish it, and an unfinished stream holds one of the
+  /// subscriber's uni-stream credits for the rest of the session. A subgroup still
+  /// being published (normally the newest group) stays open and continues live;
+  /// its StreamClosed finishes it. So does one whose cache holds objects past what
+  /// the replay wrote (added after the replay read the group: they and the close
+  /// are in this subscription's live queue).
+  async fn finish_replayed_stream_if_complete(&self, cache: &TrackCache, stream_id: &StreamId) {
+    if self
+      .active_subgroup_headers
+      .read()
+      .await
+      .contains_key(stream_id)
+    {
+      return;
+    }
+    let Some(replayed) = self
+      .subscription_state
+      .read()
+      .await
+      .replayed_through
+      .get(stream_id)
+      .copied()
+    else {
+      return;
+    };
+    let (Some(group), Some(subgroup)) = (stream_id.group_id, stream_id.subgroup_id) else {
+      return;
+    };
+    let cached_last = match cache.get_group(group).await {
+      Some(objects) => objects
+        .read()
+        .await
+        .iter()
+        .filter(|o| o.subgroup_id == subgroup)
+        .map(|o| o.object_id)
+        .max(),
+      None => None,
+    };
+    if cached_last.is_some_and(|last| last > replayed) {
+      return;
+    }
+    info!(
+      "Joining replay finished complete group: subscriber={} stream_id={} relay_track_id={} last object {}",
+      self.client_connection_id, stream_id, self.relay_track_id, replayed
+    );
+    let _ = self.handle_stream_closed(stream_id).await;
+  }
+
   async fn handle_stream_closed(&self, stream_id: &StreamId) -> Result<()> {
     // Handle the stream closed event
     debug!("Stream closed: {}", stream_id.get_stream_id());
+
+    // The publisher's subgroup is over: nothing more of it can arrive.
+    self.stopped_streams.write().await.remove(stream_id);
 
     // remove the stream id from send_stream_last_object_ids immediately
     let mut send_stream_last_object_ids = self.send_stream_last_object_ids.write().await;
@@ -1926,6 +2053,40 @@ mod tests {
     }
   }
 
+  /// R3-D2: control/request streams > every video stream > the probe, for every
+  /// subscriber and publisher priority, both group orders and the band-edge group
+  /// slots. The probe ties only with the lowest video slots of the (255, 255) band.
+  #[test]
+  fn control_outranks_every_video_band_which_outranks_the_probe() {
+    use moqtail::transport::connection::CONTROL_STREAM_PRIORITY;
+    let probe = probe_stream_priority();
+    for sub in 0u8..=255 {
+      for pub_ in 0u8..=255 {
+        for &order in &[GroupOrder::Ascending, GroupOrder::Descending] {
+          for group in [0u64, 1, 65534, 65535, 65536, u64::MAX] {
+            let video = compute_stream_priority(sub, pub_, order, group);
+            assert!(
+              video < CONTROL_STREAM_PRIORITY,
+              "video (sub={sub} pub={pub_} order={order:?} group={group}) = {video} ties control"
+            );
+            if (sub, pub_) == (255, 255) {
+              assert!(video >= probe);
+            } else {
+              assert!(
+                video > probe,
+                "video (sub={sub} pub={pub_} order={order:?} group={group}) = {video} vs probe"
+              );
+            }
+          }
+        }
+      }
+    }
+    // The harness's values: player SUBSCRIBE/SWITCH at 0, publisher at 128.
+    let harness_video = compute_stream_priority(0, 128, GroupOrder::Ascending, 0);
+    assert!(harness_video > 2_000_000_000, "{harness_video}");
+    assert_eq!(CONTROL_STREAM_PRIORITY, i32::MAX);
+  }
+
   /// A literal 0 (the previous probe priority) is NOT below video for a
   /// priority-128 subscriber: this is the defect the derived value fixes.
   #[test]
@@ -2141,6 +2302,160 @@ mod tests_replay_live_overlap {
   }
 }
 
+/// R3-D5: a joining replay's streams for groups the publisher had already finished
+/// were never finished (no StreamClosed reaches a subscription registered after the
+/// publisher's stream closed), each holding one of the subscriber's uni-stream
+/// credits for the rest of the session.
+#[cfg(test)]
+mod tests_replay_finishes_complete_groups {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, collect_streams, publish, quic_pair, relay_client, subscribe, test_track,
+    wait_until,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use std::time::Duration;
+
+  const TRACK: u64 = 1;
+
+  fn from(group: u64) -> Subscribe {
+    Subscribe::new_absolute_start(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      Location::new(group, 0),
+      vec![],
+    )
+  }
+
+  async fn open(client: &Arc<MOQTClient>, group: u64) -> bool {
+    client
+      .get_stream(&StreamId::new_subgroup(TRACK, group, Some(0)))
+      .await
+      .is_some()
+  }
+
+  /// The reviewer's scenario: groups 10 and 11 complete (publisher streams closed)
+  /// and 12 in progress when the subscription replays from 10. After the replay the
+  /// streams of 10 and 11 are finished; 12 stays open, continues live on the same
+  /// stream, and is finished when the publisher closes it.
+  #[tokio::test]
+  async fn replayed_streams_of_complete_groups_are_finished() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(77, server);
+    let received = collect_streams(peer);
+    let track = test_track(TRACK, "video-720p");
+    for g in 10..=11 {
+      for o in 0..3 {
+        publish(&track, g, o).await;
+      }
+      track
+        .stream_closed(&StreamId::new_subgroup(TRACK, g, Some(0)))
+        .await
+        .unwrap();
+    }
+    for o in 0..3 {
+      publish(&track, 12, o).await;
+    }
+    let sub = subscribe(&track, &client, from(10), false).await;
+    sub.read().await.mark_alias_announced();
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let r = received.clone();
+        async move { r.objects(TRACK).len() >= 9 }
+      })
+      .await
+    );
+    assert!(
+      wait_until(Duration::from_secs(2), || {
+        let client = client.clone();
+        async move { !open(&client, 10).await && !open(&client, 11).await }
+      })
+      .await,
+      "the streams of complete groups 10 and 11 are still open"
+    );
+    assert!(
+      open(&client, 12).await,
+      "the newest group stays open for live"
+    );
+
+    for o in 3..5 {
+      publish(&track, 12, o).await;
+    }
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let r = received.clone();
+        async move { r.objects(TRACK).contains(&(12, 4)) }
+      })
+      .await
+    );
+    assert_eq!(
+      received.streams_for(TRACK, 12),
+      1,
+      "12 continues on one stream"
+    );
+    track
+      .stream_closed(&StreamId::new_subgroup(TRACK, 12, Some(0)))
+      .await
+      .unwrap();
+    assert!(
+      wait_until(Duration::from_secs(2), || {
+        let client = client.clone();
+        async move { !open(&client, 12).await }
+      })
+      .await
+    );
+    let expected: Vec<(u64, u64)> = (10..=11)
+      .flat_map(|g| (0..3).map(move |o| (g, o)))
+      .chain((0..5).map(|o| (12, o)))
+      .collect();
+    let mut got = received.objects(TRACK);
+    got.sort();
+    assert_eq!(got, expected);
+  }
+
+  /// A replayed group whose publisher stream is still open is left to the live
+  /// path (its StreamClosed finishes it), even when a later group exists.
+  #[tokio::test]
+  async fn a_replayed_group_still_being_published_stays_open() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(78, server);
+    let received = collect_streams(peer);
+    let track = test_track(TRACK, "video-720p");
+    for o in 0..3 {
+      publish(&track, 10, o).await;
+    }
+    for o in 0..3 {
+      publish(&track, 11, o).await;
+    }
+    let sub = subscribe(&track, &client, from(10), false).await;
+    sub.read().await.mark_alias_announced();
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let r = received.clone();
+        async move { r.objects(TRACK).len() >= 6 }
+      })
+      .await
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(open(&client, 10).await, "10 is still being published");
+    publish(&track, 10, 3).await;
+    track
+      .stream_closed(&StreamId::new_subgroup(TRACK, 10, Some(0)))
+      .await
+      .unwrap();
+    assert!(
+      wait_until(Duration::from_secs(2), || {
+        let client = client.clone();
+        async move { !open(&client, 10).await }
+      })
+      .await
+    );
+    assert!(received.objects(TRACK).contains(&(10, 3)));
+    assert_eq!(received.streams_for(TRACK, 10), 1);
+  }
+}
+
 /// Native SWITCH on harness: the switched (target) subscription is gated by
 /// `check_switch_context`; the source keeps forwarding until its next group.
 #[cfg(test)]
@@ -2246,6 +2561,7 @@ mod tests_native_switch {
       &f.client.switch_context,
       new_name.clone(),
       old_name,
+      true,
       async {
         switched_subscribe(&f).await;
         Ok(())
@@ -2306,7 +2622,7 @@ mod tests_native_switch {
     let seen_in = seen.clone();
     let ctx_in = ctx.clone();
     let (t, s) = (target.clone(), source.clone());
-    with_native_switch_statuses(&ctx, target.clone(), source.clone(), async move {
+    with_native_switch_statuses(&ctx, target.clone(), source.clone(), true, async move {
       *seen_in.lock().await = Some((
         ctx_in.get_switch_status(&t).await,
         ctx_in.get_switch_status(&s).await,
@@ -2332,12 +2648,222 @@ mod tests_native_switch {
       .add_or_update_switch_item(pending.clone(), SwitchStatus::Next)
       .await;
     let before = ctx.snapshot().await;
-    let res = with_native_switch_statuses(&ctx, target, source, async {
+    let res = with_native_switch_statuses(&ctx, target, source, true, async {
       Err(TerminationCode::InternalError)
     })
     .await;
     assert!(res.is_err());
     assert_eq!(ctx.snapshot().await, before);
+  }
+
+  /// R3-D4: without --native-status-before-subscribe the order is upstream's: the
+  /// SUBSCRIBE runs with no status for either track, and target = Next, source =
+  /// Current are set once it has succeeded.
+  #[tokio::test]
+  async fn flag_off_sets_the_statuses_after_the_subscribe_as_upstream() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let seen = Arc::new(Mutex::new(None));
+    let seen_in = seen.clone();
+    let ctx_in = ctx.clone();
+    let (t, s) = (target.clone(), source.clone());
+    with_native_switch_statuses(&ctx, target.clone(), source.clone(), false, async move {
+      *seen_in.lock().await = Some((
+        ctx_in.get_switch_status(&t).await,
+        ctx_in.get_switch_status(&s).await,
+      ));
+      Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+      *seen.lock().await,
+      Some((None, None)),
+      "during the SUBSCRIBE"
+    );
+    assert_eq!(
+      (
+        ctx.get_switch_status(&target).await,
+        ctx.get_switch_status(&source).await
+      ),
+      (Some(SwitchStatus::Next), Some(SwitchStatus::Current)),
+      "after it"
+    );
+  }
+
+  /// Upstream sets nothing when the SUBSCRIBE fails.
+  #[tokio::test]
+  async fn flag_off_a_failed_subscribe_sets_no_status() {
+    let ctx = crate::server::client::switch_context::SwitchContext::new();
+    let target = crate::server::test_support::full_track_name("video-720p");
+    let source = crate::server::test_support::full_track_name("video-360p");
+    let before = ctx.snapshot().await;
+    let res = with_native_switch_statuses(&ctx, target, source, false, async {
+      Err(TerminationCode::InternalError)
+    })
+    .await;
+    assert!(res.is_err());
+    assert_eq!(ctx.snapshot().await, before);
+  }
+
+  /// End to end with the flag off (as shipped): the switched subscription forwards
+  /// the object it dequeues before the statuses are set, ungated, which is the
+  /// upstream behaviour the as-shipped arm must keep.
+  #[tokio::test]
+  async fn flag_off_end_to_end_keeps_the_upstream_window() {
+    let f = fixture(23).await;
+    let new_name = f.new.full_track_name.clone();
+    let old_name = f.old.full_track_name.clone();
+    with_native_switch_statuses(
+      &f.client.switch_context,
+      new_name.clone(),
+      old_name,
+      false,
+      async {
+        switched_subscribe(&f).await;
+        publish(&f.new, 5, 3).await;
+        assert!(
+          wait_for(&f.received, NEW, (5, 3)).await,
+          "ungated before the statuses are set: {:?}",
+          f.received.objects(NEW)
+        );
+        Ok(())
+      },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      f.client.switch_context.get_switch_status(&new_name).await,
+      Some(SwitchStatus::Next)
+    );
+  }
+}
+
+/// R3-D3: a subscriber's STOP_SENDING on a data stream. The relay used to reopen the
+/// stream for the next object (mid-subgroup join) and encode that object's id as a
+/// delta from the last id written on the stopped stream, so the subscriber read
+/// 5/2..5/4 as 5/1..5/3.
+#[cfg(test)]
+mod tests_stop_sending {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, publish, quic_pair, relay_client, subscribe, test_track,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::transport::connection::{TransportConnection, TransportRecvStream};
+  use moqtail::transport::data_stream_handler::RecvDataStream;
+  use std::time::Duration;
+
+  const TRACK: u64 = 1;
+
+  fn latest() -> Subscribe {
+    Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    )
+  }
+
+  /// (group, object) of every object on `recv`, as the subscriber parses them, until
+  /// nothing arrives for 500 ms.
+  async fn objects_on(recv: TransportRecvStream) -> Vec<(u64, u64)> {
+    let data = RecvDataStream::new(
+      recv,
+      Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+    );
+    let mut ids = vec![];
+    while let Ok((_, Some(o))) =
+      tokio::time::timeout(Duration::from_millis(500), data.next_object()).await
+    {
+      ids.push((o.location.group, o.location.object));
+    }
+    ids
+  }
+
+  async fn next_stream(peer: &TransportConnection, wait: Duration) -> Option<TransportRecvStream> {
+    tokio::time::timeout(wait, peer.accept_uni())
+      .await
+      .ok()
+      .and_then(|r| r.ok())
+  }
+
+  /// The reviewer's scenario: the subscriber stops the group-5 stream after 5/0;
+  /// 5/1..5/4 follow. The rest of the subgroup is dropped (the subscriber asked for
+  /// that), no stream is reopened for it, and group 6 arrives on its own stream with
+  /// its own ids.
+  #[tokio::test]
+  async fn a_stopped_stream_is_not_reopened_and_later_groups_keep_their_ids() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(88, server);
+    let track = test_track(TRACK, "video-720p");
+    let sub = subscribe(&track, &client, latest(), false).await;
+    let counters = sub.read().await.counters.clone();
+    sub.read().await.mark_alias_announced();
+
+    publish(&track, 5, 0).await;
+    let first = peer.accept_uni().await.unwrap();
+    first.stop(0x10);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for o in 1..5 {
+      publish(&track, 5, o).await;
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Some(reopened) = next_stream(&peer, Duration::from_secs(1)).await {
+      panic!(
+        "group 5 was reopened after STOP_SENDING, carrying {:?} (published 5/1..5/4)",
+        objects_on(reopened).await
+      );
+    }
+
+    track
+      .stream_closed(&StreamId::new_subgroup(TRACK, 5, Some(0)))
+      .await
+      .unwrap();
+    for o in 0..3 {
+      publish(&track, 6, o).await;
+    }
+    let next = next_stream(&peer, Duration::from_secs(3))
+      .await
+      .expect("group 6 is delivered");
+    assert_eq!(objects_on(next).await, vec![(6, 0), (6, 1), (6, 2)]);
+    assert!(
+      counters
+        .stopped_stream_objects_dropped
+        .load(Ordering::Relaxed)
+        >= 3,
+      "the rest of group 5 is dropped"
+    );
+  }
+
+  /// Should a stream ever be reopened (here: it vanished from the send-stream map
+  /// without the subscriber stopping it), the first object on the new stream is
+  /// encoded from scratch, not as a delta from the old stream's last id.
+  #[tokio::test]
+  async fn a_reopened_stream_starts_its_object_ids_afresh() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(89, server);
+    let track = test_track(TRACK, "video-720p");
+    let sub = subscribe(&track, &client, latest(), false).await;
+    sub.read().await.mark_alias_announced();
+
+    publish(&track, 5, 0).await;
+    publish(&track, 5, 1).await;
+    let first = peer.accept_uni().await.unwrap();
+    let first_objects = tokio::spawn(objects_on(first));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let gone = client
+      .remove_stream_by_stream_id(&StreamId::new_subgroup(TRACK, 5, Some(0)))
+      .await;
+    assert!(gone.is_some());
+    publish(&track, 5, 3).await;
+    publish(&track, 5, 4).await;
+    let reopened = next_stream(&peer, Duration::from_secs(3))
+      .await
+      .expect("the stream is reopened from the cached header");
+    assert_eq!(objects_on(reopened).await, vec![(5, 3), (5, 4)]);
+    assert_eq!(first_objects.await.unwrap(), vec![(5, 0), (5, 1)]);
   }
 }
 
@@ -2383,12 +2909,18 @@ mod tests_forward_promotion_trigger {
   }
 
   /// The source track has delivered (g_s, 0..5); the target track has published
-  /// `target_before` (before the SWITCH, so cache only). Then the native SWITCH:
-  /// statuses first, the target subscription (one-shot check armed), alias
-  /// announced. The next target object published is the trigger.
+  /// `target_before` (before the SWITCH, so cache only). Then the native SWITCH (the
+  /// statuses before the SUBSCRIBE with the flag, after it without), the target
+  /// subscription (one-shot check armed), alias announced. The next target object
+  /// published is the trigger.
   async fn switched(conn: usize, flag: bool, target_before: &[(u64, u64)]) -> Fixture {
+    // The fixed native arm runs with both corrections (as the runner starts it); the
+    // as-shipped arm with neither.
     let config = leaked_config(if flag {
-      &["--forward-promotion-trigger"]
+      &[
+        "--forward-promotion-trigger",
+        "--native-status-before-subscribe",
+      ]
     } else {
       &[]
     });
@@ -2411,6 +2943,7 @@ mod tests_forward_promotion_trigger {
       &client.switch_context,
       new.full_track_name.clone(),
       old.full_track_name.clone(),
+      config.native_status_before_subscribe,
       async {
         let sub = subscribe(&new, &client, latest(3, "video-720p"), true).await;
         sub.read().await.mark_alias_announced();

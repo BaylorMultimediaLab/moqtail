@@ -152,6 +152,8 @@ export namespace ControlMessageType {
         return ControlMessageType.PublishOk
       case 0x0fn:
         return ControlMessageType.PublishBlocked
+      case 0x22n:
+        return ControlMessageType.Switch
       default:
         throw new InvalidEnumValue('ControlMessageType.tryFrom', v)
     }

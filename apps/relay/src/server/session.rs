@@ -200,7 +200,7 @@ impl Session {
         return Err(e.into());
       }
     };
-    match context.connection.open_uni().await {
+    match context.connection.open_control_stream().await {
       Ok(send_stream) => {
         let session_context = context.clone();
         let connection_id = session_context.connection_id;
@@ -387,7 +387,7 @@ impl Session {
         return Ok(());
       }
       tokio::select! {
-        stream = context.connection.accept_bi() => {
+        stream = context.connection.accept_request_stream() => {
           match stream {
             Ok((send, recv)) => {
               let ctx = context.clone();
