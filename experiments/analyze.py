@@ -1110,6 +1110,11 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "sent_packets": (client_conn[-1].get("sent_packets") or 0) if client_conn else None,
         "congestion_events": (client_conn[-1].get("congestion_events") or 0) if client_conn else None,
         "loss_rate": ((client_conn[-1].get("lost_packets") or 0) / (client_conn[-1].get("sent_packets") or 1)) if client_conn else None,
+        # UDP datagrams per send I/O on the client connection: 1.0 means no UDP
+        # segmentation batches (C5); > 1 means quinn sent GSO batches.
+        "tx_datagrams_per_io": ((client_conn[-1].get("udp_tx_datagrams") or 0) / client_conn[-1]["udp_tx_ios"])
+        if client_conn and client_conn[-1].get("udp_tx_ios") else None,
+        "pacer_rate_bps": stats([r["pacer_rate_bps"] for r in client_conn if r.get("pacer_rate_bps") is not None]),
     }
     relay_config = first(recs, "RELAY_CONFIG")
     out["relay"] = {

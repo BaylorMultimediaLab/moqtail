@@ -52,6 +52,8 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
   pf-warmup         BROWSER_START.warmup_measured_s within 15 +- 1 s (reported)
   pf-offloads       identity.offloads_disabled is true (reported)
   pf-loss           unshaped profile: CONN_STATS loss rate < 0.1 %
+  pf-relay-gso      the relay sends one UDP datagram per I/O on the client connection
+                    (CONN_STATS udp_tx_datagrams / udp_tx_ios <= 1.05): no GSO batches (C5)
   pf-delivery-rate  every rate-limited step: over [step + 10 s, next step), the median
                     THROUGHPUT_SAMPLE rate of link-limited groups (bytes x 8 / 50 ms >= rate, i.e. a
                     group the publisher's ~50 ms burst cannot deliver faster than the link) lies in
@@ -476,6 +478,11 @@ def main() -> int:
                     f"unshaped profile: CONN_STATS loss rate={conn.get('loss_rate'):.5f} (lost {conn.get('lost_packets')} of {conn.get('sent_packets')}; required < 0.1 %)")
         else:
             rep.add("pf-loss", None, "shaped profile or no CONN_STATS" if not unshaped else "no CONN_STATS records")
+        dpi = conn.get("tx_datagrams_per_io")
+        if dpi is None:
+            rep.add("pf-relay-gso", None, "no CONN_STATS udp_tx_datagrams/udp_tx_ios on the client connection")
+        else:
+            rep.add("pf-relay-gso", dpi <= 1.05, f"relay sent {dpi:.3f} UDP datagrams per I/O to the client (required <= 1.05: no GSO batches)")
         est_ok, est_detail = delivery_rate(applied, list(by("THROUGHPUT_SAMPLE")), list(by("PROBE")), client_end)
         rep.add("pf-delivery-rate", est_ok, est_detail)
         steps = [p for p in (summary.get("link") or {}).get("probe_measured_per_step", []) if p.get("rate_mbps") is not None and p["rate_mbps"] <= 1.5]

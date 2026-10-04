@@ -589,6 +589,26 @@ class ValidateScript(TmpRun):
         self.assertEqual((st["pf-qdisc"], st["pf-gso"]), ("PASS", "SKIP"))
         self.assertEqual((st["pf-warmup"], st["pf-offloads"]), ("INFO", "INFO"))
 
+    def test_preflight_relay_gso_from_conn_stats(self):
+        # C5: the relay must send one UDP datagram per I/O to the client (no GSO batches).
+        def with_conn(datagrams, ios):
+            run = self.complete_run()
+            rel = run / "relay-events.jsonl"
+            recs = [json.loads(l) for l in rel.read_text().splitlines() if l.strip()]
+            for i in range(60):
+                t = T0 + i * 1000
+                recs.append({"ts": t, "src": "relay", "event": "CONN_STATS", "conn": 7, "udp_tx_bytes": 1_000_000 + i,
+                             "udp_tx_datagrams": datagrams * (i + 1), "udp_tx_ios": ios * (i + 1), "sent_packets": 10 * (i + 1),
+                             "lost_packets": 0, "rtt_ms": 42.0, "cwnd": 30_000})
+            rel.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+            return run
+        _, st = self.validate(with_conn(100, 100), "--preflight")
+        self.assertEqual(st["pf-relay-gso"], "PASS")
+        _, st = self.validate(with_conn(400, 100), "--preflight")
+        self.assertEqual(st["pf-relay-gso"], "FAIL")
+        _, st = self.validate(self.complete_run(), "--preflight")
+        self.assertEqual(st["pf-relay-gso"], "SKIP")
+
     def test_preflight_requires_superseded_records_with_switch_seq(self):
         _, st = self.validate(self.complete_run(with_seq=True), "--preflight")
         self.assertEqual(st["pf-terminal"], "PASS")
