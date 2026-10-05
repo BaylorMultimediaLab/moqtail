@@ -63,7 +63,10 @@
  *   object of such a group is folded into that group's accounting (cumulative
  *   bytes, `getLateObjects`) without opening a new accumulator, so it neither
  *   produces a second sample nor a second `samplesByTrack` count (which would
- *   pass the dwell early and over-weight the catch-up in the SWMA).
+ *   pass the dwell early and over-weight the catch-up in the SWMA). The
+ *   guarantee holds within the last CLOSED_KEYS_MAX (256) sampled groups of
+ *   the stream, about four minutes at 1 s GOPs: an object of a group sampled
+ *   longer ago than that opens a new accumulator and can sample it again.
  */
 
 /** One finalised per-group throughput sample. */
@@ -125,7 +128,11 @@ interface OpenGroup {
   hinted: boolean;
 }
 
-/** Sampled (track, group) keys remembered so late objects do not sample a group twice (F5). */
+/**
+ * Sampled (track, group) keys remembered so late objects do not sample a group
+ * twice (F5). Oldest evicted first: the sampled-once guarantee covers the last
+ * 256 sampled groups only.
+ */
 const CLOSED_KEYS_MAX = 256;
 
 /** A later group of the track finalises a hinted group once it has been quiet this long (ms) ... */
