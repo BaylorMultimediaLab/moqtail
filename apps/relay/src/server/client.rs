@@ -332,13 +332,16 @@ impl MOQTClient {
     header_payload: Bytes,
     priority: i32, // Priority for the stream
   ) -> Result<Arc<Mutex<TransportSendStream>>> {
-    let send_stream = match self.get_stream(stream_id).await {
+    // `fresh`: this call created the stream, so it writes the header. An existing
+    // stream (or the winner of an open race) already carries its header and is
+    // returned as is; writing it again would put a second header mid-stream.
+    let (send_stream, fresh) = match self.get_stream(stream_id).await {
       Some(s) => {
         debug!(
           "open_stream | Send stream for {} already exists connection_id: {}",
           stream_id, self.connection_id
         );
-        s
+        (s, false)
       }
       None => {
         // Opening can wait for the subscriber to grant stream credit, so it happens
@@ -362,7 +365,7 @@ impl MOQTClient {
               "open_stream | added send_stream to send streams ({}) connection_id: {}",
               stream_id, self.connection_id
             );
-            s
+            (s, true)
           }
           std::collections::hash_map::Entry::Occupied(existing) => {
             // Another open of the same id won the race while this one waited.
@@ -372,11 +375,15 @@ impl MOQTClient {
             );
             let mut extra = opened;
             let _ = extra.reset(StreamResetCode::Cancelled.to_u64());
-            existing.get().clone()
+            (existing.get().clone(), false)
           }
         }
       }
     };
+
+    if !fresh {
+      return Ok(send_stream);
+    }
 
     debug!(
       "open_stream |  writing to stream ({}) connection_id: {}",
@@ -950,6 +957,25 @@ mod tests_write_stream_object {
       client.get_stream(&stream_id).await.is_none(),
       "a stopped stream is dropped from the send-stream map"
     );
+  }
+
+  /// R5 D-3: opening an id that is already open returns that stream without
+  /// writing its header again (a second subgroup header mid-stream is malformed).
+  #[tokio::test]
+  async fn opening_an_open_stream_does_not_rewrite_its_header() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(1, server);
+    let stream_id = StreamId::new_subgroup(1, 0, Some(0));
+    client.open_stream(&stream_id, header(), 0).await.unwrap();
+    client.open_stream(&stream_id, header(), 0).await.unwrap();
+    assert!(client.close_stream(&stream_id).await.unwrap());
+    let mut recv = peer.accept_uni().await.expect("peer sees the stream");
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 64];
+    while let Some(n) = recv.read(&mut buf).await.expect("stream finished") {
+      bytes.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(bytes, b"hdr".to_vec(), "the header is written exactly once");
   }
 
   /// R3-D6: a data stream carries its priority from the moment it is opened.

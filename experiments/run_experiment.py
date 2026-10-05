@@ -395,7 +395,9 @@ def native_fixed_relay_args(flags: set[str], mechanism: str | None, mode: str | 
     missing = [f for f in NATIVE_FIXED_FLAGS if f not in flags]
     if missing:
         raise SystemExit(f"this relay has no {', '.join(missing)} (checked `relay --help`); the native "
-                         "forward-trigger arm needs both. Build it from rebuild/native-ft")
+                         "forward-trigger arm needs both. Build the relay from "
+                         f"{MECHANISM_BRANCH['native']} (the native arms' branch, which carries both flags; "
+                         "update it if it predates the rebuild) with `cargo build --release -p relay`")
     return list(NATIVE_FIXED_FLAGS)
 
 
@@ -1020,7 +1022,7 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             *(["--enable-object-logging"] if args.log_objects else []),
             # native/forward-trigger (the fixed native arm): the relay forwards the
             # promotion-triggering object in order after the replay of [start, trigger)
-            # and sets the SWITCH statuses before the SUBSCRIBE runs (rebuild/native-ft).
+            # and sets the SWITCH statuses before the SUBSCRIBE runs (switch/native relay).
             # No other run passes either flag.
             *native_fixed_argv,
         ], out / "relay.log")
