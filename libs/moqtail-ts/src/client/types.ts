@@ -122,7 +122,14 @@ export type DataStreamEndInfo = {
    * for a pushed receiver the PUBLISH's.
    */
   requestId: bigint
+  /**
+   * `subgroup` (a SUBGROUP stream, the only kind this library routes to a receiver
+   * itself) or `fetch` (a FETCH_HEADER stream a mechanism routes to a receiver).
+   */
+  streamType: 'subgroup' | 'fetch'
+  /** The SUBGROUP header's alias; the receiver's alias for a `fetch` stream. */
   trackAlias: bigint
+  /** The SUBGROUP header's group; for a `fetch` stream, the group of its first object (0 if none). */
   groupId: bigint
   /** The subgroup id its objects carried (header or first object); undefined if none was resolved. */
   subgroupId: bigint | undefined

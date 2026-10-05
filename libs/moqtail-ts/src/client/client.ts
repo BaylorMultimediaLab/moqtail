@@ -1967,9 +1967,11 @@ export class MOQtailClient {
    */
   completeIfDone(holder: SubscribeRequest | PushedReceiver): boolean {
     if (holder.expectedStreams === undefined) return false
-    const ended = BigInt(holder.streamsEnded)
-    if (ended < BigInt(holder.expectedStreams)) return false
-    if (ended !== BigInt(holder.streamsAccepted)) return false
+    if (BigInt(holder.streamsEnded) < BigInt(holder.expectedStreams)) return false
+    // No stream routed to it may still be delivering (every accepted stream has
+    // ended; a mechanism may route further streams to a receiver, which then
+    // hold its completion the same way).
+    if (this.#openDataStreams.has(holder)) return false
     try {
       holder.controller?.close()
     } catch {
@@ -2004,6 +2006,30 @@ export class MOQtailClient {
     }
     await Promise.all(stops)
     return stops.length
+  }
+
+  /**
+   * Ends the receiver with request id `requestId` (a SUBSCRIBE or a pushed PUBLISH
+   * receiver) on the application's word that it has everything it needs: its alias
+   * route is released (streams that arrive later take the unrouted path), every
+   * stream still open on it is stopped ({@link MOQtailClient.stopDataStreams}), and
+   * its object stream is closed, so a reader still gets every object already
+   * enqueued and then the end. The request itself stays known, so
+   * {@link MOQtailClient.unsubscribe} still cancels it. Returns whether a receiver
+   * was found.
+   */
+  async finishReceiver(requestId: bigint): Promise<boolean> {
+    const request = this.requests.get(requestId)
+    const holder = request instanceof SubscribeRequest ? request : this.pushedReceivers.get(requestId)
+    if (holder === undefined) return false
+    this.releaseTrackAlias(holder)
+    await this.stopDataStreams(requestId)
+    try {
+      holder.controller?.close()
+    } catch {
+      // already closed or errored
+    }
+    return true
   }
 
   /**
@@ -2872,6 +2898,7 @@ export class MOQtailClient {
             try {
               this.onDataStreamEnded?.({
                 requestId: this.#receiverRequestId(subscription),
+                streamType: 'subgroup',
                 trackAlias: header.trackAlias,
                 groupId: header.groupId,
                 subgroupId: lastSubgroupId,
@@ -3941,6 +3968,42 @@ if (import.meta.vitest) {
 
       below.enqueue(nextObjectBytes(1, 10, 0n))
       expect((await reader.read()).value?.location.object).toBe(1n)
+      await client.disconnect()
+    })
+
+    // D1/D2 support: the application ends a receiver itself. Objects already
+    // enqueued are still read, then the end; open streams are stopped and a stream
+    // that arrives later is unrouted.
+    it('finishReceiver delivers what is queued, stops open streams and releases the route', async () => {
+      const { client, transport } = await connected()
+      const ends: DataStreamEndInfo[] = []
+      const discarded: DiscardedStreamInfo[] = []
+      client.onDataStreamEnded = (info) => ends.push(info)
+      client.onStreamDiscarded = (info) => discarded.push(info)
+      const { reader } = await pushedReceiver(transport, client)
+      const below = transport.openIncomingUniStream(subgroupStreamBytes(9n, 4n, 10))
+      below.enqueue(nextObjectBytes(1, 10, 0n))
+      below.close()
+      transport.openIncomingUniStream(subgroupStreamBytes(9n, 6n, 10))
+      await vi.waitFor(() => expect(ends).toHaveLength(1))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      expect(await client.finishReceiver(1n)).toBe(true)
+      const groups: bigint[] = []
+      for (;;) {
+        const next = await readWithin(reader, 500)
+        expect(next).not.toBe('timeout')
+        const result = next as ReadableStreamReadResult<MoqtObject>
+        if (result.done) break
+        groups.push(result.value.location.group)
+      }
+      expect(groups).toEqual([4n, 4n, 6n])
+      await vi.waitFor(() => expect(ends).toHaveLength(2))
+      expect(ends[1]).toMatchObject({ groupId: 6n, end: 'stopped', streamType: 'subgroup' })
+      expect(client.subscriptions.has(9n)).toBe(false)
+
+      transport.openIncomingUniStream(subgroupStreamBytes(9n, 7n, 10))
+      await vi.waitFor(() => expect(discarded).toHaveLength(1), { timeout: 2000 })
       await client.disconnect()
     })
   })
