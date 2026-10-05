@@ -1016,8 +1016,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     promoted = by("SWITCH_PROMOTED")
     drops = by("DROP_STALE")
     # pr1378: the relay's SWITCH_WAIT (selection waited for the floor), joined to a
-    # switch by the subscription it replaces (old_request_id) after its SWITCH_RECV.
+    # switch by the subscription it replaces (old_request_id) after its SWITCH_RECV,
+    # and before whatever ends that switch on the relay (R6 D4): the next SWITCH_RECV
+    # naming the same old_request_id (a retry), its SWITCH_PROMOTED or its
+    # SWITCH_FAILED, whichever comes first (at most 10 s). A failed switch without a
+    # wait used to take its retry's wait.
     waits = by("SWITCH_WAIT")
+    relay_failed = by("SWITCH_FAILED")
     used_waits: set[int] = set()
     # Switches sent after RUN_END are not switches of the run (the switches/min denominator
     # ends there): join_switches marks them, join_decisions and the list below leave them out.
@@ -1041,9 +1046,18 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                       lambda r: track_matches(r.get("track"), sent.get("to"))) if rrecv else None
         rwait = None
         if rrecv is not None and old_rid is not None:
+            same_conn = lambda r: (r.get("conn") is None or rrecv.get("conn") is None  # noqa: E731
+                                   or r.get("conn") == rrecv.get("conn"))
+            wait_end = rrecv["ts"] + 10_000
+            retry = next((r for r in switch_recv if r is not rrecv and r["ts"] > rrecv["ts"]
+                          and r.get("old_request_id") == old_rid and same_conn(r)), None)
+            rfail = next((r for r in relay_failed if r["ts"] >= rrecv["ts"] and same_conn(r)
+                          and track_matches(r.get("track"), sent.get("to"))), None)
+            for end_rec in (retry, rprom, rfail):
+                if end_rec is not None:
+                    wait_end = min(wait_end, end_rec["ts"])
             rwait = next((w for w in waits if id(w) not in used_waits and w.get("old_request_id") == old_rid
-                          and rrecv["ts"] - 1 <= w["ts"] <= rrecv["ts"] + 10_000
-                          and (w.get("conn") is None or rrecv.get("conn") is None or w.get("conn") == rrecv.get("conn"))), None)
+                          and rrecv["ts"] - 1 <= w["ts"] <= wait_end and same_conn(w)), None)
             if rwait is not None:
                 used_waits.add(id(rwait))
         fi, ti = index_of.get(sent.get("from"), -1), index_of.get(sent.get("to"), -1)

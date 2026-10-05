@@ -1232,6 +1232,67 @@ class Pr1378Records(TmpRun):
             self.assertEqual(status.get(k), "PASS", (k, p.stdout))
 
 
+class Pr1378WaitJoin(TmpRun):
+    """R6 D4: a relay SWITCH_WAIT joins only the switch whose relay attempt it falls in:
+    after that switch's SWITCH_RECV and before the next SWITCH_RECV naming the same
+    old_request_id, its SWITCH_PROMOTED or its SWITCH_FAILED. The reviewer's case: a
+    DrainTimeout without a wait, retried from the same old request id with a wait 4 s
+    later, used to take the retry's wait (the window was a flat 10 s)."""
+
+    def bundle(self) -> Path:
+        A, B, C, D = R[4], R[2], R[3], R[1]
+        t1, t2 = T0 + 20_000, T0 + 24_000
+        client = startup(A)
+        # The route being replaced is the startup subscription (request id 0) both times.
+        client += [
+            ev("SWITCH_FLOOR", t1 - 1, switch_seq=1, switch_floor="next-group", recv_floor_group=27,
+               buffer_floor_group=None, selected_min_group=27, playhead_group=15, buffer_end_s=25.0,
+               buffered_ranges="0.00-25.00"),
+            ev("SWITCH_SENT", t1, switch_seq=1, **{"from": A, "to": C}, request_id=None, old_request_id=0,
+               switch_floor="next-group", minimum_switching_group=27, playhead_ms=t1 - T0, last_received_group=26),
+            ev("SWITCH_ERROR", t1 + 3040, switch_seq=1, to=C, request_id=None, status=10, reason="switch: DrainTimeout",
+               failure="DrainTimeout", rtt_ms=3040),
+            ev("SWITCH_FLOOR", t2 - 1, switch_seq=2, switch_floor="next-group", recv_floor_group=31,
+               buffer_floor_group=None, selected_min_group=31, playhead_group=19, buffer_end_s=29.0,
+               buffered_ranges="0.00-29.00"),
+            ev("SWITCH_SENT", t2, switch_seq=2, **{"from": A, "to": D}, request_id=None, old_request_id=0,
+               switch_floor="next-group", minimum_switching_group=31, playhead_ms=t2 - T0, last_received_group=30),
+            ev("SWITCH_OK", t2 + 900, switch_seq=2, to=D, request_id=11, switching_group=31, live_edge_group=31, rtt_ms=900),
+            ev("SWITCH_FIRST_OBJECT", t2 + 1251, switch_seq=2, **{"from": A, "to": D}, group=31, object=0,
+               landed_on_keyframe=True),
+            ev("SWITCH_APPLIED", t2 + 1252, switch_seq=2, **{"from": A, "to": D}, group=31, object=0, media_seam_gap_ms=0,
+               seam_ahead_of_playhead_ms=10000, landed_on_group_start=True, landed_on_keyframe=True),
+            ev("SWITCH_FIRST_FRAME", t2 + 11_000, switch_seq=2, **{"from": A, "to": D}, switch_visibility_delay_ms=11000.0,
+               playback_position_jump_ms=0.0, viewer_pause_ms=3.0, seam_buffer_hole_ms=0),
+        ]
+        client += samples(T0, T0 + 60_000, lambda t: A if t < t2 + 1252 else D)
+        relay_recs = [
+            relay("SWITCH_RECV", t1 + 20, request_id=None, old_request_id=0, minimum_switching_group=27,
+                  track="moqtail/" + C),
+            relay("SWITCH_FAILED", t1 + 3020, track="moqtail/" + C, request_id=9, failure="DrainTimeout", status_code=10),
+            relay("SWITCH_RECV", t2 + 20, request_id=None, old_request_id=0, minimum_switching_group=31,
+                  track="moqtail/" + D),
+            relay("SWITCH_WAIT", t2 + 21, old_request_id=0, track="moqtail/" + D, floor=31, live_edge_current=30,
+                  live_edge_target=30, waiting_for="floor"),
+            relay("SWITCH_PROMOTED", t2 + 865, track="moqtail/" + D, request_id=11, start_group=31, live_edge_group=31,
+                  live_edge_object=0, promoted_ts=t2 + 865),
+        ]
+        runner_recs = [runner("NET_CHANGE", T0 - 5000, rate_mbps=6, at_s=0, applied=True),
+                       runner("RUN_END", T0 + 60_100, elapsed_s=60.0)]
+        return write_run(self.dir, client, runner_recs, duration_s=60.0, relay_recs=relay_recs,
+                         identity_extra={"mechanism": "pr1378", "mechanism_mode": "next-group"},
+                         client_meta_extra={"switch_floor": "next-group"})
+
+    def test_a_retry_keeps_its_own_wait(self):
+        s = analyze.analyze(self.bundle())
+        failed, retry = s["switches"]["list"]
+        self.assertEqual(failed["failure"], "DrainTimeout")
+        self.assertFalse(failed["relay_waited"])
+        self.assertTrue(retry["relay_waited"])
+        self.assertEqual(retry["relay_waiting_for"], "floor")
+        self.assertEqual(s["switches"]["floor"]["relay_waits"], 1)
+
+
 class Pr1378OldBundle(Pr1378Records):
     """P9: a pr1378 bundle from before SWITCH_OK carried the switching group takes
     G_switch from the relay's SWITCH_PROMOTED.start_group."""
