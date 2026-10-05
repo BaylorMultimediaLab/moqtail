@@ -124,6 +124,26 @@ describe('AppendOrder', () => {
     expect(appended(o.offer(f(3, 0), 0))).toEqual(['3.0']);
   });
 
+  // Review 2026-10-05: at a landing the held frames of the source are below the
+  // seam; dropping them all left a hole there.
+  it('flush (before a landing) appends the held frames from their keyframe on', () => {
+    const o = new AppendOrder<string>();
+    at(o, f(5, 0), 0); // 5.1 .. 5.23 delayed by a retransmission
+    at(o, f(5, 7), 0);
+    at(o, f(6, 0), 0);
+    at(o, f(6, 1), 0);
+    const acts = o.flush(10);
+    expect(dropped(acts)).toEqual(['5.7:abandoned-gap']);
+    expect(appended(acts)).toEqual(['6.0', '6.1']);
+    expect(o.heldCount).toBe(0);
+    expect(o.frontMs).toBeUndefined();
+    // Without a held keyframe nothing is appendable: all of it goes.
+    const p = new AppendOrder<string>();
+    at(p, f(5, 0), 0);
+    at(p, f(5, 7), 0);
+    expect(dropped(p.flush(10))).toEqual(['5.7:track-changed']);
+  });
+
   it('reports the next deadline of the held frames', () => {
     const o = new AppendOrder<string>({ maxWaitMs: 1000 });
     expect(o.nextDeadline).toBeUndefined();
