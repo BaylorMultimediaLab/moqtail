@@ -181,18 +181,18 @@ Identical on every branch (`docs/rebuild-2026-10-04.md`, "Transport
 fairness"); `run_meta.json` `relay_flags`/`publisher_flags` records what was
 pinned, skipped (unknown to this binary and optional) or missing.
 
-| flag                                  | value                             | note                                                                                    |
-| ------------------------------------- | --------------------------------- | --------------------------------------------------------------------------------------- |
-| `--congestion-controller`             | `--cc` (default `cubic`)          | required; `--cc bbr` for the sensitivity batch; must match `RELAY_CONFIG`               |
-| `--keep-alive-interval`               | 3 (s)                             |                                                                                         |
-| `--max-idle-timeout`                  | 7 (s)                             |                                                                                         |
-| `--track-alias-resolution-timeout-ms` | 2000                              | harness/native/pr1378 defaulted to 500, pr1674 to 2000; now the same everywhere         |
-| `--downstream-alias-timeout-ms`       | 3000                              |                                                                                         |
-| `--publish-done-stream-timeout-ms`    | 2000                              |                                                                                         |
-| `--t-switch-ms`                       | 3000                              | required on `pr1378`; passed to any other relay that lists it, else recorded as skipped |
-| `--cache-size`                        | `--cache-size` (1000)             |                                                                                         |
-| `--forward-promotion-trigger`         | with `native` + `forward-trigger` | switch/native only                                                                      |
-| publisher `--variant-priority`        | 128                               | required; one priority for all video variants                                           |
+| flag                                  | value                             | note                                                                                                                                         |
+| ------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--congestion-controller`             | `--cc` (default `cubic`)          | required; `--cc bbr` for the sensitivity batch; must match `RELAY_CONFIG`                                                                    |
+| `--keep-alive-interval`               | 3 (s)                             |                                                                                                                                              |
+| `--max-idle-timeout`                  | 7 (s)                             |                                                                                                                                              |
+| `--track-alias-resolution-timeout-ms` | 2000                              | harness/native/pr1378 defaulted to 500, pr1674 to 2000; now the same everywhere                                                              |
+| `--downstream-alias-timeout-ms`       | 3000                              |                                                                                                                                              |
+| `--publish-done-stream-timeout-ms`    | 2000                              |                                                                                                                                              |
+| `--t-switch-ms`                       | 3000                              | required on `pr1378`, whose RELAY_CONFIG must report `t_switch_ms` = 3000; passed to any other relay that lists it, else recorded as skipped |
+| `--cache-size`                        | `--cache-size` (1000)             |                                                                                                                                              |
+| `--forward-promotion-trigger`         | with `native` + `forward-trigger` | switch/native only                                                                                                                           |
+| publisher `--variant-priority`        | 128                               | required; one priority for all video variants                                                                                                |
 
 `--allow-missing-relay-flags` lets a binary without the contract flags run
 for a smoke test (the relay may then also lack `RELAY_CONFIG`); `--final`

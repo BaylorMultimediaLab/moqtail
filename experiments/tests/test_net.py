@@ -862,8 +862,59 @@ class NativeFixedArm(unittest.TestCase):
         rs = REPO / "apps/relay/src/server/config.rs"
         if not rs.exists():
             self.skipTest("relay source not in this checkout")
+        flags = rust_long_flags(rs)
+        if (REPO / "apps/relay/src/server/switch_delivery.rs").exists():
+            # the pr1378 relay: SWITCH is PR #1378's, so neither native flag exists;
+            # it records both false and takes T_switch from the runner (P8)
+            self.assertNotIn("--native-status-before-subscribe", flags)
+            self.assertNotIn("--forward-promotion-trigger", flags)
+            self.assertIn("--t-switch-ms", flags)
+            return
         # harness has --native-status-before-subscribe; --forward-promotion-trigger is native-ft's
-        self.assertIn("--native-status-before-subscribe", rust_long_flags(rs))
+        self.assertIn("--native-status-before-subscribe", flags)
+
+
+class Pr1378Arm(unittest.TestCase):
+    """P8: `--mechanism pr1378 --mechanism-mode next-group|playhead` runs the relay with
+    T_switch pinned (3000 ms), the congestion controller and UDP GSO off, never the
+    native-fix flags; its RELAY_CONFIG must report the pinned t_switch_ms."""
+
+    FLAGS = set(rx.RELAY_PINNED) | {"--cache-size", "--congestion-controller", "--udp-gso", "--t-switch-ms"}
+
+    def test_relay_argv(self):
+        for mode in ("next-group", "playhead"):
+            argv, rec = rx.pinned_relay_args(self.FLAGS, "cubic", 1000, allow_missing=False, mechanism="pr1378")
+            pairs = dict(zip(argv[::2], argv[1::2]))
+            self.assertEqual(pairs["--t-switch-ms"], "3000")
+            self.assertEqual(pairs["--congestion-controller"], "cubic")
+            self.assertEqual(pairs["--udp-gso"], "off")
+            self.assertEqual(rx.native_fixed_relay_args(self.FLAGS | set(rx.NATIVE_FIXED_FLAGS), "pr1378", mode), [])
+            self.assertFalse(any(f in argv for f in rx.NATIVE_FIXED_FLAGS))
+            self.assertEqual(rx.expected_t_switch_ms("pr1378"), 3000)
+
+    def test_url_selects_the_floor(self):
+        self.assertEqual(rx.MECHANISM_URL_PARAM["pr1378"], "switchFloor")
+        self.assertEqual(rx.MECHANISM_MODES["pr1378"], {"next-group", "playhead"})
+
+    def test_relay_config_must_report_the_pinned_t_switch(self):
+        ok = dict(OK_CONFIG, t_switch_ms=3000)
+        self.assertIsNone(rx.check_relay_config(ok, "cubic", False, t_switch_ms=3000))
+        self.assertIsNone(rx.check_relay_config({"config": ok}, "cubic", False, t_switch_ms=3000))
+        for allow in (False, True):
+            err = rx.check_relay_config(dict(ok, t_switch_ms=6000), "cubic", allow, t_switch_ms=3000)
+            self.assertIsNotNone(err)
+            self.assertIn("t_switch_ms", err)
+        err = rx.check_relay_config(OK_CONFIG, "cubic", False, t_switch_ms=3000)
+        self.assertIn("t_switch_ms", err)
+        # a native run does not check it
+        self.assertIsNone(rx.check_relay_config(OK_CONFIG, "cubic", False))
+        self.assertIsNone(rx.expected_t_switch_ms("native"))
+
+    def test_relay_source_records_t_switch(self):
+        rs = REPO / "apps/relay/src/server/config.rs"
+        if not (REPO / "apps/relay/src/server/switch_delivery.rs").exists():
+            self.skipTest("not the pr1378 relay")
+        self.assertIn('"t_switch_ms"', rs.read_text())
 
 
 class PreflightWiring(unittest.TestCase):
