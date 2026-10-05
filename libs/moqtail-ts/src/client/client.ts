@@ -58,7 +58,7 @@ import {
   SubgroupObject,
   RequestIdMap,
 } from '../model/data'
-import { FrozenByteBuffer } from '../model/common/byte_buffer'
+import { ByteBuffer, FrozenByteBuffer } from '../model/common/byte_buffer'
 import { KeyValuePair } from '../model/common/pair'
 import { ObjectDeliveryTimeoutProperty, TrackProperty } from '../model/property/track_property'
 import { RecvStream } from './data_stream'
@@ -1008,6 +1008,17 @@ export class MOQtailClient {
     logger.log('MOQtailClient', 'disconnect', reason)
     if (this.#isDestroyed) return
     this.#isDestroyed = true
+
+    // Every SWITCH still waiting for its answer resolves now, as a failure naming
+    // why the session closed (R7-D4: e.g. a malformed SWITCH_TRANSITION), instead
+    // of waiting out SWITCH_RESPONSE_TIMEOUT_MS on a session that is gone.
+    const closedReason = `session closed: ${reason instanceof Error ? reason.message : String(reason)}`
+    const waiting = [...this.pendingSwitches.values()].flat()
+    this.pendingSwitches.clear()
+    for (const resolve of waiting) resolve(new SwitchFailure(PublishDoneStatusCode.InternalError, closedReason))
+    const failing = [...this.pendingSwitchFailures.values()]
+    this.pendingSwitchFailures.clear()
+    for (const resolve of failing) resolve(new SwitchFailure(PublishDoneStatusCode.InternalError, closedReason))
 
     // Stop datagrams first
     await this.stopDatagrams()
@@ -3953,6 +3964,54 @@ if (import.meta.vitest) {
       expect(client.subscriptionAliasMap.get(13n)).toBe(8n)
 
       await client.disconnect()
+    })
+
+    // R7-D4 (pr1378): a SWITCH_TRANSITION value that does not decode used to be
+    // swallowed (the parameter was dropped), so the switch's PUBLISH looked like an
+    // ordinary peer publish and the switch hung to its 6 s ClientTimeout. Rust
+    // rejects it. It is a PROTOCOL_VIOLATION now: the session closes and the
+    // pending switch resolves at once.
+    it('closes the session on a malformed SWITCH_TRANSITION and resolves the pending switch (R7-D4)', async () => {
+      const { client, transport } = await connected()
+      const terminated: unknown[] = []
+      client.onSessionTerminated = (reason) => terminated.push(reason)
+      const pushed: unknown[] = []
+      client.onPeerPublish = (msg) => pushed.push(msg)
+      const subscribing = client.subscribe({
+        fullTrackName: ftn,
+        filterType: FilterType.LatestObject,
+        forward: true,
+        groupOrder: GroupOrder.Original,
+        priority: 0,
+      })
+      const subscribeStream = await openedStream(transport, 0)
+      const subscribeId = (subscribeStream.messages[0] as Subscribe).requestId
+      subscribeStream.respond(SubscribeOk.create(7n, [], []))
+      await subscribing
+
+      const otherFtn = FullTrackName.tryNew('room/alice', 'video-hi')
+      const sentAt = Date.now()
+      const switching = client.switch({
+        fullTrackName: otherFtn,
+        subscriptionRequestId: subscribeId,
+        minimumSwitchingGroupId: 5n,
+      })
+      await vi.waitFor(() => expect(subscribeStream.messages).toHaveLength(2))
+      // One varint only: neither the PR's two-field form nor the three-field one.
+      const truncated = new ByteBuffer()
+      truncated.putVI(6n)
+      const malformed = {
+        toKeyValuePair: () => KeyValuePair.tryNewBytes(SwitchTransition.TYPE, truncated.toUint8Array()),
+      } as unknown as SwitchTransition
+      const answer = transport.openIncomingBiStream()
+      answer.respond(new Publish(13n, otherFtn, 8n, [new Forward(true), malformed], []))
+
+      const result = await switching
+      expect(Date.now() - sentAt).toBeLessThan(1000)
+      expect(result).toBeInstanceOf(SwitchFailure)
+      expect((result as SwitchFailure).reasonPhrase).toMatch(/^session closed: .*SWITCH_TRANSITION/)
+      await vi.waitFor(() => expect(terminated).toHaveLength(1))
+      expect(pushed).toHaveLength(0)
     })
 
     // Transport fairness (C3): the SWITCH carries the subscriber priority and group

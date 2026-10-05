@@ -353,7 +353,8 @@ export function highestCompleteBufferedGroup(opts: {
  * The kind of a failed SWITCH, for SWITCH_ERROR.failure (P6). The relay answers
  * NoCommonBoundary, DrainTimeout and Superseded all with status TIMEOUT; its
  * reason phrase (`switch: <kind>`) names which. `ClientTimeout` is the library's
- * own response deadline (no relay answer at all).
+ * own response deadline (no relay answer at all); `SessionClosed` a switch the
+ * session closed under (e.g. a malformed SWITCH_TRANSITION, R7-D4).
  *
  * Exported for unit testing.
  */
@@ -361,6 +362,8 @@ export function switchFailureKind(reason: string): string {
   const relay = /^switch: (\w+)/.exec(reason);
   if (relay) return relay[1]!;
   if (reason.startsWith('no relay response to SWITCH')) return 'ClientTimeout';
+  // The library resolves a pending SWITCH when the session closes (R7-D4).
+  if (reason.startsWith('session closed:')) return 'SessionClosed';
   return 'unknown';
 }
 

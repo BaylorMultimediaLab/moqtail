@@ -328,8 +328,15 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   Encoding: the varints back to back in the bytes-valued
   parameter `0x73`; a two-varint value (the PR's form, and this project's before
   R6) still decodes in both libraries, with B absent, and the player then falls
-  back to `drain-timeout`; anything after the third varint is malformed. The
-  failure PUBLISH still carries `{0, 0}` without B. B is also on
+  back to `drain-timeout`; anything after the third varint is malformed. A
+  malformed value (fewer than two varints, trailing bytes, not bytes-valued) is
+  a PROTOCOL_VIOLATION in both libraries (review R7 D4: the TypeScript library
+  used to drop the parameter, so the switch's PUBLISH looked like an ordinary
+  peer publish and the SWITCH hung to its response deadline): the PUBLISH does
+  not parse, the client closes the session, and every pending SWITCH resolves at
+  once as a failure (`session closed: ...`, `SWITCH_ERROR.failure` =
+  `SessionClosed`). The failure PUBLISH still carries `{0, 0}` without B. B is
+  also on
   `SWITCH_PROMOTED.below_seam_streams`. PUBLISH_DONE's Stream Count is left
   exactly as the spec defines it.
 - **"Delivered" before PUBLISH_DONE means written to QUIC.** The PR has the

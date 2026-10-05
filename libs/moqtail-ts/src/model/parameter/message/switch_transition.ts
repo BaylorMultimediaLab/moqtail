@@ -18,6 +18,7 @@ import { ByteBuffer, FrozenByteBuffer } from '../../common/byte_buffer'
 import { KeyValuePair } from '../../common/pair'
 import { MessageParameterType } from '../constant'
 import { Parameter } from '../parameter'
+import { ProtocolViolationError } from '../../error/error'
 
 /**
  * SWITCH_TRANSITION message parameter (moq-transport PR #1378, "SWITCH for
@@ -75,12 +76,27 @@ export class SwitchTransition implements Parameter {
     return KeyValuePair.tryNewBytes(SwitchTransition.TYPE, payload.toUint8Array())
   }
 
+  /**
+   * The parameter carried by `pair`, or undefined when `pair` is another type.
+   *
+   * @throws :{@link ProtocolViolationError} When the value does not decode (R7-D4):
+   * like every known parameter with an invalid value, and like the Rust library. It
+   * used to be swallowed, which dropped the parameter: the switch's PUBLISH then
+   * looked like an ordinary peer publish and the SWITCH hung to its response
+   * deadline.
+   */
   static fromKeyValuePair(pair: KeyValuePair): SwitchTransition | undefined {
-    if (Number(pair.typeValue) !== SwitchTransition.TYPE || !(pair.value instanceof Uint8Array)) return undefined
+    if (Number(pair.typeValue) !== SwitchTransition.TYPE) return undefined
+    if (!(pair.value instanceof Uint8Array)) {
+      throw new ProtocolViolationError('SwitchTransition.fromKeyValuePair', 'SWITCH_TRANSITION must be bytes-valued')
+    }
     try {
       return SwitchTransition.fromBytes(pair.value)
-    } catch {
-      return undefined
+    } catch (error) {
+      throw new ProtocolViolationError(
+        'SwitchTransition.fromKeyValuePair',
+        `malformed SWITCH_TRANSITION: ${error instanceof Error ? error.message : String(error)}`,
+      )
     }
   }
 
@@ -118,6 +134,18 @@ if (import.meta.vitest) {
       buf.putBytes(st.toKeyValuePair().serialize().toUint8Array())
       const parsed = KeyValuePair.deserialize(buf.freeze())
       expect(SwitchTransition.fromKeyValuePair(parsed)).toEqual(st)
+    })
+    // R7-D4: a value that does not decode is a protocol violation, as in the Rust
+    // library; it used to be dropped as if the parameter were absent.
+    test('a malformed value is a protocol violation, not an absent parameter', () => {
+      const one = new ByteBuffer()
+      one.putVI(6n)
+      const four = new ByteBuffer()
+      for (const v of [1n, 2n, 3n, 4n]) four.putVI(v)
+      for (const value of [one, four]) {
+        const pair = KeyValuePair.tryNewBytes(SwitchTransition.TYPE, value.toUint8Array())
+        expect(() => SwitchTransition.fromKeyValuePair(pair)).toThrow(ProtocolViolationError)
+      }
     })
     test('fromKeyValuePair returns undefined for wrong type', () => {
       const pair = KeyValuePair.tryNewVarInt(MessageParameterType.NewGroupRequest, 1n)

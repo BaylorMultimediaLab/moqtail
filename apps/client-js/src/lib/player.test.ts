@@ -417,6 +417,14 @@ describe('switchFailureKind (P6)', () => {
     expect(switchFailureKind('no relay response to SWITCH within 6000 ms')).toBe('ClientTimeout');
   });
 
+  // R7-D4: the library resolves a pending SWITCH when the session closes (e.g. on
+  // a malformed SWITCH_TRANSITION) instead of waiting out its response deadline.
+  it('names a switch the session closed under', () => {
+    expect(
+      switchFailureKind('session closed: Protocol violation: malformed SWITCH_TRANSITION'),
+    ).toBe('SessionClosed');
+  });
+
   it('keeps anything else as unknown', () => {
     expect(switchFailureKind('')).toBe('unknown');
   });
