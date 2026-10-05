@@ -333,6 +333,8 @@ export function App() {
     if (hist === 'evict' || hist === 'veto' || hist === 'off') controller.switchHistoryMode = hist;
     const sig = params.get('bufferSignal');
     if (sig === 'instant' || sig === 'envelope') controller.bufferSignal = sig;
+    // Unset (0): one GOP plus one tick, from the catalog GOP set below
+    // (effectiveBufferEnvelopeMs).
     const envMs = Number(params.get('bufferEnvelopeMs'));
     if (Number.isFinite(envMs) && envMs > 0) controller.bufferEnvelopeMs = envMs;
     const probe = params.get('probeMode');
@@ -544,6 +546,8 @@ export function App() {
         // RUN_META logs exactly abr.settings and describeController of it.
         const controllerSettings: AbrSettings = {
           ...abrSettings,
+          // The catalog GOP: the rules' group duration and, unless set
+          // explicitly, the envelope window (GOP + tick).
           controller: { ...abrSettings.controller, segmentDurationS: gopDurationMs / 1000 },
         };
         const rulesCollection = new AbrRulesCollection(controllerSettings);

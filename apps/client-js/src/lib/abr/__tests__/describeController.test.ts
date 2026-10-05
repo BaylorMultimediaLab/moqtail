@@ -89,6 +89,23 @@ describe('describeController', () => {
     expect(d.bandwidthSafetyFactor).toBe(0.8);
   });
 
+  it('defaults the envelope window to one GOP plus one tick (R4-D5)', () => {
+    const at = (segmentDurationS: number, bufferEnvelopeMs?: number) =>
+      describeController({
+        ...min,
+        controller: {
+          ...min.controller,
+          segmentDurationS,
+          ...(bufferEnvelopeMs !== undefined ? { bufferEnvelopeMs } : {}),
+        },
+      }).bufferEnvelopeMs;
+    expect(at(1)).toBe(1250);
+    expect(at(2)).toBe(2250);
+    expect(at(0.5)).toBe(750);
+    // An explicit window wins.
+    expect(at(2, 1250)).toBe(1250);
+  });
+
   it('describes grid with its own knobs, the probe and the rules it runs', () => {
     const d = describeController({
       ...DEFAULT_ABR_SETTINGS,

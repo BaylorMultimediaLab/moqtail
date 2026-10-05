@@ -63,7 +63,10 @@
  *   object of such a group is folded into that group's accounting (cumulative
  *   bytes, `getLateObjects`) without opening a new accumulator, so it neither
  *   produces a second sample nor a second `samplesByTrack` count (which would
- *   pass the dwell early and over-weight the catch-up in the SWMA).
+ *   pass the dwell early and over-weight the catch-up in the SWMA). The
+ *   guarantee holds within the last CLOSED_KEYS_MAX (256) sampled groups of
+ *   the stream, about four minutes at 1 s GOPs: an object of a group sampled
+ *   longer ago than that opens a new accumulator and can sample it again.
  */
 
 /** One finalised per-group throughput sample. */
@@ -86,7 +89,8 @@ export interface GroupSample {
   /**
    * Library-discarded (unrouted) bytes that no open group could take: the
    * group had already produced its sample, never reached the player, or the
-   * library no longer knew its track. Accumulated over the whole stream
+   * library no longer knew its track; and those that an open group took but
+   * that group then closed without a sample (one object, or no time span). Accumulated over the whole stream
    * (any track, any group) since the previous sample and reported once, with
    * the next sample of this stream (F6). They never enter the timed span.
    */
@@ -114,11 +118,21 @@ interface OpenGroup {
   lastTs: number;
   objects: number;
   discardedBytes: number;
+  /**
+   * The library-discarded part of `discardedBytes` (recordDiscardedBytes).
+   * If the group closes without a sample they move to the stream's pending
+   * unrouted bytes, so they still reach a sample (R4-D4).
+   */
+  libraryDiscardedBytes: number;
   /** The caller tells this group's last object (lastInGroup is defined). */
   hinted: boolean;
 }
 
-/** Sampled (track, group) keys remembered so late objects do not sample a group twice (F5). */
+/**
+ * Sampled (track, group) keys remembered so late objects do not sample a group
+ * twice (F5). Oldest evicted first: the sampled-once guarantee covers the last
+ * 256 sampled groups only.
+ */
 const CLOSED_KEYS_MAX = 256;
 
 /** A later group of the track finalises a hinted group once it has been quiet this long (ms) ... */
@@ -225,6 +239,7 @@ export class GoodputTracker {
         lastTs: now,
         objects: 0,
         discardedBytes: 0,
+        libraryDiscardedBytes: 0,
         hinted: false,
       };
       this.#open.set(key, g);
@@ -249,12 +264,15 @@ export class GoodputTracker {
    * that (track, group) is open they become its `discardedBytes`; otherwise
    * (already sampled, never routed, or unknown track) they are reported as
    * `unroutedBytes` with the next sample of this stream, whatever its track,
-   * so every byte reaches exactly one THROUGHPUT_SAMPLE (F6).
+   * so every byte reaches exactly one THROUGHPUT_SAMPLE (F6). If the open
+   * group later closes without a sample, they move to that pending counter.
    */
   recordDiscardedBytes(bytes: number, groupId: bigint, track: string | null): void {
     const g = track !== null ? this.#open.get(`${track}\u0000${groupId}`) : undefined;
-    if (g !== undefined) g.discardedBytes += bytes;
-    else this.#unroutedPending += bytes;
+    if (g !== undefined) {
+      g.discardedBytes += bytes;
+      g.libraryDiscardedBytes += bytes;
+    } else this.#unroutedPending += bytes;
   }
 
   /** Conservative bandwidth: average of the SWMA window. 0 until first group completes. */
@@ -363,14 +381,17 @@ export class GoodputTracker {
   }
 
   #finalize(g: OpenGroup): GroupSample | null {
-    if (g.objects < 2) return null;
-    const dtMs = g.lastTs - g.firstTs;
-    if (dtMs <= 0) return null;
-
     // Exclude the first object's bytes from the numerator: it sets t_1 and
     // contributes no inter-arrival information. Matches the IETF slides.
+    const dtMs = g.lastTs - g.firstTs;
     const bytes = g.bytes - g.firstObjBytes;
-    if (bytes <= 0) return null;
+    if (g.objects < 2 || dtMs <= 0 || bytes <= 0) {
+      // No sample (one object, or no time span): the library-discarded bytes
+      // attached to this group go out with the next sample of the stream as
+      // unrouted bytes instead of being lost with it (R4-D4).
+      this.#unroutedPending += g.libraryDiscardedBytes;
+      return null;
+    }
 
     const dtSec = dtMs / 1000;
     const groupBps = (bytes * 8) / dtSec;

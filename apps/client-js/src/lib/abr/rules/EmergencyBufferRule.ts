@@ -27,9 +27,12 @@
  *
  * with `lowBufferS = 0.5 s` and `sf = 0.7` by default. The envelope
  * (`RulesContext.bufferEnvelopeSeconds`) is the maximum of the contiguous
- * buffer over the last `bufferEnvelopeMs` (1250 ms: one group plus one tick),
- * so the low branch fires only when the buffer stayed below 0.5 s for that
- * whole window, i.e. it is draining, not merely at the trough of a group.
+ * buffer over the last `bufferEnvelopeMs`, by default one group plus one tick
+ * (`segmentDurationS × 1000 + tickMs`: 1250 ms at 1 s GOPs, 2250 ms at 2 s;
+ * effectiveBufferEnvelopeMs), the shortest window that always holds the
+ * level after a group burst. So the low branch fires only when the buffer
+ * stayed below 0.5 s for that whole window, i.e. it is draining, not merely at
+ * the trough of a group.
  *
  * Why the envelope (F1): the publisher sends each group as a burst, so at the
  * live edge the instantaneous contiguous buffer is a per-group sawtooth
@@ -60,7 +63,12 @@
  * Startup: the rule abstains until a frame has been presented
  * (`totalFrames > 0`). Before that the buffer is empty by construction and no
  * stall is possible, and the duration of that phase depends on the client
- * type (a time-shifted client waits for its backlog).
+ * type (a time-shifted client waits for its backlog). The low branch stays
+ * silent for a further `bufferEnvelopeMs` (`RulesContext.bufferEnvelopeReady`):
+ * the controller discards buffer samples from before the first frame, and a
+ * shorter window can sit entirely on a trough of the live-edge sawtooth
+ * (R4-D3: one live-edge-only emergency on the first tick in 20-24 of 288
+ * simulated pairs). The empty branch is unaffected.
  *
  * Reasons contain "emergency", so AbrController labels the switch
  * `auto-emergency` and SwitchHistoryRule counts it as a drop (unless it is
@@ -93,7 +101,9 @@ export class EmergencyBufferRule implements AbrRule {
       return { representationIndex: 0, priority, reason: 'emergency-buffer-empty' };
     }
     // The low branch reads the envelope (F1); a caller that has none (unit
-    // contexts) gets the instantaneous value.
+    // contexts) gets the instantaneous value. It is silent until the envelope
+    // covers a whole window after the first frame (R4-D3).
+    if (context.bufferEnvelopeReady === false) return null;
     const buffer = context.bufferEnvelopeSeconds ?? instant;
     if (buffer >= lowBufferS) return null;
 

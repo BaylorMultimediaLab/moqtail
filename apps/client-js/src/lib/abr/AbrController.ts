@@ -9,6 +9,7 @@ import {
   type Track,
   CONTROLLER_CONSTANTS,
   bufferEnvelope,
+  effectiveBufferEnvelopeMs,
   effectiveSegmentDurationS,
   resolveControllerSettings,
 } from './types';
@@ -233,8 +234,11 @@ export class AbrController {
   #upGuardReleasedAtSamples: number | null = null;
   #lastSampleCount = 0;
   // Recent instantaneous buffer levels for settings.controller.bufferSignal =
-  // 'envelope' (see ControllerSettings).
+  // 'envelope' (see ControllerSettings), from the first presented frame on.
   #bufferSamples: { ts: number; bufferSeconds: number }[] = [];
+  // Date.now() of the first tick with a presented frame (totalFrames > 0);
+  // null before it. The envelope is complete bufferEnvelopeMs later (R4-D3).
+  #firstFrameTs: number | null = null;
   // Switches that have been sent and not resolved yet, oldest first (M17, F7).
   // History, ABR_DECISION, the up-guard arm and the probe's tracksize are
   // written only when the player reports (onTrackSwitched) that a record's
@@ -629,14 +633,30 @@ export class AbrController {
     this.#activeTrackAtTick = activeTrack;
 
     // Buffer level for the rules: instantaneous or the maximum over the last
-    // group (the level after each burst landed).
-    const envelopeMs = this.#settings.controller.bufferEnvelopeMs;
+    // group (the level after each burst landed). Samples start with the first
+    // presented frame: before it the buffer is a pre-roll whose length depends
+    // on the client type (a time-shifted client waits for its backlog), and
+    // its zeros must not read as a drain. Until bufferEnvelopeMs has passed
+    // since that frame the window is incomplete: a live-edge client's first
+    // ticks may all sit on a trough of the group sawtooth that a full window
+    // would have covered with the burst, so the envelope is not yet a level
+    // (bufferEnvelopeReady false; EmergencyBufferRule's low branch abstains).
+    const envelopeMs = effectiveBufferEnvelopeMs(this.#settings.controller);
     const nowTs = Date.now();
-    this.#bufferSamples.push({ ts: nowTs, bufferSeconds: bufferInstantSeconds });
+    if (totalFrames > 0) {
+      this.#firstFrameTs ??= nowTs;
+      this.#bufferSamples.push({ ts: nowTs, bufferSeconds: bufferInstantSeconds });
+    }
     while (this.#bufferSamples.length > 0 && nowTs - this.#bufferSamples[0]!.ts > envelopeMs) {
       this.#bufferSamples.shift();
     }
-    const bufferEnvelopeSeconds = bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs);
+    const bufferEnvelopeReady =
+      this.#firstFrameTs !== null && nowTs - this.#firstFrameTs >= envelopeMs;
+    // Before the first frame there are no samples: the instantaneous value.
+    const bufferEnvelopeSeconds =
+      this.#bufferSamples.length > 0
+        ? bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs)
+        : bufferInstantSeconds;
     const ruleBufferSeconds =
       this.#settings.controller.bufferSignal === 'envelope'
         ? bufferEnvelopeSeconds
@@ -742,6 +762,7 @@ export class AbrController {
       bufferSeconds: ruleBufferSeconds,
       bufferInstantSeconds,
       bufferEnvelopeSeconds,
+      bufferEnvelopeReady,
       bufferTotalSeconds: bufferSeconds,
       groupsSinceLanding: this.groupsSinceLanding(raw),
       bandwidthBps,
