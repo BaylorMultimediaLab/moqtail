@@ -1747,7 +1747,12 @@ export class Player {
       ?.lastFrameDurationMs;
   }
 
-  /** True between SWITCH_OK and the target's first object (the switch has not landed). */
+  /**
+   * True from SWITCH_SENT (the write handler is armed provisionally before the
+   * SWITCH is awaited, F12) until the target's first object lands; a refusal
+   * or an error rolls the arming back (to an older switch still pending, if
+   * any).
+   */
   hasSwitchInFlight(): boolean {
     return (
       this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')?.pendingSwitch != null

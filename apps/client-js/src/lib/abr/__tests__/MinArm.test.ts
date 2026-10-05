@@ -8,6 +8,7 @@ import {
   RULE_ORDER,
   SwitchRequestPriority,
   describeController,
+  effectiveBufferEnvelopeMs,
   resolveControllerSettings,
 } from '../types';
 import type { AbrSettings, ControllerSettings, Track } from '../types';
@@ -164,7 +165,9 @@ describe('min arm: configuration', () => {
     expect(c.arm).toBe('min');
     expect(c.probeMode).toBe('off');
     expect(c.bufferSignal).toBe('envelope');
-    expect(c.bufferEnvelopeMs).toBe(1250);
+    // 0 = one GOP plus one tick (R4-D5).
+    expect(c.bufferEnvelopeMs).toBe(0);
+    expect(effectiveBufferEnvelopeMs(c)).toBe(1250);
     expect(c.switchHistoryMode).toBe('veto');
     expect(c.switchHistoryWindowS).toBe(60);
     expect(c.upDwellGroups).toBe(3);
@@ -384,9 +387,56 @@ describe('min arm: (c) emergency on the instantaneous contiguous buffer', () => 
   it('buffer below 0.5 s -> highest rung under 0.7 x SWMA, over the throughput rule', async () => {
     // ThroughputRule: 0.9 x 2 Mbps = 1.8 -> 720p; the emergency: 0.7 x 2 =
     // 1.4 -> 360p at STRONG.
-    const h = harness({ activeTrack: '1080p', bandwidthBps: 2_000_000, bufferContigSeconds: 0.3 });
-    await h.tick();
-    expect(h.switches()).toEqual(['360p']);
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      // The envelope needs bufferEnvelopeMs of samples after the first frame
+      // (R4-D3); 10 Mbps holds 1080p meanwhile.
+      const h = harness({
+        activeTrack: '1080p',
+        bandwidthBps: 10_000_000,
+        bufferContigSeconds: 0.3,
+      });
+      for (let i = 0; i < 6; i++) {
+        await h.tick();
+        vi.advanceTimersByTime(250);
+      }
+      expect(h.switches()).toEqual([]);
+      await h.tick({ bandwidthBps: 2_000_000 });
+      expect(h.switches()).toEqual(['360p']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the low branch is silent for bufferEnvelopeMs after the first frame (R4-D3)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      // Pre-roll (no frame yet) with an empty buffer, then frames at a trough
+      // of 0.3 s. ThroughputRule alone (0.9 x 5 Mbps = 4.5) keeps 1080p.
+      const h = harness({
+        activeTrack: '1080p',
+        bandwidthBps: 5_000_000,
+        bufferContigSeconds: 0,
+        totalFrames: 0,
+      });
+      for (let i = 0; i < 4; i++) {
+        await h.tick();
+        vi.advanceTimersByTime(250);
+      }
+      h.set({ totalFrames: undefined, bufferContigSeconds: 0.3 });
+      for (let i = 0; i < 5; i++) {
+        await h.tick();
+        vi.advanceTimersByTime(250);
+      }
+      expect(h.switches()).toEqual([]);
+      // 1250 ms after the first frame the whole window is below 0.5 s: a drain.
+      await h.tick();
+      expect(h.switches()).toEqual(['720p']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a low buffer is not an up-switch gate: with a healthy SWMA the throughput rule still climbs after the dwell', async () => {
@@ -692,6 +742,37 @@ describe('min arm: (i) the live-edge sawtooth is not an emergency (F1)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('min arm: the envelope window follows the GOP (R4-D5)', () => {
+  // A draining buffer below 0.5 s from t = 0; the low branch fires once the
+  // whole window (GOP + tick) after the first frame lies below it.
+  const firstEmergencyMs = async (segmentDurationS: number) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      const h = harness(
+        { activeTrack: '1080p', bandwidthBps: 5_000_000, bufferContigSeconds: 1.0 },
+        { settings: minSettings({ segmentDurationS }) },
+      );
+      await h.tick();
+      vi.advanceTimersByTime(250);
+      for (let t = 250; t <= 5_000; t += 250) {
+        await h.tick({ bufferContigSeconds: 0.4 });
+        if (h.switches().length > 0) return t;
+        vi.advanceTimersByTime(250);
+      }
+      return null;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+
+  it('GOP 1 s: 1250 ms; GOP 2 s: 2250 ms', async () => {
+    // The 1.0 s sample at t = 0 leaves the window after GOP + tick.
+    expect(await firstEmergencyMs(1)).toBe(1_500);
+    expect(await firstEmergencyMs(2)).toBe(2_500);
   });
 });
 

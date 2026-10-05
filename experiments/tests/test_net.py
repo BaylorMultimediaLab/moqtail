@@ -917,6 +917,42 @@ class Pr1378Arm(unittest.TestCase):
         self.assertIn('"t_switch_ms"', rs.read_text())
 
 
+class PreflightWiring(unittest.TestCase):
+    def test_validate_command_passes_preflight_and_final(self):
+        out = Path("/tmp/run")
+        self.assertNotIn("--preflight", rx.validate_command(out, False, False))
+        cmd = rx.validate_command(out, True, True)
+        self.assertEqual(cmd[-2:], ["--final", "--preflight"])
+        self.assertTrue(cmd[1].endswith("validate.py"))
+
+    def test_preflight_profile_steps_leave_room_for_the_delivery_check(self):
+        prof = json.loads((Path(rx.__file__).parent / "profiles" / "preflight_step.json").read_text())
+        ats = [s["at_s"] for s in prof["steps"]]
+        self.assertEqual(ats, [0, 30, 60])
+        self.assertEqual([s["rate_mbps"] for s in prof["steps"]], [6, 1.5, 6])
+
+
+class NativeFixedArmBranch(unittest.TestCase):
+    """R5 D-1: the branch guard and the missing-flag message must name the same branch."""
+
+    def test_both_native_arms_run_on_the_native_branch(self):
+        self.assertEqual(rx.MECHANISM_BRANCH["native"], "switch/native")
+
+    def test_missing_fixed_flags_name_the_guarded_branch(self):
+        flags = {"--forward-promotion-trigger"}          # an older relay: one of the two flags
+        with self.assertRaises(SystemExit) as cm:
+            rx.native_fixed_relay_args(flags, "native", "forward-trigger")
+        msg = str(cm.exception)
+        self.assertIn(rx.MECHANISM_BRANCH["native"], msg)
+        self.assertNotIn("rebuild/native-ft", msg)
+        self.assertIn("--native-status-before-subscribe", msg)
+
+    def test_as_shipped_native_passes_no_fixed_flags(self):
+        self.assertEqual(rx.native_fixed_relay_args(set(rx.NATIVE_FIXED_FLAGS), "native", None), [])
+        self.assertEqual(rx.native_fixed_relay_args(set(rx.NATIVE_FIXED_FLAGS), "native", "forward-trigger"),
+                         list(rx.NATIVE_FIXED_FLAGS))
+
+
 class RelayConfigCheck(unittest.TestCase):
     def test_udp_gso_must_be_off(self):
         self.assertIn("udp_gso", rx.check_relay_config({"congestion_controller": "cubic", "udp_gso": "on"}, "cubic", False))

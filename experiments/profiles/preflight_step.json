@@ -1,0 +1,26 @@
+{
+  "name": "preflight_step",
+  "description": "Preflight profile: 6 Mbps for 30 s, 1.5 Mbps for 30 s, 6 Mbps for 30 s (run with --duration 90). Each step leaves 20 s after the 10 s settle for pf-delivery-rate; the last step checks that delivery recovers to the link rate after the restore (the post-restore stall seen in fresh-grid-v2).",
+  "queue": "tail-drop",
+  "queue_pkts": 100,
+  "steps": [
+    {
+      "at_s": 0,
+      "rate_mbps": 6,
+      "delay_ms": 40,
+      "loss_pct": 0
+    },
+    {
+      "at_s": 30,
+      "rate_mbps": 1.5,
+      "delay_ms": 40,
+      "loss_pct": 0
+    },
+    {
+      "at_s": 60,
+      "rate_mbps": 6,
+      "delay_ms": 40,
+      "loss_pct": 0
+    }
+  ]
+}

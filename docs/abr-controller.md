@@ -21,16 +21,16 @@ definition the paper uses.
 
 ### 0.1 Inputs
 
-| input                            | source (`player.getMetrics()`)                                                                                                             | used by                                                 |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| throughput SWMA                  | `bandwidthBps`: mean of the last 5 group samples, each the bytes of objects 2..N over the arrival span of the group (`recvAt`, M11)        | ThroughputRule, EmergencyBufferRule's low-buffer cap    |
-| completed groups per track       | `samplesByTrack` (optional; fallback `sampleCount`), one sample per (track, group) (F5)                                                    | the dwell                                               |
-| contiguous buffer, instantaneous | `bufferContigSeconds` (fallback `bufferSeconds`): end of the buffered range that contains the playhead minus the playhead, 0 if none (M12) | EmergencyBufferRule, empty branch (`== 0`)              |
-| contiguous buffer, envelope      | its maximum over the last 1250 ms (`RulesContext.bufferEnvelopeSeconds`; also `buffer_rule_s`)                                             | EmergencyBufferRule, low branch (`< 0.5 s`) (F1)        |
-| playhead and presented seam      | `playheadMs`, `latestSeamPtsMs`: the latest applied seam whose region (from the hole in front of it) the playhead has entered, or null     | SwitchHistoryRule's seam exemption (F2)                 |
-| switch history                   | the controller's own record of confirmed landings                                                                                          | SwitchHistoryRule                                       |
-| presented frames                 | `totalFrames > 0`                                                                                                                          | EmergencyBufferRule stays silent before the first frame |
-| landing callback                 | `onTrackSwitched(trackName)` on every terminal outcome of a switch                                                                         | history, `ABR_DECISION`, the dwell clock (M17)          |
+| input                            | source (`player.getMetrics()`)                                                                                                                                                                   | used by                                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| throughput SWMA                  | `bandwidthBps`: mean of the last 5 group samples, each the bytes of objects 2..N over the arrival span of the group (`recvAt`, M11)                                                              | ThroughputRule, EmergencyBufferRule's low-buffer cap                                                              |
+| completed groups per track       | `samplesByTrack` (optional; fallback `sampleCount`), one sample per (track, group) (F5)                                                                                                          | the dwell                                                                                                         |
+| contiguous buffer, instantaneous | `bufferContigSeconds` (fallback `bufferSeconds`): end of the buffered range that contains the playhead minus the playhead, 0 if none (M12)                                                       | EmergencyBufferRule, empty branch (`== 0`)                                                                        |
+| contiguous buffer, envelope      | its maximum over the last `bufferEnvelopeMs` = one GOP plus one tick (1250 ms at 1 s GOPs) (`RulesContext.bufferEnvelopeSeconds`; also `buffer_rule_s`)                                          | EmergencyBufferRule, low branch (`< 0.5 s`) (F1)                                                                  |
+| playhead and presented seam      | `playheadMs`, `latestSeamPtsMs`: the latest applied seam whose region (from the hole in front of it) the playhead has entered, or null                                                           | SwitchHistoryRule's seam exemption (F2)                                                                           |
+| switch history                   | the controller's own record of confirmed landings                                                                                                                                                | SwitchHistoryRule                                                                                                 |
+| presented frames                 | `totalFrames > 0`; buffer samples before the first frame are discarded                                                                                                                           | EmergencyBufferRule stays silent before the first frame, its low branch until `bufferEnvelopeMs` after it (R4-D3) |
+| landing callback                 | `onTrackSwitched(trackName, switchSeq)` on every terminal outcome of a switch except a supersession before landing (`switchSeq`: the player's `switch_seq`, which picks the pending record, F14) | history, `ABR_DECISION`, the dwell clock (M17)                                                                    |
 
 Nothing else is read: no latency (raw or shift-corrected), no
 `targetShiftMs`, no `playbackRate`, no probe, no dropped frames, no
@@ -41,7 +41,7 @@ visibility (t5).
 | rule                | tier    | decision                                                                                                                                                                                                                                              |
 | ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ThroughputRule      | DEFAULT | the highest rung with `bitrate ≤ 0.9 × SWMA`; rung 0 when none fits (`downToLowest`); abstains with no sample yet                                                                                                                                     |
-| EmergencyBufferRule | STRONG  | instantaneous contiguous buffer `== 0` → rung 0; contiguous buffer **envelope** (maximum over 1250 ms) `< 0.5 s` → the highest rung with `bitrate ≤ 0.7 × SWMA` if that is below the active rung, else abstain                                        |
+| EmergencyBufferRule | STRONG  | instantaneous contiguous buffer `== 0` → rung 0; contiguous buffer **envelope** (maximum over GOP + tick, 1250 ms at 1 s GOPs) `< 0.5 s` → the highest rung with `bitrate ≤ 0.7 × SWMA` if that is below the active rung, else abstain                |
 | SwitchHistoryRule   | DEFAULT | veto: caps the ladder just below the first unsafe rung above the active one; a rung is unsafe with ≥ 8 events in the last 60 s, at least one up-switch to it and `drops / ups > 0.075`; drops decided while the playhead is at a seam are not counted |
 
 The emergency's two branches read two forms of the same contiguous buffer
@@ -49,7 +49,12 @@ The emergency's two branches read two forms of the same contiguous buffer
 is judged on the envelope, i.e. it fires only when the buffer stayed below
 0.5 s for a whole group plus a tick: a drain, not the trough of the live-edge
 per-group sawtooth (each group lands as a burst at ≈1.1 s and drains to
-≈0.2-0.35 s before the next).
+≈0.2-0.35 s before the next). The envelope starts with the first presented
+frame (buffer samples from the pre-roll, whose length depends on the client
+type, are discarded), and the low branch stays silent until it covers a whole
+window, `bufferEnvelopeMs` after that frame: a shorter window can sit entirely
+on a trough (R4-D3: one live-edge-only emergency on the first tick in 20-24 of
+288 simulated pairs; test `EnvelopeWarmup`).
 
 "At a seam" (F2) is measured in media time around the seam being presented,
 not in groups since the landing: the playhead is in the seam's region, which
@@ -87,7 +92,9 @@ request (by rule identity); every other automatic down-switch is
 History and `ABR_DECISION` are written only when the player confirms a landing
 on the decided target (`onTrackSwitched(target, switchSeq)`); a refused, skipped
 or failed switch (callback with the old track) leaves only
-`ABR_SWITCH_PHANTOM`. Both records carry `switch_seq` (the player's number for
+`ABR_SWITCH_PHANTOM`. A switch superseded before it landed gets no callback and
+leaves neither: its record is dropped when a newer switch lands (or ages out of the list), and
+the analyzer attributes it from `ABR_TICK`. Both records carry `switch_seq` (the player's number for
 the switch, which `switchTrack` exposes synchronously as `lastSwitchSeq` and
 resolves to; the callback names it, so a callback resolves exactly its own
 decision) and `decided_ts`; `ABR_DECISION` is emitted at the landing (F14). A
@@ -102,23 +109,23 @@ a landing later than 3 s is still history. This holds for every arm.
 `describeController(settings)` (`abr/index.ts`) returns these, after the arm
 is resolved, as plain JSON; it is what `RUN_META.controller` records.
 
-| constant                                                                               | `min` value               | tunable?                              |
-| -------------------------------------------------------------------------------------- | ------------------------- | ------------------------------------- |
-| tick                                                                                   | 250 ms                    | no (`CONTROLLER_CONSTANTS`)           |
-| slow start                                                                             | 3 samples                 | no                                    |
-| switching guard timeout / cool-down                                                    | 3000 / 5000 ms            | no                                    |
-| `upDwellGroups`                                                                        | 3                         | yes                                   |
-| `bandwidthSafetyFactor`                                                                | 0.9                       | yes                                   |
-| EmergencyBufferRule `lowBufferS`, `throughputSafetyFactor`                             | 0.5 s, 0.7                | yes (rule parameters)                 |
-| `switchHistoryMode`                                                                    | veto                      | pinned                                |
-| `switchHistoryWindowS`                                                                 | 60 s                      | yes (0 is not accepted, reads as 60)  |
-| SwitchHistoryRule `sampleSize`, `switchPercentageThreshold`                            | 8, 0.075                  | yes (rule parameters)                 |
-| `historyIgnoreGroupsAfterLanding` (seam window, GOPs of media past the presented seam) | 2                         | yes                                   |
-| history length                                                                         | 60 entries                | no                                    |
-| `bufferSignal`, `bufferEnvelopeMs`                                                     | envelope, 1250 ms         | signal pinned, window tunable         |
-| `segmentDurationS`                                                                     | catalog GOP (default 1 s) | from the catalog                      |
-| `probeMode`, `upGuardSamples`, `latencyResetOnLanding`                                 | off, 0, false             | pinned                                |
-| SWMA window                                                                            | 5 groups                  | the player's (recorded, not set here) |
+| constant                                                                               | `min` value                                             | tunable?                              |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------- | ------------------------------------- |
+| tick                                                                                   | 250 ms                                                  | no (`CONTROLLER_CONSTANTS`)           |
+| slow start                                                                             | 3 samples                                               | no                                    |
+| switching guard timeout / cool-down                                                    | 3000 / 5000 ms                                          | no                                    |
+| `upDwellGroups`                                                                        | 3                                                       | yes                                   |
+| `bandwidthSafetyFactor`                                                                | 0.9                                                     | yes                                   |
+| EmergencyBufferRule `lowBufferS`, `throughputSafetyFactor`                             | 0.5 s, 0.7                                              | yes (rule parameters)                 |
+| `switchHistoryMode`                                                                    | veto                                                    | pinned                                |
+| `switchHistoryWindowS`                                                                 | 60 s                                                    | yes (0 is not accepted, reads as 60)  |
+| SwitchHistoryRule `sampleSize`, `switchPercentageThreshold`                            | 8, 0.075                                                | yes (rule parameters)                 |
+| `historyIgnoreGroupsAfterLanding` (seam window, GOPs of media past the presented seam) | 2                                                       | yes                                   |
+| history length                                                                         | 60 entries                                              | no                                    |
+| `bufferSignal`, `bufferEnvelopeMs`                                                     | envelope, GOP + tick (0 = derived; 1250 ms at 1 s GOPs) | signal pinned, window tunable         |
+| `segmentDurationS`                                                                     | catalog GOP (default 1 s)                               | from the catalog                      |
+| `probeMode`, `upGuardSamples`, `latencyResetOnLanding`                                 | off, 0, false                                           | pinned                                |
+| SWMA window                                                                            | 5 groups                                                | the player's (recorded, not set here) |
 
 The full description for the defaults:
 
@@ -256,7 +263,7 @@ What remains asymmetric, and is reported rather than tuned:
 
 - A live-edge client has about 1 s of runway and a 10 s client about 10 s, so
   the same link collapse empties the live-edge buffer first (the empty branch
-  and, after 1250 ms below 0.5 s, the low branch fire there first). This is the
+  and, after one GOP plus one tick below 0.5 s, the low branch fire there first). This is the
   property being measured, not a policy.
 - Groups arrive faster than one per second during a catch-up replay or the
   connect backlog of a time-shifted client, so the dwell and slow start elapse
@@ -613,21 +620,21 @@ A→B→A reversals in 60 s, most superseded before they were ever visible.
 
 ## 7. Hard-coded numbers
 
-| where          | value                                                             | meaning                                                                                                                                                                                           |
-| -------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| AbrController  | 250 ms                                                            | tick                                                                                                                                                                                              |
-| AbrController  | 3000 ms / 5000 ms                                                 | switching-guard timeout / cool-down after it                                                                                                                                                      |
-| AbrController  | 3                                                                 | throughput samples before an up-switch (slow start)                                                                                                                                               |
-| AbrController  | 60                                                                | switch-history length                                                                                                                                                                             |
-| AbrController  | 2 s                                                               | probe horizon in the size formula                                                                                                                                                                 |
-| controller     | 0 B / 0 ms / 0 / landed / false / evict / 0 s / instant / 1250 ms | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs (section 9; all off = baseline) |
-| ProbeManager   | 2000 / 500 / 5000 ms                                              | min interval / nominal duration / freshness                                                                                                                                                       |
-| GoodputTracker | 5                                                                 | SWMA window (groups)                                                                                                                                                                              |
-| LatencyTracker | 100                                                               | samples in the trend window                                                                                                                                                                       |
-| BolaRule       | 10 s, 0.99                                                        | MINIMUM_BUFFER_S, placeholder decay                                                                                                                                                               |
-| L2ARule        | 4, 2, 1.5 s                                                       | horizon, REACT, buffer target                                                                                                                                                                     |
-| LoLpRule       | 0.5 s, 0.1                                                        | emergency buffer, SOM learning rate                                                                                                                                                               |
-| context        | catalog GOP (default 1 s), false                                  | segmentDurationS (`controller.segmentDurationS`), isLowLatency                                                                                                                                    |
+| where          | value                                                                | meaning                                                                                                                                                                                           |
+| -------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AbrController  | 250 ms                                                               | tick                                                                                                                                                                                              |
+| AbrController  | 3000 ms / 5000 ms                                                    | switching-guard timeout / cool-down after it                                                                                                                                                      |
+| AbrController  | 3                                                                    | throughput samples before an up-switch (slow start)                                                                                                                                               |
+| AbrController  | 60                                                                   | switch-history length                                                                                                                                                                             |
+| AbrController  | 2 s                                                                  | probe horizon in the size formula                                                                                                                                                                 |
+| controller     | 0 B / 0 ms / 0 / landed / false / evict / 0 s / instant / GOP + tick | probeMinBytes, probeMinDurationMs, upGuardSamples, upGuardRelease, latencyResetOnLanding, switchHistoryMode, switchHistoryWindowS, bufferSignal, bufferEnvelopeMs (section 9; all off = baseline) |
+| ProbeManager   | 2000 / 500 / 5000 ms                                                 | min interval / nominal duration / freshness                                                                                                                                                       |
+| GoodputTracker | 5                                                                    | SWMA window (groups)                                                                                                                                                                              |
+| LatencyTracker | 100                                                                  | samples in the trend window                                                                                                                                                                       |
+| BolaRule       | 10 s, 0.99                                                           | MINIMUM_BUFFER_S, placeholder decay                                                                                                                                                               |
+| L2ARule        | 4, 2, 1.5 s                                                          | horizon, REACT, buffer target                                                                                                                                                                     |
+| LoLpRule       | 0.5 s, 0.1                                                           | emergency buffer, SOM learning rate                                                                                                                                                               |
+| context        | catalog GOP (default 1 s), false                                     | segmentDurationS (`controller.segmentDurationS`), isLowLatency                                                                                                                                    |
 
 The controller's own fixed numbers (tick, guard timeout and cool-down, slow
 start, history length, probe horizon/interval/duration/freshness) live in
@@ -753,8 +760,10 @@ guard-lat-hist run, the drain rule fires on 168 of 575 ticks with the
 instantaneous buffer and on 22 with a 1.25 s envelope.
 
 `bufferSignal = envelope` gives every rule the maximum buffer level over the
-last `bufferEnvelopeMs` (one group plus one tick): the level after each burst
-landed, which is what the dash.js rules were written for. The empty-buffer
+last `bufferEnvelopeMs` (one group plus one tick: `segmentDurationS × 1000 +
+tickMs` unless set explicitly, 1250 ms at 1 s GOPs and 2250 ms at 2 s; RUN_META
+`controller.bufferEnvelopeMs` is the effective value): the level after each
+burst landed, which is what the dash.js rules were written for. The empty-buffer
 emergency (`insufficient-buffer-empty`) keeps the instantaneous value
 (`RulesContext.bufferInstantSeconds`). A real drain still shows: the peaks
 fall. The change is the same on every mechanism and both client types, and

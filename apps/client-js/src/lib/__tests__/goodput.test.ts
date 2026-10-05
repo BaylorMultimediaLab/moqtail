@@ -393,6 +393,29 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       }
       expect(out.filter(x => x.group === 5n)).toHaveLength(1);
     });
+
+    it('the guarantee holds within the last 256 sampled groups (R4-D6)', () => {
+      const t = new GoodputTracker(3, 8, 1000);
+      let at = 0;
+      const deliver = (g: bigint, objects = N) => {
+        const out = [];
+        for (let o = 0; o < objects; o++) {
+          at += 2;
+          out.push(
+            ...t.recordObject(1000, g, { recvAt: at, track: 'A', lastInGroup: o === objects - 1 }),
+          );
+        }
+        at += 900;
+        return out;
+      };
+      for (let g = 1n; g <= 300n; g++) deliver(g);
+      expect(t.getSampleCount()).toBe(300);
+      // Group 45 is the 256th most recent sampled group: still remembered.
+      expect(deliver(45n, 2)).toEqual([]);
+      // Group 44 has been evicted: its redelivery is sampled a second time.
+      expect(deliver(44n, 2).map(x => x.group)).toEqual([44n]);
+      expect(t.getSampleCount()).toBe(301);
+    });
   });
 
   describe('library-discarded (unrouted) bytes reach a sample (F6)', () => {
@@ -432,6 +455,21 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       expect(next[0]!.discardedBytes).toBe(0);
       expect(next[0]!.unroutedBytes).toBe(16_000);
       expect(group(t, 21n, 'B', 3000)[0]!.unroutedBytes).toBe(0);
+    });
+    it('bytes attached to an open group that closes without a sample are not lost (R4-D4)', () => {
+      // One object (no inter-arrival information): the group closes with no sample.
+      const t = new GoodputTracker(3, 8, 1000);
+      t.recordObject(1000, 5n, { recvAt: 0, track: 'B' });
+      t.recordDiscardedBytes(50_000, 5n, 'B');
+      // Two objects with the same receive stamp (dt = 0): no sample either.
+      t.recordObject(1000, 6n, { recvAt: 3_000, track: 'B' });
+      t.recordDiscardedBytes(20_000, 6n, 'B');
+      t.recordObject(1000, 6n, { recvAt: 3_000, track: 'B', lastInGroup: true });
+      const out = group(t, 7n, 'B', 6_000);
+      expect(out).toHaveLength(1);
+      expect(out[0]!.group).toBe(7n);
+      expect(out[0]!.discardedBytes).toBe(0);
+      expect(out[0]!.unroutedBytes).toBe(70_000);
     });
   });
 
