@@ -1064,13 +1064,20 @@ export class Player {
                 // seam: what can still be appended goes in now, before anything of the
                 // landing is recorded and before the target's init segment; the order
                 // then starts afresh at the target's keyframe.
-                await perform(order.flush(performance.now()));
-                if (!struct.pendingSwitch) {
-                  // The switch was rolled back meanwhile: this object belongs to no route.
+                // The landing is decided and timed now; the flush awaits appends, during
+                // which a new SWITCH can replace the pending one (switchTrack runs outside
+                // the write chain).
+                const landingPending = struct.pendingSwitch;
+                const landedAtPerf = performance.now();
+                const landedAtMs = Date.now();
+                await perform(order.flush(landedAtPerf));
+                if (struct.pendingSwitch !== landingPending) {
+                  // The switch was rolled back or replaced meanwhile: this object is not the
+                  // landing of the switch now pending.
                   this.#dropStale(struct, object, objectTrackName, {
                     track: objectTrackName,
                     current: struct.trackName,
-                    pending: null,
+                    pending: struct.pendingSwitch?.trackName ?? null,
                     group: object.location.group,
                     bytes: object.payload.byteLength,
                     object: object.location.object,
@@ -1109,13 +1116,16 @@ export class Player {
                 // The landing object. The seam fields come from the first object
                 // that passes the keyframe gate (SWITCH_APPLIED, M9).
                 events.emit('SWITCH_FIRST_OBJECT', {
+                  // Stamped when the landing was decided, not after the flush's appends.
+                  ts: landedAtMs,
+                  perf: landedAtPerf,
                   switch_seq: record.seq,
                   from: fromTrack,
                   to: newTrackName,
                   group: object.location.group,
                   object: object.location.object,
                   landed_on_keyframe: landingIsSync ?? null,
-                  since_sent_ms: performance.now() - record.sentAt,
+                  since_sent_ms: landedAtPerf - record.sentAt,
                 });
                 // A previous landing whose seam was never presented is overwritten now.
                 const { superseded } = this.#seams.landed(record, {
@@ -1123,7 +1133,7 @@ export class Player {
                   object: Number(object.location.object),
                   landedOnKeyframe: landingIsSync ?? null,
                   sourceEndMs: sourceEndAtLandingMs,
-                  now: performance.now(),
+                  now: landedAtPerf,
                 });
                 for (const old of superseded) {
                   events.emit('SWITCH_SUPERSEDED', {
