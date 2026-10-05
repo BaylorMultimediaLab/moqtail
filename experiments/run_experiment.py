@@ -225,6 +225,14 @@ RELAY_PINNED = {
 # required (RELAY_REQUIRED_BY_MECHANISM).
 RELAY_BRANCH_OPTIONAL = {"--t-switch-ms": "3000"}
 RELAY_REQUIRED_BY_MECHANISM = {"pr1378": ("--t-switch-ms",)}
+# RELAY_CONFIG fields a mechanism's relay must report with the pinned value (P8):
+# the record is what shows the run used the pinned T_switch.
+RELAY_CONFIG_PINNED_BY_MECHANISM = {"pr1378": {"t_switch_ms": int(RELAY_BRANCH_OPTIONAL["--t-switch-ms"])}}
+
+
+def expected_t_switch_ms(mechanism: str | None) -> int | None:
+    """The T_switch a mechanism's RELAY_CONFIG must report (pr1378), else None."""
+    return RELAY_CONFIG_PINNED_BY_MECHANISM.get(mechanism or "", {}).get("t_switch_ms")
 # Relay flags the contract requires (W4 adds them); their absence is an error
 # unless --allow-missing-relay-flags, and a --final run never allows it.
 RELAY_REQUIRED_NEW = ("--congestion-controller", "--udp-gso")
@@ -414,11 +422,13 @@ def _relay_config_field(rec: dict, field: str):
     return value
 
 
-def check_relay_config(rec: dict | None, cc: str, allow_missing: bool, native_fixed: bool = False) -> str | None:
+def check_relay_config(rec: dict | None, cc: str, allow_missing: bool, native_fixed: bool = False,
+                       t_switch_ms: int | None = None) -> str | None:
     """Error text unless the relay's own RELAY_CONFIG confirms the requested
     congestion controller, UDP GSO off, and the native-fix flags matching the arm:
     `forward_promotion_trigger` and `native_status_before_subscribe` both true for
-    the fixed native arm (`native_fixed`), both false otherwise. Smoke tests may run
+    the fixed native arm (`native_fixed`), both false otherwise; and, when
+    `t_switch_ms` is given (pr1378, P8), the pinned T_switch. Smoke tests may run
     a relay without the record or a field; a value that disagrees is never accepted,
     and the fixed arm always needs both fields."""
     if rec is None:
@@ -446,6 +456,13 @@ def check_relay_config(rec: dict | None, cc: str, allow_missing: bool, native_fi
             return f"relay RELAY_CONFIG has no {field} field ({arm} requires {native_fixed})"
         if value is not native_fixed:
             return f"relay reports {field}={value!r}, {arm} requires {native_fixed}"
+    if t_switch_ms is not None:
+        value = _relay_config_field(rec, "t_switch_ms")
+        if value is None:
+            if not allow_missing:
+                return f"relay RELAY_CONFIG has no t_switch_ms field (the runner pinned --t-switch-ms {t_switch_ms})"
+        elif value != t_switch_ms:
+            return f"relay reports t_switch_ms={value!r}, the runner pinned {t_switch_ms}"
     return None
 
 
@@ -1042,7 +1059,8 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         # The relay's own view of its configuration (RELAY_CONFIG, W4) is the
         # record of what actually ran; kept in run_meta as `relay_config`.
         relay_config = wait_record(out / "relay-events.jsonl", "RELAY_CONFIG", 5.0, procs["relay"], "relay")
-        err = check_relay_config(relay_config, args.cc, args.allow_missing_relay_flags, native_fixed)
+        err = check_relay_config(relay_config, args.cc, args.allow_missing_relay_flags, native_fixed,
+                                 t_switch_ms=expected_t_switch_ms(args.mechanism))
         if err:
             raise SystemExit(err)
 
