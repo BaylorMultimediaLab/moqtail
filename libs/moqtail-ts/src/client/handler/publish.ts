@@ -67,6 +67,7 @@ function registerPublishReceiver(client: Client, msg: Publish, stream: RequestSt
     pseudoRequestId: localPseudoRequestId,
     fullTrackName: msg.fullTrackName,
     streamsAccepted: 0n,
+    streamsEnded: 0n,
     expectedStreams: undefined,
     largestLocation: undefined,
     controller: streamController,

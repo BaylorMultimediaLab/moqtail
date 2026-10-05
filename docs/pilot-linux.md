@@ -992,6 +992,91 @@ not, the relay's catch-up delivery gets pacing and the pr1378 time-shifted
 cells are re-run. Either way the 11d numbers for the other five cells
 stand.
 
+### 11f. After the rebuild: the preflight (2026-10-04)
+
+Everything measured so far was made before the audit of 2026-10-04
+(`docs/audit-2026-10-04.md`) and the rebuild that followed it
+(`docs/rebuild-2026-10-04.md`). None of it is reused. The rebuilt stack
+is checked first by a preflight: short runs whose validator asserts the
+apparatus invariants (segmentation batches off at the relay and at the
+queue, the tc tree as specified, the relay running the congestion
+controller and flags the run says, every switch ending in exactly one
+record, keyframe landings, no landing behind the playhead, delivery at
+the link rate after every capacity step). A run that breaks one is
+invalid and says which. No grid batch starts until a full preflight round
+passes.
+
+The arms and their branches:
+
+| arm                 | branch          | runner flags                                          |
+| ------------------- | --------------- | ----------------------------------------------------- |
+| native (as shipped) | `switch/native` | `--mechanism native`                                  |
+| native (fixed)      | `switch/native` | `--mechanism native --mechanism-mode forward-trigger` |
+| PR #1378            | `switch/pr1378` | `--mechanism pr1378 --mechanism-mode next-group`      |
+
+The controller is `min` (the runner's default), the relay runs CUBIC
+with UDP segmentation off, and the runner builds the relay, publisher
+and client library on every run, so a branch change cannot leave a stale
+binary.
+
+```sh
+# 1. clean state (as in 11a)
+pkill -f run_experiment.py; pkill -f target/release/relay; pkill -f target/release/publisher; pkill -f firefox; pkill -f vite
+sudo ip netns del moqc 2>/dev/null; sudo ip link del veth-moqh 2>/dev/null; true
+cd ~/Documents/Baylor\ Research/moqtail
+mv results results-prerebuild-$(date +%Y%m%d) 2>/dev/null; mkdir -p results logs
+git fetch origin
+export ENC=data/encoded/tears_of_steel_240s_1080p
+git checkout harness && git reset --hard origin/harness
+python3 scripts/check_cache.py "$ENC" | tail -1          # must say OK
+
+# 2. the preflight: every arm x client type x profile, repetition-major (each
+#    repetition runs every condition once, so slow drift cannot line up with an arm)
+preflight() {  # $1 = number of repetitions (default 3)
+  local reps=${1:-3}
+  git fetch -q origin
+  for rep in $(seq 0 $((reps - 1))); do
+    for arm in native native-ft pr1378; do
+      case $arm in
+        native)    branch=switch/native; mech="--mechanism native" ;;
+        native-ft) branch=switch/native; mech="--mechanism native --mechanism-mode forward-trigger" ;;
+        pr1378)    branch=switch/pr1378; mech="--mechanism pr1378 --mechanism-mode next-group" ;;
+      esac
+      git checkout -q $branch && git reset -q --hard origin/$branch
+      for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+        for prof in unshaped:60 preflight_step:90; do
+          sudo -v
+          python3 experiments/run_experiment.py $mech $client \
+              --profile experiments/profiles/${prof%%:*}.json --duration ${prof##*:} \
+              --net netns --encoded-dir "$ENC" --repeat-index $rep --preflight --final
+        done
+      done
+    done
+  done
+}
+preflight 3        # 36 runs, about 80 minutes
+
+# 3. one line per run: PASS, or the checks that failed
+python3 - <<'PY'
+import json, pathlib
+for v in sorted(pathlib.Path("results").glob("*/validation.json")):
+    d = json.loads(v.read_text())
+    print(("PASS " if d.get("passed") else "FAIL ") + v.parent.name, "" if d.get("passed") else d.get("failed"))
+PY
+
+# 4. pack and send (and, if any run failed, its relay log too)
+bash experiments/pack_results.sh results preflight.tar.gz
+tar czf preflight-relay-logs.tar.gz results/*/relay.log
+```
+
+What I check in the bundle, beyond PASS/FAIL: CONN_STATS (loss, cwnd,
+smoothed RTT, pacer rate, datagrams per send) on the stepped profile, and
+whether delivery after the restore to 6 Mbps reaches the link rate on
+every arm (`pf-delivery-rate`: in fresh-grid-v2, 14 of 30 runs stayed at
+the low step's rate). If every run passes, the grid follows with the
+same loop shape (`step_down_up`, 200 s, 5 repetitions); if not, the
+failing checks say which layer to fix before anything else runs.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
