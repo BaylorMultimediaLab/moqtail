@@ -28,10 +28,18 @@ import { Parameter } from '../parameter'
  *
  * ```text
  * SWITCH_TRANSITION {
- *   Switching Group ID (i),   // G_switch — first group on the new track
- *   Live Edge Group ID (i)    // target's live edge when PUBLISH was opened
+ *   Switching Group ID (i),     // G_switch — first group on the new track
+ *   Live Edge Group ID (i),     // target's live edge when PUBLISH was opened
+ *   [Below-Seam Streams (i)]    // project-local, optional
  * }
  * ```
+ *
+ * The third field is a project-local extension (deliberate deviation, audit R6
+ * D2): the number of data streams the relay opened on the replaced subscription
+ * for Groups below G_switch, finished ones included. The subscriber knows the
+ * replaced subscription has delivered everything below the seam once that many
+ * of its streams below G_switch have ended. The PR's two-field payload still
+ * decodes, with `belowSeamStreams` undefined.
  *
  * Everything in `[switchingGroupId, liveEdgeGroupId)` arrives on the catch-up
  * FETCH_HEADER stream; everything from the live edge onward arrives on the
@@ -39,7 +47,7 @@ import { Parameter } from '../parameter'
  * to discard buffered old-track content at or above the seam.
  *
  * Wire-wise this is an odd-typed (`0x73`) bytes-valued parameter whose value is
- * the two varints back to back. On a *failure* PUBLISH (Forward State 0,
+ * the varints back to back. On a *failure* PUBLISH (Forward State 0,
  * immediately followed by PUBLISH_DONE) the relay still carries this parameter
  * to mark the PUBLISH as switch-related, with `{0, 0}` as placeholder values —
  * key off the PUBLISH_DONE status code, not these values, in that case.
@@ -52,12 +60,18 @@ export class SwitchTransition implements Parameter {
     public readonly switchingGroupId: bigint,
     /** The target Track's live edge group_id at the moment the PUBLISH opened. */
     public readonly liveEdgeGroupId: bigint,
+    /**
+     * Project-local: data streams the relay opened on the replaced subscription for
+     * Groups below G_switch (finished ones included). Undefined when not carried.
+     */
+    public readonly belowSeamStreams?: bigint,
   ) {}
 
   toKeyValuePair(): KeyValuePair {
     const payload = new ByteBuffer()
     payload.putVI(this.switchingGroupId)
     payload.putVI(this.liveEdgeGroupId)
+    if (this.belowSeamStreams !== undefined) payload.putVI(this.belowSeamStreams)
     return KeyValuePair.tryNewBytes(SwitchTransition.TYPE, payload.toUint8Array())
   }
 
@@ -70,12 +84,19 @@ export class SwitchTransition implements Parameter {
     }
   }
 
-  /** Decode the two-varint payload of a SWITCH_TRANSITION value. Throws on malformed input. */
+  /**
+   * Decode a SWITCH_TRANSITION value: two varints, optionally a third (the
+   * below-seam stream count). Throws on malformed input, including bytes after the
+   * third varint.
+   */
   static fromBytes(value: Uint8Array): SwitchTransition {
     const buf = new FrozenByteBuffer(value)
     const switchingGroupId = buf.getVI()
     const liveEdgeGroupId = buf.getVI()
-    return new SwitchTransition(switchingGroupId, liveEdgeGroupId)
+    if (buf.remaining === 0) return new SwitchTransition(switchingGroupId, liveEdgeGroupId)
+    const belowSeamStreams = buf.getVI()
+    if (buf.remaining !== 0) throw new Error('SWITCH_TRANSITION: trailing bytes after the below-seam stream count')
+    return new SwitchTransition(switchingGroupId, liveEdgeGroupId, belowSeamStreams)
   }
 }
 
@@ -101,6 +122,18 @@ if (import.meta.vitest) {
     test('fromKeyValuePair returns undefined for wrong type', () => {
       const pair = KeyValuePair.tryNewVarInt(MessageParameterType.NewGroupRequest, 1n)
       expect(SwitchTransition.fromKeyValuePair(pair)).toBeUndefined()
+    })
+    test('the project-local below-seam stream count roundtrips; the two-field form still decodes (R6 D2)', () => {
+      const st = new SwitchTransition(42n, 100n, 3n)
+      expect(SwitchTransition.fromKeyValuePair(st.toKeyValuePair())).toEqual(st)
+      const zero = new SwitchTransition(5n, 6n, 0n)
+      expect(SwitchTransition.fromKeyValuePair(zero.toKeyValuePair())?.belowSeamStreams).toBe(0n)
+      const old = SwitchTransition.fromKeyValuePair(new SwitchTransition(42n, 100n).toKeyValuePair())
+      expect(old?.switchingGroupId).toBe(42n)
+      expect(old?.belowSeamStreams).toBeUndefined()
+      const four = new ByteBuffer()
+      for (const v of [1n, 2n, 3n, 4n]) four.putVI(v)
+      expect(() => SwitchTransition.fromBytes(four.toUint8Array())).toThrow()
     })
     test('large group ids roundtrip', () => {
       const st = new SwitchTransition(1_000_000n, 2n ** 30n)

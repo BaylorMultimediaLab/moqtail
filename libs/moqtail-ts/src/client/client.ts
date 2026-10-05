@@ -52,6 +52,7 @@ import {
   FetchObject,
   FullTrackName,
   MoqtObject,
+  ObjectForwardingPreference,
   SubgroupHeader,
   SubgroupHeaderType,
   SubgroupObject,
@@ -1283,7 +1284,11 @@ export class MOQtailClient {
           await this.#resetRequestStream(requestId, StreamResetCode.Cancelled)
           subscription.unsubscribe()
         }
-      } else if (this.subscriptionAliasMap.has(requestId)) {
+      } else if (
+        this.subscriptionAliasMap.has(requestId) ||
+        this.pushedRequestStreams.has(requestId) ||
+        this.pushedReceivers.has(requestId)
+      ) {
         // PUBLISH-originated subscription (unsolicited peer publish, or the
         // post-switch subscription of SWITCH PR #1378). It was never registered in
         // `requests` — the relay pushed it via PUBLISH — but the relay tracks
@@ -1291,7 +1296,9 @@ export class MOQtailClient {
         // that id tears it down relay-side. Locally, close the pushed stream
         // and drop the routing entries (including the pseudo-id ones the
         // PUBLISH handler registered).
-        const trackAlias = this.subscriptionAliasMap.get(requestId)!
+        // The alias route may already be released (finishReceiver), while the
+        // request stream is still to be reset.
+        const trackAlias = this.subscriptionAliasMap.get(requestId)
         // Draft-18 §3.3.2: a pushed PUBLISH is cancelled by resetting the request
         // stream it arrived on; the relay reads CANCELLED off that reset and tears
         // the subscription down under this PUBLISH's request id.
@@ -1304,7 +1311,9 @@ export class MOQtailClient {
         // The receiver registered for this PUBLISH (pushedReceivers is keyed by its
         // request id); the alias route is released only if this receiver still owns
         // it (M16: the same track's alias may already belong to a newer receiver).
-        const receiver = this.pushedReceivers.get(requestId) ?? this.subscriptions.get(trackAlias)
+        const receiver =
+          this.pushedReceivers.get(requestId) ??
+          (trackAlias !== undefined ? this.subscriptions.get(trackAlias) : undefined)
         try {
           receiver?.controller?.close()
         } catch {
@@ -2742,18 +2751,71 @@ export class MOQtailClient {
         )?.value
         if (catchupRoute) {
           const { receiver: catchupReceiver, name: catchupName } = catchupRoute
+          // R6 D2: the catch-up is one of the receiver's routed streams. It is
+          // registered as open, so it holds the receiver's completion, can be
+          // stopped (stopDataStreams / finishReceiver) and has its end reported
+          // (streamType 'fetch'): the player waits for it before it releases a
+          // replaced subscription whose own catch-up still carries groups below
+          // the next seam.
+          let end: DataStreamEnd = 'reset'
+          let stoppedHere = false
+          let objectsDelivered = 0
+          let firstGroup: bigint | undefined
+          let lastSubgroupId: bigint | undefined
+          let openStreams = this.#openDataStreams.get(catchupReceiver)
+          if (!openStreams) {
+            openStreams = new Set()
+            this.#openDataStreams.set(catchupReceiver, openStreams)
+          }
+          const openEntry = {
+            groupId: 0n,
+            stop: async () => {
+              stoppedHere = true
+              await recvStream.stopSending(StreamResetCode.Cancelled)
+            },
+          }
+          openStreams.add(openEntry)
           try {
             while (true) {
               const { done, value: nextObject } = await reader.read()
-              if (done) break
+              if (done) {
+                end = stoppedHere ? 'stopped' : 'fin'
+                break
+              }
               if (nextObject instanceof FetchObject) {
-                catchupReceiver.controller?.enqueue(MoqtObject.fromFetchObject(nextObject, catchupName))
+                const moqtObject = MoqtObject.fromFetchObject(nextObject, catchupName)
+                catchupReceiver.controller?.enqueue(moqtObject)
+                objectsDelivered++
+                firstGroup ??= moqtObject.location.group
+                lastSubgroupId = moqtObject.subgroupId ?? lastSubgroupId
                 continue
               }
               throw new ProtocolViolationError('MOQtailClient', 'Received subgroup object after fetch header')
             }
+          } catch (error) {
+            if (stoppedHere) end = 'stopped'
+            throw error
           } finally {
             reader.releaseLock()
+            openStreams.delete(openEntry)
+            if (openStreams.size === 0 && this.#openDataStreams.get(catchupReceiver) === openStreams) {
+              this.#openDataStreams.delete(catchupReceiver)
+            }
+            try {
+              this.onDataStreamEnded?.({
+                requestId: this.#receiverRequestId(catchupReceiver),
+                streamType: 'fetch',
+                trackAlias: this.subscriptionAliasMap.get(header.requestId) ?? 0n,
+                groupId: firstGroup ?? 0n,
+                subgroupId: lastSubgroupId,
+                end,
+                objects: objectsDelivered,
+                bytes: recvStream.bytesReceived,
+              })
+            } catch (callbackError) {
+              logger.error('MOQtailClient', 'onDataStreamEnded callback failed', callbackError)
+            }
+            this.completeIfDone(catchupReceiver)
           }
           return
         }
@@ -3628,6 +3690,41 @@ if (import.meta.vitest) {
       await vi.waitFor(() => expect(transport.uniCancelReasons).toHaveLength(1))
       expect(streamResetCodeOf(transport.uniCancelReasons[0])).toBe(StreamResetCode.Cancelled)
 
+      await client.disconnect()
+    })
+
+    // R6 D2 (pr1378): the catch-up FETCH_HEADER stream routed to a PUBLISH receiver
+    // is one of its routed streams: it holds the receiver's completion while it
+    // delivers, and its end is reported (streamType 'fetch').
+    it('holds a receiver open while its catch-up delivers and reports the catch-up end (R6 D2)', async () => {
+      const { client, transport } = await connected()
+      const ends: DataStreamEndInfo[] = []
+      client.onDataStreamEnded = (info) => ends.push(info)
+      const pushed: ReadableStream<MoqtObject>[] = []
+      client.onPeerPublish = (_msg, stream) => pushed.push(stream)
+      const incoming = transport.openIncomingBiStream()
+      incoming.respond(new Publish(1n, ftn, 9n, [], []))
+      await vi.waitFor(() => expect(incoming.messages).toHaveLength(1))
+      const reader = pushed[0]!.getReader()
+
+      const header = new FetchHeader(FetchHeaderType.Type0x05, 1n).serialize().toUint8Array()
+      const catchUp = transport.openIncomingUniStream(header)
+      const first = FetchObject.newObject(4, 0, 0, 128, ObjectForwardingPreference.Subgroup, null, new Uint8Array(8))
+      catchUp.enqueue(first.serialize().toUint8Array())
+      expect((await reader.read()).value?.location.group).toBe(4n)
+
+      incoming.respond(new PublishDone(PublishDoneStatusCode.SubscriptionEnded, 0n, new ReasonPhrase('switched')))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(client.subscriptions.has(9n)).toBe(true)
+
+      const second = FetchObject.newObject(5, 0, 0, 128, ObjectForwardingPreference.Subgroup, null, new Uint8Array(8))
+      catchUp.enqueue(second.serialize(first.toContext()!).toUint8Array())
+      catchUp.close()
+      expect((await reader.read()).value?.location.group).toBe(5n)
+      expect((await reader.read()).done).toBe(true)
+      expect(ends).toHaveLength(1)
+      expect(ends[0]).toMatchObject({ requestId: 1n, streamType: 'fetch', groupId: 4n, end: 'fin', objects: 2 })
+      expect(client.subscriptions.has(9n)).toBe(false)
       await client.disconnect()
     })
 

@@ -379,6 +379,11 @@ pub struct Subscription {
   /// Monotonic count of data streams opened for this subscription, including
   /// empty subgroups. Reported as PUBLISH_DONE Stream Count.
   opened_stream_count: Arc<AtomicU64>,
+  /// SUBGROUP data streams opened for this subscription, per Group, kept for the
+  /// subscription's lifetime (finished and reset streams included;
+  /// `send_stream_last_object_ids` forgets a stream once it ends). Read at a
+  /// SWITCH hand-over for the below-seam stream count (pr1378, R6 D2).
+  opened_streams_by_group: Arc<std::sync::Mutex<std::collections::BTreeMap<u64, u64>>>,
   finished: Arc<AtomicBool>,
   #[allow(dead_code)]
   cache: TrackCache,
@@ -426,6 +431,7 @@ impl Subscription {
       send_stream_last_object_ids: Arc::new(RwLock::new(HashMap::new())),
       stopped_streams: Arc::new(RwLock::new(std::collections::HashSet::new())),
       opened_stream_count: Arc::new(AtomicU64::new(0)),
+      opened_streams_by_group: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
       finished: Arc::new(AtomicBool::new(false)),
       cache,
       client_connection_id,
@@ -689,6 +695,18 @@ impl Subscription {
   /// Count), including subgroups that carried no objects.
   pub fn opened_stream_count(&self) -> u64 {
     self.opened_stream_count.load(Ordering::Relaxed)
+  }
+
+  /// SUBGROUP data streams opened for this subscription for Groups below `group`,
+  /// however they ended (finished, reset or still open). At a SWITCH hand-over,
+  /// with `group` = G_switch, this is the count the target PUBLISH's
+  /// SWITCH_TRANSITION carries (project-local third field, R6 D2).
+  pub fn opened_streams_below(&self, group: u64) -> u64 {
+    let by_group = self
+      .opened_streams_by_group
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    by_group.range(..group).map(|(_, n)| *n).sum()
   }
 
   pub fn subscriber(&self) -> Arc<MOQTClient> {
@@ -1433,6 +1451,14 @@ impl Subscription {
       // Count every data stream opened for this subscription (PUBLISH_DONE
       // Stream Count), including subgroups that end up carrying no objects.
       self.opened_stream_count.fetch_add(1, Ordering::Relaxed);
+      if let HeaderInfo::Subgroup { header } = &header_info {
+        *self
+          .opened_streams_by_group
+          .lock()
+          .unwrap_or_else(|poisoned| poisoned.into_inner())
+          .entry(header.group_id)
+          .or_insert(0) += 1;
+      }
 
       Ok((stream_id, send_stream.clone()))
     } else {

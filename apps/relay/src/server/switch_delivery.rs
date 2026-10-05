@@ -171,6 +171,7 @@ pub(crate) fn switch_promoted_record(
     "request_id": publish_request_id,
     "start_group": switch_transition.switching_group_id,
     "live_edge_group": switch_transition.live_edge_group_id,
+    "below_seam_streams": switch_transition.below_seam_streams,
     "live_edge_object": live_edge.object,
     "promoted_ts": promoted_ts,
   })
@@ -637,6 +638,12 @@ pub(crate) async fn apply_seam_bound(
 /// subscription's request stream. State goes first because the subscriber may
 /// react to the PUBLISH_DONE at once (e.g. another SWITCH naming this Request
 /// ID), and a stale entry would let that pass the Established gate.
+///
+/// Returns the number of SUBGROUP data streams the replaced subscription opened
+/// for Groups below `g_switch` (finished, reset and open ones), read once the
+/// subscription is ended so no further stream can be opened; `None` when the
+/// source subscription was already gone. The target PUBLISH carries it in
+/// SWITCH_TRANSITION (project-local third field, R6 D2).
 pub(crate) async fn terminate_source(
   subscriber: &Arc<MOQTClient>,
   current_track: &Arc<RwLock<Track>>,
@@ -644,7 +651,7 @@ pub(crate) async fn terminate_source(
   connection_id: usize,
   current_sub_req_id: u64,
   g_switch: u64,
-) {
+) -> Option<u64> {
   let sub_arc = current_track
     .read()
     .await
@@ -703,7 +710,9 @@ pub(crate) async fn terminate_source(
     );
     // Streams at/above the seam are reset; streams below it finish and deliver.
     sub.cancel_from_group(g_switch).await;
+    return Some(sub.opened_streams_below(g_switch));
   }
+  None
 }
 
 /// Attaches the target subscription for `live_sub` to `target_track`. `None`
@@ -735,7 +744,9 @@ pub(crate) async fn attach_switch_target(
 /// attach first (audit M6): the target subscription is attached, then the source
 /// is bounded at the seam and ended (Close-After-Switch). `None` = the target
 /// could not be attached; nothing has touched the source then, so the
-/// PublishBuildFailed answer's "current subscription untouched" holds.
+/// PublishBuildFailed answer's "current subscription untouched" holds. Otherwise
+/// the attached target and the source's below-seam stream count
+/// ([`terminate_source`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn hand_over_to_target(
   subscriber: &Arc<MOQTClient>,
@@ -745,13 +756,13 @@ pub(crate) async fn hand_over_to_target(
   current_full_track_name: &FullTrackName,
   current_sub_req_id: u64,
   g_switch: u64,
-) -> Option<Arc<RwLock<Subscription>>> {
+) -> Option<(Arc<RwLock<Subscription>>, Option<u64>)> {
   let connection_id = subscriber.connection_id;
   let subscription = attach_switch_target(subscriber, target_track, live_sub).await?;
   // Bound the source at the seam so it forwards no Group >= G_switch while it
   // is being ended, then end it.
   apply_seam_bound(current_track, connection_id, g_switch).await;
-  terminate_source(
+  let below_seam_streams = terminate_source(
     subscriber,
     current_track,
     current_full_track_name,
@@ -760,7 +771,7 @@ pub(crate) async fn hand_over_to_target(
     g_switch,
   )
   .await;
-  Some(subscription)
+  Some((subscription, below_seam_streams))
 }
 
 #[cfg(test)]
@@ -988,9 +999,12 @@ mod tests_switch_seam_helpers {
 #[cfg(test)]
 mod tests_switch_hand_over {
   use super::*;
+  use crate::server::stream_id::StreamId;
   use crate::server::test_support::{
-    TEST_NAMESPACE, quic_pair, relay_client, subscribe, test_track,
+    TEST_NAMESPACE, collect_streams, publish, quic_pair, relay_client, subscribe, test_track,
+    wait_until,
   };
+  use std::time::Duration;
 
   fn latest(request_id: u64, track: &str) -> Subscribe {
     Subscribe::new_latest_object(
@@ -1071,11 +1085,79 @@ mod tests_switch_hand_over {
 
     let out = hand_over_to_target(&client, &target, live_sub(5), &current, &name, 1, 4).await;
 
-    let attached = out.expect("the target must be attached");
+    let (attached, below_seam_streams) = out.expect("the target must be attached");
+    assert_eq!(below_seam_streams, Some(0), "the source opened no stream");
     assert_eq!(attached.read().await.request_id, 5);
     assert!(target.read().await.get_subscription(62).await.is_some());
     assert!(current.read().await.get_subscription(62).await.is_none());
     assert!(source.read().await.is_finished().await);
+  }
+
+  /// R6 D2: the hand-over reports how many data streams the source opened for
+  /// Groups below G_switch, the finished ones included (the relay forgets a
+  /// stream's send state once it ends) and none at or above the seam.
+  #[tokio::test]
+  async fn the_hand_over_counts_the_source_streams_below_the_seam_including_finished_ones() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(63, server);
+    let received = collect_streams(peer);
+    let current = Arc::new(RwLock::new(test_track(1, "video-360p")));
+    let target = Arc::new(RwLock::new(test_track(2, "video-720p")));
+    let source = subscribe(
+      &*current.read().await,
+      &client,
+      latest(1, "video-360p"),
+      false,
+    )
+    .await;
+    source.read().await.mark_alias_announced();
+    // Groups 1..=5 on one stream each; 1..=3 finished by the publisher, 4 and 5
+    // still open when the switch hands over at G_switch = 5.
+    for g in 1..=5 {
+      publish(&*current.read().await, g, 0).await;
+      publish(&*current.read().await, g, 1).await;
+    }
+    assert!(
+      wait_until(Duration::from_secs(5), || {
+        let r = received.clone();
+        async move { r.objects(1).len() >= 10 }
+      })
+      .await,
+      "delivered {:?}",
+      received.objects(1)
+    );
+    for g in 1..=3 {
+      current
+        .read()
+        .await
+        .stream_closed(&StreamId::new_subgroup(1, g, Some(0)))
+        .await
+        .unwrap();
+    }
+    assert!(
+      wait_until(Duration::from_secs(2), || {
+        let client = client.clone();
+        async move {
+          client
+            .get_stream(&StreamId::new_subgroup(1, 3, Some(0)))
+            .await
+            .is_none()
+        }
+      })
+      .await,
+      "the finished streams must be gone from the send state"
+    );
+    let name = current.read().await.full_track_name.clone();
+    assert_eq!(source.read().await.opened_stream_count(), 5);
+
+    let out = hand_over_to_target(&client, &target, live_sub(7), &current, &name, 1, 5).await;
+
+    let (_attached, below_seam_streams) = out.expect("the target must be attached");
+    assert_eq!(
+      below_seam_streams,
+      Some(4),
+      "groups 1, 2, 3 (finished) and 4 (open)"
+    );
   }
 }
 

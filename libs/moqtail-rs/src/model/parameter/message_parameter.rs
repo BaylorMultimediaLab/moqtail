@@ -73,10 +73,13 @@ pub enum MessageParameter {
   },
   /// Project-local extension (moq-transport PR #1378 SWITCH_TRANSITION, odd type
   /// 0x73, bytes-valued): carried on the PUBLISH a relay opens in answer to a
-  /// SWITCH. Payload is two varints: G_switch, then the target's live edge.
+  /// SWITCH. Payload: G_switch, then the target's live edge, then (project-local,
+  /// optional) the number of data streams the relay opened on the replaced
+  /// subscription for Groups below G_switch (see `SwitchTransition`).
   SwitchTransition {
     switching_group_id: u64,
     live_edge_group_id: u64,
+    below_seam_streams: Option<u64>,
   },
 }
 
@@ -149,6 +152,7 @@ impl MessageParameter {
     Self::SwitchTransition {
       switching_group_id,
       live_edge_group_id,
+      below_seam_streams: None,
     }
   }
   /// Returns the raw wire type value for this parameter.
@@ -376,6 +380,7 @@ impl MessageParameter {
             Ok(Self::SwitchTransition {
               switching_group_id: st.switching_group_id,
               live_edge_group_id: st.live_edge_group_id,
+              below_seam_streams: st.below_seam_streams,
             })
           }
           MessageParameterType::SubscriptionFilter => {
@@ -534,11 +539,13 @@ impl TryInto<KeyValuePair> for MessageParameter {
       Self::SwitchTransition {
         switching_group_id,
         live_edge_group_id,
+        below_seam_streams,
       } => {
-        let value = crate::model::parameter::switch_transition::SwitchTransition::new(
+        let value = crate::model::parameter::switch_transition::SwitchTransition {
           switching_group_id,
           live_edge_group_id,
-        )
+          below_seam_streams,
+        }
         .to_bytes()?;
         KeyValuePair::try_new_bytes(MessageParameterType::SwitchTransition as u64, value)
       }

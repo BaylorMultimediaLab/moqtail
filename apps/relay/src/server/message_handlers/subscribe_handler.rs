@@ -1913,7 +1913,7 @@ async fn handle_switch_message(
     // with PUBLISH_DONE(SUBSCRIPTION_ENDED) on its request stream and dropped. A
     // target that cannot be attached is answered PublishBuildFailed with the
     // source untouched.
-    let Some(subscription) = hand_over_to_target(
+    let Some((subscription, below_seam_streams)) = hand_over_to_target(
       &client,
       &target_track_arc,
       live_sub.clone(),
@@ -1972,7 +1972,7 @@ async fn handle_switch_message(
       &target_full_track_name,
       Location::new(live_edge, 0),
       &target_parameters,
-      SwitchTransition::new(g_switch, live_edge),
+      SwitchTransition::new(g_switch, live_edge).with_below_seam_streams(below_seam_streams),
     )
     .await;
 

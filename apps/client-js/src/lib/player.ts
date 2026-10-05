@@ -518,6 +518,13 @@ export class Player {
     // PUBLISH_DONE on a subscription (P5).
     this.client.onPeerPublishDone = (msg, requestId) => this.handlePublishDone(msg, requestId);
 
+    // The end of each data stream of a route (R6 D2): a replaced subscription is
+    // released once every one of its streams below the seam has ended.
+    this.client.onDataStreamEnded = info => {
+      const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+      vs?.pump?.streamEnded(info);
+    };
+
     // Debug-only escape hatch: lets the network test harness force a SWITCH
     // without going through the AbrController. Used by Slice C/Phase B E2Es
     // (see tests/network/scenarios/test_naive_switch_discontinuity.py). Not
@@ -2252,18 +2259,32 @@ export class Player {
         request_id: result.requestId,
         switching_group: Number(result.switchTransition.switchingGroupId),
         live_edge_group: Number(result.switchTransition.liveEdgeGroupId),
+        // R6 D2: project-local SWITCH_TRANSITION field; null from a relay without it.
+        below_seam_streams:
+          result.switchTransition.belowSeamStreams !== undefined
+            ? Number(result.switchTransition.belowSeamStreams)
+            : null,
         rtt_ms: performance.now() - switchSentAt,
       });
 
       // Queue the relay's new data route (`stream`: the catch-up range and the
       // post-switch live objects) behind the subscription it replaces, which
       // keeps being read until it is done (audit M5).
-      videoStruct.pump?.replace(subscriptionRequestId, result.switchTransition.switchingGroupId, {
-        stream: result.stream,
-        requestId: result.requestId,
-        trackName,
-        switchSeq: record.seq,
-      });
+      videoStruct.pump?.replace(
+        subscriptionRequestId,
+        result.switchTransition.switchingGroupId,
+        {
+          stream: result.stream,
+          requestId: result.requestId,
+          trackName,
+          switchSeq: record.seq,
+          // The relay opens a catch-up stream for [G_switch, live edge) when that
+          // range is not empty; a later switch away from this route waits for it.
+          expectsCatchUp:
+            result.switchTransition.switchingGroupId < result.switchTransition.liveEdgeGroupId,
+        },
+        result.switchTransition.belowSeamStreams,
+      );
       logger.info(
         'media',
         `switchTrack: seam at group ${result.switchTransition.switchingGroupId}, ` +
@@ -2307,6 +2328,11 @@ export class Player {
       {
         onRelease: (source, reason) => this.#onSourceReleased(source, reason),
         onError: (_source, error) => logger.error('media', 'Stream pipe error:', error),
+        // A replaced route that is done (or whose fallback fired) is ended in the
+        // library: its streams still open (at or above the seam) are stopped and
+        // its object stream closes after the objects already queued (R6 D2).
+        onFinish: source =>
+          this.client ? this.client.finishReceiver(source.requestId) : Promise.resolve(false),
       },
     );
   }
@@ -2327,6 +2353,14 @@ export class Player {
       seam_group: source.seamGroup !== undefined ? Number(source.seamGroup) : null,
       held_ms: performance.now() - source.replacedAt,
       publish_done: source.publishDoneAt !== undefined,
+      // R6 D2: the done condition's inputs at release.
+      below_seam_streams:
+        source.belowSeamStreams !== undefined ? Number(source.belowSeamStreams) : null,
+      below_seam_streams_ended:
+        source.seamGroup !== undefined
+          ? source.endedStreamGroups.filter(g => g < source.seamGroup!).length
+          : null,
+      catch_up_pending: source.catchUpPending,
       objects_after_switch_ok: source.objectsAfterReplace,
       post_seam_dropped: source.postSeamDropped,
     });
