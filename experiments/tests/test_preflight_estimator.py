@@ -133,3 +133,61 @@ class EstimatorFidelity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _tree(*levels):
+    return [{"kind": k, "handle": h, "parent": p} for k, h, p in levels]
+
+
+SHAPED_TREE = _tree(("netem", "1:", "root"), ("htb", "2:", "1:1"), ("bfifo", "20:", "2:10"))
+
+
+class QdiscTree(unittest.TestCase):
+    """pf-qdisc reads the kernel tree recorded after each step. Preflight 2026-10-05:
+    the old check read the step's tc commands, and a capacity step (`tc class change`)
+    names only htb, so every shaped run failed although the tree was right."""
+
+    def step(self, rate, tree=SHAPED_TREE, cmds=("tc class change dev veth-moqh parent 2: classid 2:10 htb rate 1500kbit",),
+             htb_rate=None):
+        qs = {"tree": tree}
+        if htb_rate is not None:
+            qs["htb_class"] = {"classid": "2:10", "rate_bps": htb_rate}
+        return {"at_s": 30, "rate_mbps": rate, "queue": "tail-drop", "applied": True, "tc": list(cmds), "qdisc_stats": qs}
+
+    def test_a_class_change_step_with_the_full_tree_passes(self):
+        self.assertEqual(validate.qdisc_tree_errors([self.step(1.5)]), [])
+
+    def test_the_class_rate_must_be_the_steps(self):
+        self.assertEqual(validate.qdisc_tree_errors([self.step(1.5, htb_rate=1_500_000)]), [])
+        bad = validate.qdisc_tree_errors([self.step(1.5, htb_rate=6_000_000)])
+        self.assertEqual(len(bad), 1)
+        self.assertIn("htb class rate 6000000", bad[0])
+
+    def test_a_missing_or_misplaced_level_fails(self):
+        no_leaf = _tree(("netem", "1:", "root"), ("htb", "2:", "1:1"))
+        self.assertIn("want bfifo 20: under 2:10, found none", validate.qdisc_tree_errors([self.step(1.5, no_leaf)])[0])
+        wrong_leaf = _tree(("netem", "1:", "root"), ("htb", "2:", "1:1"), ("fq_codel", "20:", "2:10"))
+        self.assertIn("found fq_codel", validate.qdisc_tree_errors([self.step(1.5, wrong_leaf)])[0])
+
+    def test_unshaped_is_netem_alone(self):
+        self.assertEqual(validate.qdisc_tree_errors([self.step(None, _tree(("netem", "1:", "root")))]), [])
+        self.assertIn("unexpected htb", validate.qdisc_tree_errors([self.step(None)])[0])
+
+    def test_bundles_without_a_recorded_tree_fall_back_to_the_commands(self):
+        old = {"at_s": 0, "rate_mbps": 6, "applied": True, "qdisc_stats": {"leaf": {}},
+               "tc": ["tc qdisc add dev h root handle 1: netem", "tc qdisc add dev h parent 1:1 handle 2: htb",
+                      "tc qdisc add dev h parent 2:10 handle 20: bfifo limit 150000"]}
+        self.assertEqual(validate.qdisc_tree_errors([old]), [])
+
+
+class LandingBelowStart(unittest.TestCase):
+    """pf-landing. Preflight 2026-10-05 pr1378 live-edge r2: switch 8 asked for group 61
+    and the relay started there, but the first object was G60 of an earlier subscription
+    to the same track; landing on it ended in MEDIA_ERR_DECODE."""
+
+    def test_a_first_object_below_the_relay_start_is_reported(self):
+        sws = [{"switch_seq": 7, "t4_group": 58, "relay_start_group": 58},
+               {"switch_seq": 8, "t4_group": 60, "relay_start_group": 61},
+               {"switch_seq": 9, "t4_group": None, "relay_start_group": 62},
+               {"switch_seq": 10, "t4_group": 70, "relay_start_group": None}]
+        self.assertEqual(validate.landing_below_start(sws), ["switch 8 landed on G60, relay start G61"])

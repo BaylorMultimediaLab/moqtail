@@ -70,6 +70,16 @@ interface PendingSwitch {
   mimeType: string;
   /** The switch's own record (C1): identity, send-time snapshots, landing and seam. */
   record: SwitchRecord;
+  /**
+   * The lowest group the switched subscription can deliver. An object of the
+   * target track below it is a late object of an earlier subscription to that
+   * track: the relay may reuse a track alias for the same track (draft-18 11.1),
+   * so the library maps such an object to the new subscription. Native: the
+   * source's last received group when the SWITCH was sent (the relay starts the
+   * target at or after what it sent of the source). PR #1378: the Minimum
+   * Switching Group the SWITCH carried (G_switch is at or above it).
+   */
+  minGroup: bigint;
 }
 
 /** An old-track object held while its switch is unanswered (R6 D5), and its route. */
@@ -116,6 +126,13 @@ interface MOQStreamStruct {
   requestId: bigint;
   tracker: GoodputTracker;
   pendingSwitch: PendingSwitch | null;
+  /**
+   * The current subscription's lowest deliverable group (its switch's
+   * `PendingSwitch.minGroup` from the landing on; undefined for the initial
+   * subscription). Objects of the current track below it are late objects of an
+   * earlier subscription to the same track and are dropped.
+   */
+  currentMinGroup?: bigint;
   /** End PTS (ms) of the last appended segment from the active track (the append front). Updated after a successful append only (M9). Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
   /** Frame duration (ms) of the most recently parsed object, for seam arithmetic. */
@@ -1016,7 +1033,7 @@ export class Player {
               return;
             }
 
-            const route = this.#route(struct, objectTrackName);
+            const route = this.#route(struct, objectTrackName, object.location.group);
             if (route === 'stale') {
               logger.info(
                 'media',
@@ -1049,6 +1066,24 @@ export class Player {
               return;
             }
 
+            if (route === 'earlier-subscription') {
+              // A late object of an earlier subscription to this track, below what
+              // the current (or switched) subscription can deliver: appending it
+              // would put the old subscription's frames behind the seam, and
+              // landing on it would start the switch below its own start group.
+              this.#dropStale(struct, object, objectTrackName, {
+                track: objectTrackName,
+                current: struct.trackName,
+                pending: struct.pendingSwitch?.trackName ?? null,
+                group: object.location.group,
+                bytes: object.payload.byteLength,
+                object: object.location.object,
+                reason: 'earlier-subscription',
+                floor_group: this.#floorGroup(struct, objectTrackName) ?? null,
+              });
+              return;
+            }
+
             if (route === 'land' && struct.pendingSwitch) {
               const { initData, mimeType, trackName: newTrackName, record } = struct.pendingSwitch;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
@@ -1057,6 +1092,7 @@ export class Player {
               // frames that arrived while the SWITCH was in flight).
               const sourceEndAtLandingMs = struct.lastAppendedEndPTS_ms;
               struct.trackName = newTrackName;
+              struct.currentMinGroup = struct.pendingSwitch.minGroup;
               struct.pendingSwitch = null;
               // Whether the landing object is a keyframe: the trun sync-sample flag
               // of its moof (undefined when the moof carries no flags).
@@ -1471,13 +1507,16 @@ export class Player {
    * `struct`: `stale` (neither the current track nor the pending switch
    * target: dropped), `pre-landing` (the pending target's name, but the
    * library has not mapped the switched subscription yet: a trailing object
-   * of an earlier subscription to that track, dropped), `land` (the pending
-   * switch lands on it) or `current` (append).
+   * of an earlier subscription to that track, dropped), `earlier-subscription`
+   * (the current or pending target's name, but `group` is below what that
+   * subscription can deliver, see `PendingSwitch.minGroup`: dropped), `land` (the
+   * pending switch lands on it) or `current` (append).
    */
   #route(
     struct: MOQStreamStruct,
     objectTrackName: string,
-  ): 'stale' | 'pre-landing' | 'land' | 'current' {
+    group?: bigint,
+  ): 'stale' | 'pre-landing' | 'earlier-subscription' | 'land' | 'current' {
     const pending = struct.pendingSwitch;
     if (objectTrackName !== struct.trackName && objectTrackName !== pending?.trackName) {
       return 'stale';
@@ -1492,17 +1531,30 @@ export class Player {
     ) {
       return 'pre-landing';
     }
+    const floor = this.#floorGroup(struct, objectTrackName);
+    if (group !== undefined && floor !== undefined && group < floor) return 'earlier-subscription';
     if (pending && objectTrackName === pending.trackName) return 'land';
     return 'current';
+  }
+
+  /** The lowest group the subscription `objectTrackName` routes to can deliver (see #route). */
+  #floorGroup(struct: MOQStreamStruct, objectTrackName: string): bigint | undefined {
+    const pending = struct.pendingSwitch;
+    if (pending && objectTrackName === pending.trackName) return pending.minGroup;
+    if (objectTrackName === struct.trackName) return struct.currentMinGroup;
+    return undefined;
   }
 
   /**
    * The write handler's routing of a video object of `trackName` right now
    * (see #route); null without a video stream. For tests.
    */
-  routeVideoObject(trackName: string): 'stale' | 'pre-landing' | 'land' | 'current' | null {
+  routeVideoObject(
+    trackName: string,
+    group?: bigint,
+  ): 'stale' | 'pre-landing' | 'earlier-subscription' | 'land' | 'current' | null {
     const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    return vs ? this.#route(vs, trackName) : null;
+    return vs ? this.#route(vs, trackName, group) : null;
   }
 
   /**
@@ -2296,6 +2348,9 @@ export class Player {
       initData: initData.buffer as ArrayBuffer,
       mimeType,
       record,
+      // PR #1378: G_switch >= the Minimum Switching Group this SWITCH carries, so
+      // no object of the switched subscription is below it (next-group or playhead).
+      minGroup: BigInt(minimumSwitchingGroupId),
     };
     const previousPending = videoStruct.pendingSwitch;
     videoStruct.pendingSwitch = pending;

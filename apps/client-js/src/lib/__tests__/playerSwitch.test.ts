@@ -5,6 +5,7 @@ import { SwitchTransition } from 'moqtail/model';
 import { Player } from '@/lib/player';
 import { events } from '@/lib/events/EventLog';
 import { SwitchHold } from '@/lib/switchSources';
+import { GoodputTracker } from '@/lib/goodput';
 
 /**
  * Player.switchTrack against a fake MOQtail client and catalog: no relay, no
@@ -382,5 +383,50 @@ describe('Player.probeTrackBandwidth: PROBE object timestamps (F13)', () => {
     });
     await player.probeTrackBandwidth('.probe:3000:0', 500);
     expect(probes[0]).toMatchObject({ first_object_ms: null, last_object_ms: null });
+  });
+});
+
+/**
+ * Preflight 2026-10-05 (pr1378 live-edge r2): the relay reuses a track's alias for
+ * every subscription to it (draft-18 11.1 allows this for the same track), so a
+ * late object of an earlier subscription to the target track was mapped to the
+ * switched subscription, landed the switch one group below its start and was
+ * appended over the buffered source group; the decoder failed (MEDIA_ERR_DECODE).
+ * A target object below the source's last received group cannot be the switched
+ * subscription's: native starts at or after what the relay sent of the source.
+ */
+describe('Player.switchTrack: late objects of an earlier subscription to the target track', () => {
+  beforeEach(() => {
+    vi.spyOn(events, 'emit').mockImplementation(() => {});
+    vi.spyOn(GoodputTracker.prototype, 'getMaxGroup').mockReturnValue(60n);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  // pr1378: the bound is the Minimum Switching Group the SWITCH carried. With the
+  // source's last received group at 60 the next-group floor is 61, so G60 (the
+  // object that landed switch 8 in the preflight run) cannot be the target's.
+  it('a target object below the Minimum Switching Group does not land the switch', async () => {
+    const routed: Record<string, string | null> = {};
+    const env: { player?: Player } = {};
+    const made = await makePlayer({
+      switchResult: async () => {
+        routed.below = env.player!.routeVideoObject('720p', 59n);
+        routed.lastReceived = env.player!.routeVideoObject('720p', 60n);
+        routed.floor = env.player!.routeVideoObject('720p', 61n);
+        return switchSuccess(42n, 61n, 66n);
+      },
+    });
+    env.player = made.player;
+    await made.player.switchTrack('720p');
+    expect(routed).toEqual({
+      below: 'earlier-subscription',
+      lastReceived: 'earlier-subscription',
+      floor: 'land',
+    });
+  });
+
+  it('the initial subscription has no lower bound', async () => {
+    const { player } = await makePlayer();
+    expect(player.routeVideoObject('360p', 0n)).toBe('current');
   });
 });

@@ -765,6 +765,9 @@ pub(crate) async fn terminate_source(
     // deep-buffer subscriber on a saturated link has a group or two in flight):
     // finish those.
     let streams = sub.opened_stream_count();
+    // Streams at/above the seam are reset, FIN'd ones included; streams below it
+    // finish and deliver.
+    let (reset_open, reset_finished) = sub.cancel_from_group(g_switch).await;
     crate::server::events::emit(
       "SWITCH_SOURCE_RESET",
       serde_json::json!({
@@ -773,10 +776,10 @@ pub(crate) async fn terminate_source(
         "track": crate::server::events::track_name_string(current_full_track_name),
         "streams_opened": streams,
         "seam_group": g_switch,
+        "reset_open": reset_open,
+        "reset_finished": reset_finished,
       }),
     );
-    // Streams at/above the seam are reset; streams below it finish and deliver.
-    sub.cancel_from_group(g_switch).await;
     return Some(sub.opened_streams_below(g_switch));
   }
   None

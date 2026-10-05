@@ -36,19 +36,24 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
                   switch. A freeze with nothing to play is starvation, an outcome
                   of the system under test, and keeps the run valid however long
                   it lasts (the advancing fraction is reported, not judged)
+  media-error     no media element error (MEDIA_ERROR): after one the decoder has
+                  stopped and every append throws, so nothing later is a measurement
   clean-worktree  (--final only) the run was made from a committed tree
 
 --preflight adds the apparatus invariants of docs/rebuild-2026-10-04.md ("Preflight"):
 
   pf-keyframe       keyframe landings = 100 % (as-shipped native: reported, not asserted)
   pf-behind         landed_behind_playhead = 0
+  pf-landing        no switch's first object below the relay's start group for it (a late object
+                    of an earlier subscription to the target track, same alias)
   pf-terminal       every switch has exactly one terminal; none left open except those sent within
                     5 s + target shift of the end; with switch_seq, no terminal inferred without its
                     record (SWITCH_SUPERSEDED); no conflicting, unjoined or duplicate records
   pf-unrouted       DROP_STALE{unrouted} bytes after the first switch settled (reported)
   pf-relay-cc       RELAY_CONFIG.congestion_controller matches the run identity
-  pf-qdisc          qdisc_stats on every applied NET_CHANGE; the recorded tc commands show netem / htb /
-                    bfifo|fq_codel on a rate-limited step and netem on an unshaped one
+  pf-qdisc          qdisc_stats on every applied NET_CHANGE; its recorded kernel tree is netem 1: root,
+                    and on a rate-limited step htb 2: under 1:1 and bfifo|fq_codel 20: under 2:10
+                    with the htb class at the step's rate (when recorded); netem alone unshaped
   pf-gso            qdisc_stats.leaf.gso_at_qdisc false on every rate-limited NET_CHANGE (fails when true;
                     a top-level gso_at_qdisc is read only when the leaf has none)
   pf-maxpacket      qdisc_stats.leaf.maxpacket <= 1514 when recorded (reported above, fails above 3000)
@@ -134,6 +139,68 @@ def probe_transfer_rate(r: dict) -> tuple[float, str] | None:
     if r.get("dt_ms") and pb > 0:
         return pb * 8 / (r["dt_ms"] / 1000), "dt_ms"
     return None
+
+
+QDISC_WANT_UNSHAPED = [("netem", "1:", "root")]
+HTB_RATE_TOLERANCE = 0.01  # tc prints the class rate in whole Kbit
+
+
+def qdisc_tree_errors(applied: list[dict]) -> list[str]:
+    """pf-qdisc: one entry per applied NET_CHANGE whose recorded kernel state is not
+    the specified tree. The tree is `qdisc_stats.tree` (the `tc -s qdisc show` the
+    runner read after the step): netem 1: at the root; on a rate-limited step also
+    htb 2: under 1:1 and the leaf 20: under 2:10 (bfifo for the tail-drop queue,
+    fq_codel otherwise), and nothing else. When the runner recorded the htb class
+    (`qdisc_stats.htb_class.rate_bps`, runners after 2026-10-05) its rate must be the
+    step's. A capacity step is a `tc class change`, whose command text names only
+    htb, so the commands cannot show the tree; bundles without `tree` fall back to
+    the qdisc kinds named in the commands and listing."""
+    bad: list[str] = []
+    for c in applied:
+        qs = c.get("qdisc_stats") or {}
+        tree = qs.get("tree")
+        rate = c.get("rate_mbps")
+        where = f"at_s={c.get('at_s')} rate={rate}"
+        if not tree:
+            text = " ".join(_text(c.get(k)) for k in ("tc", "tc_show", "qdisc_tree")).lower()
+            levels = {"netem": "netem" in text, "htb": "htb" in text, "leaf": any(k in text for k in ("bfifo", "fq_codel"))}
+            need = ("netem",) if rate is None else ("netem", "htb", "leaf")
+            if not all(levels[k] for k in need):
+                bad.append(f"{where} saw {sorted(k for k, v in levels.items() if v)} (no recorded tree)")
+            continue
+        want = list(QDISC_WANT_UNSHAPED)
+        if rate is not None:
+            leaf = "bfifo" if c.get("queue", "tail-drop") == "tail-drop" else "fq_codel"
+            want += [("htb", "2:", "1:1"), (leaf, "20:", "2:10")]
+        by_handle = {q.get("handle"): q for q in tree}
+        errs = [f"want {k} {h} under {p}, found "
+                + (f"{by_handle[h].get('kind')} under {by_handle[h].get('parent')}" if h in by_handle else "none")
+                for k, h, p in want
+                if not (h in by_handle and by_handle[h].get("kind") == k and by_handle[h].get("parent") == p)]
+        handles = {h for _, h, _ in want}
+        errs += [f"unexpected {q.get('kind')} {q.get('handle')}" for q in tree
+                 if q.get("handle") not in handles and q.get("kind") not in ("ingress", "clsact")]
+        hc = qs.get("htb_class")
+        if rate is not None and hc is not None:
+            got = hc.get("rate_bps")
+            if got is None or abs(got - rate * 1e6) > HTB_RATE_TOLERANCE * rate * 1e6:
+                errs.append(f"htb class rate {got} bit/s, step {rate} Mbit/s")
+        if errs:
+            bad.append(f"{where}: " + "; ".join(errs))
+    return bad
+
+
+def landing_below_start(switches: list[dict]) -> list[str]:
+    """pf-landing: switches whose first object (t4_group) is below the relay's start
+    group for them (SWITCH_PROMOTED.start_group, joined as relay_start_group). The
+    relay never sends the switched subscription anything below its start, so such an
+    object belongs to an earlier subscription to the same track (same alias)."""
+    out = []
+    for sw in switches:
+        got, start = sw.get("t4_group"), sw.get("relay_start_group")
+        if got is not None and start is not None and got < start:
+            out.append(f"switch {sw.get('switch_seq')} landed on G{got}, relay start G{start}")
+    return out
 
 
 def delivery_rate(applied: list[dict], tput: list[dict], probes: list[dict] | None, client_end: float | None) -> tuple[bool | None, str]:
@@ -441,6 +508,15 @@ def main() -> int:
                             f"{longest / 1000:.1f} s, of which frozen with playable data {wedged / 1000:.1f} s (max {args.max_freeze_s:g}: "
                             f"a player wedge is an apparatus failure, starvation is an outcome); session destroyed={destroyed}; "
                             f"data starved {starved / 1000:.1f} s (raw episodes from the last append)")
+    # A media element error (MEDIA_ERR_DECODE and the like) ends playback for the rest of
+    # the run: every later append throws InvalidStateError, so the player can no longer
+    # measure the system under test. That is an apparatus failure however it came about.
+    media_errors = summary.get("media_errors") or []
+    rep.add("media-error", not media_errors,
+            f"media element errors: {len(media_errors)}"
+            + (" (" + "; ".join(f"code {e.get('code')} on {e.get('track')} at playhead {e.get('playhead_ms')} ms"
+                                for e in media_errors[:3]) + ")" if media_errors else "")
+            + " (required 0: the decoder stopped, nothing after it is a measurement)")
 
     # worktree ---------------------------------------------------------------
     dirty = identity.get("dirty_worktree")
@@ -464,6 +540,11 @@ def main() -> int:
             rep.add("pf-keyframe", kf == known, detail + " (required 100 %)")
         behind = sw_block.get("landed_behind_playhead") or 0
         rep.add("pf-behind", behind == 0, f"landed_behind_playhead={behind} (required 0)")
+        below = landing_below_start(sw_block.get("list") or [])
+        rep.add("pf-landing", not below,
+                f"switches whose first object is below the relay's start group: {len(below)}"
+                + (f" ({', '.join(below[:5])})" if below else "")
+                + " (required 0: such an object is a late one of an earlier subscription to the target track)")
         # A switch may legitimately still be open when the run ends: it needs the delivery
         # time plus the buffered media ahead of the seam (the target shift) to be presented.
         grace = END_GRACE_MS + (client_meta.get("target_shift_ms") or 0)
@@ -491,21 +572,14 @@ def main() -> int:
         applied = [c for c in changes if c.get("applied")]
         with_stats = [c for c in applied if c.get("qdisc_stats") is not None]
         unshaped = (not applied) or all(c.get("rate_mbps") is None for c in applied) or "unshaped" in str(summary.get("profile"))
-        # Rate-limited steps need netem root -> htb -> bfifo|fq_codel; the unshaped profile
-        # has the netem delay alone (the leaf qdisc_stats are then netem's).
-        bad_tree = []
-        for c in applied:
-            text = " ".join(_text(c.get(k)) for k in ("tc", "tc_show", "qdisc_tree")).lower()
-            levels = {"netem": "netem" in text, "htb": "htb" in text, "leaf": any(k in text for k in ("bfifo", "fq_codel"))}
-            need = ("netem",) if c.get("rate_mbps") is None else ("netem", "htb", "leaf")
-            if not all(levels[k] for k in need):
-                bad_tree.append(f"at_s={c.get('at_s')} rate={c.get('rate_mbps')} saw {sorted(k for k, v in levels.items() if v)}")
+        bad_tree = qdisc_tree_errors(applied)
         if not applied:
             rep.add("pf-qdisc", None, "no applied NET_CHANGE (unshaped run)")
         else:
             rep.add("pf-qdisc", len(with_stats) == len(applied) and not bad_tree,
-                    f"qdisc_stats on {len(with_stats)} of {len(applied)} applied NET_CHANGE; tc tree (netem only when unshaped, "
-                    f"netem/htb/leaf when rate-limited) wrong on: {bad_tree or 'none'}")
+                    f"qdisc_stats on {len(with_stats)} of {len(applied)} applied NET_CHANGE; kernel tree after each step "
+                    f"(netem 1: root; rate-limited: htb 2: under 1:1, bfifo|fq_codel 20: under 2:10, htb class 2:10 at "
+                    f"the step's rate) wrong on: {bad_tree or 'none'}")
         # Offloads: GSO super-packets at the qdisc make a packet-counted queue meaningless (C5).
         # The runner writes the verdict into the leaf (net.leaf_stats: qdisc_stats.leaf.gso_at_qdisc);
         # a top-level gso_at_qdisc is read only when the leaf has none.
