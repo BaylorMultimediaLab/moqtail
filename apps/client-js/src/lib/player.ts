@@ -30,7 +30,13 @@ import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
 import { StallTracker } from '@/lib/stall';
-import { SourcePump, type PumpSource, type ReleaseReason } from '@/lib/switchSources';
+import {
+  SourcePump,
+  SwitchHold,
+  type HoldOutcome,
+  type PumpSource,
+  type ReleaseReason,
+} from '@/lib/switchSources';
 import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
@@ -66,6 +72,20 @@ interface PendingSwitch {
   record: SwitchRecord;
 }
 
+/** An old-track object held while its switch is unanswered (R6 D5), and its route. */
+interface HeldObject {
+  object: MoqtObject;
+  route: PumpSource | undefined;
+}
+
+/** The verdict a held object is replayed with into the write path (R6 D5). */
+interface HeldVerdict {
+  verdict: 'append' | 'post-seam';
+  seam: bigint | undefined;
+  seq: number;
+  route: PumpSource | undefined;
+}
+
 interface MOQStreamStruct {
   trackName: string;
   /** The subscription's object stream (the startup route; see `pump` for the routes after a SWITCH). */
@@ -84,6 +104,16 @@ interface MOQStreamStruct {
    * EXCESSIVE_LOAD).
    */
   switchInFlight?: boolean;
+  /**
+   * Old-route objects at or above the floor of the switch in flight, held until
+   * it is answered (R6 D5), and the timer that bounds the hold by T_switch.
+   */
+  hold?: SwitchHold<HeldObject>;
+  holdTimer?: ReturnType<typeof setTimeout>;
+  /** Serialises the write handler's work, so held objects replay in order (R6 D5). */
+  writeChain?: Promise<void>;
+  /** Replays a held object through the write path with its verdict (R6 D5). */
+  processHeld?: (object: MoqtObject, held: HeldVerdict) => Promise<void>;
   requestId: bigint;
   tracker: GoodputTracker;
   pendingSwitch: PendingSwitch | null;
@@ -880,8 +910,14 @@ export class Player {
       let kickStarted = false;
 
       // Create the WritableStream to handle incoming objects
-      const writable = new WritableStream<MoqtObject>({
-        write: async (object, controller) => {
+      let writeController: WritableStreamDefaultController | undefined;
+      // The write path (an object literal so the handler keeps its indentation).
+      const sink = {
+        write: async (
+          object: MoqtObject,
+          controller: WritableStreamDefaultController,
+          held?: HeldVerdict,
+        ): Promise<void> => {
           try {
             // Skip end-of-group objects
             if (object.isEndOfGroup()) {
@@ -924,7 +960,38 @@ export class Player {
             // a replaced subscription's objects at or above the G_switch its
             // SWITCH_OK named are dropped, the target's catch-up covers them on
             // the new track (audit M6).
-            if (struct.pump?.admit(object.location.group) === 'post-seam') {
+            //
+            // While a SWITCH on this route is unanswered, its objects at or above
+            // the floor the switch sent are held (R6 D5): G_switch >= floor is not
+            // known yet, and those at or above it are covered by the target's
+            // catch-up. A held object comes back through here with its verdict.
+            let verdict: 'append' | 'post-seam';
+            let seamForDrop: bigint | undefined;
+            let seqForDrop: number | undefined;
+            if (held) {
+              ({ verdict, seam: seamForDrop, seq: seqForDrop } = held);
+              if (verdict === 'post-seam' && held.route) held.route.postSeamDropped += 1;
+            } else {
+              const pumpRoute = struct.pump?.current;
+              verdict = struct.pump?.admit(object.location.group) ?? 'append';
+              seamForDrop = pumpRoute?.seamGroup;
+              seqForDrop = pumpRoute?.replacedBySeq;
+              const hold = struct.hold;
+              if (
+                verdict === 'append' &&
+                hold &&
+                pumpRoute?.pendingSwitchSeq === hold.seq &&
+                hold.holds(object.location.group)
+              ) {
+                const tripped = hold.add(object.location.group, object.payload.byteLength, {
+                  object,
+                  route: pumpRoute,
+                });
+                if (tripped) this.#releaseHold(struct, hold.seq, undefined, tripped);
+                return;
+              }
+            }
+            if (verdict === 'post-seam') {
               this.#dropStale(struct, object, objectTrackName, {
                 track: objectTrackName,
                 current: struct.trackName,
@@ -933,8 +1000,9 @@ export class Player {
                 bytes: object.payload.byteLength,
                 object: object.location.object,
                 reason: 'post-seam',
-                seam_group: Number(struct.pump.current?.seamGroup ?? -1n),
-                switch_seq: struct.pump.current?.replacedBySeq ?? null,
+                seam_group: Number(seamForDrop ?? -1n),
+                switch_seq: seqForDrop ?? null,
+                held: held !== undefined,
               });
               return;
             }
@@ -1360,6 +1428,18 @@ export class Player {
             logger.error('media', 'Error processing media object:', error);
             controller.error(error);
           }
+        },
+      };
+      struct.processHeld = (object, held) =>
+        writeController ? sink.write(object, writeController, held) : Promise.resolve();
+      const writable = new WritableStream<MoqtObject>({
+        write: (object, controller) => {
+          writeController = controller;
+          const run = (struct.writeChain ?? Promise.resolve()).then(() =>
+            sink.write(object, controller),
+          );
+          struct.writeChain = run.catch(() => {});
+          return run;
         },
       });
 
@@ -2172,6 +2252,9 @@ export class Player {
     });
     videoStruct.switchInFlight = true;
     videoStruct.pump?.switchSent(subscriptionRequestId, record.seq);
+    // R6 D5: hold this route's objects at or above the floor until the answer,
+    // for at most T_switch.
+    this.#startHold(videoStruct, record.seq, BigInt(minimumSwitchingGroupId));
     events.emit('SWITCH_SENT', {
       switch_seq: record.seq,
       from: videoStruct.trackName,
@@ -2229,6 +2312,7 @@ export class Player {
         // videoStruct.requestId was never overwritten, so the next attempt
         // references the still-active subscription.
         rollback();
+        this.#releaseHold(videoStruct, record.seq, undefined, 'failed');
         logger.error(
           'media',
           `switchTrack: SWITCH failed for ${trackName}: status=${result.statusCode} ${result.reasonPhrase}`,
@@ -2268,6 +2352,10 @@ export class Player {
         rtt_ms: performance.now() - switchSentAt,
       });
 
+      // The objects held since SWITCH_SENT (R6 D5): below G_switch appended,
+      // the rest dropped as post-seam.
+      this.#releaseHold(videoStruct, record.seq, result.switchTransition.switchingGroupId, 'ok');
+
       // Queue the relay's new data route (`stream`: the catch-up range and the
       // post-switch live objects) behind the subscription it replaces, which
       // keeps being read until it is done (audit M5).
@@ -2293,6 +2381,7 @@ export class Player {
       );
     } catch (error) {
       rollback();
+      this.#releaseHold(videoStruct, record.seq, undefined, 'failed');
       logger.error('media', 'switchTrack: unexpected error', error);
       events.emit('SWITCH_ERROR', {
         switch_seq: record.seq,
@@ -2309,8 +2398,68 @@ export class Player {
     } finally {
       videoStruct.switchInFlight = false;
       videoStruct.pump?.switchAnswered(subscriptionRequestId);
+      this.#releaseHold(videoStruct, record.seq, undefined, 'failed');
     }
     return record.seq;
+  }
+
+  /** Starts holding the replaced route's objects at or above `floor` (R6 D5). */
+  #startHold(struct: MOQStreamStruct, seq: number, floor: bigint): void {
+    if (struct.hold) this.#releaseHold(struct, struct.hold.seq, undefined, 'failed');
+    const hold = new SwitchHold<HeldObject>(seq, floor, performance.now());
+    struct.hold = hold;
+    struct.holdTimer = setTimeout(
+      () => this.#releaseHold(struct, seq, undefined, 'bound-time'),
+      hold.maxMs,
+    );
+  }
+
+  /**
+   * Ends the hold of switch `seq` (R6 D5): every held object is replayed into
+   * the write path in arrival order, those at or above `seam` (SWITCH_OK) as
+   * post-seam drops, the rest appended. No-op when that switch holds nothing.
+   */
+  #releaseHold(
+    struct: MOQStreamStruct,
+    seq: number,
+    seam: bigint | undefined,
+    outcome: HoldOutcome,
+  ): void {
+    const hold = struct.hold;
+    if (!hold || hold.seq !== seq) return;
+    struct.hold = undefined;
+    if (struct.holdTimer !== undefined) clearTimeout(struct.holdTimer);
+    struct.holdTimer = undefined;
+    const heldBytes = hold.bytes;
+    const items = hold.release(seam);
+    if (items.length === 0) return;
+    const appended = items.filter(i => i.verdict === 'append').length;
+    if (outcome === 'bound-bytes' || outcome === 'bound-time') {
+      logger.warn(
+        'media',
+        `switch ${seq}: hold bound tripped (${outcome}); appending ${items.length} held objects`,
+      );
+    }
+    events.emit('SWITCH_HOLD_RELEASED', {
+      switch_seq: seq,
+      outcome,
+      floor: Number(hold.floor),
+      seam_group: seam !== undefined ? Number(seam) : null,
+      held_objects: items.length,
+      held_bytes: heldBytes,
+      held_ms: performance.now() - hold.startedAt,
+      appended,
+      dropped_post_seam: items.length - appended,
+    });
+    const replay = async () => {
+      for (const { item, verdict } of items) {
+        await struct.processHeld?.(item.object, { verdict, seam, seq, route: item.route });
+      }
+    };
+    const run = (struct.writeChain ?? Promise.resolve()).then(replay);
+    struct.writeChain = run.catch(error =>
+      logger.error('media', 'held object replay failed', error),
+    );
   }
 
   /**

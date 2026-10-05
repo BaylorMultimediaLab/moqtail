@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import type { MoqtObject } from 'moqtail';
-import { DRAIN_TIMEOUT_MS, SourcePump, type PumpSource, type ReleaseReason } from './switchSources';
+import {
+  DRAIN_TIMEOUT_MS,
+  SWITCH_HOLD_MAX_MS,
+  SourcePump,
+  SwitchHold,
+  type PumpSource,
+  type ReleaseReason,
+} from './switchSources';
 
 /** An object as the write handler sees it: only the track and the location matter here. */
 function obj(track: string, group: number, object = 0): MoqtObject {
@@ -379,5 +386,49 @@ describe('SourcePump (R6 D3): a route that ends before the SWITCH replacing it i
     await settle();
     expect(released).toEqual([[1n, 'closed']]);
     ac.abort();
+  });
+});
+
+describe('SwitchHold (R6 D5): old-track objects at or above the floor wait for the answer', () => {
+  it('holds only groups at or above the floor', () => {
+    const hold = new SwitchHold<string>(3, 5n, 0);
+    expect(hold.holds(4n)).toBe(false);
+    expect(hold.holds(5n)).toBe(true);
+    expect(hold.holds(9n)).toBe(true);
+  });
+
+  it('SWITCH_OK: appends what is below G_switch, drops the rest as post-seam, in arrival order', () => {
+    const hold = new SwitchHold<string>(3, 5n, 0);
+    hold.add(6n, 10, 'A:6/0');
+    hold.add(5n, 10, 'A:5/2');
+    hold.add(6n, 10, 'A:6/1');
+    hold.add(7n, 10, 'A:7/0');
+    expect(hold.release(6n)).toEqual([
+      { item: 'A:6/0', group: 6n, verdict: 'post-seam' },
+      { item: 'A:5/2', group: 5n, verdict: 'append' },
+      { item: 'A:6/1', group: 6n, verdict: 'post-seam' },
+      { item: 'A:7/0', group: 7n, verdict: 'post-seam' },
+    ]);
+    expect(hold.size).toBe(0);
+  });
+
+  it('failure or refusal: appends everything, in arrival order', () => {
+    const hold = new SwitchHold<string>(3, 5n, 0);
+    hold.add(5n, 10, 'A:5/0');
+    hold.add(6n, 10, 'A:6/0');
+    expect(hold.release().map(r => [r.item, r.verdict])).toEqual([
+      ['A:5/0', 'append'],
+      ['A:6/0', 'append'],
+    ]);
+  });
+
+  it('is bounded by bytes and by time (T_switch)', () => {
+    const hold = new SwitchHold<string>(3, 5n, 1000, 25, 3000);
+    expect(hold.add(5n, 10, 'a')).toBeUndefined();
+    expect(hold.add(5n, 10, 'b')).toBeUndefined();
+    expect(hold.add(6n, 10, 'c')).toBe('bound-bytes');
+    expect(hold.expired(3999)).toBeUndefined();
+    expect(hold.expired(4000)).toBe('bound-time');
+    expect(SWITCH_HOLD_MAX_MS).toBe(3000);
   });
 });

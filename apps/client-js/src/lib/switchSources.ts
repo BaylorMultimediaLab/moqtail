@@ -389,3 +389,98 @@ export class SourcePump {
     }
   }
 }
+
+/**
+ * Upper bound on the old-track bytes held while a SWITCH is unanswered (R6 D5):
+ * about 5 s of the top rung. Exceeding it releases the hold (append, logged).
+ */
+export const SWITCH_HOLD_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * Upper bound on how long old-track objects are held while a SWITCH is
+ * unanswered (R6 D5): the relay's T_switch (`--t-switch-ms`, 3000 in every
+ * pr1378 run), by which the relay has answered or timed the switch out.
+ */
+export const SWITCH_HOLD_MAX_MS = 3000;
+
+export type HoldOutcome = 'ok' | 'failed' | 'bound-bytes' | 'bound-time';
+
+/**
+ * Old-track objects held while a pr1378 SWITCH is in flight (R6 D5).
+ *
+ * Between SWITCH_SENT and SWITCH_OK the player does not know G_switch, only the
+ * floor it sent (Minimum Switching Group ID); G_switch >= floor. Objects of the
+ * replaced route below the floor are below the seam and are appended as they
+ * come. Objects at or above the floor may be at or above the seam, where the
+ * target's catch-up delivers the same span on the new track; appending them
+ * (1-3 frames in practice) put two representations in one span and biased
+ * media_seam_gap_ms by -42..-125 ms. They are held, in arrival order, until the
+ * answer: SWITCH_OK appends those below G_switch and drops the rest as
+ * DROP_STALE{post-seam}; a failure or refusal appends them all. The hold is
+ * bounded by bytes and by time (T_switch); when a bound trips everything held
+ * is appended (logged) and nothing more is held for that switch.
+ */
+export class SwitchHold<T> {
+  readonly #items: Array<{ group: bigint; bytes: number; item: T }> = [];
+  #bytes = 0;
+  readonly #startedAt: number;
+
+  constructor(
+    /** switch_seq of the switch in flight. */
+    readonly seq: number,
+    /** The floor that switch sent (Minimum Switching Group ID). */
+    readonly floor: bigint,
+    now: number,
+    readonly maxBytes: number = SWITCH_HOLD_MAX_BYTES,
+    readonly maxMs: number = SWITCH_HOLD_MAX_MS,
+  ) {
+    this.#startedAt = now;
+  }
+
+  /** Whether an old-route object of `group` is held (at or above the floor). */
+  holds(group: bigint): boolean {
+    return group >= this.floor;
+  }
+
+  /**
+   * Holds `item`; returns `bound-bytes` when the hold now exceeds its byte
+   * bound (the caller then releases it), else undefined.
+   */
+  add(group: bigint, bytes: number, item: T): HoldOutcome | undefined {
+    this.#items.push({ group, bytes, item });
+    this.#bytes += bytes;
+    return this.#bytes > this.maxBytes ? 'bound-bytes' : undefined;
+  }
+
+  /** `bound-time` once the hold is older than its time bound, else undefined. */
+  expired(now: number): HoldOutcome | undefined {
+    return now - this.#startedAt >= this.maxMs ? 'bound-time' : undefined;
+  }
+
+  get size(): number {
+    return this.#items.length;
+  }
+
+  get bytes(): number {
+    return this.#bytes;
+  }
+
+  get startedAt(): number {
+    return this.#startedAt;
+  }
+
+  /**
+   * Everything held, in arrival order, each with its verdict: `post-seam` for a
+   * group at or above `seam` (SWITCH_OK), `append` otherwise (no seam: failure,
+   * refusal or a tripped bound).
+   */
+  release(seam?: bigint): Array<{ item: T; group: bigint; verdict: 'append' | 'post-seam' }> {
+    const out = this.#items.map(({ group, item }) => ({
+      item,
+      group,
+      verdict: seam !== undefined && group >= seam ? ('post-seam' as const) : ('append' as const),
+    }));
+    this.#items.length = 0;
+    this.#bytes = 0;
+    return out;
+  }
+}
