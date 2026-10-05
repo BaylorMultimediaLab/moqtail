@@ -446,6 +446,7 @@ pub(crate) async fn poll_select_switch_group(
   deadline: Instant,
 ) -> SelectOutcome {
   let mut last_avail: Option<(u64, u64)> = None;
+  let mut wait_reported = false;
   loop {
     if subscriber
       .switch_in_flight
@@ -471,6 +472,38 @@ pub(crate) async fn poll_select_switch_group(
         select_switch_group(current_track, target_track, minimum_switching_group_id).await
       {
         return SelectOutcome::Ready(g);
+      }
+      if !wait_reported {
+        // The first miss: selection now waits (within T_switch) for the floor
+        // or a common boundary to materialise. Said once per switch (P6).
+        wait_reported = true;
+        let live_edge_current = current_track
+          .read()
+          .await
+          .largest_location
+          .read()
+          .await
+          .group;
+        let (target_name, live_edge_target) = {
+          let t = target_track.read().await;
+          let edge = t.largest_location.read().await.group;
+          (t.full_track_name.clone(), edge)
+        };
+        crate::server::events::emit(
+          "SWITCH_WAIT",
+          serde_json::json!({
+            "conn": subscriber.connection_id,
+            "old_request_id": current_sub_req_id,
+            "track": crate::server::events::track_name_string(&target_name),
+            "floor": minimum_switching_group_id,
+            "live_edge_current": live_edge_current,
+            "live_edge_target": live_edge_target,
+            // floor: the floor is above the target's live edge (a next-group
+            // floor naming a group not produced yet); boundary: no common
+            // gap-free boundary at or above the floor yet.
+            "waiting_for": if minimum_switching_group_id > live_edge_target { "floor" } else { "boundary" },
+          }),
+        );
       }
     }
     if Instant::now() >= deadline {
@@ -1015,5 +1048,72 @@ mod tests_switch_failure_stream {
     let client = relay_client(71, server);
     let (send, _recv) = open_switch_failure_stream(&client).await.expect("open");
     assert_eq!(send.priority(), Some(CONTROL_STREAM_PRIORITY));
+  }
+}
+
+/// P6: selection that waits for the floor says so (SWITCH_WAIT) instead of a
+/// silent wait that ends in a TIMEOUT indistinguishable from the others.
+#[cfg(test)]
+mod tests_switch_wait {
+  use super::*;
+  use crate::server::test_support::{publish, quic_pair, relay_client, test_track};
+
+  #[tokio::test]
+  async fn a_floor_above_the_live_edge_emits_switch_wait_once_then_times_out() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(81, server);
+    let current = test_track(1, "video-360p");
+    let target = test_track(2, "video-720p");
+    for g in 0..=4 {
+      publish(&current, g, 0).await;
+      publish(&target, g, 0).await;
+    }
+    let current = Arc::new(RwLock::new(current));
+    let target = Arc::new(RwLock::new(target));
+    let outcome = poll_select_switch_group(
+      &client,
+      &current,
+      &target,
+      9,
+      1,
+      0,
+      Instant::now() + Duration::from_millis(200),
+    )
+    .await;
+    assert_eq!(outcome, SelectOutcome::TimedOut);
+    let waits = crate::server::events::test_capture::records("SWITCH_WAIT", 81);
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    let w = &waits[0];
+    assert_eq!(w["floor"], 9);
+    assert_eq!(w["live_edge_current"], 4);
+    assert_eq!(w["live_edge_target"], 4);
+    assert_eq!(w["old_request_id"], 1);
+    assert_eq!(w["track"], "moqtail/video-720p");
+  }
+
+  #[tokio::test]
+  async fn a_ready_floor_emits_no_switch_wait() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(82, server);
+    let current = test_track(1, "video-360p");
+    let target = test_track(2, "video-720p");
+    for g in 0..=4 {
+      publish(&current, g, 0).await;
+      publish(&target, g, 0).await;
+    }
+    let current = Arc::new(RwLock::new(current));
+    let target = Arc::new(RwLock::new(target));
+    let outcome = poll_select_switch_group(
+      &client,
+      &current,
+      &target,
+      3,
+      1,
+      0,
+      Instant::now() + Duration::from_millis(200),
+    )
+    .await;
+    assert_eq!(outcome, SelectOutcome::Ready(3));
+    assert!(crate::server::events::test_capture::records("SWITCH_WAIT", 82).is_empty());
   }
 }

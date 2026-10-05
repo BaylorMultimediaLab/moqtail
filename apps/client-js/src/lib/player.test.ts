@@ -8,6 +8,7 @@ import {
   computeStartupTarget,
   computeSwitchMinimumGroup,
   highestCompleteBufferedGroup,
+  switchFailureKind,
   unroutedDropFields,
 } from './player';
 import { TimeMap } from './abr/TimeMap';
@@ -372,5 +373,22 @@ describe('media scheduling parameters (transport fairness)', () => {
       new SubscriberPriority(0).toKeyValuePair(),
       new GroupOrderParam(GroupOrder.Ascending).toKeyValuePair(),
     ]);
+  });
+});
+
+describe('switchFailureKind (P6)', () => {
+  it('names the relay failure from its reason phrase', () => {
+    expect(switchFailureKind('switch: NoCommonBoundary')).toBe('NoCommonBoundary');
+    expect(switchFailureKind('switch: DrainTimeout')).toBe('DrainTimeout');
+    expect(switchFailureKind('switch: Superseded')).toBe('Superseded');
+    expect(switchFailureKind('switch: AlreadyInFlight')).toBe('AlreadyInFlight');
+  });
+
+  it('tells the client-side response deadline apart from every relay answer', () => {
+    expect(switchFailureKind('no relay response to SWITCH within 6000 ms')).toBe('ClientTimeout');
+  });
+
+  it('keeps anything else as unknown', () => {
+    expect(switchFailureKind('')).toBe('unknown');
   });
 });

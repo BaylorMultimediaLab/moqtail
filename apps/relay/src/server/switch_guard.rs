@@ -263,9 +263,9 @@ pub(crate) enum SwitchFailure {
   /// unchanged, rather than terminating it and truncating source Objects below
   /// G_switch.
   DrainTimeout,
-  /// The target PUBLISH could not be built/sent after the drain succeeded. The
-  /// seam bound applied by the drain is unwound so the current subscription is
-  /// left unaltered, and the failure is reported as INTERNAL_ERROR.
+  /// The target subscription could not be attached after the drain succeeded.
+  /// The hand-over attaches the target before it touches the source, so the
+  /// current subscription is left unaltered; reported as INTERNAL_ERROR.
   PublishBuildFailed,
   /// The switch's slot was reclaimed by a newer SWITCH after its T_switch
   /// deadline passed (`ClaimResult::Superseded`): the task ran out of budget,

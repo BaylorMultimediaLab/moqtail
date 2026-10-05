@@ -322,6 +322,21 @@ export function highestCompleteBufferedGroup(opts: {
 }
 
 /**
+ * The kind of a failed SWITCH, for SWITCH_ERROR.failure (P6). The relay answers
+ * NoCommonBoundary, DrainTimeout and Superseded all with status TIMEOUT; its
+ * reason phrase (`switch: <kind>`) names which. `ClientTimeout` is the library's
+ * own response deadline (no relay answer at all).
+ *
+ * Exported for unit testing.
+ */
+export function switchFailureKind(reason: string): string {
+  const relay = /^switch: (\w+)/.exec(reason);
+  if (relay) return relay[1]!;
+  if (reason.startsWith('no relay response to SWITCH')) return 'ClientTimeout';
+  return 'unknown';
+}
+
+/**
  * DROP_STALE fields for a data stream the library discarded without delivering
  * it (M15): no subscription claimed its track alias in time, so the library
  * cancelled it with STOP_SENDING and reported what it had read. `track` is the
@@ -2146,6 +2161,7 @@ export class Player {
           request_id: null,
           status: result.statusCode,
           reason: String(result.reasonPhrase),
+          failure: switchFailureKind(String(result.reasonPhrase)),
           rtt_ms: performance.now() - switchSentAt,
         });
         this.#options.onTrackSwitched?.(videoStruct.trackName, record.seq);
@@ -2187,6 +2203,7 @@ export class Player {
         to: trackName,
         request_id: null,
         reason: String(error),
+        failure: 'Exception',
         rtt_ms: performance.now() - switchSentAt,
       });
       // videoStruct.requestId still holds the pre-switch id; nothing to roll

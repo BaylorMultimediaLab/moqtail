@@ -165,7 +165,7 @@ messages.
 - **Catch-up priority and the switch's scheduling parameters (P3).** The
   catch-up FETCH_HEADER stream is scheduled like any FETCH response stream:
   `compute_stream_priority(subscriber priority, publisher priority of the
-  target's group G_switch, group order, G_switch)`. With ascending order that
+target's group G_switch, group order, G_switch)`. With ascending order that
   is above every live group of the target (the PR's SHOULD) and below the
   replaced subscription's streams of groups < G_switch, which play first (it
   used to take the top of the publisher-0 band, above that remainder). The
@@ -178,3 +178,12 @@ messages.
   both on every SWITCH, so in the experiments nothing is actually inherited.
   The failure PUBLISH's request stream opens at `CONTROL_STREAM_PRIORITY`
   before its first byte, like every request stream the relay opens.
+- **SWITCH_WAIT and distinguishable failures (P6).** When G_switch selection
+  first misses (the floor names a group the target has not produced, or no
+  common gap-free boundary exists yet) the relay emits `SWITCH_WAIT {floor,
+live_edge_current, live_edge_target, waiting_for}` once per switch, so a
+  T_switch wait is visible before its TIMEOUT. NoCommonBoundary, DrainTimeout
+  and Superseded all answer with status TIMEOUT (0xA); the player's
+  `SWITCH_ERROR.failure` names which, from the relay's reason phrase
+  (`switch: <kind>`), and `ClientTimeout` marks the library's own response
+  deadline (no relay answer at all).
