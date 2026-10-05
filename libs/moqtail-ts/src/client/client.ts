@@ -59,6 +59,7 @@ import {
   RequestIdMap,
 } from '../model/data'
 import { FrozenByteBuffer } from '../model/common/byte_buffer'
+import { KeyValuePair } from '../model/common/pair'
 import { ObjectDeliveryTimeoutProperty, TrackProperty } from '../model/property/track_property'
 import { RecvStream } from './data_stream'
 import {
@@ -77,6 +78,8 @@ import {
   GroupOrderParam,
   SubscriptionFilter,
   StreamResetCode,
+  TerminationCode,
+  TerminationError,
   resolveTransportUrl,
 } from '../model'
 import { Track } from './track/track'
@@ -2607,7 +2610,13 @@ export class MOQtailClient {
    * the first message started.
    */
   async #dispatchIncomingRequestStream(requestStream: RequestStream): Promise<void> {
-    const first = await requestStream.next()
+    let first: ControlMessage | undefined
+    try {
+      first = await requestStream.next()
+    } catch (error) {
+      await this.#requestStreamReadFailed(error)
+      return
+    }
     if (!first) return
 
     if (!ControlMessageType.isFirst(first.getType())) {
@@ -2634,7 +2643,8 @@ export class MOQtailClient {
         msg = await requestStream.next()
       }
     } catch (error) {
-      logger.error('MOQtailClient', 'incoming request stream failed', error)
+      if (isMalformedMessage(error)) await this.#requestStreamReadFailed(error)
+      else logger.error('MOQtailClient', 'incoming request stream failed', error)
     } finally {
       // The peer closed or reset the stream: cancel whatever it was serving. Every
       // First-marked type carries a request id, but the union as a whole does not.
@@ -2645,6 +2655,22 @@ export class MOQtailClient {
       }
       await requestStream.close()
     }
+  }
+
+  /**
+   * A peer-opened request stream could not be read (R7-D4). A message that fails to
+   * parse (the request stream reports a PROTOCOL_VIOLATION, e.g. a known parameter
+   * with an invalid value) closes the session, as the protocol requires; it used to
+   * surface as an unhandled rejection with the session left up. Any other failure
+   * (the peer reset the stream) is logged.
+   */
+  async #requestStreamReadFailed(error: unknown): Promise<void> {
+    if (isMalformedMessage(error)) {
+      logger.error('MOQtailClient', 'malformed message on a peer request stream; closing the session', error)
+      await this.disconnect(new ProtocolViolationError('MOQtailClient', error.context))
+      return
+    }
+    logger.warn('MOQtailClient', 'peer request stream failed', error)
   }
 
   // TODO: Handle request cancellation. Cancel streams are expected to receive some on-fly objects.
@@ -3038,6 +3064,11 @@ export class MOQtailClient {
       throw error
     }
   }
+}
+
+/** A request stream's deserialization failure: the peer sent a malformed message. */
+function isMalformedMessage(error: unknown): error is TerminationError {
+  return error instanceof TerminationError && error.terminationCode === TerminationCode.PROTOCOL_VIOLATION
 }
 
 if (import.meta.vitest) {
@@ -3461,6 +3492,26 @@ if (import.meta.vitest) {
       // Without the properties the same exchange resolves; see the request-per-stream
       // test above.
       await expect(announcing).rejects.toThrow()
+    })
+
+    // R7-D4 (shared half): a peer-opened request stream whose first message fails to
+    // parse (here a PUBLISH whose FORWARD parameter is 2: a known parameter with an
+    // invalid value is a PROTOCOL_VIOLATION) used to be an unhandled rejection that
+    // left the session up. It closes the session, as the protocol requires.
+    it('closes the session when a peer request stream opens with a malformed message (R7-D4)', async () => {
+      const { client, transport } = await connected()
+      const terminated: unknown[] = []
+      client.onSessionTerminated = (reason) => terminated.push(reason)
+      const pushed: unknown[] = []
+      client.onPeerPublish = (msg) => pushed.push(msg)
+      const badForward = {
+        toKeyValuePair: () => KeyValuePair.tryNewVarInt(Forward.TYPE, 2n),
+      } as unknown as Forward
+      const incoming = transport.openIncomingBiStream()
+      incoming.respond(new Publish(1n, ftn, 9n, [badForward], []))
+      await vi.waitFor(() => expect(terminated).toHaveLength(1))
+      expect(String((terminated[0] as Error).message)).toMatch(/FORWARD must be 0 or 1/)
+      expect(pushed).toHaveLength(0)
     })
 
     it('answers a peer-opened request stream on that stream', async () => {
