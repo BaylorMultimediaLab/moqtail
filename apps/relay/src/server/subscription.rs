@@ -408,6 +408,63 @@ pub(crate) struct SubscriptionCounters {
   pub stopped_stream_objects_dropped: AtomicU64,
 }
 
+/// How a FIN'd stream's wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinishOutcome {
+  /// The subscriber acknowledged everything.
+  Acknowledged,
+  /// A reset of the subscription abandoned what was still unsent.
+  Reset,
+}
+
+#[derive(Debug)]
+struct FinishingEntry {
+  stream: Arc<Mutex<TransportSendStream>>,
+  /// Dropped with the entry; ends the acknowledgement wait of a reset stream.
+  _cancel: tokio::sync::oneshot::Sender<()>,
+}
+
+/// A subscription's FIN'd data streams whose data the subscriber has not yet
+/// acknowledged, and the reset that covers streams from now on.
+#[derive(Debug, Default)]
+pub(crate) struct FinishingStreams {
+  entries: HashMap<StreamId, FinishingEntry>,
+  /// Set by a reset of the subscription: (group, code). Streams of groups at or
+  /// above the group (every stream for 0, FETCH streams included) are reset with
+  /// the code instead of FIN'd from then on, so a close racing a reset cannot
+  /// deliver what the reset abandons.
+  reset_from: Option<(u64, u64)>,
+}
+
+impl FinishingStreams {
+  #[cfg(test)]
+  pub(crate) fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
+
+  fn covered(id: &StreamId, from_group: u64) -> bool {
+    from_group == 0 || id.group_id.is_some_and(|g| g >= from_group)
+  }
+
+  fn reset_code_for(&self, id: &StreamId) -> Option<u64> {
+    self
+      .reset_from
+      .filter(|(g, _)| Self::covered(id, *g))
+      .map(|(_, code)| code)
+  }
+
+  /// Removes the entry of `id` if it is still `stream`'s.
+  fn retire(&mut self, id: &StreamId, stream: &Arc<Mutex<TransportSendStream>>) {
+    if self
+      .entries
+      .get(id)
+      .is_some_and(|e| Arc::ptr_eq(&e.stream, stream))
+    {
+      self.entries.remove(id);
+    }
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct Subscription {
   pub request_id: u64,
@@ -422,7 +479,7 @@ pub struct Subscription {
   /// acknowledged. A FIN'd stream's queued bytes are still sent, so a reset of this
   /// subscription's streams (cancel, too far behind, a switch seam) must reach these
   /// too; an entry leaves once the acknowledgement (or a reset) ends the stream.
-  finishing_streams: Arc<RwLock<HashMap<StreamId, Arc<Mutex<TransportSendStream>>>>>,
+  finishing_streams: Arc<RwLock<FinishingStreams>>,
   /// Data streams the subscriber stopped (STOP_SENDING, seen as a write that failed
   /// with ClosedOrStopped). The rest of such a subgroup is dropped rather than sent
   /// on a reopened stream (R3-D3). An entry is retired when the publisher's stream
@@ -486,7 +543,7 @@ impl Subscription {
       subscriber,
       event_rx,
       send_stream_last_object_ids: Arc::new(RwLock::new(HashMap::new())),
-      finishing_streams: Arc::new(RwLock::new(HashMap::new())),
+      finishing_streams: Arc::new(RwLock::new(FinishingStreams::default())),
       stopped_streams: Arc::new(RwLock::new(std::collections::HashSet::new())),
       opened_stream_count: Arc::new(AtomicU64::new(0)),
       finished: Arc::new(AtomicBool::new(false)),
@@ -955,9 +1012,9 @@ impl Subscription {
               "Background stream cleanup error for subscriber={} stream_id={} relay_track_id={} error: {:?}",
               connection_id, stream_id, relay_track_id, e
             ),
-            Ok((stream_id, Ok(()))) => debug!(
-              "Background stream cleanup successful for subscriber={} stream_id={} relay_track_id={}",
-              connection_id, stream_id, relay_track_id
+            Ok((stream_id, Ok(outcome))) => debug!(
+              "Background stream cleanup ({:?}) for subscriber={} stream_id={} relay_track_id={}",
+              outcome, connection_id, stream_id, relay_track_id
             ),
             Err(e) => warn!(
               "Background stream cleanup task failed for subscriber={} relay_track_id={} error: {:?}",
@@ -1300,10 +1357,12 @@ impl Subscription {
     }
   }
 
-  /// Reset every data stream this subscription has opened with the given code.
-  /// Resets every open data stream, draining the map so `finish` does not then try to
-  /// close a stream that has already been reset.
+  /// Reset every data stream this subscription has opened with the given code:
+  /// the open ones (draining the map so `finish` does not then try to close a stream
+  /// already reset) and the FIN'd, unacknowledged ones. From now on a stream this
+  /// subscription would FIN is reset instead (see `FinishingStreams::reset_from`).
   async fn reset_data_streams(&self, code: u64) {
+    let finished = self.reset_finishing_streams(code, 0).await;
     let stream_ids: Vec<StreamId> = {
       let mut map = self.send_stream_last_object_ids.write().await;
       map.drain().map(|(stream_id, _)| stream_id).collect()
@@ -1311,89 +1370,86 @@ impl Subscription {
     for stream_id in stream_ids {
       self.subscriber.reset_stream(&stream_id, code).await;
     }
-    self.reset_finishing_streams(code, None).await;
+    debug!(
+      "reset data streams of subscriber={} relay_track_id={}: {} FIN'd streams reset",
+      self.client_connection_id, self.relay_track_id, finished
+    );
   }
 
-  /// FINs one of this subscription's data streams. The stream is in
-  /// `finishing_streams` before it leaves the connection's send-stream map, so a reset
-  /// of this subscription reaches it at every point. The returned future waits for the
-  /// subscriber's acknowledgement and then retires the entry. `None` when no stream
-  /// was open under this id.
+  /// FINs one of this subscription's data streams. The stream enters
+  /// `finishing_streams` before it leaves the connection's send-stream map, both
+  /// under checks that make every interleaving with a reset safe: a stream a reset
+  /// of this subscription already covers (`reset_from`) is reset, never FIN'd; a
+  /// stream another close is already finishing is left to it; a stream reopened
+  /// under the same id is not touched. The returned future resolves when the
+  /// subscriber has acknowledged everything or a reset ended the stream, and then
+  /// retires the entry. `None` when there was nothing for this call to finish.
   async fn begin_close_data_stream(
     &self,
     stream_id: &StreamId,
-  ) -> Result<Option<impl std::future::Future<Output = Result<()>> + Send + 'static>> {
+  ) -> Result<Option<impl std::future::Future<Output = Result<FinishOutcome>> + Send + 'static>> {
     let Some(stream) = self.subscriber.get_stream(stream_id).await else {
       return Ok(None);
     };
-    self
-      .finishing_streams
-      .write()
-      .await
-      .insert(stream_id.clone(), stream.clone());
-    let finishing = self.finishing_streams.clone();
-    let retire = move |id: StreamId, stream: Arc<Mutex<TransportSendStream>>| async move {
-      let mut f = finishing.write().await;
-      // A reset may have taken the entry already, and a later stream may reuse the id.
-      if f.get(&id).is_some_and(|s| Arc::ptr_eq(s, &stream)) {
-        f.remove(&id);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+      let mut finishing = self.finishing_streams.write().await;
+      if finishing
+        .entries
+        .get(stream_id)
+        .is_some_and(|e| Arc::ptr_eq(&e.stream, &stream))
+      {
+        return Ok(None);
       }
-    };
-    let ack = match self.subscriber.begin_close_stream(stream_id).await {
-      Ok(Some((closed, ack))) if Arc::ptr_eq(&closed, &stream) => ack,
-      Ok(Some((closed, ack))) => {
-        // The id was reopened in between; what was closed is the newer stream.
-        retire(stream_id.clone(), stream).await;
+      if let Some(code) = finishing.reset_code_for(stream_id) {
+        drop(finishing);
+        self.subscriber.reset_stream(stream_id, code).await;
+        return Ok(None);
+      }
+      finishing.entries.insert(
+        stream_id.clone(),
+        FinishingEntry {
+          stream: stream.clone(),
+          _cancel: cancel_tx,
+        },
+      );
+    }
+    let ack = match self
+      .subscriber
+      .begin_close_stream_matching(stream_id, &stream)
+      .await
+    {
+      Ok(Some(ack)) => ack,
+      other => {
+        // Closed or reset concurrently, or the id now holds another stream.
         self
           .finishing_streams
           .write()
           .await
-          .insert(stream_id.clone(), closed.clone());
-        return Ok(Some(self.ack_then_retire(stream_id.clone(), closed, ack)));
-      }
-      Ok(None) => {
-        // Reset (or closed) concurrently: nothing is left to finish.
-        retire(stream_id.clone(), stream).await;
-        return Ok(None);
-      }
-      Err(e) => {
-        retire(stream_id.clone(), stream).await;
-        return Err(e);
+          .retire(stream_id, &stream);
+        return other.map(|_| None);
       }
     };
-    Ok(Some(self.ack_then_retire(stream_id.clone(), stream, ack)))
-  }
-
-  fn ack_then_retire(
-    &self,
-    stream_id: StreamId,
-    stream: Arc<Mutex<TransportSendStream>>,
-    ack: crate::server::client::FinishAck,
-  ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
     let finishing = self.finishing_streams.clone();
+    let stream_id = stream_id.clone();
     let connection_id = self.client_connection_id;
-    async move {
-      let res = ack.await;
-      {
-        let mut f = finishing.write().await;
-        if f.get(&stream_id).is_some_and(|s| Arc::ptr_eq(s, &stream)) {
-          f.remove(&stream_id);
-        }
-      }
-      res.map_err(|e| {
-        anyhow::anyhow!(
-          "stream {} did not finish for subscriber={}: {:?}",
-          stream_id,
-          connection_id,
-          e
-        )
-      })
-    }
+    Ok(Some(async move {
+      let res = tokio::select! {
+        r = ack => r.map(|_| FinishOutcome::Acknowledged).map_err(|e| {
+          anyhow::anyhow!("stream {} did not finish for subscriber={}: {:?}", stream_id, connection_id, e)
+        }),
+        // The entry was dropped by a reset (its sender with it): a reset stream's
+        // acknowledgement wait would otherwise last until the connection closes.
+        _ = cancel_rx => Ok(FinishOutcome::Reset),
+      };
+      finishing.write().await.retire(&stream_id, &stream);
+      res
+    }))
   }
 
-  /// FINs one of this subscription's data streams and waits for the subscriber's
-  /// acknowledgement (see `begin_close_data_stream`). `Ok(false)` when no stream was
-  /// open under this id.
+  /// FINs one of this subscription's data streams and waits until the subscriber
+  /// has acknowledged it or a reset ended it (see `begin_close_data_stream`).
+  /// `Ok(false)` when there was nothing for this call to finish.
   async fn close_data_stream(&self, stream_id: &StreamId) -> Result<bool> {
     match self.begin_close_data_stream(stream_id).await? {
       None => Ok(false),
@@ -1401,22 +1457,26 @@ impl Subscription {
     }
   }
 
-  /// Resets this subscription's FIN'd but unacknowledged data streams: all of them, or
-  /// those of groups at or above `from_group`. Returns how many were reset.
-  async fn reset_finishing_streams(&self, code: u64, from_group: Option<u64>) -> usize {
+  /// Resets this subscription's FIN'd but unacknowledged data streams of groups at or
+  /// above `from_group` (0: all of them, FETCH streams included) and makes every
+  /// later close of such a stream a reset (`FinishingStreams::reset_from`). Returns
+  /// how many FIN'd streams were reset.
+  async fn reset_finishing_streams(&self, code: u64, from_group: u64) -> usize {
     let streams: Vec<(StreamId, Arc<Mutex<TransportSendStream>>)> = {
       let mut finishing = self.finishing_streams.write().await;
+      finishing.reset_from = Some(match finishing.reset_from {
+        Some((g, c)) if g <= from_group => (g, c),
+        _ => (from_group, code),
+      });
       let ids: Vec<StreamId> = finishing
+        .entries
         .keys()
-        .filter(|id| match from_group {
-          None => true,
-          Some(seam) => id.group_id.is_some_and(|g| g >= seam),
-        })
+        .filter(|id| FinishingStreams::covered(id, from_group))
         .cloned()
         .collect();
       ids
         .into_iter()
-        .filter_map(|id| finishing.remove(&id).map(|s| (id, s)))
+        .filter_map(|id| finishing.entries.remove(&id).map(|e| (id, e.stream)))
         .collect()
     };
     let n = streams.len();
@@ -2131,9 +2191,9 @@ impl Subscription {
         let stream_id = stream_id.clone();
         tokio::spawn(async move {
           match ack.await {
-            Ok(()) => debug!(
-              "handle_stream_closed | successful for subscriber={} stream_id={} relay_track_id={}",
-              connection_id, stream_id, relay_track_id
+            Ok(outcome) => debug!(
+              "handle_stream_closed | {:?} for subscriber={} stream_id={} relay_track_id={}",
+              outcome, connection_id, stream_id, relay_track_id
             ),
             Err(e) => warn!(
               "handle_stream_closed | error for subscriber={} stream_id={} relay_track_id={} error: {:?}",
@@ -3916,5 +3976,109 @@ mod tests_reset_reaches_finishing_streams {
       finishing.read().await.is_empty(),
       "the reset retires the entry"
     );
+  }
+
+  /// Opens group 1 on a delayed link with `objects` large objects; returns the
+  /// subscription, the track, the group's stream id and a receiver of how the
+  /// subscriber saw the stream end.
+  async fn one_large_group(
+    conn: usize,
+    objects: u64,
+  ) -> (
+    Arc<RwLock<Subscription>>,
+    Track,
+    StreamId,
+    tokio::sync::oneshot::Receiver<String>,
+  ) {
+    let (peer, server) = webtransport_pair_delayed(ONE_WAY).await;
+    let client = relay_client(conn, server);
+    let track = test_track(TRACK, "video-720p");
+    let latest = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    );
+    let sub = subscribe(&track, &client, latest, false).await;
+    sub.read().await.mark_alias_announced();
+    let (end_tx, end_rx) = tokio::sync::oneshot::channel::<String>();
+    tokio::spawn(async move {
+      let mut recv = peer.accept_uni().await.expect("the group's stream");
+      let mut buf = vec![0u8; 65_536];
+      let end = loop {
+        match recv.read(&mut buf).await {
+          Ok(Some(_)) => continue,
+          Ok(None) => break "fin".to_string(),
+          Err(TransportReadError::Reset(code)) => break format!("reset {code}"),
+          Err(e) => break format!("error {e:?}"),
+        }
+      };
+      let _ = end_tx.send(end);
+      std::mem::forget(peer);
+    });
+    let mut stream_id = None;
+    for object in 0..objects {
+      stream_id = Some(publish_large(&track, 1, object).await);
+    }
+    (sub, track, stream_id.unwrap(), end_rx)
+  }
+
+  /// Review 2026-10-05: a close that runs after a reset of the subscription (here
+  /// the group completes after the reset's sweep) must reset the stream, not FIN it.
+  #[tokio::test]
+  async fn a_close_after_a_reset_resets_instead_of_finishing() {
+    let (sub, track, stream_id, end_rx) = one_large_group(100, OBJECTS).await;
+    // The reset's sweep finds nothing FIN'd yet: the group's stream is still open
+    // and, as in the race, already out of the open-stream bookkeeping.
+    sub
+      .read()
+      .await
+      .send_stream_last_object_ids
+      .write()
+      .await
+      .remove(&stream_id);
+    let swept = sub
+      .read()
+      .await
+      .reset_finishing_streams(StreamResetCode::Cancelled.to_u64(), 0)
+      .await;
+    assert_eq!(swept, 0);
+    track
+      .stream_closed(&stream_id)
+      .await
+      .expect("stream closed");
+    let end = tokio::time::timeout(Duration::from_secs(10), end_rx)
+      .await
+      .expect("the stream ends")
+      .unwrap();
+    assert_eq!(
+      end,
+      format!("reset {}", StreamResetCode::Cancelled.to_u64())
+    );
+  }
+
+  /// Review 2026-10-05: quinn frees a stream reset after FIN without waking its
+  /// `stopped()` waiter, so the acknowledgement wait of a reset stream lasted until
+  /// the connection closed. It must end with the reset.
+  #[tokio::test]
+  async fn a_reset_ends_the_acknowledgement_wait() {
+    let (sub, _track, stream_id, _end_rx) = one_large_group(101, OBJECTS).await;
+    let ack = sub
+      .read()
+      .await
+      .begin_close_data_stream(&stream_id)
+      .await
+      .expect("close")
+      .expect("an open stream to finish");
+    sub
+      .read()
+      .await
+      .reset_finishing_streams(StreamResetCode::Cancelled.to_u64(), 0)
+      .await;
+    let outcome = tokio::time::timeout(Duration::from_secs(2), ack)
+      .await
+      .expect("the wait ends with the reset")
+      .expect("no error");
+    assert_eq!(outcome, FinishOutcome::Reset);
   }
 }
