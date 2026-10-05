@@ -17,8 +17,8 @@ use moka::notification::RemovalCause;
 use moqtail::model::common::location::Location;
 use moqtail::model::data::fetch_object::FetchObjectPayload;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{
@@ -74,6 +74,12 @@ pub struct TrackCache {
   /// Maintained at insert and eviction so the experiment log can report the
   /// memory cost of caching several representations.
   bytes: Arc<AtomicU64>,
+  /// Group ids currently cached, maintained by `add_object` (insert) and the
+  /// eviction listener (remove), so the bounds and the count are exact the moment
+  /// an object is added. moka's `iter()` / `entry_count()` are only brought up to
+  /// date by its maintenance: the count lagged every insert, and the replay end of
+  /// a joining subscription (newest group) could miss the group just added.
+  group_ids: Arc<StdMutex<BTreeSet<u64>>>,
 }
 
 /// Snapshot of one track cache for the experiment event log.
@@ -100,10 +106,16 @@ impl TrackCache {
     let generation_for_listener = generation.clone();
     let bytes = Arc::new(AtomicU64::new(0));
     let bytes_for_listener = bytes.clone();
+    let group_ids = Arc::new(StdMutex::new(BTreeSet::new()));
+    let group_ids_for_listener = group_ids.clone();
 
     let cache_builder = Cache::builder()
       .max_capacity(cache_size as u64)
       .eviction_listener(move |key: Arc<CacheKey>, value: GroupObjects, cause| {
+        // A Replaced entry's key is still cached (under the new value).
+        if cause != RemovalCause::Replaced {
+          group_ids_for_listener.lock().unwrap().remove(&key.group_id);
+        }
         // Eviction changes availability, so it must bump the generation:
         // gated consumers (SWITCH selection) can flip on group REMOVAL too --
         // e.g. a blocking group evicted from the current track unblocks a
@@ -166,25 +178,22 @@ impl TrackCache {
       log_folder,
       generation,
       bytes,
+      group_ids,
     }
   }
 
   /// Groups, payload bytes and group-id bounds currently cached for this track.
+  ///
+  /// Constant time: read from the maintained group-id set rather than by walking
+  /// every cache entry (the cache is one moka instance per track, so the old walk's
+  /// relay_track_id filter never excluded anything).
   pub async fn stats(&self) -> CacheStats {
-    let mut oldest = None;
-    let mut newest = None;
-    for (k, _) in self.cache.iter() {
-      if k.relay_track_id != self.relay_track_id {
-        continue;
-      }
-      oldest = Some(oldest.map_or(k.group_id, |o: u64| o.min(k.group_id)));
-      newest = Some(newest.map_or(k.group_id, |n: u64| n.max(k.group_id)));
-    }
+    let ids = self.group_ids.lock().unwrap();
     CacheStats {
-      groups: self.cache.entry_count(),
+      groups: ids.len() as u64,
       bytes: self.bytes.load(Ordering::Relaxed),
-      oldest_group: oldest,
-      newest_group: newest,
+      oldest_group: ids.first().copied(),
+      newest_group: ids.last().copied(),
     }
   }
 
@@ -294,6 +303,7 @@ impl TrackCache {
       }
       Err(index) => {
         objects.insert(index, object.clone());
+        self.group_ids.lock().unwrap().insert(object.group_id);
         if objects.len() == 1 {
           events::emit(
             "CACHE_GROUP",
@@ -472,14 +482,8 @@ impl TrackCache {
   /// Returns the smallest group_id currently in the cache, or None if empty.
   /// Used by the SUBSCRIBE handler to clamp delay-mode start_locations to the
   /// oldest available group when the requested target predates the cache window.
-  #[allow(dead_code)]
   pub async fn oldest_group_id(&self) -> Option<u64> {
-    self
-      .cache
-      .iter()
-      .filter(|(k, _)| k.relay_track_id == self.relay_track_id)
-      .map(|(k, _)| k.group_id)
-      .min()
+    self.group_ids.lock().unwrap().first().copied()
   }
 
   /// The greatest `(group, max object_id)` location held for any group
@@ -495,12 +499,12 @@ impl TrackCache {
   /// single-subgroup groups this relay produces, approximate under subgroup
   /// interleaving).
   pub async fn max_location_below_group(&self, group_bound: u64) -> Option<Location> {
-    let group_id = self
-      .cache
-      .iter()
-      .filter(|(k, _)| k.relay_track_id == self.relay_track_id && k.group_id < group_bound)
-      .map(|(k, _)| k.group_id)
-      .max()?;
+    let group_id = *self
+      .group_ids
+      .lock()
+      .unwrap()
+      .range(..group_bound)
+      .next_back()?;
     let key = CacheKey::new(self.relay_track_id, group_id);
     let objects_arc = self.cache.get(&key).await?;
     let objects = objects_arc.read().await;
@@ -513,14 +517,10 @@ impl TrackCache {
   /// Feeds the SWITCH handler's `compute_switch_group` (PR #1378): the relay
   /// needs the full availability set on both the current and target Tracks to
   /// test the common-boundary and gap-free-to-live-edge conditions, which the
-  /// scalar `oldest`/`newest` accessors can't express. O(n) over cache entries.
+  /// scalar `oldest`/`newest` accessors can't express. Read from the maintained
+  /// group-id set, so a group is visible the moment its first object is added.
   pub async fn available_group_ids(&self) -> BTreeSet<u64> {
-    self
-      .cache
-      .iter()
-      .filter(|(k, _)| k.relay_track_id == self.relay_track_id)
-      .map(|(k, _)| k.group_id)
-      .collect()
+    self.group_ids.lock().unwrap().clone()
   }
 
   /// Returns the largest group_id currently in the cache for this track,
@@ -531,14 +531,8 @@ impl TrackCache {
   /// the upper bound for cache replay so the subscriber receives objects in
   /// the range [start_location, newest_group_id] before live forwarding takes
   /// over.
-  #[allow(dead_code)]
   pub async fn newest_group_id(&self) -> Option<u64> {
-    self
-      .cache
-      .iter()
-      .filter(|(k, _)| k.relay_track_id == self.relay_track_id)
-      .map(|(k, _)| k.group_id)
-      .max()
+    self.group_ids.lock().unwrap().last().copied()
   }
 }
 
@@ -558,6 +552,8 @@ mod tests_group_bounds {
       key_file: String::new(),
       max_idle_timeout: 60,
       keep_alive_interval: 30,
+      congestion_controller: crate::server::config::CongestionController::Cubic,
+      udp_gso: crate::server::config::UdpGso::Off,
       cache_size: 100,
       log_folder: String::new(),
       cache_expiration_type: CacheExpirationType::Ttl,
@@ -632,6 +628,44 @@ mod tests_group_bounds {
     assert_eq!(s.newest_group, Some(4));
   }
 
+  /// Report 5 (Minor): the replay end and CACHE_STATS read the group bounds right
+  /// after an insert, without moka's maintenance having run. They must already
+  /// include the group just added (and the count must too).
+  #[tokio::test]
+  async fn bounds_and_count_include_a_group_as_soon_as_it_is_added() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 100, &cfg);
+    for g in 10..60u64 {
+      cache.add_object(fetch_object(g, 0)).await;
+      cache.add_object(fetch_object(g, 1)).await;
+      assert_eq!(cache.newest_group_id().await, Some(g));
+      assert_eq!(cache.oldest_group_id().await, Some(10));
+      let s = cache.stats().await;
+      assert_eq!(s.newest_group, Some(g));
+      assert_eq!(s.oldest_group, Some(10));
+      assert_eq!(s.groups, g - 9, "groups after adding {g}");
+    }
+  }
+
+  /// Evicted groups leave the bounds and the count.
+  #[tokio::test]
+  async fn evicted_groups_leave_the_bounds() {
+    let cfg = test_config();
+    let cache = TrackCache::new(1, 3, &cfg);
+    for g in 0..10u64 {
+      cache.add_object(fetch_object(g, 0)).await;
+      cache.run_pending_tasks().await;
+    }
+    let s = cache.stats().await;
+    assert_eq!(s.groups, cache.cache.entry_count(), "{s:?}");
+    assert!(s.groups <= 3, "{s:?}");
+    let present: Vec<u64> = (0..10u64)
+      .filter(|g| cache.cache.contains_key(&CacheKey::new(1, *g)))
+      .collect();
+    assert_eq!(s.oldest_group, present.first().copied());
+    assert_eq!(s.newest_group, present.last().copied());
+  }
+
   #[tokio::test]
   async fn group_bounds_handle_single_group() {
     let cfg = test_config();
@@ -660,6 +694,8 @@ mod tests_switch_cache_support {
       key_file: String::new(),
       max_idle_timeout: 60,
       keep_alive_interval: 30,
+      congestion_controller: crate::server::config::CongestionController::Cubic,
+      udp_gso: crate::server::config::UdpGso::Off,
       cache_size: 100,
       log_folder: String::new(),
       cache_expiration_type: CacheExpirationType::Ttl,

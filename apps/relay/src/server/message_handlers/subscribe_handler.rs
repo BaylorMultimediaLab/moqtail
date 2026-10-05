@@ -209,8 +209,16 @@ async fn handle_probe_subscribe(
 
   let stream_id = StreamId::new_subgroup(track_alias, 0, Some(0));
 
-  // Stream-scheduling priority 0 -- yield to real video under congestion.
-  let send_stream = match client.open_stream(&stream_id, header_bytes, 0).await {
+  // Stream-scheduling priority: the lowest slot of the lowest band, so the probe
+  // yields to every video stream whatever subscriber priority they carry (M3).
+  let send_stream = match client
+    .open_stream(
+      &stream_id,
+      header_bytes,
+      crate::server::subscription::probe_stream_priority(),
+    )
+    .await
+  {
     Ok(s) => s,
     Err(e) => {
       warn!("probe: failed to open stream: {:?}", e);
@@ -327,7 +335,7 @@ async fn upstream_subscribe_exchange(
   new_sub: Subscribe,
   context: Arc<SessionContext>,
 ) {
-  let (send, recv) = match publisher.connection.open_bi().await {
+  let (send, recv) = match publisher.connection.open_request_stream().await {
     Ok(streams) => streams,
     Err(e) => {
       error!("Failed to open upstream subscribe stream: {:?}", e);
@@ -710,19 +718,15 @@ async fn handle_subscribe_message(
     );
     // Clone the handles out of the guard: the hold below awaits, and the
     // track lock must not be held across it.
-    let (live_edge_advanced, cache, holding_subscribes) = {
+    let (live_edge_advanced, cache) = {
       let track = track_arc.read().await;
-      (
-        track.live_edge_advanced.clone(),
-        track.cache.clone(),
-        track.holding_subscribes.clone(),
-      )
+      (track.live_edge_advanced.clone(), track.cache.clone())
     };
     // Loop until we can resolve the requested start position.
     // Mesa-style condition wait: arm the Notify *before* re-reading state
     // to avoid lost-wakeup races (a notify_waiters between our compute and
     // our await would otherwise be missed).
-    let mut registered = false;
+    let mut held = false;
     loop {
       let notified = live_edge_advanced.notified();
       tokio::pin!(notified);
@@ -752,7 +756,7 @@ async fn handle_subscribe_message(
               "largest_group": largest.as_ref().map(|l| l.group),
               "oldest_cached_group": oldest_cached,
               "start_group": loc.group,
-              "held": registered,
+              "held": held,
             }),
           );
           sub
@@ -762,14 +766,10 @@ async fn handle_subscribe_message(
               Some(loc),
               None,
             ));
-          // Drain any holding-state record for this request (informational).
-          if registered && let Some(largest) = largest {
-            let _ = holding_subscribes.write().await.try_resolve(largest);
-          }
           break;
         }
         DelayedStart::Hold { delay_groups: dg } => {
-          if !registered {
+          if !held {
             info!(
               "Subscribe delay-mode HOLD: request_id={} delay_groups={} \
                largest={:?}; awaiting live edge advance",
@@ -785,11 +785,7 @@ async fn handle_subscribe_message(
                 "largest_group": largest.as_ref().map(|l| l.group),
               }),
             );
-            holding_subscribes
-              .write()
-              .await
-              .register(sub.request_id, dg);
-            registered = true;
+            held = true;
           }
           // Wait for the live edge to advance, then re-check. The Notify arm
           // placed before the read still covers any notify_waiters that fired

@@ -18,13 +18,14 @@ import { RequestStreamMessageHandler } from './handler'
 import { MoqtObject } from '../../model/data'
 import { MessageParameter } from '../../model/parameter/message_parameter'
 import { ProtocolViolationError } from '../../model/error/error'
+import type { PushedReceiver } from '../types'
 import { logger } from '../../util/logger'
 import { RequestStream } from '../request_stream'
 
 /**
  * Delay before unsubscribing a PUBLISH that answered an already-timed-out
  * SWITCH (see the tombstone branch in {@link handlerPublish}). Must exceed
- * MOQtailClient.DATA_ROUTE_WAIT_TIMEOUT_MS (2000 ms) so in-flight data
+ * MOQtailClient.trackAliasResolutionTimeoutMs (500 ms by default) so in-flight data
  * streams resolve their route before local routing state is removed.
  * It's a module-local constant to avoid a runtime import cycle with client.ts.
  */
@@ -52,23 +53,29 @@ function registerPublishReceiver(client: Client, msg: Publish, stream: RequestSt
   const localPseudoRequestId = client.allocatePseudoRequestId()
 
   client.requestIdMap.addMapping(localPseudoRequestId, msg.fullTrackName)
-  client.subscriptionAliasMap.set(localPseudoRequestId, msg.trackAlias)
-  client.aliasFullTrackNameMap.set(msg.trackAlias, msg.fullTrackName)
 
-  client.subscriptionAliasMap.set(msg.requestId, msg.trackAlias)
   client.pushedRequestStreams.set(msg.requestId, stream)
 
   // This object mimics a SubscribeRequest so #handleRecvStreams can use it
-  // identically. `pseudoRequestId` is kept so unsubscribe() can clean up the
-  // pseudo-id mappings alongside the PUBLISH's own request id.
-  const receiver = {
+  // identically. Its requestId is the PUBLISH's own id (not the pseudo id), so the
+  // alias claim maps that id to the alias: the relay-opened catch-up FETCH_HEADER
+  // stream names it, the next SWITCH names it as its Current Subscribe Request ID,
+  // and unsubscribe() resets it. `pseudoRequestId` is kept so unsubscribe() can
+  // clean up the pseudo-id mappings alongside it.
+  const receiver: PushedReceiver & { pseudoRequestId: bigint } = {
     requestId: msg.requestId,
     pseudoRequestId: localPseudoRequestId,
-    streamsAccepted: 0,
+    fullTrackName: msg.fullTrackName,
+    streamsAccepted: 0n,
+    expectedStreams: undefined,
     largestLocation: undefined,
     controller: streamController,
   }
-  client.subscriptions.set(msg.trackAlias, receiver)
+  // Register the receiver so data streams route to it, and file it under the
+  // PUBLISH's own request id so the PUBLISH_DONE that later arrives on this same
+  // stream can complete it (M16).
+  client.claimTrackAlias(msg.trackAlias, receiver)
+  client.pushedReceivers.set(msg.requestId, receiver)
   return objects
 }
 

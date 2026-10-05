@@ -73,6 +73,38 @@ describe('ThroughputRule', () => {
     expect(rule.getMaxIndex(ctx)).toBeNull();
   });
 
+  it('min arm (parameters.downToLowest): nothing fits -> the lowest rung, not an abstention', () => {
+    const downToLowest = {
+      ...DEFAULT_ABR_SETTINGS,
+      rules: {
+        ...DEFAULT_ABR_SETTINGS.rules,
+        ThroughputRule: {
+          ...DEFAULT_ABR_SETTINGS.rules.ThroughputRule!,
+          parameters: { downToLowest: 1 },
+        },
+      },
+    };
+    // 0.9 x 400 kbps = 360 kbps: below 360p's 500 kbps.
+    const r = rule.getMaxIndex(
+      makeContext({ bandwidthBps: 400_000, activeTrackIndex: 2, abrSettings: downToLowest }),
+    );
+    expect(r?.representationIndex).toBe(0);
+    expect(r?.priority).toBe(SwitchRequestPriority.DEFAULT);
+    // The clamps still hold: the lowest rung at or above minBitrate.
+    const clamped = rule.getMaxIndex(
+      makeContext({
+        bandwidthBps: 400_000,
+        activeTrackIndex: 2,
+        abrSettings: { ...downToLowest, minBitrate: 1_000_000 },
+      }),
+    );
+    expect(clamped?.representationIndex).toBe(1);
+    // Cold start still abstains.
+    expect(
+      rule.getMaxIndex(makeContext({ bandwidthBps: 0, abrSettings: downToLowest })),
+    ).toBeNull();
+  });
+
   it('respects bandwidthSafetyFactor from settings', () => {
     // With safetyFactor = 1.0, effectiveBandwidth = 1_500_000 → index 1
     const ctx = makeContext({

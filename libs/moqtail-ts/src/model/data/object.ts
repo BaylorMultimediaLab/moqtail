@@ -43,6 +43,11 @@ export class MoqtObject {
     public readonly objectStatus: ObjectStatus,
     public readonly properties: KeyValuePair[] | null,
     public readonly payload: Uint8Array | null,
+    /**
+     * `performance.now()` at which the data stream parsed this object off the wire
+     * (M11). Undefined for objects built locally rather than received.
+     */
+    public readonly recvAt: number | undefined = undefined,
   ) {
     this.location = location
     this.subgroupId = subgroupId !== null ? BigInt(subgroupId) : null
@@ -205,6 +210,7 @@ export class MoqtObject {
       ObjectStatus.Normal,
       fetchObject.properties,
       fetchObject.payload && fetchObject.payload.length > 0 ? fetchObject.payload : null,
+      fetchObject.recvAt,
     )
   }
 
@@ -224,6 +230,7 @@ export class MoqtObject {
       subgroupObject.objectStatus || ObjectStatus.Normal,
       subgroupObject.properties,
       subgroupObject.payload,
+      subgroupObject.recvAt,
     )
   }
   /**
@@ -327,6 +334,23 @@ if (import.meta.vitest) {
   const { describe, test, expect } = import.meta.vitest
 
   describe('MoqtObject', () => {
+    test('carries the data stream receive stamp through fromSubgroupObject and fromFetchObject', () => {
+      const ftn = FullTrackName.tryNew('ns', 'track')
+      const sub = SubgroupObject.newWithPayload(3, null, new Uint8Array([1]))
+      sub.recvAt = 1234.5
+      expect(MoqtObject.fromSubgroupObject(sub, 7n, 0, 0n, ftn).recvAt).toBe(1234.5)
+
+      const fetched = FetchObject.newObject(1, 0, 2, 0, ObjectForwardingPreference.Subgroup, null, new Uint8Array([1]))
+      fetched.recvAt = 99
+      expect(MoqtObject.fromFetchObject(fetched, ftn).recvAt).toBe(99)
+
+      // Unstamped objects (built locally, not received) carry no stamp.
+      expect(
+        MoqtObject.fromSubgroupObject(SubgroupObject.newWithPayload(4, null, new Uint8Array([1])), 7n, 0, 0n, ftn)
+          .recvAt,
+      ).toBeUndefined()
+    })
+
     test('create object with payload', () => {
       const payload = new TextEncoder().encode('test payload')
       const properties = new LOCProperties().addAudioLevel(100).addTimestamp(0).build()

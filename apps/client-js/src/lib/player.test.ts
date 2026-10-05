@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'vitest';
+import { FullTrackName, GroupOrder, Tuple } from 'moqtail';
+import { GroupOrderParam, SubscriberPriority } from 'moqtail/model';
 import {
+  MEDIA_SCHEDULING,
   buildSubscribeParameters,
-  computeSwitchMinimumGroup,
+  buildSwitchParameters,
   computeStartupTarget,
+  computeSwitchMinimumGroup,
   highestCompleteBufferedGroup,
+  unroutedDropFields,
 } from './player';
 import { TimeMap } from './abr/TimeMap';
 
@@ -301,5 +306,71 @@ describe('computeStartupTarget', () => {
         timeShiftSeconds: 5,
       }),
     ).toBeCloseTo(9);
+  });
+});
+
+// M15: a data stream the library cancelled because no subscription claimed its
+// alias becomes DROP_STALE{reason:'unrouted'} with the bytes it cost.
+describe('unroutedDropFields', () => {
+  it('names the track the alias last mapped to, the group and the bytes', () => {
+    const ftn = FullTrackName.tryNew(
+      Tuple.fromUtf8Path('/moqtail'),
+      new TextEncoder().encode('720p'),
+    );
+    expect(
+      unroutedDropFields(
+        {
+          reason: 'unrouted',
+          trackAlias: 7n,
+          groupId: 42n,
+          subgroupId: 0n,
+          fullTrackName: ftn,
+          bytes: 1234,
+        },
+        { current: '480p', pending: null },
+      ),
+    ).toEqual({
+      reason: 'unrouted',
+      track: '720p',
+      current: '480p',
+      pending: null,
+      group: 42,
+      subgroup: 0,
+      track_alias: 7,
+      bytes: 1234,
+    });
+  });
+
+  it('reports a null track when the alias is no longer known', () => {
+    expect(
+      unroutedDropFields(
+        {
+          reason: 'unrouted',
+          trackAlias: 9n,
+          groupId: 1n,
+          subgroupId: undefined,
+          fullTrackName: undefined,
+          bytes: 10,
+        },
+        { current: '480p', pending: '720p' },
+      ),
+    ).toMatchObject({ track: null, subgroup: null, pending: '720p', bytes: 10 });
+  });
+});
+
+// Transport fairness: the relay schedules by subscriber priority, then group
+// order. A SWITCH without them fell back to priority 128 on the relay (C3 on
+// pr1378, and the native promoted subscription on harness), below the old
+// subscription's leftovers and the probe.
+describe('media scheduling parameters (transport fairness)', () => {
+  it('SUBSCRIBE: subscriber priority 0, ascending group order', () => {
+    expect(MEDIA_SCHEDULING).toEqual({ priority: 0, groupOrder: GroupOrder.Ascending });
+  });
+
+  it('SWITCH carries SubscriberPriority(0) and GroupOrder(Ascending) explicitly', () => {
+    expect(buildSwitchParameters().map(p => p.toKeyValuePair())).toEqual([
+      new SubscriberPriority(0).toKeyValuePair(),
+      new GroupOrderParam(GroupOrder.Ascending).toKeyValuePair(),
+    ]);
   });
 });

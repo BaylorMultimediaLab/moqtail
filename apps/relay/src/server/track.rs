@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::holding_subscribes::HoldingSubscribes;
 use super::seen_objects::SeenObjects;
 use super::track_cache::TrackCache;
 use crate::server::config::AppConfig;
@@ -207,11 +206,6 @@ pub struct Track {
   /// while nothing downstream wants the track; this records whether it has
   /// since been raised, so it is raised only once.
   pub upstream_forward: Arc<AtomicBool>,
-  /// SUBSCRIBEs in delay-mode "holding" state, waiting for the live edge to
-  /// advance past their `delay_groups`. Drained by Task A8 when the publisher
-  /// emits new objects.
-  #[allow(dead_code)]
-  pub(crate) holding_subscribes: Arc<RwLock<HoldingSubscribes>>,
   /// Notified whenever `largest_location` advances. Subscribe handlers
   /// holding for the live edge to reach `delay_groups` await on this.
   pub(crate) live_edge_advanced: Arc<Notify>,
@@ -253,7 +247,6 @@ impl Track {
       upstream_subscribe_cancellers: Arc::new(Mutex::new(Vec::new())),
       pending_upstream_subscribe_count: Arc::new(AtomicUsize::new(0)),
       upstream_forward: Arc::new(AtomicBool::new(false)),
-      holding_subscribes: Arc::new(RwLock::new(HoldingSubscribes::default())),
       live_edge_advanced: Arc::new(Notify::new()),
     }
   }
@@ -508,18 +501,7 @@ impl Track {
       .await?;
 
     if let Ok(fetch_object) = object.clone().try_into_fetch() {
-      if !self.cache.add_object(fetch_object).await {
-        // Duplicate ingest: concurrent paths (live-forward from the upstream
-        // subscription racing an upstream backfill FETCH) can deliver the same
-        // object twice. The cache collapsed it; forwarding it again would hand
-        // subscribers a duplicate the replay watermark cannot catch (it only
-        // guards replay-vs-live, not live-vs-live).
-        debug!(
-          "new_subgroup_object: duplicate ingest skipped | track: {:?} location: {:?}",
-          object.track_alias, object.location
-        );
-        return Ok(());
-      }
+      self.cache.add_object(fetch_object).await;
     } else {
       warn!(
         "new_subgroup_object: object cannot be cached | relay_track_id: {} track_alias: {} location: {:?} stream_id: {} diff_ms: {} object: {:?}",
@@ -604,14 +586,7 @@ impl Track {
         }
 
         if let Ok(fetch_object) = object.clone().try_into_fetch() {
-          if !self.cache.add_object(fetch_object).await {
-            // Duplicate ingest — see new_subgroup_object: forward once only.
-            debug!(
-              "new_datagram_object: duplicate ingest skipped | track: {:?} group: {:?} object_id: {}",
-              datagram.track_alias, datagram.group_id, datagram.object_id
-            );
-            return Ok(());
-          }
+          self.cache.add_object(fetch_object).await;
         } else {
           warn!(
             "new_datagram: object cannot be cached | relay_track_id={} group: {:?} object_id={} diff_ms={} object: {:?}",

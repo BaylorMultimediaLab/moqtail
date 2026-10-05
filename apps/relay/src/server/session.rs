@@ -200,7 +200,7 @@ impl Session {
         return Err(e.into());
       }
     };
-    match context.connection.open_uni().await {
+    match context.connection.open_control_stream().await {
       Ok(send_stream) => {
         let session_context = context.clone();
         let connection_id = session_context.connection_id;
@@ -401,7 +401,7 @@ impl Session {
         return Ok(());
       }
       tokio::select! {
-        stream = context.connection.accept_bi() => {
+        stream = context.connection.accept_request_stream() => {
           match stream {
             Ok((send, recv)) => {
               let ctx = context.clone();
@@ -1163,6 +1163,7 @@ impl Session {
       context.connection_id,
       Arc::new(context.connection.clone()),
       Arc::new(client_setup),
+      context.server_config.write_kbps_limit,
     );
     let client = Arc::new(client);
     context.client_manager.add(client.clone()).await;

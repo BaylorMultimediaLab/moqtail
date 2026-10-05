@@ -242,3 +242,115 @@ describe('SwitchHistoryRule', () => {
     });
   });
 });
+
+describe('seam drops without seam metrics: groups since landing (controller.historyIgnoreGroupsAfterLanding, M17)', () => {
+  const veto = (ignore: number) => ({
+    ...DEFAULT_ABR_SETTINGS,
+    controller: {
+      ...DEFAULT_ABR_SETTINGS.controller,
+      switchHistoryMode: 'veto' as const,
+      historyIgnoreGroupsAfterLanding: ignore,
+    },
+  });
+  /** `drops` drops from 1080p decided `groupsSinceLanding` groups after a landing, plus `ups` climbs to it. */
+  const seamHistory = (drops: number, ups: number, groupsSinceLanding: number): SwitchEvent[] => [
+    ...makeHistory('1080p', drops, 0, '720p').map(e => ({ ...e, groupsSinceLanding })),
+    ...makeHistory('1080p', 0, ups, '720p'),
+  ];
+
+  it('drops decided within the window after a landing are not counted against the rung', () => {
+    const rule = new SwitchHistoryRule();
+    const ctx = makeContext({
+      activeTrackIndex: 1,
+      switchHistory: seamHistory(4, 4, 1),
+      abrSettings: veto(2),
+    });
+    expect(rule.getMaxIndex(ctx)).toBeNull();
+  });
+
+  it('a drop exactly at the window edge is still the seam; one group later it is the rung', () => {
+    const rule = new SwitchHistoryRule();
+    expect(
+      rule.getMaxIndex(
+        makeContext({
+          activeTrackIndex: 1,
+          switchHistory: seamHistory(4, 4, 2),
+          abrSettings: veto(2),
+        }),
+      ),
+    ).toBeNull();
+    const r = rule.getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: seamHistory(4, 4, 3),
+        abrSettings: veto(2),
+      }),
+    );
+    expect(r?.representationIndex).toBe(1);
+    expect(r?.reason).toContain('veto');
+  });
+
+  it('with the window at 0 every drop counts (grid as frozen)', () => {
+    const rule = new SwitchHistoryRule();
+    const r = rule.getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: seamHistory(4, 4, 1),
+        abrSettings: veto(0),
+      }),
+    );
+    expect(r?.representationIndex).toBe(1);
+  });
+
+  it('drops without a stamp (before the first landing) count', () => {
+    const rule = new SwitchHistoryRule();
+    const r = rule.getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: makeHistory('1080p', 4, 4, '720p'),
+        abrSettings: veto(2),
+      }),
+    );
+    expect(r?.representationIndex).toBe(1);
+  });
+});
+
+describe('seam drops anchored at the presented seam (msPastSeam, F2)', () => {
+  const veto = {
+    ...DEFAULT_ABR_SETTINGS,
+    controller: {
+      ...DEFAULT_ABR_SETTINGS.controller,
+      switchHistoryMode: 'veto' as const,
+      historyIgnoreGroupsAfterLanding: 2,
+    },
+  };
+  /** 4 drops from 1080p stamped as given, plus 4 climbs to it. */
+  const history = (stamp: Partial<SwitchEvent>): SwitchEvent[] => [
+    ...makeHistory('1080p', 4, 0, '720p').map(e => ({ ...e, ...stamp })),
+    ...makeHistory('1080p', 0, 4, '720p'),
+  ];
+  const run = (stamp: Partial<SwitchEvent>, segmentDurationS = 1) =>
+    new SwitchHistoryRule().getMaxIndex(
+      makeContext({
+        activeTrackIndex: 1,
+        switchHistory: history(stamp),
+        abrSettings: veto,
+        segmentDurationS,
+      }),
+    );
+
+  it('a drop in the hole before the seam or up to 2 group durations past it is exempt, whatever the groups since landing', () => {
+    expect(run({ msPastSeam: -20, groupsSinceLanding: 10 })).toBeNull();
+    expect(run({ msPastSeam: 2000, groupsSinceLanding: 10 })).toBeNull();
+  });
+
+  it('a drop elsewhere is counted even right after a landing', () => {
+    expect(run({ msPastSeam: 2001, groupsSinceLanding: 0 })?.representationIndex).toBe(1);
+    expect(run({ msPastSeam: null, groupsSinceLanding: 1 })?.representationIndex).toBe(1);
+  });
+
+  it('the window is in group durations of media (GOP from the catalog)', () => {
+    expect(run({ msPastSeam: 3500 }, 2)).toBeNull();
+    expect(run({ msPastSeam: 4500 }, 2)?.representationIndex).toBe(1);
+  });
+});

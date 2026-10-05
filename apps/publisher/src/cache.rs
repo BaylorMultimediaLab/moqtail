@@ -162,6 +162,16 @@ pub fn read_variant_meta(variant_dir: &Path) -> Result<VariantMeta> {
   })
 }
 
+/// SHA-256 of the cache's `meta.json` bytes as lowercase hex, so PUBLISHER_CONFIG
+/// identifies exactly which prepared cache a run replayed.
+pub fn top_meta_sha256(root: &Path) -> Result<String> {
+  use sha2::{Digest, Sha256};
+  let path = root.join(TOP_META_FILE);
+  let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+  let digest = Sha256::digest(&bytes);
+  Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 pub fn read_top_meta(root: &Path) -> Result<TopMeta> {
   let path = root.join(TOP_META_FILE);
   let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -389,6 +399,22 @@ mod tests {
     assert_eq!(read.variants, vec!["1080p".to_string(), "720p".to_string()]);
     assert_eq!(read.gops_per_variant, 30);
     assert_eq!(read.schema_version, SCHEMA_VERSION);
+  }
+
+  /// PUBLISHER_CONFIG identifies the replayed cache by the hash of its meta.json.
+  #[test]
+  fn test_top_meta_sha256_hashes_the_file_bytes() {
+    let td = TempDir::new("meta-sha");
+    assert!(top_meta_sha256(td.path()).is_err(), "no meta.json yet");
+    fs::write(td.path().join(TOP_META_FILE), b"abc").unwrap();
+    assert_eq!(
+      top_meta_sha256(td.path()).unwrap(),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    write_top_meta_atomic(td.path(), &sample_top_meta()).unwrap();
+    let h = top_meta_sha256(td.path()).unwrap();
+    assert_eq!(h.len(), 64);
+    assert_eq!(top_meta_sha256(td.path()).unwrap(), h, "deterministic");
   }
 
   #[test]

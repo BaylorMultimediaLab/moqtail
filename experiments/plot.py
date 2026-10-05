@@ -4,8 +4,9 @@
 Reads each run's summary.json (analyze.py must have run) and, for the
 trajectory figures, its client-events.jsonl and runner-events.jsonl. Runs are
 grouped into conditions exactly as compare.py does (mechanism, client type,
-network profile + background flows, controller arm), so every bar here is the
-same population as the corresponding column of the comparison table.
+network profile + qdisc + congestion controller + background flows, controller
+arm), so every bar here is the same population as the corresponding column of
+the comparison table.
 
     python3 experiments/plot.py results/*/ --out figures/
     python3 experiments/plot.py results-linux-*/grid/results/*/ --out figures/grid --format pdf,png
@@ -15,15 +16,21 @@ same population as the corresponding column of the comparison table.
 Figures (one file per metric or facet; `--facet` picks what becomes a panel):
 
   bars_<metric>        median over valid repetitions with the inter-quartile
-                       range as the error bar and one dot per repetition
+                       range as the error bar and one dot per repetition; for a
+                       Bernoulli row the bar is the fraction k/n; for a censored
+                       row the bar is the median with never = inf (no bar when
+                       at least half the runs never had the event) and the label
+                       says k/n
   summary              the headline metrics as a grid of such bar panels
   traj_live_edge_*     live-edge distance vs time since first frame, one thin
                        line per repetition and a thick median trajectory per
                        condition; vertical lines mark NET_CHANGE events
-  traj_rung_*          played ladder rung vs time (same layout)
+  traj_rung_*          presented ladder rung vs time (SAMPLE.presented_track;
+                       the subscribed track on bundles without it)
   traj_buffer_*        buffer level vs time (same layout)
   seam_*               ECDFs of per-switch seam costs (viewer pause, buffer
-                       hole, visibility delay) pooled over repetitions
+                       hole, visibility delay) over switches with their own
+                       first frame, pooled over repetitions
 
 Requires matplotlib (pip install matplotlib). Everything else is stdlib.
 """
@@ -32,43 +39,49 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare  # noqa: E402  (same directory; grouping and metric accessors)
+from analyze import censored_summary, is_valid  # noqa: E402
 
 FIELDS = ("mechanism", "client", "profile", "ctl")
 
 # Metrics plotted as bars. Names must match compare.ROWS so that the figure and
 # the table always compute the same thing.
 BAR_METRICS = [
-    "switches / min",
+    "switches / min (run duration)",
     "A->B->A reversals",
-    "superseded",
-    "stalls",
-    "stalled s",
-    "data starved s",
-    "viewer pause p95 ms",
-    "seam buffer hole p50 ms",
-    "switch visibility p50 ms",
-    "mean played rung index",
-    "played kbps",
+    "superseded (frac of switches)",
+    "presented rung mean",
+    "presented kbps",
+    "fit share, low window (frac)",
+    "share >= pre-drop rung after restore",
+    "stall s (episodes >= 250 ms)",
+    "stall count (>= 250 ms)",
+    "media skipped s (gap seeks)",
+    "starvation s (subset of stall)",
+    "viewer pause p95 ms (own 1st frame)",
+    "visibility p50 ms (own 1st frame)",
     "startup ms",
-    "live-edge dist mean ms",
     "shift retained, last 60 s (s)",
-    "time to half shift s",
-    "down-reaction s (held 5 s)",
-    "up-recovery s (held 5 s)",
-    "landed on a keyframe (frac, sync flag)",
+    "half shift lost (k/n runs)",
+    "time to half shift s (k/n, never=inf)",
+    "live-edge dist mean ms (after window)",
+    "landed on a keyframe (frac)",
+    "down-reaction s (detect_step; k/n)",
+    "up-recovery s (detect_step; k/n)",
 ]
 SUMMARY_METRICS = [
-    "switches / min",
-    "A->B->A reversals",
-    "stalled s",
-    "viewer pause p95 ms",
-    "mean played rung index",
+    "switches / min (run duration)",
+    "superseded (frac of switches)",
+    "presented rung mean",
+    "stall s (episodes >= 250 ms)",
+    "media skipped s (gap seeks)",
+    "viewer pause p95 ms (own 1st frame)",
     "shift retained, last 60 s (s)",
 ]
 SEAM_METRICS = [
@@ -76,7 +89,8 @@ SEAM_METRICS = [
     ("seam_buffer_hole_ms", "buffer hole at the seam (ms)"),
     ("switch_visibility_delay_ms", "switch visibility delay (ms)"),
 ]
-ROW_BY_NAME = {name: fn for name, fn in compare.ROWS}
+ROW_BY_NAME = {name: fn for name, fn, _ in compare.ROWS}
+KIND_BY_NAME = compare.KIND_BY_NAME
 
 
 def condition(s: dict) -> dict[str, str]:
@@ -100,7 +114,7 @@ def load_runs(paths: list[Path], include_invalid: bool) -> list[dict]:
         if not p.exists():
             continue
         s = json.loads(p.read_text())
-        if s.get("validity", {}).get("valid") is False and not include_invalid:
+        if not is_valid(s.get("validity")) and not include_invalid:
             continue
         # The same run may appear in several extracted bundles; count it once.
         if s.get("run_id") in seen:
@@ -130,9 +144,19 @@ def events(run: Path, name: str, wanted: set[str]) -> list[dict]:
     return out
 
 
+def presented_switch(sw: dict) -> bool:
+    """A switch with its own first frame. Summaries from before 2026-10-04 carry only the
+    (wrong) `superseded` flag; those are accepted when the flag is false."""
+    term = sw.get("terminal")
+    if term is not None:
+        return term == "first_frame"
+    return not sw.get("superseded")
+
+
 def trajectory(run: dict, field: str) -> tuple[list[float], list[float], list[float]]:
     """(t_s, value, net_change_t_s) for one run; t = 0 at the first presented frame of the
-    last client session. Rung index is resolved from the RUN_META ladder."""
+    last client session. Rung index is resolved from the RUN_META ladder; the rung is the
+    presented track when SAMPLE carries `presented_track`, else the subscribed track."""
     ev = events(run["_dir"], "client-events.jsonl", {"SAMPLE", "STARTUP", "RUN_META"})
     sessions = {e.get("session") for e in ev if e.get("event") == "SAMPLE"}
     if not sessions:
@@ -145,10 +169,11 @@ def trajectory(run: dict, field: str) -> tuple[list[float], list[float], list[fl
     meta = next((e for e in ev if e["event"] == "RUN_META"), None) or {}
     ladder = sorted(meta.get("ladder", []), key=lambda t: t.get("bitrate") or 0)
     rung = {t["track"]: i for i, t in enumerate(ladder)}
+    has_presented = any(e.get("presented_track") is not None for e in samples)
     ts, vs = [], []
     for e in samples:
         if field == "rung":
-            v = rung.get(e.get("track"))
+            v = rung.get(e.get("presented_track") if has_presented else e.get("track"))
         else:
             v = e.get(field)
         if v is None:
@@ -228,8 +253,35 @@ def save(fig, out: Path, name: str, formats: list[str], index: list[str], note: 
     index.append(f"- `{name}.{formats[0]}` — {note}")
 
 
+def bar_value(metric: str, sel: list[dict]) -> tuple[float | None, list[float], str]:
+    """(bar height, dots, label) for one group of runs according to the row kind:
+    median (IQR dots), fraction k/n, or censored median with never = inf."""
+    fn, kind = ROW_BY_NAME[metric], KIND_BY_NAME.get(metric, "median")
+    raw = [fn(r) for r in sel]
+    raw = [v for v in raw if v is not compare.NA]
+    if kind == "frac":
+        vals = [v for v in raw if v is not None]
+        if not vals:
+            return None, [], ""
+        k = sum(1 for v in vals if v)
+        return k / len(vals), [], f"{k}/{len(vals)}"
+    if kind == "censored":
+        if not raw:
+            return None, [], ""
+        c = censored_summary(raw)
+        events_ = [float(v) for v in raw if v is not None]
+        m = c["median_censored_s"]
+        if m is None or math.isinf(m):
+            return math.inf, events_, f"never ({c['n']}/{c['of']})"
+        return m, events_, f"{c['n']}/{c['of']}"
+    vals = [float(v) for v in raw if v is not None]
+    if not vals:
+        return None, [], ""
+    return statistics.median(vals), vals, f"n={len(vals)}"
+
+
 def bar_panel(ax, runs: list[dict], metric: str, x: str, hue: str, colors: dict[str, str]) -> bool:
-    fn = ROW_BY_NAME[metric]
+    kind = KIND_BY_NAME.get(metric, "median")
     xs = sorted({r["_cond"][x] for r in runs})
     hues = sorted({r["_cond"][hue] for r in runs}) if hue != "none" else [""]
     width = 0.8 / len(hues)
@@ -237,17 +289,25 @@ def bar_panel(ax, runs: list[dict], metric: str, x: str, hue: str, colors: dict[
     for hi, h in enumerate(hues):
         for xi, xv in enumerate(xs):
             sel = [r for r in runs if r["_cond"][x] == xv and (hue == "none" or r["_cond"][hue] == h)]
-            vals = [v for v in (fn(r) for r in sel) if v is not None]
-            if not vals:
+            med, dots, label = bar_value(metric, sel)
+            if med is None:
                 continue
             drew = True
             pos = xi - 0.4 + width * (hi + 0.5)
-            med = statistics.median(vals)
-            q1, q3 = (compare_pct(vals, 25), compare_pct(vals, 75)) if len(vals) > 1 else (med, med)
+            if math.isinf(med):
+                top = max(dots) if dots else 0
+                ax.scatter([pos] * len(dots), dots, s=6, color="black", zorder=3, alpha=0.7)
+                ax.text(pos, top, label, va="bottom", ha="center", fontsize=5, color="gray")
+                continue
+            if kind == "median" and len(dots) > 1:
+                q1, q3 = compare_pct(dots, 25), compare_pct(dots, 75)
+            else:
+                q1, q3 = med, med
             ax.bar(pos, med, width * 0.9, color=colors.get(h, "C0"), alpha=0.75,
                    yerr=[[med - q1], [q3 - med]], capsize=2, error_kw={"lw": 0.8})
-            ax.scatter([pos] * len(vals), vals, s=6, color="black", zorder=3, alpha=0.7)
-            ax.text(pos, max(q3, med), f"n={len(vals)}", va="bottom", ha="center", fontsize=5)
+            if dots:
+                ax.scatter([pos] * len(dots), dots, s=6, color="black", zorder=3, alpha=0.7)
+            ax.text(pos, max(q3, med, max(dots) if dots else med), label, va="bottom", ha="center", fontsize=5)
     ax.set_xticks(range(len(xs)))
     ax.set_xticklabels([xv.replace("/", "/\n") for xv in xs])
     ax.set_ylabel(metric)
@@ -290,7 +350,7 @@ def make_bars(plt, runs, metrics, x, hue, facet, out, formats, index, name=None,
     fig.tight_layout()
     if any_drawn:
         save(fig, out, name or f"bars_{slug(metrics[0])}", formats, index,
-             note or f"{metrics[0]}: median over repetitions, IQR error bar, one dot per repetition")
+             note or f"{metrics[0]}: median over repetitions (IQR error bar, one dot per repetition); k/n for fractions and censored rows")
     plt.close(fig)
 
 
@@ -348,7 +408,7 @@ def make_seams(plt, runs, x, hue, facet, out, formats, index):
                         continue
                     for sw in r["switches"].get("list", []):
                         v = sw.get(field)
-                        if v is not None and not sw.get("superseded"):
+                        if v is not None and presented_switch(sw):
                             vals.append(v)
                 if not vals:
                     continue
@@ -372,7 +432,7 @@ def make_seams(plt, runs, x, hue, facet, out, formats, index):
         fig.suptitle(facet_title(facet, key))
         fig.tight_layout()
         save(fig, out, f"seam_{slug(facet_title(facet, key))}", formats, index,
-             "ECDF of per-switch seam costs, superseded switches excluded, pooled over repetitions")
+             "ECDF of per-switch seam costs over switches with their own first frame, pooled over repetitions")
         plt.close(fig)
 
 
@@ -381,7 +441,7 @@ def main() -> int:
     ap.add_argument("runs", nargs="+", type=Path)
     ap.add_argument("--out", type=Path, default=Path("figures"))
     ap.add_argument("--format", default="pdf,png", help="comma-separated: pdf, png, svg")
-    ap.add_argument("--all", action="store_true", help="include runs whose validation failed")
+    ap.add_argument("--all", action="store_true", help="include runs whose validation did not pass")
     ap.add_argument("--x", default="mechanism", choices=FIELDS, help="bar groups / trajectory colours")
     ap.add_argument("--hue", default="client", choices=FIELDS + ("none",), help="bars within a group")
     ap.add_argument("--facet", default="profile,ctl", help="comma-separated fields that become panels, or none")
@@ -424,7 +484,7 @@ def main() -> int:
               name="summary", note="headline metrics, one row per metric")
     make_trajectories(plt, runs, "live_edge_distance_ms", "live-edge distance (ms)", "traj_live_edge",
                       args.x, facet + ["client"], args.out, formats, index)
-    make_trajectories(plt, runs, "rung", "played rung index", "traj_rung",
+    make_trajectories(plt, runs, "rung", "presented rung index", "traj_rung",
                       args.x, facet + ["client"], args.out, formats, index)
     make_trajectories(plt, runs, "buffer_s", "buffer (s)", "traj_buffer",
                       args.x, facet + ["client"], args.out, formats, index)

@@ -1,14 +1,16 @@
-import type { Player } from '@/lib/player';
 import { events } from '@/lib/events/EventLog';
 import type { AbrRulesCollection } from './AbrRulesCollection';
-import { ProbeManager } from './ProbeManager';
+import { ProbeManager, type ProbeResult } from './ProbeManager';
 import {
   type AbrSettings,
   type RulesContext,
   type SwitchEvent,
   type SwitchReason,
   type Track,
+  CONTROLLER_CONSTANTS,
   bufferEnvelope,
+  effectiveSegmentDurationS,
+  resolveControllerSettings,
 } from './types';
 
 export interface AbrMetrics {
@@ -16,6 +18,8 @@ export interface AbrMetrics {
   fastEmaBps: number;
   slowEmaBps: number;
   bufferSeconds: number;
+  /** Contiguous buffer (= bufferSeconds when the player does not expose it); the min arm's buffer signal. */
+  bufferContigSeconds: number;
   activeTrack: string | null;
   activeTrackIndex: number;
   droppedFrames: number;
@@ -41,10 +45,129 @@ export interface AbrMetrics {
   lastLatencyMs: number;
 }
 
-const MAX_HISTORY = 60;
+const MAX_HISTORY = CONTROLLER_CONSTANTS.maxHistory;
+/** Unresolved switch records kept (F7); the guard allows one in flight, so a few suffice. */
+const MAX_PENDING_SWITCHES = 8;
+
+/**
+ * The player metrics the controller consumes (`player.getMetrics()`), listed so
+ * the player (W3) and the controller (W5) agree on names. Required fields are
+ * the shipped ones; optional fields are the rebuild additions and fall back as
+ * documented when absent.
+ */
+export interface AbrPlayerMetrics {
+  /** SWMA of the last 5 arrival-spaced group throughput samples, bps. */
+  bandwidthBps: number;
+  fastEmaBps: number;
+  slowEmaBps: number;
+  /** Total buffered-ahead: last buffered range end minus playhead, s. */
+  bufferSeconds: number;
+  /**
+   * Contiguous buffer: end of the buffered range containing the playhead minus
+   * the playhead, 0 if none (M12). The rules' buffer signal in the `min` arm
+   * (falls back to bufferSeconds when absent); `grid` and `baseline` keep
+   * bufferSeconds.
+   */
+  bufferContigSeconds?: number;
+  activeTrack: string | null;
+  droppedFrames: number;
+  totalFrames: number;
+  playbackRate: number;
+  deliveryTimeMs: number;
+  lastObjectBytes: number;
+  /** Completed-group throughput samples so far, all tracks. */
+  sampleCount: number;
+  /**
+   * Completed-group throughput samples per track, keyed by the track the
+   * group belonged to (THROUGHPUT_SAMPLE.track), cumulative over the session.
+   * The dwell and the history's seam window count groups *of the landed
+   * track* since the landing from it. Without it the controller uses
+   * `sampleCount` and discounts one group per landing (see
+   * AbrController.groupsSinceLanding).
+   */
+  samplesByTrack?: Readonly<Record<string, number>>;
+  /** Raw capture-to-receipt trend ratio (legacy; see RulesContext.latencyTrendRatio). */
+  latencyTrendRatio: number;
+  lastLatencyMs: number;
+  /** Half-window means of the latency tracker, ms (C6). */
+  latencyRecentMeanMs?: number;
+  latencyOlderMeanMs?: number;
+  /** The client's target shift behind live, ms: 0 live-edge, delayGroups × GOP time-shifted (C6). */
+  targetShiftMs?: number;
+  /** Playhead (media time), ms. */
+  playheadMs?: number;
+  /**
+   * PTS (ms) of the latest applied switch seam whose region the playhead has
+   * entered (the region begins at the hole in front of the seam), null when
+   * it has entered none. SwitchHistoryRule's seam exemption (F2). Absent on
+   * players that do not track seams.
+   */
+  latestSeamPtsMs?: number | null;
+  // Diagnostics copied into AbrMetrics for the UI / SAMPLE log.
+  readyState?: number;
+  paused?: boolean;
+  currentTime?: number;
+  bufferedRanges?: string;
+  mseReadyState?: string;
+  videoErrorCode?: number;
+}
+
+/** What the controller needs from the player. `Player` satisfies it structurally. */
+export interface AbrPlayer {
+  getMetrics(): AbrPlayerMetrics;
+  /** Sends a switch; resolves to its `switch_seq` when the player numbers switches. */
+  switchTrack(trackName: string): Promise<unknown>;
+  /**
+   * `switch_seq` the last switchTrack call allocated, readable synchronously
+   * right after the call (Player sets it before its first await); null or
+   * absent when the player does not number switches (F14).
+   */
+  readonly lastSwitchSeq?: number | null;
+  setEmaHalfLives(fastHalfLifeSeconds: number, slowHalfLifeSeconds: number): void;
+  probeTrackBandwidth(trackName: string, durationMs: number): Promise<number | ProbeResult>;
+}
+
+/** A switch that has been sent and not yet confirmed by the player (see onTrackSwitched). */
+interface PendingSwitch {
+  /** The player's `switch_seq` for this switch (null when it does not number switches). */
+  switchSeq: number | null;
+  fromTrack: string;
+  toTrack: string;
+  fromIndex: number;
+  toIndex: number;
+  fromBitrate: number;
+  toBitrate: number;
+  reason: SwitchReason;
+  ruleReason: string;
+  /** The rule whose request was chosen (null for a manual switch). */
+  rule: string | null;
+  /** Rules that asked for the same index at the same priority (see AbrRulesCollection arbitrate). */
+  tiedRules: string[];
+  priority: number | null;
+  bufferSeconds: number;
+  bandwidthBps: number;
+  fastEmaBps: number;
+  slowEmaBps: number;
+  probeBps: number;
+  latencyTrend: number;
+  /** Completed groups since the last landing when the decision was taken; null before the first landing. */
+  groupsSinceLanding: number | null;
+  /** Playhead minus the seam it was at when the decision was taken (SwitchEvent.msPastSeam). */
+  msPastSeam: number | null | undefined;
+  decidedTs: number;
+}
+
+/** SwitchEvent.msPastSeam from the player's metrics at decision time (F2). */
+function msPastSeamOf(
+  m: Pick<AbrPlayerMetrics, 'playheadMs' | 'latestSeamPtsMs'>,
+): number | null | undefined {
+  if (m.latestSeamPtsMs === undefined || typeof m.playheadMs !== 'number') return undefined;
+  if (m.latestSeamPtsMs === null) return null;
+  return m.playheadMs - m.latestSeamPtsMs;
+}
 
 export class AbrController {
-  #player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>;
+  #player: AbrPlayer;
   #rulesCollection: AbrRulesCollection;
   #tracks: Track[];
   #settings: AbrSettings;
@@ -77,20 +200,20 @@ export class AbrController {
   // enough to cover normal switch landing under healthy conditions
   // (typically < 1 GOP duration), short enough that ABR can re-evaluate
   // before buffer fully drains.
-  static readonly SWITCH_TIMEOUT_MS = 3000;
+  static readonly SWITCH_TIMEOUT_MS = CONTROLLER_CONSTANTS.switchTimeoutMs;
   // After a switch times out (init segment never arrived — typical under severe
   // packet loss or a fleeting bandwidth spike), hold off this long before
   // running rules again. Without the cooldown the ABR re-fires the same
   // switch every SWITCH_TIMEOUT_MS, generating unbounded downswitch events
   // while activeTrack never changes.
-  static readonly SWITCH_COOLDOWN_MS = 5_000;
+  static readonly SWITCH_COOLDOWN_MS = CONTROLLER_CONSTANTS.switchCooldownMs;
   // Minimum number of real per-group throughput samples before an *upswitch*
   // is allowed. The startup throughput signal (handshake burst, first backlog
   // GOP, or a not-yet-shaped link) over-reads the sustainable rate; gating
   // upswitches on a few sustained samples is a config-agnostic slow-start that
   // stops a single startup burst from green-lighting a multi-tier climb.
   // Downswitches are never gated — an emergency drop must always be allowed.
-  static readonly MIN_STARTUP_SAMPLES = 3;
+  static readonly MIN_STARTUP_SAMPLES = CONTROLLER_CONSTANTS.minStartupSamples;
   // Carry-over bitrate delta from the most recent switch. Used in the
   // thesis Algorithm 1 probe_size formula: probe_size = t · (b[i+1] - b[i]
   // + tracksize). Initialized to 0; updated whenever a switch fires.
@@ -99,7 +222,7 @@ export class AbrController {
   // payload to match. Our relay sends the synthesized payload as fast as
   // the link allows, so this is "the bitrate window the probe is supposed
   // to test", not the actual on-wire duration.
-  #probeHorizonSec = 2;
+  #probeHorizonSec = CONTROLLER_CONSTANTS.probeHorizonS;
   // Post-switch up-guard (settings.controller.upGuardSamples > 0). Armed by
   // every switch; an up-switch is held until the switch has been released
   // (landed or visible, per settings.controller.upGuardRelease) and
@@ -112,9 +235,27 @@ export class AbrController {
   // Recent instantaneous buffer levels for settings.controller.bufferSignal =
   // 'envelope' (see ControllerSettings).
   #bufferSamples: { ts: number; bufferSeconds: number }[] = [];
+  // Switches that have been sent and not resolved yet, oldest first (M17, F7).
+  // History, ABR_DECISION, the up-guard arm and the probe's tracksize are
+  // written only when the player reports (onTrackSwitched) that a record's
+  // target landed. A refused, skipped or failed switch calls back with the old
+  // track and leaves no trace other than ABR_SWITCH_PHANTOM. A record outlives
+  // its switching guard: the guard may time out (3 s) and a later decision may
+  // be sent, but the record stays until it lands, its own phantom callback
+  // arrives, or a newer switch lands (an older one can no longer land then).
+  #pendingSwitches: PendingSwitch[] = [];
+  // activeTrack as of the last tick; a callback with a different track is a
+  // landing even when no decision is pending (a switch that landed after its
+  // guard timed out).
+  #activeTrackAtTick: string | null = null;
+  // The last confirmed landing: the landed track and the sample counters at
+  // that moment, or null before the first one. groupsSinceLanding() derives the
+  // completed groups of the landed track since then from it; that is the
+  // min arm's dwell clock and is stamped on every history entry.
+  #landing: { track: string; sampleCount: number; trackSamples: number | null } | null = null;
 
   constructor(
-    player: Pick<Player, 'getMetrics' | 'switchTrack' | 'setEmaHalfLives' | 'probeTrackBandwidth'>,
+    player: AbrPlayer,
     rulesCollection: AbrRulesCollection,
     tracks: Track[],
     settings: AbrSettings,
@@ -124,10 +265,14 @@ export class AbrController {
     this.#rulesCollection = rulesCollection;
     // Sort ascending by bitrate — index 0 = lowest quality, last = highest
     this.#tracks = [...tracks].sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
-    this.#settings = settings;
+    // The arm decides the effective settings (types.ts resolveControllerSettings).
+    this.#settings = resolveControllerSettings(settings);
     this.#onMetricsUpdate = onMetricsUpdate;
     this.#probeManager = new ProbeManager(this.#player, {
-      minDurationMs: settings.controller?.probeMinDurationMs ?? 0,
+      intervalMs: CONTROLLER_CONSTANTS.probeIntervalMs,
+      durationMs: CONTROLLER_CONSTANTS.probeDurationMs,
+      freshnessMs: CONTROLLER_CONSTANTS.probeFreshnessMs,
+      minDurationMs: this.#settings.controller.probeMinDurationMs,
     });
     this.#player.setEmaHalfLives(
       settings.ewma.throughputFastHalfLifeSeconds,
@@ -135,9 +280,14 @@ export class AbrController {
     );
   }
 
+  /** The settings the controller runs (arm resolved). */
+  get settings(): AbrSettings {
+    return this.#settings;
+  }
+
   start(): void {
     if (this.#intervalId !== null) return;
-    this.#intervalId = setInterval(() => void this._tick(), 250);
+    this.#intervalId = setInterval(() => void this._tick(), CONTROLLER_CONSTANTS.tickMs);
   }
 
   stop(): void {
@@ -148,21 +298,190 @@ export class AbrController {
   }
 
   updateSettings(settings: AbrSettings): void {
-    this.#settings = settings;
-    this.#probeManager.setMinDurationMs(settings.controller?.probeMinDurationMs ?? 0);
+    this.#settings = resolveControllerSettings(settings);
+    this.#probeManager.setMinDurationMs(this.#settings.controller.probeMinDurationMs);
     this.#player.setEmaHalfLives(
       settings.ewma.throughputFastHalfLifeSeconds,
       settings.ewma.throughputSlowHalfLifeSeconds,
     );
   }
 
-  releaseSwitchingGuard(): void {
-    // Player fires this when the new track's init segment has been applied.
+  /**
+   * Player callback for every terminal outcome of a switchTrack call: the
+   * target's first object was applied (landed, `trackName` = target), or the
+   * switch was refused / skipped / failed (`trackName` = the track the player is
+   * still on). Only a landing on the pending target is a switch: it is then
+   * written to the history, logged as ABR_DECISION, arms the post-switch
+   * up-guard and starts the dwell clock. Anything else releases the switching
+   * guard and is logged as ABR_SWITCH_PHANTOM (M17).
+   *
+   * Without an argument (legacy wiring) the landed track is read from
+   * `player.getMetrics().activeTrack`, which the player updates before it calls
+   * back. `switchSeq` (the player's `switch_seq` of the switch the callback is
+   * about) picks the pending record exactly; ABR_DECISION and
+   * ABR_SWITCH_PHANTOM carry it as `switch_seq` (F14).
+   */
+  onTrackSwitched(landedTrack?: string, switchSeq?: number): void {
+    const m = this.#player.getMetrics();
+    const landed = landedTrack ?? m.activeTrack ?? null;
+    const pending = this.#resolvePending(landed, switchSeq);
+    const seq = pending?.switchSeq ?? switchSeq ?? null;
+    this.#lastSampleCount = m.sampleCount;
     // Defer actually clearing #switching until totalVideoFrames advances past
     // the snapshot — that's when MSE has decoded an actual frame from the new
     // track. Prevents rapid switches from shredding the MSE timeline.
     this.#pendingFrameAdvance = true;
+
+    const isLanding = pending
+      ? landed === pending.toTrack
+      : landed !== null && landed !== this.#activeTrackAtTick;
+    if (!isLanding) {
+      if (pending) {
+        events.emit('ABR_SWITCH_PHANTOM', {
+          switch_seq: seq,
+          from: pending.fromTrack,
+          to: pending.toTrack,
+          landed,
+          reason: pending.reason,
+          rule_reason: pending.ruleReason,
+          decided_ms_ago: Date.now() - pending.decidedTs,
+          decided_ts: pending.decidedTs,
+        });
+      }
+      return;
+    }
+
+    this.#landing = {
+      track: landed!,
+      sampleCount: m.sampleCount,
+      trackSamples: m.samplesByTrack ? (m.samplesByTrack[landed!] ?? 0) : null,
+    };
+    this.#activeTrackAtTick = landed;
+    if (pending) {
+      this.#recordHistory(pending);
+      events.emit('ABR_DECISION', {
+        switch_seq: seq,
+        from: pending.fromTrack,
+        to: pending.toTrack,
+        from_index: pending.fromIndex,
+        to_index: pending.toIndex,
+        from_bitrate: pending.fromBitrate,
+        to_bitrate: pending.toBitrate,
+        reason: pending.reason,
+        rule_reason: pending.ruleReason,
+        rule: pending.rule,
+        tied_rules: pending.tiedRules,
+        priority: pending.priority,
+        buffer_s: pending.bufferSeconds,
+        bandwidth_bps: pending.bandwidthBps,
+        fast_ema_bps: pending.fastEmaBps,
+        slow_ema_bps: pending.slowEmaBps,
+        probe_bps: pending.probeBps,
+        latency_trend: pending.latencyTrend,
+        groups_since_landing: pending.groupsSinceLanding,
+        ms_past_seam: pending.msPastSeam ?? null,
+        decided_ts: pending.decidedTs,
+        landed_after_ms: Date.now() - pending.decidedTs,
+      });
+      // Update tracksize (Algorithm 1 lines 13/16): after upswitch, carry
+      // forward the gap from new current to next-up; after downswitch,
+      // carry forward the gap from previous tier to new current. Either
+      // way the value is the bitrate delta of the tier that's currently
+      // adjacent to the new position in the SAME direction as the switch.
+      const targetBitrate = pending.toBitrate;
+      if (pending.toIndex > pending.fromIndex) {
+        const next = this.#tracks[pending.toIndex + 1]?.bitrate ?? targetBitrate;
+        this.#tracksize = Math.max(0, next - targetBitrate);
+      } else if (pending.toIndex < pending.fromIndex) {
+        const prev = this.#tracks[pending.toIndex - 1]?.bitrate ?? targetBitrate;
+        this.#tracksize = Math.max(0, targetBitrate - prev);
+      }
+    }
+    this.#armUpGuard();
     if (this.#settings.controller?.upGuardRelease !== 'visible') this.#releaseUpGuard('landed');
+  }
+
+  /**
+   * The unresolved decision a callback resolves, removed from the pending
+   * list. With the player's `switchSeq` it is the record of that switch (F14);
+   * a seq no record carries is a switch the controller did not decide (null),
+   * unless some records were never numbered, which are then matched by track.
+   * By track: the newest record whose target is `landed` (a landing), else the
+   * newest one (a refusal of the latest switch, ABR_SWITCH_PHANTOM). A landing
+   * also resolves every older record: an older switch can no longer land once
+   * a newer one has. Null when nothing matches.
+   */
+  #resolvePending(landed: string | null, switchSeq?: number): PendingSwitch | null {
+    const list = this.#pendingSwitches;
+    if (switchSeq !== undefined) {
+      const i = list.findIndex(p => p.switchSeq === switchSeq);
+      if (i >= 0) {
+        const rec = list[i]!;
+        if (rec.toTrack === landed) list.splice(0, i + 1);
+        else list.splice(i, 1);
+        return rec;
+      }
+      if (!list.some(p => p.switchSeq === null)) return null;
+    }
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i]!.toTrack === landed) {
+        const rec = list[i]!;
+        list.splice(0, i + 1);
+        return rec;
+      }
+    }
+    return list.pop() ?? null;
+  }
+
+  /**
+   * Sends the switch of `rec` and keeps the record for its callback (bounded;
+   * the oldest is forgotten). The record takes the player's `switch_seq`:
+   * read synchronously (the player may call back before its promise
+   * resolves), else from the resolved value.
+   */
+  #send(rec: PendingSwitch): void {
+    this.#pendingSwitches.push(rec);
+    if (this.#pendingSwitches.length > MAX_PENDING_SWITCHES) this.#pendingSwitches.shift();
+    const sent = this.#player.switchTrack(rec.toTrack);
+    const seq = this.#player.lastSwitchSeq;
+    if (typeof seq === 'number') rec.switchSeq = seq;
+    void Promise.resolve(sent).then(
+      v => {
+        if (rec.switchSeq === null && typeof v === 'number') rec.switchSeq = v;
+      },
+      () => {},
+    );
+  }
+
+  /** @deprecated Use onTrackSwitched(trackName); kept for the existing app.tsx wiring. */
+  releaseSwitchingGuard(): void {
+    this.onTrackSwitched();
+  }
+
+  /**
+   * Completed groups of the landed track since the last confirmed landing, or
+   * null before the first landing.
+   *
+   * With `samplesByTrack` this is exact: the landed track's samples now minus
+   * at the landing (the player keys samples by the group's own track, one per
+   * (track, group), F5). Without it, the total sample count minus one. The
+   * tracker keeps one accumulator per (track, group) and a target object
+   * never closes a source group, so the source's last group, which is usually
+   * still open when the target lands (the landing object is the target's
+   * first), closes after the landing: at its own last object, or after two
+   * group times without one. That sample is the old track's and is in the
+   * total; discounting one for it keeps "N groups of the new track" from
+   * running ahead. On a player whose source group had already closed before
+   * the callback, the discount errs by one group too many (the dwell waits one
+   * group longer), never too few.
+   */
+  groupsSinceLanding(m: Pick<AbrPlayerMetrics, 'sampleCount' | 'samplesByTrack'>): number | null {
+    const landing = this.#landing;
+    if (landing === null) return null;
+    if (landing.trackSamples !== null && m.samplesByTrack) {
+      return Math.max(0, (m.samplesByTrack[landing.track] ?? 0) - landing.trackSamples);
+    }
+    return Math.max(0, m.sampleCount - landing.sampleCount - 1);
   }
 
   /** Player fires this when the first frame of the switched-to track is presented (t5). */
@@ -204,10 +523,32 @@ export class AbrController {
     const m = this.#player.getMetrics();
     this.#framesAtSwitch = m.totalFrames;
     this.#pendingFrameAdvance = false;
-    this.#armUpGuard();
-    this.#recordHistory(m.activeTrack ?? '', trackName, 'manual', 0, 0);
-    events.emit('ABR_DECISION', { from: m.activeTrack, to: trackName, reason: 'manual' });
-    void this.#player.switchTrack(trackName);
+    const fromTrack = m.activeTrack ?? '';
+    const fromIndex = this.#tracks.findIndex(t => t.name === fromTrack);
+    const toIndex = this.#tracks.findIndex(t => t.name === trackName);
+    this.#send({
+      switchSeq: null,
+      fromTrack,
+      toTrack: trackName,
+      fromIndex,
+      toIndex,
+      fromBitrate: this.#tracks[fromIndex]?.bitrate ?? 0,
+      toBitrate: this.#tracks[toIndex]?.bitrate ?? 0,
+      reason: 'manual',
+      ruleReason: 'manual',
+      rule: null,
+      tiedRules: [],
+      priority: null,
+      bufferSeconds: m.bufferSeconds,
+      bandwidthBps: m.bandwidthBps,
+      fastEmaBps: m.fastEmaBps,
+      slowEmaBps: m.slowEmaBps,
+      probeBps: 0,
+      latencyTrend: m.latencyTrendRatio,
+      groupsSinceLanding: this.groupsSinceLanding(m),
+      msPastSeam: msPastSeamOf(m),
+      decidedTs: Date.now(),
+    });
   }
 
   getHistory(): SwitchEvent[] {
@@ -221,6 +562,7 @@ export class AbrController {
       fastEmaBps,
       slowEmaBps,
       bufferSeconds,
+      bufferContigSeconds: rawContig,
       activeTrack,
       droppedFrames,
       totalFrames,
@@ -236,18 +578,31 @@ export class AbrController {
       videoErrorCode,
       latencyTrendRatio,
       lastLatencyMs,
+      latencyRecentMeanMs,
+      latencyOlderMeanMs,
+      targetShiftMs,
     } = raw;
 
     // Find the active track index in the sorted tracks array
     const activeTrackIndex = activeTrack ? this.#tracks.findIndex(t => t.name === activeTrack) : -1;
 
     const mode: 'auto' | 'manual' = this.#settings.videoAutoSwitch ? 'auto' : 'manual';
+    const isMin = this.#settings.controller.arm === 'min';
+
+    // The min arm's rules see the contiguous buffer (M12): a hole ahead of the
+    // playhead is not playable buffer. grid and baseline keep the total
+    // buffered-ahead they were run with. Players without the field report the
+    // total as both.
+    const bufferContigSeconds =
+      typeof rawContig === 'number' && Number.isFinite(rawContig) ? rawContig : bufferSeconds;
+    const bufferInstantSeconds = isMin ? bufferContigSeconds : bufferSeconds;
 
     const metrics: AbrMetrics = {
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
       bufferSeconds,
+      bufferContigSeconds,
       activeTrack,
       activeTrackIndex,
       droppedFrames,
@@ -259,31 +614,33 @@ export class AbrController {
       switchHistory: [...this.#switchHistory],
       mode,
       switching: this.#switching,
-      readyState,
-      paused,
-      currentTime,
-      bufferedRanges,
-      mseReadyState,
-      videoErrorCode,
+      readyState: readyState ?? 0,
+      paused: paused ?? false,
+      currentTime: currentTime ?? 0,
+      bufferedRanges: bufferedRanges ?? '',
+      mseReadyState: mseReadyState ?? '',
+      videoErrorCode: videoErrorCode ?? 0,
       latencyTrendRatio,
       lastLatencyMs,
     };
 
     this.#onMetricsUpdate(metrics);
     this.#lastSampleCount = sampleCount;
+    this.#activeTrackAtTick = activeTrack;
 
-    // Buffer level for the rules: instantaneous, or the maximum over the last
+    // Buffer level for the rules: instantaneous or the maximum over the last
     // group (the level after each burst landed).
-    const envelopeMs = this.#settings.controller?.bufferEnvelopeMs ?? 1250;
+    const envelopeMs = this.#settings.controller.bufferEnvelopeMs;
     const nowTs = Date.now();
-    this.#bufferSamples.push({ ts: nowTs, bufferSeconds });
+    this.#bufferSamples.push({ ts: nowTs, bufferSeconds: bufferInstantSeconds });
     while (this.#bufferSamples.length > 0 && nowTs - this.#bufferSamples[0]!.ts > envelopeMs) {
       this.#bufferSamples.shift();
     }
+    const bufferEnvelopeSeconds = bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs);
     const ruleBufferSeconds =
-      this.#settings.controller?.bufferSignal === 'envelope'
-        ? bufferEnvelope(this.#bufferSamples, nowTs, envelopeMs)
-        : bufferSeconds;
+      this.#settings.controller.bufferSignal === 'envelope'
+        ? bufferEnvelopeSeconds
+        : bufferInstantSeconds;
 
     // Once the player signals the init segment landed, hold #switching until
     // a real new-track frame is decoded (totalVideoFrames moved past the
@@ -318,7 +675,11 @@ export class AbrController {
         track: activeTrack,
         held_ms: Date.now() - this.#switchingStartTs,
         cooldown_ms: AbrController.SWITCH_COOLDOWN_MS,
+        pending_to: this.#pendingSwitches.at(-1)?.toTrack ?? null,
       });
+      // The switch has not confirmed, so it is not history yet (M17); its
+      // record stays pending: a landing later than the guard is still this
+      // decision and writes its history and ABR_DECISION then (F7).
       // A switch that never lands must not hold up-switches forever: start the
       // fresh-sample count now.
       this.#releaseUpGuard('timeout');
@@ -379,19 +740,25 @@ export class AbrController {
       tracks: this.#tracks,
       activeTrackIndex: currentIdx,
       bufferSeconds: ruleBufferSeconds,
-      bufferInstantSeconds: bufferSeconds,
+      bufferInstantSeconds,
+      bufferEnvelopeSeconds,
+      bufferTotalSeconds: bufferSeconds,
+      groupsSinceLanding: this.groupsSinceLanding(raw),
       bandwidthBps,
       fastEmaBps,
       slowEmaBps,
       droppedFrames,
       totalFrames,
-      segmentDurationS: 1,
+      segmentDurationS: effectiveSegmentDurationS(this.#settings.controller),
       isLowLatency: false,
       playbackRate,
       switchHistory: [...this.#switchHistory],
       abrSettings: this.#settings,
       probeBandwidthBps: this.#probeManager.getFreshBandwidthBps(),
       latencyTrendRatio,
+      latencyRecentMeanMs,
+      latencyOlderMeanMs,
+      targetShiftMs,
     };
 
     const evaluation = this.#rulesCollection.evaluate(context);
@@ -408,10 +775,13 @@ export class AbrController {
             : { index: req.representationIndex, priority: req.priority, reason: req.reason };
       }
       events.emit('ABR_TICK', {
+        arm: this.#settings.controller.arm,
         track: activeTrack,
         active_index: currentIdx,
         buffer_s: bufferSeconds,
+        buffer_contig_s: bufferContigSeconds,
         buffer_rule_s: ruleBufferSeconds,
+        groups_since_landing: context.groupsSinceLanding,
         bandwidth_bps: bandwidthBps,
         fast_ema_bps: fastEmaBps,
         slow_ema_bps: slowEmaBps,
@@ -434,6 +804,8 @@ export class AbrController {
                 index: switchRequest.representationIndex,
                 priority: switchRequest.priority,
                 reason: switchRequest.reason,
+                rule: evaluation.chosenBy,
+                tied: evaluation.tied,
               },
       });
     }
@@ -481,6 +853,28 @@ export class AbrController {
       this.#upGuardArmed = false;
     }
 
+    // min arm: up-switch dwell. No up-switch until upDwellGroups completed
+    // groups of the landed track have arrived since the last landing (before
+    // the first landing: since startup). Down-switches pass.
+    if (targetIndex > currentIdx && isMin) {
+      const needed = this.#settings.controller.upDwellGroups;
+      const groups =
+        context.groupsSinceLanding ??
+        (activeTrack !== null ? raw.samplesByTrack?.[activeTrack] : undefined) ??
+        sampleCount;
+      if (groups < needed) {
+        events.emit('ABR_GATED', {
+          why: 'up-dwell',
+          from_index: currentIdx,
+          to_index: targetIndex,
+          groups_since_landing: groups,
+          min_groups: needed,
+          rule_reason: switchRequest.reason,
+        });
+        return;
+      }
+    }
+
     const targetTrack = this.#tracks[targetIndex];
     if (!targetTrack) return;
 
@@ -488,54 +882,46 @@ export class AbrController {
     const currentBitrate =
       activeTrackIndex >= 0 ? (this.#tracks[activeTrackIndex]?.bitrate ?? 0) : 0;
     const targetBitrate = targetTrack.bitrate ?? 0;
+    // auto-emergency is the label of a down-switch chosen from
+    // EmergencyBufferRule's request (by rule identity, not by reason text; no
+    // other rule produces it). SwitchHistoryRule counts it as a drop like
+    // auto-downgrade.
     let reason: SwitchReason;
     if (targetBitrate < currentBitrate) {
-      reason = switchRequest.reason.toLowerCase().includes('emergency')
-        ? 'auto-emergency'
-        : 'auto-downgrade';
+      reason = evaluation.chosenBy === 'EmergencyBufferRule' ? 'auto-emergency' : 'auto-downgrade';
     } else {
       reason = 'auto-upgrade';
     }
 
-    // Activate switching guard, record history, and switch
+    // Activate the switching guard and send the switch. History, ABR_DECISION,
+    // the up-guard arm and tracksize wait for the landing (onTrackSwitched).
     this.#switching = true;
     this.#switchingStartTs = Date.now();
     this.#framesAtSwitch = totalFrames;
     this.#pendingFrameAdvance = false;
-    this.#armUpGuard();
-    this.#recordHistory(activeTrack ?? '', targetTrack.name, reason, bufferSeconds, fastEmaBps);
-    events.emit('ABR_DECISION', {
-      from: activeTrack,
-      to: targetTrack.name,
-      from_index: currentIdx,
-      to_index: targetIndex,
-      from_bitrate: currentBitrate,
-      to_bitrate: targetBitrate,
+    this.#send({
+      switchSeq: null,
+      fromTrack: activeTrack ?? '',
+      toTrack: targetTrack.name,
+      fromIndex: currentIdx,
+      toIndex: targetIndex,
+      fromBitrate: currentBitrate,
+      toBitrate: targetBitrate,
       reason,
-      rule_reason: switchRequest.reason,
+      ruleReason: switchRequest.reason,
+      rule: evaluation.chosenBy,
+      tiedRules: evaluation.tied,
       priority: switchRequest.priority,
-      buffer_s: bufferSeconds,
-      bandwidth_bps: bandwidthBps,
-      fast_ema_bps: fastEmaBps,
-      slow_ema_bps: slowEmaBps,
-      probe_bps: context.probeBandwidthBps,
-      latency_trend: latencyTrendRatio,
+      bufferSeconds: bufferInstantSeconds,
+      bandwidthBps,
+      fastEmaBps,
+      slowEmaBps,
+      probeBps: context.probeBandwidthBps,
+      latencyTrend: latencyTrendRatio,
+      groupsSinceLanding: context.groupsSinceLanding ?? null,
+      msPastSeam: msPastSeamOf(raw),
+      decidedTs: Date.now(),
     });
-    // Update tracksize (Algorithm 1 lines 13/16): after upswitch, carry
-    // forward the gap from new current to next-up; after downswitch,
-    // carry forward the gap from previous tier to new current. Either
-    // way the value is the bitrate delta of the tier that's currently
-    // adjacent to the new position in the SAME direction as the switch.
-    if (targetIndex > currentIdx) {
-      // upswitch: tracksize = b[newIdx+1] - b[newIdx]
-      const next = this.#tracks[targetIndex + 1]?.bitrate ?? targetBitrate;
-      this.#tracksize = Math.max(0, next - targetBitrate);
-    } else if (targetIndex < currentIdx) {
-      // downswitch: tracksize = b[newIdx] - b[newIdx-1]
-      const prev = this.#tracks[targetIndex - 1]?.bitrate ?? targetBitrate;
-      this.#tracksize = Math.max(0, targetBitrate - prev);
-    }
-    void this.#player.switchTrack(targetTrack.name);
   }
 
   #updateDynamicStrategy(bufferLevel: number): void {
@@ -544,6 +930,16 @@ export class AbrController {
       this.#rulesCollection.isRuleActive('L2ARule') ||
       this.#rulesCollection.isRuleActive('LoLPRule')
     ) {
+      return;
+    }
+    // No BOLA, no DYNAMIC toggle: with BolaRule inactive (the min arm) the
+    // toggle would only silence ThroughputRule above bufferTimeDefault.
+    if (!this.#rulesCollection.isRuleActive('BolaRule')) {
+      if (this.#usingBolaRule) {
+        this.#usingBolaRule = false;
+        events.emit('ABR_STRATEGY', { using_bola: false, buffer_s: bufferLevel });
+      }
+      this.#rulesCollection.setShouldUseBolaRule(false);
       return;
     }
 
@@ -561,20 +957,16 @@ export class AbrController {
     this.#rulesCollection.setShouldUseBolaRule(this.#usingBolaRule);
   }
 
-  #recordHistory(
-    fromTrack: string,
-    toTrack: string,
-    reason: SwitchReason,
-    bufferAtSwitch: number,
-    emaBwAtSwitch: number,
-  ): void {
+  #recordHistory(p: PendingSwitch): void {
     const event: SwitchEvent = {
       ts: Date.now(),
-      fromTrack,
-      toTrack,
-      reason,
-      bufferAtSwitch,
-      emaBwAtSwitch,
+      fromTrack: p.fromTrack,
+      toTrack: p.toTrack,
+      reason: p.reason,
+      bufferAtSwitch: p.bufferSeconds,
+      emaBwAtSwitch: p.fastEmaBps,
+      groupsSinceLanding: p.groupsSinceLanding ?? undefined,
+      ...(p.msPastSeam !== undefined ? { msPastSeam: p.msPastSeam } : {}),
     };
 
     this.#switchHistory.push(event);

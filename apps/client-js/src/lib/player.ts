@@ -24,17 +24,31 @@ import {
   RequestError,
   Tuple,
 } from 'moqtail';
-import { MOQtailClient, SwitchFailure } from 'moqtail/client';
+import { MOQtailClient, SwitchFailure, type DiscardedStreamInfo } from 'moqtail/client';
 import { CMSFCatalog, MessageParameters, type MessageParameter } from 'moqtail/model';
 import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
+import { StallTracker } from '@/lib/stall';
 import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
 import { events } from '@/lib/events/EventLog';
 import { estimateLiveEdge, readPrft, targetShiftMs, type PrftAnchor } from '@/lib/events/liveEdge';
-import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
+import {
+  DEFAULT_LIVE_EDGE_DELAY,
+  GapFillLog,
+  contiguousBufferAheadS,
+  type GapFillQuery,
+  type GapFillState,
+} from '@/lib/buffer';
+import {
+  SeamTracker,
+  nextPageSwitchSeq,
+  seamBehindPlayhead,
+  switchAppliedFields,
+  type SwitchRecord,
+} from '@/lib/seam';
 
 /**
  * Guard band for seam replacement. The seam must sit far enough ahead of the
@@ -43,57 +57,12 @@ import { DEFAULT_LIVE_EDGE_DELAY } from '@/lib/buffer';
  */
 const SEAM_REMOVE_GUARD_SECONDS = 0.05;
 
-/**
- * One record per track-switch (or, in C4, per time-shifted connect).
- * Pushed to window.__moqtailMetrics.switchDiscontinuities for offline analysis.
- */
-export interface DiscontinuityRecord {
-  eventType: 'connect' | 'switch';
-  switchSentAt: number;
-  switchAppliedAt: number;
-  fromTrack?: string;
-  toTrack: string;
-
-  // PTS-domain (headline)
-  oldEndPTS_ms?: number;
-  newStartPTS_ms: number;
-  /** Media seam gap: newStartPTS_ms - oldEndPTS_ms. Buffered-region continuity at
-   *  the seam (0 = contiguous), not a viewer-visible discontinuity. */
-  mediaSeamGapMs: number;
-  /** Playhead at the moment switchTrack() fired (video.currentTime * 1000). Undefined for `connect` records. */
-  playheadPTS_ms?: number;
-  /** Seam distance ahead of the playhead: newStartPTS_ms - playheadPTS_ms, i.e. how
-   *  much media the viewer still plays before seeing the new representation.
-   *  Undefined for `connect` records. */
-  seamAheadOfPlayheadMs?: number;
-
-  // wall-clock context
-  wallClockMs: number;
-  /** Wall-clock pause at the seam crossing beyond one frame period (ms). */
-  viewerPauseMs?: number;
-
-  // connect-time clamp signal (Task C4)
-  expectedStartGroup?: number;
-  actualStartGroup?: number;
-  clampedByRelay?: boolean;
-
-  // mode context (every record)
-  clientMode: 'time-shifted' | 'live-edge';
-  timeShiftSeconds: number;
-}
-
 interface PendingSwitch {
   trackName: string;
   initData: ArrayBuffer;
   mimeType: string;
-  /** Snapshot of struct.lastAppendedEndPTS_ms at the moment switchTrack() was called. */
-  oldEndPTS_ms: number | undefined;
-  /** Snapshot of video.currentTime * 1000 at switchTrack() call, for `seamAheadOfPlayheadMs`. */
-  playheadPTS_ms: number | undefined;
-  /** performance.now() at switchTrack() call — for wallClockMs and the visibility delay. */
-  switchSentAt: number;
-  /** videoElement.getVideoPlaybackQuality().totalVideoFrames at switch time (diagnostic). */
-  framesAtSwitch: number;
+  /** The switch's own record (C1): identity, send-time snapshots, landing and seam. */
+  record: SwitchRecord;
 }
 
 interface MOQStreamStruct {
@@ -108,10 +77,6 @@ interface MOQStreamStruct {
   source: ReadableStream<MoqtObject>;
   /** Aborts only the in-flight pipe, so a SWITCH can re-bind `source` without tearing down the track. */
   pipeAc?: AbortController;
-  requestId: bigint;
-  tracker: GoodputTracker;
-  lastGroupId: bigint;
-  pendingSwitch: PendingSwitch | null;
   /**
    * True from the moment a SWITCH is sent until the relay's PUBLISH (success
    * or failure) resolves it. Prevents a second SWITCH from referencing a
@@ -120,28 +85,13 @@ interface MOQStreamStruct {
    * EXCESSIVE_LOAD).
    */
   switchInFlight?: boolean;
-  /** End PTS (ms) of the last appended segment from the active track. Updated before each appendBuffer call. Undefined until the first segment is appended. */
+  requestId: bigint;
+  tracker: GoodputTracker;
+  pendingSwitch: PendingSwitch | null;
+  /** End PTS (ms) of the last appended segment from the active track (the append front). Updated after a successful append only (M9). Undefined until the first segment is appended. */
   lastAppendedEndPTS_ms: number | undefined;
-  /** Set true after the first new-track frame is presented post-switch. Reset when pendingSwitch is set. */
-  firstFrameAfterSwitchSeen?: boolean;
-  /**
-   * Media time (ms) where the new representation begins in the buffer: the
-   * first appended target frame's PTS. The rVFC poll watches presented
-   * `mediaTime` cross it; that presented frame is the first the viewer sees
-   * of the new representation. Set when the new init segment is applied;
-   * cleared by the poll.
-   */
-  postSwitchSeamPTS_ms?: number;
   /** Frame duration (ms) of the most recently parsed object, for seam arithmetic. */
   lastFrameDurationMs?: number;
-  /** Snapshot of pendingSwitch.switchSentAt at the moment of init-segment application. */
-  postSwitchSentAt?: number;
-  /** Source track of the switch whose first frame is awaited (for SWITCH_FIRST_FRAME). */
-  postSwitchFromTrack?: string;
-  /** tracker.getSampleCount() after the previous object; a change means a THROUGHPUT_SAMPLE was finalised. */
-  lastSampleCount?: number;
-  /** Track name to attach viewerPauseMs to in switchDiscontinuities. */
-  postSwitchToTrack?: string;
   /** performance.now() of the last successful media append (data-starvation watchdog). */
   lastAppendPerf?: number;
   /**
@@ -167,7 +117,6 @@ interface MOQStreamStruct {
 
 interface SubscribeOptions {
   trackName: string;
-  priority?: number;
 }
 
 export interface PlayerOptions {
@@ -179,20 +128,24 @@ export interface PlayerOptions {
   receiveCatalogViaSubscribe?: boolean;
   /** Catalog location (default: group 0, object 1) */
   catalogLocation?: [Location, Location];
-  /** Called when a switchTrack() completes (success or failure). Releases the ABR switching guard. */
-  onTrackSwitched?: (trackName: string) => void;
+  /**
+   * Called when a switchTrack() completes (success or failure) with the track
+   * the player is now on and the switch's `switch_seq` (undefined only when
+   * the switch failed before a number was allocated). Releases the ABR
+   * switching guard.
+   */
+  onTrackSwitched?: (trackName: string, switchSeq?: number) => void;
   /** Called when the first frame of a switched-to track is presented (the seam became visible). */
   onSwitchVisible?: (trackName: string) => void;
-  /** Client type: a 'live-edge' client plays at the live edge; a 'time-shifted' client
-   *  asks the relay (DELAY_GROUPS) to start it `timeShiftSeconds` behind live and holds there. */
-  clientMode?: 'live-edge' | 'time-shifted';
-  /** Requested shift behind the live edge for a 'time-shifted' client (quantised to whole groups on the wire). */
+  /** Pre-connect: 'time-shifted' clients subscribe behind live by `timeShiftSeconds`; 'live-edge' is today's behavior. */
+  clientMode?: 'time-shifted' | 'live-edge';
+  /** When clientMode === 'time-shifted', subscribe at `timeShiftSeconds` behind the live edge. */
   timeShiftSeconds?: number;
   /** SWITCH PR #1378 floor policy for the Minimum Switching Group ID:
-   *  'next-group' = the boundary after the latest received group (switch as
-   *  close to live as possible, gap-free); 'playhead' = the group containing
-   *  the player's current PTS (a time-shifted client switches at the point it
-   *  is watching, re-fetching the buffered groups on the new track). */
+   *  'next-group' = the boundary after the latest group the client holds
+   *  (switch as close to live as possible, gap-free); 'playhead' = the group
+   *  containing the player's current PTS (a time-shifted client switches at the
+   *  point it is watching, re-fetching the buffered groups on the new track). */
   switchFloor?: 'next-group' | 'playhead';
   /** Experiment log: emit one OBJECT_RECV record per received media object (frame). */
   logObjects?: boolean;
@@ -211,7 +164,7 @@ const DefaultOptions = {
   namespace: Tuple.fromUtf8Path('/moqtail'),
   receiveCatalogViaSubscribe: false,
   catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
-  onTrackSwitched: undefined as ((trackName: string) => void) | undefined,
+  onTrackSwitched: undefined as ((trackName: string, switchSeq?: number) => void) | undefined,
   onSwitchVisible: undefined as ((trackName: string) => void) | undefined,
   clientMode: 'live-edge' as 'time-shifted' | 'live-edge',
   timeShiftSeconds: 0,
@@ -243,38 +196,58 @@ export function buildSubscribeParameters(opts: {
 }
 
 /**
+ * Scheduling of every media subscription, identical on every branch
+ * (transport fairness): the relay orders streams by subscriber priority, then
+ * group order. The player's SUBSCRIBEs use these.
+ */
+export const MEDIA_SCHEDULING = { priority: 0, groupOrder: GroupOrder.Ascending } as const;
+
+/**
+ * Parameters of every SWITCH: the same SubscriberPriority and GroupOrder as the
+ * SUBSCRIBE, carried explicitly so the switched subscription is scheduled like
+ * the original one. A SWITCH without them is scheduled at the relay's default
+ * (priority 128): below the old subscription's remaining streams and the
+ * probe. The relay also inherits the old subscription's values for a native
+ * SWITCH that carries none; carrying them makes every branch say the same.
+ *
+ * Exported for unit testing.
+ */
+export function buildSwitchParameters(): MessageParameter[] {
+  return new MessageParameters()
+    .addSubscriberPriority(MEDIA_SCHEDULING.priority)
+    .addGroupOrder(MEDIA_SCHEDULING.groupOrder)
+    .build();
+}
+
+/**
  * Computes the SWITCH "Minimum Switching Group ID" from the active
- * switchFloor, the player's current PTS, and the latest group received on the
- * current track.
+ * switchFloor, the group at the player's current PTS, and the groups the
+ * client already holds.
  *
  * SWITCH PR #1378 defines the field as a plain floor: the relay selects the
  * smallest common, gap-free boundary at or above it, and `0` means "any group
  * is acceptable" (oldest boundary, maximal catch-up). There is no live-edge
- * sentinel, so "switch as close to live as possible" (live-edge mode) must be
- * expressed AS a floor:
+ * sentinel, so "switch as close to live as possible" must be expressed AS a
+ * floor:
  *
- * - 'live-edge' mode: returns `latestGroup + 1` — the next boundary after the
- *   buffer's edge. That group may not exist at the relay yet (a client at the
- *   live edge names a group that hasn't started); the relay identifies
- *   G_switch within its T_switch window, waiting for the boundary to
- *   materialize while the current subscription keeps delivering (PR #1378
- *   frames TIMEOUT as "could not identify G_switch within T_switch", not a
- *   one-shot check at receipt). The switch therefore lands cleanly on the
- *   first group that starts after the request: no redelivery of the
- *   in-progress group, no catch-up, no seam gap.
- * - 'time-shifted' mode: returns the group containing `currentTime` (via the
- *   TimeMap) as the floor. If the TimeMap has no anchor yet (rare: switch
- *   fired before any object was received), flags `timeMapMiss: true` and
- *   falls through to the live-edge computation.
- * - Before any object has arrived (`latestGroup < 0`), returns 0 — the spec
- *   floor for "nothing buffered, any group works".
+ * - 'next-group': `1 + max(latestGroup, bufferedGroup)` — the next boundary
+ *   after the latest group the client holds. That group may not exist at the
+ *   relay yet (a client at the live edge names a group that hasn't started);
+ *   the relay identifies G_switch within its T_switch window, waiting for the
+ *   boundary to materialise while the current subscription keeps delivering
+ *   (SWITCH_WAIT on the relay). No redelivery of media already held.
+ * - 'playhead': the group containing the playhead (via the TimeMap). If the
+ *   TimeMap has no anchor yet (switch fired before any object was received),
+ *   flags `timeMapMiss: true` and falls through to the next-group floor.
+ * - Before any object has arrived (`latestGroup < 0`, nothing buffered),
+ *   returns 0 — the spec floor for "nothing buffered, any group works".
  *
  * Exported for unit testing.
  */
 export function computeSwitchMinimumGroup(opts: {
   switchFloor: 'next-group' | 'playhead';
   targetGroup: number | undefined;
-  /** Latest group id received on the current track; -1n when none yet. */
+  /** Highest group id received on the current track (any order); -1n when none yet. */
   latestGroup: bigint;
   /**
    * Highest group completely present in the element's buffered horizon ahead
@@ -346,6 +319,32 @@ export function highestCompleteBufferedGroup(opts: {
     }
   }
   return best;
+}
+
+/**
+ * DROP_STALE fields for a data stream the library discarded without delivering
+ * it (M15): no subscription claimed its track alias in time, so the library
+ * cancelled it with STOP_SENDING and reported what it had read. `track` is the
+ * name the alias last mapped to (null once the library has forgotten it).
+ * Same record as the player's own drops, so every arm counts discarded media
+ * on the same basis whether the library or the player dropped it.
+ *
+ * Exported for unit testing.
+ */
+export function unroutedDropFields(
+  info: DiscardedStreamInfo,
+  state: { current: string | null; pending: string | null },
+): Record<string, unknown> {
+  return {
+    reason: info.reason,
+    track: info.fullTrackName ? new TextDecoder().decode(info.fullTrackName.name) : null,
+    current: state.current,
+    pending: state.pending,
+    group: Number(info.groupId),
+    subgroup: info.subgroupId !== undefined ? Number(info.subgroupId) : null,
+    track_alias: Number(info.trackAlias),
+    bytes: info.bytes,
+  };
 }
 
 /**
@@ -422,11 +421,10 @@ export class Player {
   // `LatencyTrendRule` reads `getTrendRatio()` for downswitch decisions.
   #latencyTracker = new LatencyTracker();
   // Connect-time state (Task C4) for time-shifted-mode clamp detection.
-  // Captured in subscribe(); consumed once on the first received object.
-  #connectSentAt: number | undefined;
+  // Captured in subscribe(); reported on FIRST_OBJECT.
   #expectedStartGroupId: number | undefined;
   // PTS <-> group lookup populated from incoming object decode times. Used by
-  // the measurements (playhead -> group) and by the 'playhead' switch floor.
+  // the measurements (playhead -> group) and by the SWITCH floor (pr1378).
   #timeMap: TimeMap | undefined;
   // Most recent Producer Reference Time seen on the video track; anchors the
   // live-edge estimate (see lib/events/liveEdge.ts).
@@ -436,8 +434,25 @@ export class Player {
   #tConnectStart: number | undefined;
   #tFirstObject: number | undefined;
   #firstFrameSeen = false;
-  // Open stall, if any: STALL_START was emitted and STALL_END is pending.
-  #stall: { startPerf: number; cause: 'waiting' | 'frozen'; playheadMs: number } | null = null;
+  // Stall episodes (STALL_START / STALL_END) from the element's events and the
+  // frozen-playhead watchdog; never overlapping (F15).
+  #stalls = new StallTracker(
+    (event, fields) => events.emit(event, fields),
+    () => ({
+      ready: this.#element !== null && this.#firstFrameSeen,
+      playheadMs: (this.#element?.currentTime ?? 0) * 1000,
+      // The track the viewer is looking at, not the one being received (M13).
+      track: this.getMetrics().presentedTrack,
+    }),
+  );
+  // Per-switch records (C1): switch_seq, landing, seam and first-frame state.
+  // Numbers come from the page-wide sequence so a reconnect never reuses one.
+  #seams = new SeamTracker(nextPageSwitchSeq);
+  // Video appends that landed inside a gap (buffered media after them): the
+  // fills the gap-crossing policy waits for (F4).
+  #gapFills = new GapFillLog();
+  // switch_seq allocated by the latest switchTrack call (F14).
+  #lastSwitchSeq: number | null = null;
 
   constructor(options: Partial<PlayerOptions> = {}) {
     this.#options = { ...DefaultOptions, ...options };
@@ -461,6 +476,23 @@ export class Player {
       throw error;
     }
     events.emit('CONNECTED', { connect_ms: performance.now() - this.#tConnectStart });
+    // Streams the library cancels for want of a route (M15) are counted here,
+    // on the same basis as the write handler's own drops.
+    this.client.onStreamDiscarded = info => {
+      const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+      const fields = unroutedDropFields(info, {
+        current: vs?.trackName ?? null,
+        pending: vs?.pendingSwitch?.trackName ?? null,
+      });
+      events.emit('DROP_STALE', fields);
+      // Attributed to its group if that group is open, else reported with the
+      // stream's next THROUGHPUT_SAMPLE as unrouted_bytes (F6).
+      vs?.tracker.recordDiscardedBytes(
+        info.bytes,
+        info.groupId,
+        typeof fields.track === 'string' ? fields.track : null,
+      );
+    };
 
     // Debug-only escape hatch: lets the network test harness force a SWITCH
     // without going through the AbrController. Used by Slice C/Phase B E2Es
@@ -468,8 +500,9 @@ export class Player {
     // for production use — direct switchTrack() calls bypass the ABR
     // switching guard's bookkeeping.
     if (typeof window !== 'undefined') {
-      (window as Window & { __forceSwitch?: (trackName: string) => Promise<void> }).__forceSwitch =
-        (trackName: string) => this.switchTrack(trackName);
+      (
+        window as Window & { __forceSwitch?: (trackName: string) => Promise<number | null> }
+      ).__forceSwitch = (trackName: string) => this.switchTrack(trackName);
     }
 
     // Fetch the catalog
@@ -611,18 +644,14 @@ export class Player {
     if (!this.#element) throw new Error('Media element not attached');
     if (this.#streams.length === 0) throw new Error('No active media streams to start');
 
-    // Wedge watchdog. Each ABR switch leaves a ~1-frame gap in the MSE
-    // timeline (the relay activates the new track at the next group boundary,
-    // so a few frames at the boundary are dropped). When currentTime walks
-    // into one of those gaps, MSE goes ready_state=2 and stops advancing
-    // forever even though data is buffered on the far side. Detect that
-    // exact pattern (frames frozen, currentTime sitting at the end of a
-    // buffered range, with another range immediately after) and seek across
-    // the gap.
+    // Stall watchdog. Detects a playhead that does not advance while playing
+    // (a stall whether or not the element fired `waiting`) and records what
+    // it saw. It never seeks: crossing gaps and recovering from a decoder
+    // wedge is the one gap-crossing policy in MSEBuffer (lib/buffer.ts, M14),
+    // which used to be overridden from here after 1 s.
     const el = this.#element;
     let lastFrames = 0;
     let lastTime = -1;
-    let frozenSince = 0;
     const wedgeIntervalId = setInterval(() => {
       this.#watchdog.ticks += 1;
       const q = el.getVideoPlaybackQuality?.();
@@ -631,93 +660,27 @@ export class Player {
       // Progress means the playhead moved. Decoded frames alone do not: one
       // run sat at the same currentTime with readyState 2 for 28 s while
       // totalVideoFrames rose by 9000 (the decoder chewing through a 37 s
-      // buffer it never presented), and the old frame-based test called that
-      // "playing" and never seeked.
+      // buffer it never presented).
       const time = el.currentTime;
       const advanced = time > lastTime + 0.01 || (lastTime < 0 && frames > lastFrames);
       lastFrames = frames;
-      if (advanced) {
-        lastTime = time;
-        frozenSince = 0;
-        this.#watchdog.frozen = 0;
-        this.#closeStall();
-        return;
-      }
-      if (el.paused || el.ended) return;
-      frozenSince += 1;
-      this.#watchdog.frozen = frozenSince;
-      if (frozenSince < 2) return; // wait ~1s of confirmed freeze
+      if (advanced) lastTime = time;
       // Frozen frames while playing is a stall whether or not the element
-      // fired `waiting`; the interval is credited from the first frozen tick.
-      this.#openStall('frozen', performance.now() - 500 * (frozenSince - 1));
-      const buf = el.buffered;
-      // Decoder wedge: frozen for 3 s while playing with data buffered ahead
-      // of the playhead. Seen on Firefox after rapid switches, with readyState
-      // 2 (cannot decode at this position) and also with readyState 4 (the
-      // playhead parked on a group boundary while the buffer kept growing for
-      // 100 s). Skip forward to the next group boundary; the alternative is a
-      // frozen picture for the rest of the run.
-      if (frozenSince >= 6) {
-        for (let i = 0; i < buf.length; i++) {
-          if (el.currentTime >= buf.start(i) - 0.05 && buf.end(i) - el.currentTime > 1.5) {
-            const gopS = (this.#timeMap?.gopDurationMs ?? 1000) / 1000;
-            const target = Math.min(
-              buf.end(i) - 0.5,
-              (Math.floor(el.currentTime / gopS) + 1) * gopS + 0.001,
-            );
-            logger.warn(
-              'media',
-              `Decoder wedge at ${el.currentTime.toFixed(2)}s (readyState ${el.readyState}), seeking to ${target.toFixed(2)}s`,
-            );
-            events.emit('SEEK', {
-              reason: 'unwedge',
-              from_ms: el.currentTime * 1000,
-              to_ms: target * 1000,
-              ready_state: el.readyState,
-            });
-            el.currentTime = target;
-            frozenSince = 0;
-            return;
-          }
-        }
-      }
-      for (let i = 0; i < buf.length - 1; i++) {
-        const start = buf.start(i);
-        const end = buf.end(i);
-        const nextStart = buf.start(i + 1);
-        // Only the range the playhead is actually sitting at the end of. Firefox
-        // keeps every old range (Chrome coalesces or evicts them), so without the
-        // lower bound an old hole far behind the playhead matches and the seek
-        // throws playback back by many seconds.
-        // A gap of any size once the freeze has lasted 3 s: the buffer's own
-        // range-jump should have crossed it, so if we are still here something
-        // held it back and the picture is frozen either way.
-        if (
-          el.currentTime >= start - 0.05 &&
-          el.currentTime >= end - 0.05 &&
-          el.currentTime <= end + 0.25 &&
-          nextStart > end &&
-          (nextStart - end < 1.5 || frozenSince >= 6)
-        ) {
-          logger.info(
-            'media',
-            `Wedge detected at ${el.currentTime.toFixed(2)}s, seeking across ${end.toFixed(2)}-${nextStart.toFixed(2)} gap`,
-          );
-          events.emit('SEEK', {
-            reason: 'wedge',
-            from_ms: el.currentTime * 1000,
-            to_ms: (nextStart + 0.001) * 1000,
-            gap_ms: (nextStart - end) * 1000,
-          });
-          el.currentTime = nextStart + 0.001;
-          frozenSince = 0;
-          return;
-        }
-      }
-      // Frozen for 3 s and no branch applied: say what the watchdog saw, once
-      // every 10 s, so the next such run is diagnosable from the log.
+      // fired `waiting`: the tracker opens one after ~1 s of confirmed freeze,
+      // credited from the first frozen tick but never from before the
+      // previous episode's end (F15).
+      const frozenSince = this.#stalls.watchdogTick(
+        performance.now(),
+        advanced,
+        !el.paused && !el.ended,
+      );
+      this.#watchdog.frozen = frozenSince;
+      if (advanced || el.paused || el.ended || frozenSince < 2) return;
+      // Frozen for 3 s: say what the watchdog saw, once every 10 s, so a run
+      // the gap policy could not recover is diagnosable from the log.
       if (frozenSince >= 6 && (frozenSince - 6) % 20 === 0) {
         this.#watchdog.unhandled += 1;
+        const buf = el.buffered;
         const parts: string[] = [];
         for (let i = 0; i < buf.length; i++)
           parts.push(`${buf.start(i).toFixed(3)}-${buf.end(i).toFixed(3)}`);
@@ -736,8 +699,8 @@ export class Player {
 
     // Element-reported stalls: `waiting` opens, `playing` closes. Frozen-frame
     // detection above catches stalls the element never reports.
-    const onWaiting = () => this.#openStall('waiting', performance.now());
-    const onPlaying = () => this.#closeStall();
+    const onWaiting = () => this.#stalls.waiting(performance.now());
+    const onPlaying = () => this.#stalls.playing(performance.now());
     // A fatal media element error (e.g. MEDIA_ERR_DECODE = 3 from the HEVC
     // decoder) makes every later append fail; record it as its own event so a
     // run that died this way is classified as a decoder failure, not a stall.
@@ -925,15 +888,13 @@ export class Player {
             //      arrives after pendingSwitch was overwritten to C.
             //   2. Old-track trailing packets delivered after a switch has
             //      already activated and pendingSwitch was cleared.
-            if (
-              objectTrackName !== struct.trackName &&
-              objectTrackName !== struct.pendingSwitch?.trackName
-            ) {
+            const route = this.#route(struct, objectTrackName);
+            if (route === 'stale') {
               logger.info(
                 'media',
                 `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
               );
-              events.emit('DROP_STALE', {
+              this.#dropStale(struct, object, objectTrackName, {
                 track: objectTrackName,
                 current: struct.trackName,
                 pending: struct.pendingSwitch?.trackName ?? null,
@@ -944,21 +905,14 @@ export class Player {
               return;
             }
 
-            if (
-              struct.pendingSwitch &&
-              objectTrackName === struct.pendingSwitch.trackName &&
-              this.#options.landingRequiresAliasMapping &&
-              objectTrackName !== struct.trackName &&
-              this.client !== null &&
-              !this.client.subscriptionAliasMap.has(struct.requestId)
-            ) {
+            if (route === 'pre-landing') {
               // Same track name, but the library has not yet seen a stream for
               // the switched subscription: this is a trailing object of the
               // earlier subscription to that track, not the switch landing.
-              events.emit('DROP_STALE', {
+              this.#dropStale(struct, object, objectTrackName, {
                 track: objectTrackName,
                 current: struct.trackName,
-                pending: struct.pendingSwitch.trackName,
+                pending: struct.pendingSwitch?.trackName ?? null,
                 group: object.location.group,
                 bytes: object.payload.byteLength,
                 object: object.location.object,
@@ -967,51 +921,78 @@ export class Player {
               return;
             }
 
-            if (struct.pendingSwitch && objectTrackName === struct.pendingSwitch.trackName) {
-              const {
-                initData,
-                mimeType,
-                trackName: newTrackName,
-                oldEndPTS_ms,
-                playheadPTS_ms,
-                switchSentAt,
-                framesAtSwitch,
-              } = struct.pendingSwitch;
+            if (route === 'land' && struct.pendingSwitch) {
+              const { initData, mimeType, trackName: newTrackName, record } = struct.pendingSwitch;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
               // The source's last appended frame at the moment the switch lands
-              // (the send-time snapshot in pendingSwitch predates ~1 GOP of
-              // source frames that arrived while the SWITCH was in flight).
-              const sourceEndAtApplyPTS_ms = struct.lastAppendedEndPTS_ms;
+              // (the send-time snapshot in the record predates ~1 GOP of source
+              // frames that arrived while the SWITCH was in flight).
+              const sourceEndAtLandingMs = struct.lastAppendedEndPTS_ms;
               struct.trackName = newTrackName;
               struct.pendingSwitch = null;
-              struct.firstFrameAfterSwitchSeen = false;
-              // Stash post-switch state on sibling struct fields that survive the
-              // pendingSwitch clear; the rVFC poll consumes them once the presented
-              // media time crosses the seam.
-              void framesAtSwitch;
-              struct.postSwitchSentAt = switchSentAt;
-              struct.postSwitchToTrack = newTrackName;
-              struct.postSwitchFromTrack = fromTrack;
+              // Whether the landing object is a keyframe: the trun sync-sample flag
+              // of its moof (undefined when the moof carries no flags).
+              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              const landingIsSync =
+                newTimescale && newTimescale > 0
+                  ? parseMoofMediaInfo(
+                      new Uint8Array(
+                        object.payload.buffer,
+                        object.payload.byteOffset,
+                        object.payload.byteLength,
+                      ),
+                      newTimescale,
+                    )?.isSync
+                  : undefined;
+
+              // The landing object. The seam fields come from the first object
+              // that passes the keyframe gate (SWITCH_APPLIED, M9).
               events.emit('SWITCH_FIRST_OBJECT', {
+                switch_seq: record.seq,
                 from: fromTrack,
                 to: newTrackName,
                 group: object.location.group,
                 object: object.location.object,
-                since_sent_ms: performance.now() - switchSentAt,
+                landed_on_keyframe: landingIsSync ?? null,
+                since_sent_ms: performance.now() - record.sentAt,
               });
+              // A previous landing whose seam was never presented is overwritten now.
+              const { superseded } = this.#seams.landed(record, {
+                group: Number(object.location.group),
+                object: Number(object.location.object),
+                landedOnKeyframe: landingIsSync ?? null,
+                sourceEndMs: sourceEndAtLandingMs,
+                now: performance.now(),
+              });
+              for (const old of superseded) {
+                events.emit('SWITCH_SUPERSEDED', {
+                  switch_seq: old.seq,
+                  by_switch_seq: record.seq,
+                  playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
+                  landed: true,
+                });
+              }
+              // Nothing of the target is appended before a sync sample, the landing
+              // object included: the gate below decides for every object, and the
+              // first one it lets into the buffer applies the switch.
+              struct.awaitKeyframe = true;
+              if (this.#resetLatencyOnLanding) {
+                this.#latencyTracker.reset();
+                events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
+              }
 
-              // Seam replacement (SWITCH PR #1378): the relay's catch-up range starts
-              // at switchTransition.switchingGroupId, so whatever is already
-              // buffered at or above that point is old-track media about to be
-              // re-delivered. Discard it first — otherwise both tracks' samples
-              // occupy the same span of the SourceBuffer, which is what fragments
-              // the buffered timeline and, on a large enough overlap, trips the
-              // demuxer.
-              //
-              // The first object of the new track begins exactly at the seam, so
-              // its baseMediaDecodeTime is the removal point. Parsed once here and
-              // reused below for the discontinuity record.
-              const newTimescale = this.catalog?.getTimescale(newTrackName);
+              // Seam replacement, playhead floor only (SWITCH PR #1378): the relay's
+              // catch-up range starts at the switching group, so whatever is
+              // already buffered at or above the landing object's PTS is old-track
+              // media about to be re-delivered on the target. Discard it first;
+              // otherwise both tracks' samples occupy the same span of the
+              // SourceBuffer. With the next-group floor the seam is the buffered
+              // end and the remove() would be a no-op that still flushes Firefox's
+              // decoder pipeline right before changeType() (it preceded each of
+              // the MEDIA_ERR_DECODE failures seen on that floor), so it is skipped.
+              // The landing object's own tfdt (parsed here: the landing block no
+              // longer carries it, and parseMoofMediaInfo needs per-sample
+              // durations a moof may not have).
               const newStartPTS_ms =
                 newTimescale && newTimescale > 0
                   ? parseMoofBaseMediaDecodeTime(
@@ -1023,34 +1004,20 @@ export class Player {
                       newTimescale,
                     )
                   : undefined;
-
-              if (newStartPTS_ms !== undefined) {
+              if (this.#options.switchFloor === 'playhead' && newStartPTS_ms !== undefined) {
                 const seamSeconds = newStartPTS_ms / 1000;
                 const playheadSeconds = this.#element?.currentTime ?? 0;
-                // Only remove when old-track media actually exists at or past the
-                // seam (the playhead floor re-delivers the buffered horizon). With
-                // the next-group floor the seam is the buffered end and the
-                // remove() would be a no-op that still flushes Firefox's decoder
-                // pipeline right before changeType(); the three MEDIA_ERR_DECODE
-                // failures seen so far were all on this branch, inside bursts of
-                // switches one second apart.
                 const bufferedEndSeconds =
                   sourceBuffer.buffered.length > 0
                     ? sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
                     : 0;
-                if (this.#options.switchFloor !== 'playhead') {
-                  // Next-group floor: the seam is the source's cut point and any
-                  // overlap is a few frames that the append's own coded-frame
-                  // removal replaces. The explicit remove() ran before every
-                  // changeType() and precedes each of the four MEDIA_ERR_DECODE
-                  // failures seen on this branch; the playhead floor, which
-                  // re-delivers the whole buffered horizon, keeps it.
-                } else if (bufferedEndSeconds <= seamSeconds + SEAM_REMOVE_GUARD_SECONDS) {
+                if (bufferedEndSeconds <= seamSeconds + SEAM_REMOVE_GUARD_SECONDS) {
                   // nothing buffered beyond the seam: append in place
                 } else if (seamSeconds > playheadSeconds + SEAM_REMOVE_GUARD_SECONDS) {
                   try {
                     if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
                     events.emit('SEAM_REMOVE', {
+                      switch_seq: record.seq,
                       to: newTrackName,
                       seam_ms: newStartPTS_ms,
                       buffered_end_ms: bufferedEndSeconds * 1000,
@@ -1078,8 +1045,9 @@ export class Player {
                 // Keep the pipeline alive: retry the init before the next object
                 // append and drop this object (it cannot be decoded without it).
                 struct.pendingInit = { mimeType, initData, attempts: 1 };
-                this.#options.onTrackSwitched?.(newTrackName);
-                events.emit('DROP_STALE', {
+                this.#options.onTrackSwitched?.(newTrackName, record.seq);
+                this.#seams.discarded();
+                this.#dropStale(struct, object, objectTrackName, {
                   track: objectTrackName,
                   current: struct.trackName,
                   pending: null,
@@ -1091,108 +1059,11 @@ export class Player {
                 return;
               }
 
-              // Push the discontinuity record. PTS-gap is the headline metric:
-              // signed difference between the first appended frame's PTS on the new
-              // track and the last appended frame's end PTS on the old track.
-              // newStartPTS_ms was parsed above for the seam removal.
-              const landingIsSync =
-                newTimescale && newTimescale > 0
-                  ? parseMoofMediaInfo(
-                      new Uint8Array(
-                        object.payload.buffer,
-                        object.payload.byteOffset,
-                        object.payload.byteLength,
-                      ),
-                      newTimescale,
-                    )?.isSync
-                  : undefined;
-
-              events.emit('SWITCH_APPLIED', {
-                from: fromTrack,
-                to: newTrackName,
-                group: object.location.group,
-                object: object.location.object,
-                new_start_pts_ms: newStartPTS_ms ?? null,
-                old_end_pts_ms: sourceEndAtApplyPTS_ms ?? null,
-                old_end_pts_at_send_ms: oldEndPTS_ms ?? null,
-                // Seam continuity of the appended media: first target frame PTS
-                // minus the last appended source frame's end PTS at landing time
-                // (0 = contiguous, >0 = hole, <0 = overlap: the target restarts
-                // inside media the source already covered).
-                media_seam_gap_ms:
-                  newStartPTS_ms !== undefined && sourceEndAtApplyPTS_ms !== undefined
-                    ? newStartPTS_ms - sourceEndAtApplyPTS_ms
-                    : null,
-                // Object 0 of a group is where a keyframe is expected ...
-                landed_on_group_start: object.location.object === 0n,
-                // ... and this is whether the landing object actually is one
-                // (trun sync-sample flag of its moof). null when the moof has no flags.
-                landed_on_keyframe: landingIsSync ?? null,
-                playhead_ms: playheadPTS_ms ?? null,
-                // How far ahead of the viewer the new representation lands: the
-                // media the viewer still has to play before seeing it. NOT a
-                // playback-position jump; that is measured at the seam crossing.
-                seam_ahead_of_playhead_ms:
-                  newStartPTS_ms !== undefined && playheadPTS_ms !== undefined
-                    ? newStartPTS_ms - playheadPTS_ms
-                    : null,
-                since_sent_ms: performance.now() - switchSentAt,
-              });
-              struct.postSwitchSeamPTS_ms = newStartPTS_ms;
-              // Discard until a sync sample. The flag is read from each object's
-              // moof; object index 0 is the fallback when a moof carries no flags.
-              struct.awaitKeyframe = !(landingIsSync ?? object.location.object === 0n);
-              if (this.#resetLatencyOnLanding) {
-                this.#latencyTracker.reset();
-                events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
-              }
-
-              if (newStartPTS_ms !== undefined) {
-                const mediaSeamGapMs =
-                  sourceEndAtApplyPTS_ms !== undefined
-                    ? newStartPTS_ms - sourceEndAtApplyPTS_ms
-                    : 0;
-                const seamAheadOfPlayheadMs =
-                  playheadPTS_ms !== undefined ? newStartPTS_ms - playheadPTS_ms : undefined;
-                const wallClockMs = performance.now() - switchSentAt;
-                const record: DiscontinuityRecord = {
-                  eventType: 'switch',
-                  switchSentAt,
-                  switchAppliedAt: performance.now(),
-                  fromTrack,
-                  toTrack: newTrackName,
-                  oldEndPTS_ms,
-                  newStartPTS_ms,
-                  mediaSeamGapMs,
-                  playheadPTS_ms,
-                  seamAheadOfPlayheadMs,
-                  wallClockMs,
-                  clientMode: this.#options.clientMode,
-                  timeShiftSeconds: this.#options.timeShiftSeconds,
-                };
-                if (typeof window !== 'undefined') {
-                  const w = window as Window & {
-                    __moqtailMetrics?: {
-                      switchDiscontinuities?: DiscontinuityRecord[];
-                      [k: string]: unknown;
-                    };
-                  };
-                  w.__moqtailMetrics ??= {} as Window['__moqtailMetrics'] & object;
-                  const metrics = w.__moqtailMetrics as Window['__moqtailMetrics'] & {
-                    switchDiscontinuities?: DiscontinuityRecord[];
-                  };
-                  metrics.switchDiscontinuities ??= [];
-                  metrics.switchDiscontinuities.push(record);
-                }
-              }
-
               // NOW release the ABR switching guard — the relay has completed the
               // transition and delivered data on the new track. Safe to switch again.
-              this.#options.onTrackSwitched?.(newTrackName);
+              this.#options.onTrackSwitched?.(newTrackName, record.seq);
             }
 
-            // Update lastAppendedEndPTS_ms before appending. C3 will read this for the
-            // "old end PTS" half of the discontinuity calculation.
             // Publisher emits one moof+mdat per access unit (see apps/publisher/src/cmaf.rs),
             // so each moof's tfdt is a per-frame decode time and the trun carries that
             // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
@@ -1219,8 +1090,12 @@ export class Player {
                   attempts: pi.attempts,
                 });
                 struct.pendingInit = undefined;
+                // The landing block's gate, which a failed init used to skip: the
+                // switch is applied by the first sync sample after the recovery.
+                struct.awaitKeyframe = true;
               } else {
-                events.emit('DROP_STALE', {
+                this.#seams.discarded();
+                this.#dropStale(struct, object, objectTrackName, {
                   track: objectTrackName,
                   current: struct.trackName,
                   pending: struct.pendingSwitch?.trackName ?? null,
@@ -1236,7 +1111,8 @@ export class Player {
             if (struct.awaitKeyframe) {
               const isSync = info?.isSync ?? object.location.object === 0n;
               if (!isSync) {
-                events.emit('DROP_STALE', {
+                this.#seams.discarded();
+                this.#dropStale(struct, object, objectTrackName, {
                   track: objectTrackName,
                   current: struct.trackName,
                   pending: struct.pendingSwitch?.trackName ?? null,
@@ -1247,26 +1123,18 @@ export class Player {
                 });
                 return;
               }
-              struct.awaitKeyframe = false;
             }
-
-            if (info !== undefined) {
-              decodeTimeMs = info.decodeTimeMs;
-              struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-              struct.lastFrameDurationMs = info.frameDurationMs;
-              // Feed the TimeMap so measurements can resolve playhead -> group.
-              // Only the first object of each group records (idempotent in TimeMap),
-              // and frame 0 of a group has decodeTime == group start PTS.
-              if (this.#timeMap) {
-                this.#timeMap.recordGroupBoundary(Number(object.location.group), info.decodeTimeMs);
-              }
-            }
+            decodeTimeMs = info?.decodeTimeMs;
 
             // Append the data
             let maxRetries = 5;
+            // When the successful appendBuffer call was made: the seam's target
+            // append front is dated here, not at updateend (F9).
+            let appendCalledAt = performance.now();
             while (maxRetries--) {
               try {
                 // Append the data
+                appendCalledAt = performance.now();
                 sourceBuffer.appendBuffer(object.payload.buffer);
 
                 // Wait for the source buffer to be consumed
@@ -1314,6 +1182,53 @@ export class Player {
                 this.#starvedSince = undefined;
               }
               struct.lastAppendPerf = nowPerf;
+              // The gate stays armed until a sync sample is actually in the buffer.
+              struct.awaitKeyframe = false;
+              // Append front and TimeMap move only for a frame that is in the buffer.
+              if (info !== undefined) {
+                struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
+                struct.lastFrameDurationMs = info.frameDurationMs;
+                // A frame with buffered media after it landed inside a gap: a
+                // fill (refetch or catch-up), not live delivery at the end (F4).
+                if (this.catalog?.getRole(struct.trackName) === 'video') {
+                  const endS = struct.lastAppendedEndPTS_ms / 1000;
+                  const ranges = sourceBuffer.buffered;
+                  if (ranges.length > 0 && ranges.start(ranges.length - 1) > endS + 0.001) {
+                    this.#gapFills.record(endS, nowPerf);
+                  }
+                }
+                // Feed the TimeMap so measurements can resolve playhead -> group.
+                // Only the first object of each group records (idempotent in TimeMap),
+                // and frame 0 of a group has decodeTime == group start PTS.
+                if (this.#timeMap) {
+                  this.#timeMap.recordGroupBoundary(
+                    Number(object.location.group),
+                    info.decodeTimeMs,
+                  );
+                }
+                // Every target frame moves the pending switch's append front; the
+                // first one applies the switch (M9). Only the video track switches.
+                const applied =
+                  this.catalog?.getRole(struct.trackName) === 'video'
+                    ? this.#seams.appended({
+                        ptsMs: info.decodeTimeMs,
+                        endPtsMs: info.decodeTimeMs + info.frameDurationMs,
+                        group: Number(object.location.group),
+                        object: Number(object.location.object),
+                        now: nowPerf,
+                        appendStartedAt: appendCalledAt,
+                      })
+                    : null;
+                if (applied !== null) {
+                  events.emit(
+                    'SWITCH_APPLIED',
+                    switchAppliedFields(applied, {
+                      now: nowPerf,
+                      playheadMs: this.#element ? this.#element.currentTime * 1000 : undefined,
+                    }),
+                  );
+                }
+              }
             }
 
             // Check the buffered amount
@@ -1324,28 +1239,10 @@ export class Player {
               if (bufferDuration > 1.0) bufferNotification(maxEnd);
             }
 
-            // Record goodput sample — SWMA on per-group object timing.
-            // The publisher bursts a GOP's objects back-to-back so the
-            // intra-group rate reflects link capacity, not source bitrate.
-            const previousGroupId = struct.lastGroupId;
-            struct.tracker.recordObject(object.payload.byteLength, object.location.group);
-            struct.lastGroupId = object.location.group;
-            // A group roll-over finalises the previous group's throughput sample.
-            const sampleCountNow = struct.tracker.getSampleCount();
-            if (struct.lastSampleCount !== undefined && sampleCountNow > struct.lastSampleCount) {
-              events.emit('THROUGHPUT_SAMPLE', {
-                track: struct.trackName,
-                group: previousGroupId,
-                bytes: struct.tracker.getLastSampleBytes(),
-                duration_ms: struct.tracker.getLastDeliveryTimeMs(),
-                bps: struct.tracker.getLastSampleBps(),
-                swma_bps: struct.tracker.getBandwidthBps(),
-                fast_ema_bps: struct.tracker.getFastEmaBps(),
-                slow_ema_bps: struct.tracker.getSlowEmaBps(),
-                sample_count: sampleCountNow,
-              });
-            }
-            struct.lastSampleCount = sampleCountNow;
+            // Throughput: arrival spacing of this object's group (M11). A frame
+            // that could not be appended still crossed the link. The tracker
+            // also keeps the highest group received per track (F10).
+            this.#recordArrival(struct, object, objectTrackName, info, maxRetries < 0);
 
             // First-received-group export for E2E smoke + connect-time metrics (Phase C).
             // Only set once across all streams to capture the earliest received group.
@@ -1373,57 +1270,6 @@ export class Player {
                       ? this.#tFirstObject - this.#tConnectStart
                       : null,
                 });
-
-                // Connect-time discontinuity record (Task C4): emit only if we
-                // were in time-shifted mode AND we have a known expected start
-                // group (i.e. the relay sent a SubscribeOk with largestLocation
-                // and delay_groups was non-zero).
-                if (
-                  this.#options.clientMode === 'time-shifted' &&
-                  this.#expectedStartGroupId !== undefined &&
-                  this.#connectSentAt !== undefined
-                ) {
-                  const expected = this.#expectedStartGroupId;
-                  const actual = Number(object.location.group);
-                  // Relay clamps when our requested target was older than the
-                  // oldest cached group: it returns a more-recent group instead.
-                  const clampedByRelay = actual > expected;
-
-                  const connectTimescale = this.catalog?.getTimescale(struct.trackName);
-                  const newStartPTS_ms =
-                    connectTimescale && connectTimescale > 0
-                      ? parseMoofBaseMediaDecodeTime(
-                          new Uint8Array(
-                            object.payload.buffer,
-                            object.payload.byteOffset,
-                            object.payload.byteLength,
-                          ),
-                          connectTimescale,
-                        )
-                      : undefined;
-
-                  const connectGopDurationMs =
-                    this.catalog?.getGopDurationMs(struct.trackName) ?? 1000;
-                  const mediaSeamGapMs = (actual - expected) * connectGopDurationMs;
-                  const wallClockMs = performance.now() - this.#connectSentAt;
-
-                  const record: DiscontinuityRecord = {
-                    eventType: 'connect',
-                    switchSentAt: this.#connectSentAt,
-                    switchAppliedAt: performance.now(),
-                    toTrack: struct.trackName,
-                    newStartPTS_ms: newStartPTS_ms ?? 0,
-                    mediaSeamGapMs,
-                    wallClockMs,
-                    expectedStartGroup: expected,
-                    actualStartGroup: actual,
-                    clampedByRelay,
-                    clientMode: this.#options.clientMode,
-                    timeShiftSeconds: this.#options.timeShiftSeconds,
-                  };
-                  window.__moqtailMetrics.switchDiscontinuities ??= [];
-                  window.__moqtailMetrics.switchDiscontinuities.push(record);
-                }
               }
             }
 
@@ -1469,17 +1315,15 @@ export class Player {
       // Pump the current data route into `writable`, re-piping whenever a
       // SWITCH replaces `struct.source`.
       //
-      // A single pipeTo() was correct while a switch kept one subscription
-      // alive and merely changed what flowed through it. Under SWITCH PR #1378
-      // the relay tears the old subscription down (PUBLISH_DONE) and opens a
-      // new PUBLISH route for the target, so the post-switch objects arrive on
-      // a different ReadableStream. Piping only the original one left every
-      // post-switch object unread: no appends, the pending init segment never
-      // applied, and playback froze at the seam with no error anywhere.
+      // Under SWITCH PR #1378 the relay tears the old subscription down
+      // (PUBLISH_DONE) and opens a new PUBLISH route for the target, so the
+      // post-switch objects arrive on a different ReadableStream; a single
+      // pipeTo() would leave every post-switch object unread.
       //
       // preventClose/preventAbort keep `writable` — and with it the
-      // SourceBuffer, the pendingSwitch bookkeeping and the discontinuity
-      // records — alive across the seam. Only call endOfStream() on dispose.
+      // SourceBuffer, the pendingSwitch bookkeeping and the seam records —
+      // alive across the seam. For live streams endOfStream() is never called
+      // when a pipe ends (it would seal the MediaSource); only on dispose.
       const pump = async () => {
         while (!ac.signal.aborted) {
           const current = struct.source;
@@ -1509,18 +1353,150 @@ export class Player {
     }
   }
 
+  /**
+   * What the write handler does with an object of `objectTrackName` on
+   * `struct`: `stale` (neither the current track nor the pending switch
+   * target: dropped), `pre-landing` (the pending target's name, but the
+   * library has not mapped the switched subscription yet: a trailing object
+   * of an earlier subscription to that track, dropped), `land` (the pending
+   * switch lands on it) or `current` (append).
+   */
+  #route(
+    struct: MOQStreamStruct,
+    objectTrackName: string,
+  ): 'stale' | 'pre-landing' | 'land' | 'current' {
+    const pending = struct.pendingSwitch;
+    if (objectTrackName !== struct.trackName && objectTrackName !== pending?.trackName) {
+      return 'stale';
+    }
+    if (
+      pending &&
+      objectTrackName === pending.trackName &&
+      this.#options.landingRequiresAliasMapping &&
+      objectTrackName !== struct.trackName &&
+      this.client !== null &&
+      !this.client.subscriptionAliasMap.has(struct.requestId)
+    ) {
+      return 'pre-landing';
+    }
+    if (pending && objectTrackName === pending.trackName) return 'land';
+    return 'current';
+  }
+
+  /**
+   * The write handler's routing of a video object of `trackName` right now
+   * (see #route); null without a video stream. For tests.
+   */
+  routeVideoObject(trackName: string): 'stale' | 'pre-landing' | 'land' | 'current' | null {
+    const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    return vs ? this.#route(vs, trackName) : null;
+  }
+
+  /**
+   * DROP_STALE for an object the write handler will not append; the object is
+   * still a link arrival of its group (THROUGHPUT_SAMPLE discarded_bytes).
+   */
+  #dropStale(
+    struct: MOQStreamStruct,
+    object: MoqtObject,
+    objectTrackName: string,
+    fields: Record<string, unknown>,
+  ): void {
+    events.emit('DROP_STALE', fields);
+    this.#recordArrival(struct, object, objectTrackName, undefined, true);
+  }
+
+  /**
+   * Feeds one received object into the stream's throughput tracker, timed by
+   * the library's receive stamp and kept per (track, group) (M11), and emits a
+   * THROUGHPUT_SAMPLE for every group sample that closes. `info` is the
+   * object's parsed moof when the caller already has it.
+   */
+  #recordArrival(
+    struct: MOQStreamStruct,
+    object: MoqtObject,
+    objectTrackName: string,
+    info: { frameDurationMs: number } | undefined,
+    discarded: boolean,
+  ): void {
+    const bytes = object.payload?.byteLength ?? 0;
+    if (info === undefined && object.payload) {
+      const timescale = this.catalog?.getTimescale(objectTrackName);
+      info =
+        timescale && timescale > 0
+          ? parseMoofMediaInfo(
+              new Uint8Array(
+                object.payload.buffer,
+                object.payload.byteOffset,
+                object.payload.byteLength,
+              ),
+              timescale,
+            )
+          : undefined;
+    }
+    // The last object of a group: object ids run 0..frames-1 with one frame per
+    // object, frames = GOP / frame duration.
+    const gopMs = this.#timeMap?.gopDurationMs;
+    const lastInGroup =
+      info !== undefined && gopMs !== undefined && info.frameDurationMs > 0
+        ? Number(object.location.object) >= Math.round(gopMs / info.frameDurationMs) - 1
+        : undefined;
+    const samples = struct.tracker.recordObject(bytes, object.location.group, {
+      recvAt: object.recvAt,
+      track: objectTrackName,
+      lastInGroup,
+      discarded,
+    });
+    for (const sample of samples) {
+      events.emit('THROUGHPUT_SAMPLE', {
+        track: sample.track,
+        group: sample.group,
+        bytes: sample.bytes,
+        duration_ms: sample.durationMs,
+        bps: sample.bps,
+        // Bytes of this group dropped by the player, plus library (unrouted)
+        // discards of this group while it was open.
+        discarded_bytes: sample.discardedBytes,
+        // Library (unrouted) discards no open group could take (already
+        // sampled, never routed, or unknown track), any track, since this
+        // stream's previous sample; every such byte is reported once (F6).
+        unrouted_bytes: sample.unroutedBytes,
+        objects: sample.objects,
+        swma_bps: struct.tracker.getBandwidthBps(),
+        fast_ema_bps: struct.tracker.getFastEmaBps(),
+        slow_ema_bps: struct.tracker.getSlowEmaBps(),
+        sample_count: struct.tracker.getSampleCount(),
+      });
+    }
+  }
+
   getMetrics(): {
     bandwidthBps: number;
     fastEmaBps: number;
     slowEmaBps: number;
+    /** Last buffered range end minus playhead (counts across holes), s. */
     bufferSeconds: number;
+    /** End of the buffered range containing the playhead minus playhead, 0 if none (M12), s. */
+    bufferContigSeconds: number;
+    /** The track subscribed to: switches at the landing. */
     activeTrack: string | null;
+    /** The track whose media is at the playhead: switches at the seam (M13). */
+    presentedTrack: string | null;
+    /**
+     * PTS (ms) of the latest applied switch seam whose region (from the hole in
+     * front of it) the playhead has entered; null when none. With `playheadMs`
+     * it anchors SwitchHistoryRule's seam exemption at the seam being
+     * presented (F2).
+     */
+    latestSeamPtsMs: number | null;
     droppedFrames: number;
     totalFrames: number;
     playbackRate: number;
     deliveryTimeMs: number;
     lastObjectBytes: number;
     sampleCount: number;
+    /** Closed THROUGHPUT_SAMPLE groups per track (the group's own track). */
+    samplesByTrack: Record<string, number>;
     readyState: number;
     paused: boolean;
     ended: boolean;
@@ -1532,6 +1508,11 @@ export class Player {
     videoErrorCode: number;
     latencyTrendRatio: number;
     lastLatencyMs: number;
+    /** Means of the older / recent half of the latency window; undefined until it is full. */
+    latencyOlderMeanMs: number | undefined;
+    latencyRecentMeanMs: number | undefined;
+    /** Target shift behind live: 0 live-edge, delay_groups x GOP time-shifted, ms. */
+    targetShiftMs: number;
     playheadMs: number;
     bufferedEndMs: number;
     liveEdgeDistanceMs: number;
@@ -1545,24 +1526,26 @@ export class Player {
       buffered && buffered.length > 0 && el
         ? Math.max(0, buffered.end(buffered.length - 1) - el.currentTime)
         : 0;
+    const bufferContigSeconds =
+      buffered && el ? contiguousBufferAheadS(buffered, el.currentTime) : 0;
     const playheadMs = (el?.currentTime ?? 0) * 1000;
+    const shift = targetShiftMs({
+      clientMode: this.#options.clientMode,
+      timeShiftSeconds: this.#options.timeShiftSeconds,
+      gopDurationMs: this.#timeMap?.gopDurationMs ?? 0,
+      liveEdgeDelaySeconds: DEFAULT_LIVE_EDGE_DELAY,
+    }).targetShiftMs;
+    const latencyMeans = this.#latencyTracker.getHalfMeans();
     const bufferedEndMs =
       buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) * 1000 : 0;
     let liveEdgeDistanceMs = Number.NaN;
     let timeShiftErrorMs = Number.NaN;
     if (this.#prftAnchor && el) {
-      const gopDurationMs = this.#timeMap?.gopDurationMs ?? 0;
-      const target = targetShiftMs({
-        clientMode: this.#options.clientMode,
-        timeShiftSeconds: this.#options.timeShiftSeconds,
-        gopDurationMs,
-        liveEdgeDelaySeconds: DEFAULT_LIVE_EDGE_DELAY,
-      });
       const est = estimateLiveEdge({
         anchor: this.#prftAnchor,
         nowMs: Date.now(),
         playheadMs,
-        targetShiftMs: target.targetShiftMs,
+        targetShiftMs: shift,
       });
       liveEdgeDistanceMs = est.liveEdgeDistanceMs;
       timeShiftErrorMs = est.timeShiftErrorMs;
@@ -1585,13 +1568,20 @@ export class Player {
       fastEmaBps: videoStruct?.tracker.getFastEmaBps() ?? 0,
       slowEmaBps: videoStruct?.tracker.getSlowEmaBps() ?? 0,
       bufferSeconds,
+      bufferContigSeconds,
       activeTrack: videoStruct?.trackName ?? null,
+      presentedTrack: this.#seams.presentedTrack(playheadMs) ?? videoStruct?.trackName ?? null,
+      latestSeamPtsMs: this.#seams.seamRegionAt(
+        playheadMs,
+        videoStruct?.lastFrameDurationMs ?? 1000 / 30,
+      ),
       droppedFrames: quality?.droppedVideoFrames ?? 0,
       totalFrames: quality?.totalVideoFrames ?? 0,
       playbackRate: el?.playbackRate ?? 1,
       deliveryTimeMs: videoStruct?.tracker.getLastDeliveryTimeMs() ?? 0,
       lastObjectBytes: videoStruct?.tracker.getLastObjectBytes() ?? 0,
       sampleCount: videoStruct?.tracker.getSampleCount() ?? 0,
+      samplesByTrack: videoStruct?.tracker.getSamplesByTrack() ?? {},
       readyState: el?.readyState ?? 0,
       paused: el?.paused ?? true,
       ended: el?.ended ?? false,
@@ -1603,6 +1593,9 @@ export class Player {
       videoErrorCode: el?.error?.code ?? 0,
       latencyTrendRatio: this.#latencyTracker.getTrendRatio(),
       lastLatencyMs: this.#latencyTracker.getLastLatencyMs(),
+      latencyOlderMeanMs: latencyMeans?.olderMs,
+      latencyRecentMeanMs: latencyMeans?.recentMs,
+      targetShiftMs: shift,
       playheadMs,
       bufferedEndMs,
       liveEdgeDistanceMs,
@@ -1634,7 +1627,7 @@ export class Player {
       track: vs.trackName,
       request_id: Number(vs.requestId),
       pending: vs.pendingSwitch?.trackName ?? null,
-      last_group: Number(vs.lastGroupId),
+      last_group: Number(this.#lastGroupOf(vs)),
       since_last_append_ms: now - vs.lastAppendPerf,
       playhead_ms: el.currentTime * 1000,
       buffered_end_ms: buf.length > 0 ? buf.end(buf.length - 1) * 1000 : null,
@@ -1644,10 +1637,34 @@ export class Player {
     });
   }
 
+  /** Highest group id received for the stream's current track, -1n before any (F10). */
+  #lastGroupOf(struct: MOQStreamStruct): bigint {
+    return struct.tracker.getMaxGroup(struct.trackName) ?? -1n;
+  }
+
   /** End PTS (ms) of the most recently appended video frame: where new data is landing in the buffer. */
   getAppendFrontMs(): number | undefined {
     return this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')
       ?.lastAppendedEndPTS_ms;
+  }
+
+  /**
+   * The gap-crossing policy's fill probe (F4): the furthest end of the video
+   * appends that landed inside a gap within `q.windowMs` and end inside
+   * [q.fromS, q.toS), with the last-appended front for the record.
+   */
+  getGapFillState(q: GapFillQuery): GapFillState {
+    const front = this.getAppendFrontMs();
+    return {
+      appendFrontS: front !== undefined ? front / 1000 : undefined,
+      ...this.#gapFills.state(q, performance.now()),
+    };
+  }
+
+  /** Duration (ms) of the most recently parsed video frame; undefined before the first one. */
+  getFrameDurationMs(): number | undefined {
+    return this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')
+      ?.lastFrameDurationMs;
   }
 
   /** True between SWITCH_OK and the target's first object (the switch has not landed). */
@@ -1655,29 +1672,6 @@ export class Player {
     return (
       this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video')?.pendingSwitch != null
     );
-  }
-
-  #openStall(cause: 'waiting' | 'frozen', startPerf: number): void {
-    if (this.#stall !== null || !this.#element) return;
-    if (!this.#firstFrameSeen) return; // pre-startup waiting is startup delay, not a stall
-    const playheadMs = this.#element.currentTime * 1000;
-    this.#stall = { startPerf, cause, playheadMs };
-    events.emit('STALL_START', {
-      cause,
-      playhead_ms: playheadMs,
-      track: this.getMetrics().activeTrack,
-    });
-  }
-
-  #closeStall(): void {
-    if (this.#stall === null) return;
-    const s = this.#stall;
-    this.#stall = null;
-    events.emit('STALL_END', {
-      cause: s.cause,
-      playhead_ms: s.playheadMs,
-      duration_ms: performance.now() - s.startPerf,
-    });
   }
 
   setEmaHalfLives(halfLifeFastSec: number, halfLifeSlowSec: number): void {
@@ -1699,8 +1693,9 @@ export class Player {
    * Recurring requestVideoFrameCallback poll.
    *
    * Every presented frame reports its `mediaTime`. The first presented frame
-   * whose media time is at or past a pending switch's seam PTS is the first
-   * frame of the new representation the viewer sees. At that frame:
+   * whose media time lies in the pending switch's appended target range
+   * [seam PTS, target append front] is the first frame of the new
+   * representation the viewer sees (SeamTracker.presented, M10). At that frame:
    *   switch_visibility_delay_ms = now - switchSentAt
    *   playback_position_jump_ms  = mediaTime - previous mediaTime - one frame
    *                                (0 when the seam is played through contiguously)
@@ -1710,6 +1705,19 @@ export class Player {
    */
   #installPerceivedPausePoll(): void {
     if (!this.#element) return;
+    // requestVideoFrameCallback reports each presented frame with its media
+    // time; where it is missing, fall back to an animation-frame poll that
+    // reads currentTime (coarser, but the seam crossing is still detected).
+    // Every record this poll emits says which one it was.
+    const el = this.#element;
+    const rvfc = (
+      el as HTMLVideoElement & {
+        requestVideoFrameCallback?: (
+          cb: (now: number, m: VideoFrameCallbackMetadata) => void,
+        ) => number;
+      }
+    ).requestVideoFrameCallback;
+    const source: 'rvfc' | 'raf' = typeof rvfc === 'function' ? 'rvfc' : 'raf';
     let prevMediaMs: number | undefined;
     let prevNowMs: number | undefined;
     const poll = (now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata) => {
@@ -1718,6 +1726,7 @@ export class Player {
       if (!this.#firstFrameSeen) {
         this.#firstFrameSeen = true;
         events.emit('STARTUP', {
+          source,
           track: this.getMetrics().activeTrack,
           playhead_ms: mediaMs,
           connect_to_first_object_ms:
@@ -1729,87 +1738,59 @@ export class Player {
           startup_delay_ms: this.#tConnectStart !== undefined ? now - this.#tConnectStart : null,
         });
       }
-      for (const struct of this.#streams) {
-        const seam = struct.postSwitchSeamPTS_ms;
-        if (
-          struct.firstFrameAfterSwitchSeen !== true &&
-          seam !== undefined &&
-          struct.postSwitchSentAt !== undefined &&
-          struct.postSwitchToTrack !== undefined
-        ) {
-          const frameMs = struct.lastFrameDurationMs ?? 1000 / 30;
-          if (mediaMs < seam - frameMs / 2) continue;
-          struct.firstFrameAfterSwitchSeen = true;
-          const visibilityDelayMs = now - struct.postSwitchSentAt;
-          const jumpMs = prevMediaMs !== undefined ? mediaMs - prevMediaMs - frameMs : null;
-          const pauseMs = prevNowMs !== undefined ? Math.max(0, now - prevNowMs - frameMs) : null;
-          const targetTrack = struct.postSwitchToTrack;
-          // Ground truth for the seam: the hole in the element's buffered ranges
-          // at the seam (0 = the seam lies inside one contiguous range). This is
-          // what a range-jump seek crosses; the parsed-PTS gap above cannot see
-          // frames the decoder never presented. The hole behind the presented
-          // frame's range counts only when that range begins at or after the
-          // seam; otherwise it is an older hole still sitting in the buffer, and
-          // the seam itself was contiguous. The raw value stays available as
-          // buffer_hole_behind_ms.
-          let bufferHoleMs: number | null = null;
-          let bufferHoleBehindMs: number | null = null;
-          const ranges = this.#element.buffered;
-          for (let i = 0; i < ranges.length; i++) {
-            const startMs = ranges.start(i) * 1000;
-            if (startMs - frameMs <= mediaMs && mediaMs <= ranges.end(i) * 1000 + frameMs) {
-              bufferHoleBehindMs = i > 0 ? startMs - ranges.end(i - 1) * 1000 : 0;
-              bufferHoleMs = startMs >= seam - frameMs / 2 ? bufferHoleBehindMs : 0;
-              break;
-            }
+      const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+      const frameMs = videoStruct?.lastFrameDurationMs ?? 1000 / 30;
+      // When the frame was handed to the compositor (rVFC), else the callback time.
+      const presentedAt = metadata.presentationTime ?? now;
+      const rec = this.#seams.presented({ mediaMs, frameMs, now: presentedAt });
+      if (rec !== null && rec.seamPtsMs !== undefined) {
+        const seam = rec.seamPtsMs;
+        const visibilityDelayMs = now - rec.sentAt;
+        const jumpMs = prevMediaMs !== undefined ? mediaMs - prevMediaMs - frameMs : null;
+        const pauseMs = prevNowMs !== undefined ? Math.max(0, now - prevNowMs - frameMs) : null;
+        // Ground truth for the seam: the hole in the element's buffered ranges
+        // at the seam (0 = the seam lies inside one contiguous range). This is
+        // what a range-jump seek crosses; the parsed-PTS gap above cannot see
+        // frames the decoder never presented. The hole behind the presented
+        // frame's range counts only when that range begins at or after the
+        // seam; otherwise it is an older hole still sitting in the buffer, and
+        // the seam itself was contiguous. The raw value stays available as
+        // buffer_hole_behind_ms.
+        let bufferHoleMs: number | null = null;
+        let bufferHoleBehindMs: number | null = null;
+        const ranges = this.#element.buffered;
+        for (let i = 0; i < ranges.length; i++) {
+          const startMs = ranges.start(i) * 1000;
+          if (startMs - frameMs <= mediaMs && mediaMs <= ranges.end(i) * 1000 + frameMs) {
+            bufferHoleBehindMs = i > 0 ? startMs - ranges.end(i - 1) * 1000 : 0;
+            bufferHoleMs = startMs >= seam - frameMs / 2 ? bufferHoleBehindMs : 0;
+            break;
           }
-          events.emit('SWITCH_FIRST_FRAME', {
-            from: struct.postSwitchFromTrack ?? null,
-            to: targetTrack,
-            seam_pts_ms: seam,
-            presented_pts_ms: mediaMs,
-            switch_visibility_delay_ms: visibilityDelayMs,
-            playback_position_jump_ms: jumpMs,
-            viewer_pause_ms: pauseMs,
-            seam_buffer_hole_ms: bufferHoleMs,
-            buffer_hole_behind_ms: bufferHoleBehindMs,
-          });
-
-          if (typeof window !== 'undefined' && window.__moqtailMetrics) {
-            const records = window.__moqtailMetrics.switchDiscontinuities;
-            if (records) {
-              for (let i = records.length - 1; i >= 0; i--) {
-                const r = records[i];
-                if (r && r.eventType === 'switch' && r.toTrack === targetTrack) {
-                  r.viewerPauseMs = pauseMs ?? undefined;
-                  break;
-                }
-              }
-            }
-          }
-
-          struct.postSwitchSeamPTS_ms = undefined;
-          struct.postSwitchSentAt = undefined;
-          struct.postSwitchToTrack = undefined;
-          struct.postSwitchFromTrack = undefined;
-          this.#options.onSwitchVisible?.(targetTrack);
         }
+        events.emit('SWITCH_FIRST_FRAME', {
+          switch_seq: rec.seq,
+          from: rec.from,
+          to: rec.to,
+          seam_pts_ms: seam,
+          presented_pts_ms: mediaMs,
+          switch_visibility_delay_ms: visibilityDelayMs,
+          playback_position_jump_ms: jumpMs,
+          viewer_pause_ms: pauseMs,
+          seam_buffer_hole_ms: bufferHoleMs,
+          buffer_hole_behind_ms: bufferHoleBehindMs,
+          target_append_front_ms: rec.targetAppendFrontMs ?? null,
+          // The seam landed behind the playhead the switch was sent at; the
+          // frame above is still target media (M10), reached later.
+          seam_behind_playhead: seamBehindPlayhead(rec),
+          source,
+        });
+
+        this.#options.onSwitchVisible?.(rec.to);
       }
       prevMediaMs = mediaMs;
       prevNowMs = now;
       schedule(poll);
     };
-    // requestVideoFrameCallback reports each presented frame with its media
-    // time; where it is missing, fall back to an animation-frame poll that
-    // reads currentTime (coarser, but the seam crossing is still detected).
-    const el = this.#element;
-    const rvfc = (
-      el as HTMLVideoElement & {
-        requestVideoFrameCallback?: (
-          cb: (now: number, m: VideoFrameCallbackMetadata) => void,
-        ) => number;
-      }
-    ).requestVideoFrameCallback;
     const schedule =
       typeof rvfc === 'function'
         ? (cb: (now: number, m: VideoFrameCallbackMetadata) => void) => rvfc.call(el, cb)
@@ -1845,9 +1826,11 @@ export class Player {
     const vBytesStart = videoStruct?.tracker.getCumulativeBytes() ?? 0;
     const tStart = Date.now();
 
+    // The probe stays at the lowest subscriber priority: the relay derives its
+    // stream priority below every video stream regardless, and 255 says the same.
     const result = await this.client.subscribe({
       fullTrackName,
-      groupOrder: GroupOrder.Original,
+      groupOrder: MEDIA_SCHEDULING.groupOrder,
       filterType: FilterType.LatestObject,
       forward: true,
       priority: 255,
@@ -1866,6 +1849,10 @@ export class Player {
     const capMs = Math.max(durationMs * 10, 5000);
     let streamDone = false;
     let lastObjectAt = tStart;
+    // Date.now() of the first and last probe object received (F13): the
+    // burst's own span, without the subscribe RTT before it and the idle wait
+    // after it that dt_ms includes.
+    let firstObjectAt: number | null = null;
 
     try {
       for (;;) {
@@ -1895,6 +1882,7 @@ export class Player {
         pBytes += len;
         count++;
         lastObjectAt = Date.now();
+        if (firstObjectAt === null) firstObjectAt = lastObjectAt;
       }
     } catch {
       /* swallow — return what we have */
@@ -1917,6 +1905,8 @@ export class Player {
         p_bytes: pBytes,
         objects: count,
         dt_ms: tEnd - tStart,
+        first_object_ms: firstObjectAt,
+        last_object_ms: count > 0 ? lastObjectAt : null,
         bps: 0,
       });
       return { bps: 0, dtMs: tEnd - tStart };
@@ -1932,7 +1922,11 @@ export class Player {
       p_bytes: pBytes,
       v_bytes: vBytes,
       objects: count,
+      // Subscribe sent to the end of the read (RTT and idle wait included).
       dt_ms: tEnd - tStart,
+      // Epoch ms (Date.now) of the first and last probe object received.
+      first_object_ms: firstObjectAt,
+      last_object_ms: lastObjectAt,
       stream_done: streamDone,
       bps,
     });
@@ -1946,7 +1940,7 @@ export class Player {
    * Called by app.tsx after creating the Player and AbrController,
    * to wire the ABR switching guard release without a circular dependency.
    */
-  setOnTrackSwitched(cb: (trackName: string) => void): void {
+  setOnTrackSwitched(cb: (trackName: string, switchSeq?: number) => void): void {
     this.#options.onTrackSwitched = cb;
   }
 
@@ -1961,35 +1955,26 @@ export class Player {
   }
 
   /**
-   * Abort an in-flight track switch. Called by AbrController when its
-   * switching-guard timeout fires — meaning the chosen target track is
-   * unfulfillable (typically: upswitch fired right before a regime change
-   * dropped the link below the target's source rate). Clearing
-   * `pendingSwitch` ensures any stale data arriving later on the abandoned
-   * track is dropped by the write handler's `objectTrackName !==
-   * struct.pendingSwitch?.trackName` filter rather than belatedly applied.
-   */
-  abortPendingSwitch(): void {
-    const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    if (!videoStruct) return;
-    videoStruct.pendingSwitch = null;
-  }
-
-  /**
-   * Seamlessly switches the active video track using the MoQ SWITCH message.
-   * The relay will complete delivery of the current group then begin sending
-   * the new track. The WritableStream.write handler detects the group boundary
-   * and re-injects the new init segment before appending the first new payload.
+   * Switches the active video track with SWITCH (moq-transport PR #1378). The
+   * relay selects the switching group G_switch at or above the Minimum
+   * Switching Group ID this sends, delivers the current track below it, ends
+   * the current subscription (Close-After-Switch) and answers with a PUBLISH
+   * for the target carrying SWITCH_TRANSITION, whose catch-up and live objects
+   * arrive on a new stream. The write handler re-injects the new init segment
+   * before appending the first target object.
    *
    * Fire-and-forget from AbrController: do NOT await this externally.
    * The #switching guard in AbrController is released via onTrackSwitched callback.
    */
-  async switchTrack(trackName: string): Promise<void> {
-    if (!this.client) return;
-    if (!this.catalog) return;
+  async switchTrack(trackName: string): Promise<number | null> {
+    // Set synchronously below once a number is allocated, so the caller can
+    // read it right after the call returns its promise (F14).
+    this.#lastSwitchSeq = null;
+    if (!this.client) return null;
+    if (!this.catalog) return null;
 
     const videoStruct = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-    if (!videoStruct) return;
+    if (!videoStruct) return null;
 
     const fullTrackName = getFullTrackName(this.#options.namespace, trackName);
     const initData = this.catalog.getInitData(trackName);
@@ -1999,29 +1984,55 @@ export class Player {
     if (!initData || !role || !codec) {
       logger.error('media', `switchTrack: missing catalog data for track ${trackName}`);
       this.#options.onTrackSwitched?.(videoStruct.trackName);
-      return;
+      return null;
     }
 
     const mimeType = `${role}/mp4; codecs="${codec}"`;
 
     // Snapshot playhead + wall clock BEFORE sending the SWITCH so that
-    // playheadPTS_ms pairs with the targetGroup decision below. Capturing
-    // these after `await client.switch()` reads playhead AFTER the relay
-    // round-trip — the playhead can advance past a group boundary in that
-    // window (offset30 with mininet ~50ms RTT cleared one GOP, pushing
-    // |playheadGap| just above gopDurationMs even when alignment was
-    // correct at the moment of decision).
+    // playheadPTS_ms pairs with the floor decision below.
     const playheadPTS_ms = this.#element !== null ? this.#element.currentTime * 1000 : undefined;
     const switchSentAt = performance.now();
-    const framesAtSwitch = this.#element?.getVideoPlaybackQuality().totalVideoFrames ?? 0;
 
-    // Compute the time-shifted target group from the playhead via TimeMap.
-    let targetGroup: number | undefined;
-    if (this.#options.switchFloor === 'playhead' && this.#timeMap && playheadPTS_ms !== undefined) {
-      targetGroup = this.#timeMap.groupContainingPTS(playheadPTS_ms);
+    // Per SWITCH PR #1378 the subscriber does NOT allocate a Request ID for a
+    // SWITCH: the relay allocates the Request ID of the PUBLISH it opens for
+    // the target track. videoStruct.requestId is left untouched until that
+    // PUBLISH arrives (and adopted from it then), so a concurrent switchTrack
+    // would send the same still-established Current Subscribe Request ID,
+    // which the relay rejects with EXCESSIVE_LOAD (one SWITCH in flight per
+    // subscription). The player does not issue that duplicate: it skips the
+    // attempt, numbered like any other, and releases the controller's guard
+    // exactly as native's skip path does.
+    const subscriptionRequestId = videoStruct.requestId;
+    const skipReason = videoStruct.switchInFlight
+      ? 'switch in flight'
+      : !this.client.subscriptionAliasMap.has(subscriptionRequestId)
+        ? 'previous switch not landed'
+        : null;
+    if (skipReason !== null) {
+      logger.warn('media', `switchTrack: ${skipReason}; skipping switch to ${trackName}`);
+      // Not sent, so no SWITCH_SENT; the attempt still gets its own number.
+      const skippedSeq = this.#seams.allocateSeq();
+      this.#lastSwitchSeq = skippedSeq;
+      events.emit('SWITCH_SKIPPED', {
+        switch_seq: skippedSeq,
+        from: videoStruct.trackName,
+        to: trackName,
+        reason: skipReason,
+        pending_request_id: subscriptionRequestId,
+      });
+      this.#options.onTrackSwitched?.(videoStruct.trackName, skippedSeq);
+      return skippedSeq;
     }
-    // Buffer-aware floor: the highest group completely buffered ahead of the
-    // playhead, so the switch never re-requests media the element already holds.
+
+    // The floor (Minimum Switching Group ID). Buffer-aware: the highest group
+    // completely buffered ahead of the playhead, so the switch never
+    // re-requests media the element already holds.
+    const lastReceivedGroup = this.#lastGroupOf(videoStruct);
+    const playheadGroup =
+      playheadPTS_ms !== undefined && this.#timeMap?.hasAnchor()
+        ? (this.#timeMap.groupContainingPTS(playheadPTS_ms) ?? null)
+        : null;
     const bufferedPairs: Array<[number, number]> = [];
     const buffered = this.#element?.buffered;
     if (buffered) {
@@ -2040,51 +2051,36 @@ export class Player {
     const { minimumSwitchingGroupId, timeMapMiss, recvFloorGroup, bufferFloorGroup } =
       computeSwitchMinimumGroup({
         switchFloor: this.#options.switchFloor,
-        targetGroup,
-        latestGroup: videoStruct.lastGroupId,
+        targetGroup:
+          this.#options.switchFloor === 'playhead' ? (playheadGroup ?? undefined) : undefined,
+        latestGroup: lastReceivedGroup,
         bufferedGroup,
       });
     if (timeMapMiss) {
       logger.warn('media', 'playhead switch floor: TimeMap miss; falling through to next-group');
     }
+
+    // The switch's record, allocated before SWITCH_FLOOR so every record of
+    // this switch carries its switch_seq.
+    const record = this.#seams.sent(videoStruct.trackName, trackName, {
+      playheadMs: playheadPTS_ms,
+      appendFrontMs: videoStruct.lastAppendedEndPTS_ms,
+      sentAt: switchSentAt,
+    });
+    this.#lastSwitchSeq = record.seq;
     events.emit('SWITCH_FLOOR', {
+      switch_seq: record.seq,
       switch_floor: this.#options.switchFloor,
       recv_floor_group: recvFloorGroup,
       buffer_floor_group: bufferFloorGroup,
       selected_min_group: minimumSwitchingGroupId,
-      playhead_group:
-        playheadPTS_ms !== undefined && this.#timeMap?.hasAnchor()
-          ? (this.#timeMap.groupContainingPTS(playheadPTS_ms) ?? null)
-          : null,
-      buffer_end_s: bufferedPairs.length ? bufferedPairs[bufferedPairs.length - 1][1] : null,
+      playhead_group: playheadGroup,
+      buffer_end_s: bufferedPairs.length ? bufferedPairs[bufferedPairs.length - 1]![1] : null,
       buffered_ranges: bufferedPairs.map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}`).join(','),
     });
-
-    // Per SWITCH PR #1378 the subscriber does NOT allocate a Request ID for a
-    // SWITCH: the relay allocates the Request ID of the PUBLISH it opens for
-    // the target track, and that id is what the relay registers the new
-    // subscription under. The player must therefore adopt `result.requestId`
-    // (relay-allocated) on success — a locally pre-allocated id would be
-    // unknown to the relay and every subsequent SWITCH referencing it as the
-    // Current Subscribe Request ID would fail validation.
-    //
-    // videoStruct.requestId is left untouched until the relay's PUBLISH
-    // arrives, so a concurrent switchTrack (force_switch racing the ABR tick)
-    // sends the same still-established Current Subscribe Request ID; the relay
-    // serializes it via its single-in-flight guard (EXCESSIVE_LOAD), which is
-    // the discipline PR #1378 prescribes. The switchInFlight flag below keeps
-    // the player from issuing that duplicate in the first place.
-    if (videoStruct.switchInFlight) {
-      logger.warn(
-        'media',
-        `switchTrack: SWITCH already in flight; ignoring request for ${trackName}`,
-      );
-      return;
-    }
-    const subscriptionRequestId = videoStruct.requestId;
     videoStruct.switchInFlight = true;
-
     events.emit('SWITCH_SENT', {
+      switch_seq: record.seq,
       from: videoStruct.trackName,
       to: trackName,
       request_id: null, // PR #1378: the relay allocates the id of the PUBLISH it answers with
@@ -2093,57 +2089,89 @@ export class Player {
       minimum_switching_group: minimumSwitchingGroupId,
       time_map_miss: timeMapMiss,
       playhead_ms: playheadPTS_ms ?? null,
-      playhead_group:
-        playheadPTS_ms !== undefined && this.#timeMap?.hasAnchor()
-          ? this.#timeMap.groupContainingPTS(playheadPTS_ms)
-          : null,
-      last_received_group: videoStruct.lastGroupId,
+      playhead_group: playheadGroup,
+      // Highest group received on the current track (any order, dropped
+      // objects included), -1 before any (F10); the floor's recv candidate.
+      last_received_group: lastReceivedGroup,
+      // The append front (end PTS of the last appended frame). buffered_end_ms
+      // is the same value under its historical name; SAMPLE.buffered_end_ms is
+      // the element's last buffered range end, a different quantity.
+      append_front_ms: videoStruct.lastAppendedEndPTS_ms ?? null,
       buffered_end_ms: videoStruct.lastAppendedEndPTS_ms ?? null,
     });
+
+    // Arm the write handler provisionally, before awaiting the SWITCH (F12),
+    // as on every arm. Target objects reach the write handler only once the
+    // pump has re-bound to the PUBLISH's stream, so nothing lands before
+    // SWITCH_OK here; the arming keeps the landing bookkeeping identical.
+    // Rolled back on a refusal or an error unless the switch already landed.
+    const pending: PendingSwitch = {
+      trackName,
+      initData: initData.buffer as ArrayBuffer,
+      mimeType,
+      record,
+    };
+    const previousPending = videoStruct.pendingSwitch;
+    videoStruct.pendingSwitch = pending;
+    const rollback = () => {
+      if (videoStruct.pendingSwitch === pending && record.landedAt === undefined) {
+        videoStruct.pendingSwitch = previousPending;
+      }
+    };
 
     try {
       const result = await this.client.switch({
         fullTrackName,
         subscriptionRequestId,
         minimumSwitchingGroupId: BigInt(minimumSwitchingGroupId),
+        // SubscriberPriority(0) + GroupOrder(Ascending), as on every arm (C3):
+        // without them the relay schedules the target at its default 128.
+        parameters: buildSwitchParameters(),
       });
 
       if (result instanceof SwitchFailure) {
-        // Relay could not perform the switch (TIMEOUT, EXCESSIVE_LOAD,
+        // The relay could not perform the switch (TIMEOUT, EXCESSIVE_LOAD,
         // DOES_NOT_EXIST, ... — or the client-side response timeout). Per
         // SWITCH PR #1378 the relay left the CURRENT subscription untouched, and
         // videoStruct.requestId was never overwritten, so the next attempt
-        // automatically references the still-active subscription.
+        // references the still-active subscription.
+        rollback();
         logger.error(
           'media',
           `switchTrack: SWITCH failed for ${trackName}: status=${result.statusCode} ${result.reasonPhrase}`,
         );
         events.emit('SWITCH_ERROR', {
+          switch_seq: record.seq,
           to: trackName,
+          request_id: null,
           status: result.statusCode,
           reason: String(result.reasonPhrase),
           rtt_ms: performance.now() - switchSentAt,
         });
-        // videoStruct.requestId was never overwritten, so the next attempt
-        // automatically references the still-active subscription.
-        this.#options.onTrackSwitched?.(videoStruct.trackName);
-        return;
+        this.#options.onTrackSwitched?.(videoStruct.trackName, record.seq);
+        return record.seq;
       }
 
       // Success: adopt the relay-allocated PUBLISH request id. This is the id
       // the relay registered the post-switch subscription under, and the id
       // the NEXT SWITCH must reference as its Current Subscribe Request ID.
       videoStruct.requestId = result.requestId;
+      // Confirm the arming: the write handler re-injects the init segment at
+      // the landing. onTrackSwitched (the ABR guard release) fires there, once
+      // the target has actually delivered data.
+      this.#confirmPendingSwitch(videoStruct, pending);
       events.emit('SWITCH_OK', {
+        switch_seq: record.seq,
         to: trackName,
         request_id: result.requestId,
+        switching_group: Number(result.switchTransition.switchingGroupId),
+        live_edge_group: Number(result.switchTransition.liveEdgeGroupId),
         rtt_ms: performance.now() - switchSentAt,
       });
 
-      // Adopt the relay's new data route. SwitchSuccess extends SubscribeResult,
-      // and `stream` is where the catch-up range and the post-switch live
-      // objects arrive; the old subscription's stream is finished. Aborting the
-      // in-flight pipe makes the pump re-bind to it.
+      // Adopt the relay's new data route: `stream` is where the catch-up range
+      // and the post-switch live objects arrive. Aborting the in-flight pipe
+      // makes the pump re-bind to it.
       videoStruct.source = result.stream;
       videoStruct.pipeAc?.abort();
       logger.info(
@@ -2151,38 +2179,64 @@ export class Player {
         `switchTrack: seam at group ${result.switchTransition.switchingGroupId}, ` +
           `catch-up [${result.switchTransition.switchingGroupId}, ${result.switchTransition.liveEdgeGroupId})`,
       );
-
-      // Arm the write handler for init segment re-injection at the next group
-      // boundary. The onTrackSwitched callback (which releases the ABR switching
-      // guard) is NOT called here — it fires in the write handler AFTER the relay
-      // has actually delivered data on the new track. This prevents rapid
-      // consecutive SWITCH messages that corrupt the relay's switch context.
-      // Tracker is intentionally not reset — the previous-track bandwidth
-      // estimate is still a valid indicator of network capacity. (dash.js
-      // doesn't reset throughput on quality switches either.)
-      videoStruct.pendingSwitch = {
-        trackName,
-        initData: initData.buffer as ArrayBuffer,
-        mimeType,
-        oldEndPTS_ms: videoStruct.lastAppendedEndPTS_ms,
-        playheadPTS_ms,
-        switchSentAt,
-        framesAtSwitch,
-      };
-      videoStruct.firstFrameAfterSwitchSeen = false; // reset for next switch
     } catch (error) {
+      rollback();
       logger.error('media', 'switchTrack: unexpected error', error);
       events.emit('SWITCH_ERROR', {
+        switch_seq: record.seq,
         to: trackName,
+        request_id: null,
         reason: String(error),
         rtt_ms: performance.now() - switchSentAt,
       });
       // videoStruct.requestId still holds the pre-switch id; nothing to roll
       // back. (client.switch() disconnects the session on throw, so recovery
       // here is best-effort logging + guard release.)
-      this.#options.onTrackSwitched?.(videoStruct.trackName);
+      this.#options.onTrackSwitched?.(videoStruct.trackName, record.seq);
     } finally {
       videoStruct.switchInFlight = false;
+    }
+    return record.seq;
+  }
+
+  /**
+   * `switch_seq` of the most recent switchTrack call, set synchronously during
+   * the call (null when it returned before allocating one). The controller
+   * stores it on its pending record so ABR_DECISION / ABR_SWITCH_PHANTOM name
+   * the switch they decided (F14).
+   */
+  get lastSwitchSeq(): number | null {
+    return this.#lastSwitchSeq;
+  }
+
+  /**
+   * The relay accepted `pending` (armed provisionally before the SWITCH was
+   * awaited, F12; it may even have landed already). A switch that was
+   * accepted earlier and has not landed was replaced and can never land: it
+   * ends in SWITCH_SUPERSEDED (C1), so every switch has exactly one terminal
+   * record. If a newer switch re-armed the stream in the meantime, this one
+   * can never land either and is superseded by it.
+   */
+  #confirmPendingSwitch(struct: MOQStreamStruct, pending: PendingSwitch): void {
+    const playheadMs = (this.#element?.currentTime ?? 0) * 1000;
+    const newer = struct.pendingSwitch;
+    if (newer !== pending && pending.record.landedAt === undefined) {
+      pending.record.supersededBy = newer?.record.seq;
+      events.emit('SWITCH_SUPERSEDED', {
+        switch_seq: pending.record.seq,
+        by_switch_seq: newer?.record.seq ?? null,
+        playhead_ms: playheadMs,
+        landed: false,
+      });
+      return;
+    }
+    for (const old of this.#seams.armed(pending.record).superseded) {
+      events.emit('SWITCH_SUPERSEDED', {
+        switch_seq: old.seq,
+        by_switch_seq: pending.record.seq,
+        playhead_ms: playheadMs,
+        landed: false,
+      });
     }
   }
 
@@ -2230,7 +2284,7 @@ export class Player {
 
     let struct: MOQStreamStruct;
     if (this.#options.receiveCatalogViaSubscribe) {
-      struct = await this.subscribe({ trackName: 'catalog', priority: 0 });
+      struct = await this.subscribe({ trackName: 'catalog' });
     } else {
       const result = await this.client.fetch({
         groupOrder: GroupOrder.Original,
@@ -2252,7 +2306,6 @@ export class Player {
         requestId: result.requestId,
         source: result.stream,
         tracker,
-        lastGroupId: -1n,
         pendingSwitch: null,
         lastAppendedEndPTS_ms: undefined,
       };
@@ -2317,10 +2370,10 @@ export class Player {
     }
     const result = await this.client.subscribe({
       fullTrackName: getFullTrackName(this.#options.namespace, params.trackName),
-      groupOrder: GroupOrder.Original,
+      groupOrder: MEDIA_SCHEDULING.groupOrder,
       filterType: FilterType.LatestObject,
       forward: true,
-      priority: params.priority ?? 0,
+      priority: MEDIA_SCHEDULING.priority,
       parameters,
     });
     if (result instanceof RequestError) {
@@ -2332,15 +2385,14 @@ export class Player {
       throw new Error(`Error occured during subscription: ${result.reasonPhrase.phrase}`);
     }
 
-    // Capture connect-time state for media tracks (not catalog) so C4 can emit
-    // a connect-time discontinuity record on the first arriving object. We only
+    // Capture connect-time state for media tracks (not catalog) so FIRST_OBJECT
+    // can report whether the relay clamped the start group. We only
     // populate #expectedStartGroupId for time-shifted mode with a non-zero
     // delay_groups; otherwise the relay does not clamp and we have nothing to
     // detect against.
     if (params.trackName !== 'catalog' && this.catalog) {
       const gopDurationMs = this.catalog.getGopDurationMs(params.trackName);
       const largest = result.largestLocation;
-      this.#connectSentAt = performance.now();
       if (this.#options.clientMode === 'time-shifted' && largest !== undefined) {
         const delayGroups = Math.round((this.#options.timeShiftSeconds * 1000) / gopDurationMs);
         if (delayGroups > 0) {
@@ -2358,16 +2410,27 @@ export class Player {
       });
     }
 
-    const tracker = new GoodputTracker();
+    // Abandoned groups are closed after two group times (GOP from the catalog).
+    const tracker = new GoodputTracker(
+      3,
+      8,
+      params.trackName !== 'catalog' && this.catalog
+        ? this.catalog.getGopDurationMs(params.trackName)
+        : undefined,
+    );
     struct = {
       trackName: params.trackName,
       requestId: result.requestId,
       source: result.stream,
       tracker,
-      lastGroupId: -1n,
       pendingSwitch: null,
       lastAppendedEndPTS_ms: undefined,
     };
+
+    // The startup video track is what is presented until the first seam.
+    if (params.trackName !== 'catalog' && this.catalog?.getRole(params.trackName) === 'video') {
+      this.#seams.setInitialTrack(params.trackName);
+    }
 
     // Add the stream to the pool
     this.#streams.push(struct);

@@ -66,6 +66,21 @@ export class LatencyTracker {
     return meanRecent / meanOlder;
   }
 
+  /**
+   * Means of the older and the recent half of a full window (the two terms of
+   * getTrendRatio); undefined until the window is full.
+   */
+  getHalfMeans(): { olderMs: number; recentMs: number } | undefined {
+    if (this.#samples.length < this.#windowSize) return undefined;
+    const halfIdx = Math.floor(this.#samples.length / 2);
+    const older = this.#samples.slice(0, halfIdx);
+    const recent = this.#samples.slice(halfIdx);
+    return {
+      olderMs: older.reduce((a, b) => a + b, 0) / older.length,
+      recentMs: recent.reduce((a, b) => a + b, 0) / recent.length,
+    };
+  }
+
   /** Most recent sample (ms). 0 if none. */
   getLastLatencyMs(): number {
     return this.#samples[this.#samples.length - 1] ?? 0;

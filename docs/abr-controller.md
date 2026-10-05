@@ -8,6 +8,289 @@ our two client types. Everything here is read from the code on `harness`
 60 s unshaped run of a 10 s time-shifted client on native SWITCH
 (197 controller ticks, 13 switches).
 
+## 0. The paper controller: `min`
+
+`AbrSettings.controller.arm` selects the rule set: `min` (the paper
+controller, the runner's default from the 2026-10-04 rebuild), `grid` (the
+frozen ablation controller of section 9.7, kept only for the ablation record)
+or `baseline` (as shipped, every knob at its default). For `min`,
+`resolveControllerSettings` (`abr/types.ts`) derives the whole configuration
+from the arm; the caller sets nothing else. Sections 1-9 describe the shipped
+rules and the ablation history that led here; this section is the
+definition the paper uses.
+
+### 0.1 Inputs
+
+| input                            | source (`player.getMetrics()`)                                                                                                             | used by                                                 |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
+| throughput SWMA                  | `bandwidthBps`: mean of the last 5 group samples, each the bytes of objects 2..N over the arrival span of the group (`recvAt`, M11)        | ThroughputRule, EmergencyBufferRule's low-buffer cap    |
+| completed groups per track       | `samplesByTrack` (optional; fallback `sampleCount`), one sample per (track, group) (F5)                                                    | the dwell                                               |
+| contiguous buffer, instantaneous | `bufferContigSeconds` (fallback `bufferSeconds`): end of the buffered range that contains the playhead minus the playhead, 0 if none (M12) | EmergencyBufferRule, empty branch (`== 0`)              |
+| contiguous buffer, envelope      | its maximum over the last 1250 ms (`RulesContext.bufferEnvelopeSeconds`; also `buffer_rule_s`)                                             | EmergencyBufferRule, low branch (`< 0.5 s`) (F1)        |
+| playhead and presented seam      | `playheadMs`, `latestSeamPtsMs`: the latest applied seam whose region (from the hole in front of it) the playhead has entered, or null     | SwitchHistoryRule's seam exemption (F2)                 |
+| switch history                   | the controller's own record of confirmed landings                                                                                          | SwitchHistoryRule                                       |
+| presented frames                 | `totalFrames > 0`                                                                                                                          | EmergencyBufferRule stays silent before the first frame |
+| landing callback                 | `onTrackSwitched(trackName)` on every terminal outcome of a switch                                                                         | history, `ABR_DECISION`, the dwell clock (M17)          |
+
+Nothing else is read: no latency (raw or shift-corrected), no
+`targetShiftMs`, no `playbackRate`, no probe, no dropped frames, no
+visibility (t5).
+
+### 0.2 Rules and the arbiter
+
+| rule                | tier    | decision                                                                                                                                                                                                                                              |
+| ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ThroughputRule      | DEFAULT | the highest rung with `bitrate ≤ 0.9 × SWMA`; rung 0 when none fits (`downToLowest`); abstains with no sample yet                                                                                                                                     |
+| EmergencyBufferRule | STRONG  | instantaneous contiguous buffer `== 0` → rung 0; contiguous buffer **envelope** (maximum over 1250 ms) `< 0.5 s` → the highest rung with `bitrate ≤ 0.7 × SWMA` if that is below the active rung, else abstain                                        |
+| SwitchHistoryRule   | DEFAULT | veto: caps the ladder just below the first unsafe rung above the active one; a rung is unsafe with ≥ 8 events in the last 60 s, at least one up-switch to it and `drops / ups > 0.075`; drops decided while the playhead is at a seam are not counted |
+
+The emergency's two branches read two forms of the same contiguous buffer
+(F1). Empty is a stall now, so it is judged on the instantaneous value. Low
+is judged on the envelope, i.e. it fires only when the buffer stayed below
+0.5 s for a whole group plus a tick: a drain, not the trough of the live-edge
+per-group sawtooth (each group lands as a burst at ≈1.1 s and drains to
+≈0.2-0.35 s before the next).
+
+"At a seam" (F2) is measured in media time around the seam being presented,
+not in groups since the landing: the playhead is in the seam's region, which
+runs from the hole in front of the seam (the source's append front at landing,
+when that lies before the seam) to `historyIgnoreGroupsAfterLanding` (2) group
+durations past the seam PTS. Every decision is stamped with
+`msPastSeam = playheadMs − latestSeamPtsMs` (`ABR_DECISION.ms_past_seam`); a
+drop is exempt when `msPastSeam ≤ 2 × GOP` (negative = in the hole), and
+counted when the playhead was in no seam region (`null`) or further past it. A
+player that reports no seams falls back to "≤ 2 completed groups since the
+landing".
+
+The arbiter is dash.js's: the highest tier that has a request, then the lowest
+index. A tie (same index, same tier) is resolved by registration order
+(`RULE_ORDER`) and recorded: `ABR_TICK.chosen.rule/tied`,
+`ABR_DECISION.rule/tied_rules`. In `min` a tie can only be ThroughputRule and
+SwitchHistoryRule's veto at the throughput rung, i.e. a veto that did not bind;
+the decision is the same either way.
+
+Before the rules run, the switching guard allows one switch in flight
+(released when the landing is confirmed and a frame has been presented, or
+after 3 s followed by a 5 s cool-down). After the arbiter, two gates hold
+up-switches only: slow start (no up-switch before 3 samples in the session)
+and the **dwell** (no up-switch until `upDwellGroups = 3` completed groups of
+the landed track since the last confirmed landing, `ABR_GATED why =
+up-dwell`; before the first landing, groups of the startup track). The dwell
+counts with the player's per-track sample counts; without them it takes the
+total count minus the one group the landing object closes (the source's last
+group), which errs one group long, never short.
+
+`auto-emergency` labels a down-switch chosen from EmergencyBufferRule's
+request (by rule identity); every other automatic down-switch is
+`auto-downgrade`. Both count as drops in the history.
+
+History and `ABR_DECISION` are written only when the player confirms a landing
+on the decided target (`onTrackSwitched(target, switchSeq)`); a refused, skipped
+or failed switch (callback with the old track) leaves only
+`ABR_SWITCH_PHANTOM`. Both records carry `switch_seq` (the player's number for
+the switch, which `switchTrack` exposes synchronously as `lastSwitchSeq` and
+resolves to; the callback names it, so a callback resolves exactly its own
+decision) and `decided_ts`; `ABR_DECISION` is emitted at the landing (F14). A
+decision's record outlives its switching guard (F7): the guard may time out
+and release, but the record stays pending until its target lands (which also
+resolves every older record: an older switch cannot land after a newer one
+has), its own phantom callback arrives, or it ages out of the 8-entry list, so
+a landing later than 3 s is still history. This holds for every arm.
+
+### 0.3 Constants
+
+`describeController(settings)` (`abr/index.ts`) returns these, after the arm
+is resolved, as plain JSON; it is what `RUN_META.controller` records.
+
+| constant                                                                               | `min` value               | tunable?                              |
+| -------------------------------------------------------------------------------------- | ------------------------- | ------------------------------------- |
+| tick                                                                                   | 250 ms                    | no (`CONTROLLER_CONSTANTS`)           |
+| slow start                                                                             | 3 samples                 | no                                    |
+| switching guard timeout / cool-down                                                    | 3000 / 5000 ms            | no                                    |
+| `upDwellGroups`                                                                        | 3                         | yes                                   |
+| `bandwidthSafetyFactor`                                                                | 0.9                       | yes                                   |
+| EmergencyBufferRule `lowBufferS`, `throughputSafetyFactor`                             | 0.5 s, 0.7                | yes (rule parameters)                 |
+| `switchHistoryMode`                                                                    | veto                      | pinned                                |
+| `switchHistoryWindowS`                                                                 | 60 s                      | yes (0 is not accepted, reads as 60)  |
+| SwitchHistoryRule `sampleSize`, `switchPercentageThreshold`                            | 8, 0.075                  | yes (rule parameters)                 |
+| `historyIgnoreGroupsAfterLanding` (seam window, GOPs of media past the presented seam) | 2                         | yes                                   |
+| history length                                                                         | 60 entries                | no                                    |
+| `bufferSignal`, `bufferEnvelopeMs`                                                     | envelope, 1250 ms         | signal pinned, window tunable         |
+| `segmentDurationS`                                                                     | catalog GOP (default 1 s) | from the catalog                      |
+| `probeMode`, `upGuardSamples`, `latencyResetOnLanding`                                 | off, 0, false             | pinned                                |
+| SWMA window                                                                            | 5 groups                  | the player's (recorded, not set here) |
+
+The full description for the defaults:
+
+```json
+{
+  "arm": "min",
+  "tickMs": 250,
+  "segmentDurationS": 1,
+  "swmaWindowGroups": 5,
+  "bufferSource": "contiguous",
+  "bufferSignal": "envelope",
+  "bufferEnvelopeMs": 1250,
+  "upDwellGroups": 3,
+  "minStartupSamples": 3,
+  "upGuardSamples": 0,
+  "upGuardRelease": "landed",
+  "switchTimeoutMs": 3000,
+  "switchCooldownMs": 5000,
+  "maxHistory": 60,
+  "switchHistoryMode": "veto",
+  "switchHistoryWindowS": 60,
+  "switchHistorySampleSize": 8,
+  "switchHistoryDropRatio": 0.075,
+  "historyIgnoreGroupsAfterLanding": 2,
+  "bandwidthSafetyFactor": 0.9,
+  "throughputDownToLowest": true,
+  "minBitrate": -1,
+  "maxBitrate": -1,
+  "emergencyLowBufferS": 0.5,
+  "emergencyThroughputSafetyFactor": 0.7,
+  "probeMode": "off",
+  "probeMinBytes": 0,
+  "probeMinDurationMs": 0,
+  "probeMaxBytes": 0,
+  "probeSafetyFactor": 0.8,
+  "probeIntervalMs": 2000,
+  "probeDurationMs": 500,
+  "probeFreshnessMs": 5000,
+  "probeHorizonS": 2,
+  "latencyResetOnLanding": false,
+  "latencyTrendThreshold": 1.2,
+  "latencyTrendDeltaMs": 100,
+  "bufferTimeDefault": 18,
+  "stableBufferTime": 18,
+  "activeRules": ["ThroughputRule", "SwitchHistoryRule", "EmergencyBufferRule"],
+  "rules": {
+    "ThroughputRule": { "priority": 0.5, "parameters": { "downToLowest": 1 } },
+    "SwitchHistoryRule": { "priority": 0.5, "parameters": { "sampleSize": 8, "switchPercentageThreshold": 0.075 } },
+    "EmergencyBufferRule": { "priority": 1, "parameters": { "lowBufferS": 0.5, "throughputSafetyFactor": 0.7 } }
+  }
+}
+```
+
+(The probe, latency-trend and BOLA fields describe rules that do not run in
+`min`; they are recorded so every arm has the same record.)
+
+### 0.4 What is off, and why
+
+| off                                  | why                                                                                                                                                                                                         |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BolaRule and the DYNAMIC toggle      | engage at 18 s of buffer, which neither client type reaches (a time-shifted client is capped by its shift); dead code that would only silence ThroughputRule if it ever fired                               |
+| ProbeRule and the probe track        | the probe shares the bottleneck queue with the video it measures (9.9) and the group-burst SWMA already reads the link rate on this relay; with no probe there is no probe load to differ by mechanism      |
+| InsufficientBufferRule               | its admission `0.7 × SWMA × buffer` binds on a live-edge client and is no constraint on a 10 s client (M18): a different up-switch policy per client type. Its emergency half is EmergencyBufferRule        |
+| BufferDrainRateRule                  | differences the buffer, so the group-burst sawtooth reads as a drain at the live edge and it cannot fire above 2 s on a time-shifted client (9.4); it turned a one-group seam hole into a rung-0 vote (M17) |
+| LatencyTrendRule                     | its signal is capture-to-receipt latency, whose baseline is the shift (C6); even shift-corrected it reacts to every mechanism's catch-up burst (9.3). Off rather than corrected                             |
+| AbandonRequestsRule                  | fires at SWMA < 0.55 × bitrate, which ThroughputRule already covers at 0.9                                                                                                                                  |
+| L2A, LoLP, DroppedFrames             | off in every arm; untuned for this stack                                                                                                                                                                    |
+| up-guard, probe floor, latency reset | ablation knobs (section 9); the dwell replaces the up-guard                                                                                                                                                 |
+
+### 0.5 Why `min` is neutral to the client type and the mechanism
+
+The paper compares a live-edge client with time-shifted clients (0.1-10 s
+behind live) across switching mechanisms, so the controller must not apply a
+different policy to one of them. `min` is built from the inputs below, and
+each is either the same quantity on every client or the same function of a
+physical quantity whose value the clients legitimately differ in:
+
+1. **Throughput** is a per-group burst rate measured at arrival. The relay
+   delivers each group as a burst whether it is the live group or a delayed
+   one from cache, so both client types measure the same bottleneck rate from
+   the same kind of event; the shift does not enter the sample. Test (e)
+   drives a 0.1 s and a 10 s client with identical throughput and contiguous
+   buffer inputs (and opposite latency, shift and playback-rate signals) and
+   requires identical decisions.
+2. **Time is counted in groups**, not seconds of buffer or presentation: the
+   dwell is 3 completed groups of the landed track since the landing (one
+   sample per (track, group), so a redelivered or split catch-up group does
+   not count twice, F5), and the landing is the target's first applied object
+   (t4, about one group on every mechanism and both client types). Visibility
+   (t5), which takes the whole shift on a time-shifted client, is not used. The
+   history window (60 s) is wall-clock time and the same for everyone.
+3. **The seam exemption is anchored at the seam the viewer is shown**, in
+   media time (the hole before it and 2 GOPs after it), not at the landing. The
+   same hole reaches the playhead about one group after the landing at the
+   live edge and about one shift after it on a time-shifted client; anchored
+   at the landing (≤ 2 groups) it was exempt on the first and counted on the
+   second, so a time-shifted client paid a 60 s veto for the hole a live-edge
+   client was forgiven. Anchored at the seam it is exempt on both and no
+   other drop is exempt on either (F2; test `MinArm (j)`: identical
+   hole-induced drops on a 1-group and a 10-group client leave 720p uncapped on
+   both, ordinary drops cap it on both).
+4. **The only buffer rule is an emergency on playable seconds**, with the same
+   thresholds (0 and 0.5 s) for every client, judged on the level after each
+   group burst (the envelope) except for the empty test. A stall is a stall on
+   either client type; what differs is how much runway each has, which is the
+   property being measured, not a policy. This is the line `min` draws against
+   InsufficientBufferRule (admission scaled by the buffer, so the same link
+   event is judged differently) and LatencyTrendRule (sensitivity inversely
+   proportional to the shift).
+
+Mechanism neutrality: no rule reads anything a mechanism produces differently
+by design (the probe, the catch-up latency burst, the seam hole as a drain).
+A seam hole costs what it costs (a stall if it empties the playable buffer),
+and a drop decided while the playhead is at the seam is kept out of the
+history, so a mechanism with a bigger hole does not also pay a 60 s ladder cap
+for it. Phantom switches are not history on any mechanism, and a late landing
+is history on every mechanism.
+
+Two asymmetries of the first `min` version were policy, not physics, and are
+fixed (review of 2026-10-04):
+
+- **The live-edge sawtooth (F1).** The low-buffer branch read the
+  instantaneous contiguous buffer, whose live-edge trough (0.2-0.35 s) is below
+  0.5 s once per group, so with a SWMA in `[bitrate/0.9, bitrate/0.7)` the
+  live-edge client alternated between ThroughputRule's rung and the 0.7 × SWMA
+  rung while a 10 s client with the same throughput never moved. Reviewer's
+  simulation (120 s, 3-rung ladder, one group per 4 ticks, SWMA 2.0 Mbps on
+  720p, sawtooth 1.1/0.85/0.6/0.35 s vs the same +9 s): **before 45 switches
+  live-edge vs 0 time-shifted; after 0 vs 0** (trough 0.2 s at 1.9 Mbps: 45 vs
+  0 before, 0 vs 0 after; test `MinArm (i)`). A real drain (envelope below
+  0.5 s) still drops.
+- **The seam window anchored at the landing (F2)**, see item 3 above.
+
+What remains asymmetric, and is reported rather than tuned:
+
+- A live-edge client has about 1 s of runway and a 10 s client about 10 s, so
+  the same link collapse empties the live-edge buffer first (the empty branch
+  and, after 1250 ms below 0.5 s, the low branch fire there first). This is the
+  property being measured, not a policy.
+- Groups arrive faster than one per second during a catch-up replay or the
+  connect backlog of a time-shifted client, so the dwell and slow start elapse
+  sooner in wall time there (the minor "slow start is instant" finding). The
+  samples are real link-rate samples, so the decision is not wrong, only
+  faster.
+
+### 0.6 Wiring (integration contract for app.tsx and the runner)
+
+- URL `?controllerArm=min|grid|baseline` → `AbrSettings.controller.arm`
+  (runner `--controller`, default `min`). The controller selects its rule set
+  from `arm` alone; the other controller URL parameters keep working for
+  `grid`/`baseline` and are overridden where `min` pins them.
+- `controller.segmentDurationS = catalog.getGopDurationMs(videoTrack) / 1000`.
+- `RUN_META.controller = describeController(effectiveAbrSettings)` (the
+  settings actually given to the controller, after any override).
+- `player.setOnTrackSwitched((name, seq) => abr.onTrackSwitched(name, seq))`
+  for every terminal outcome, with the track the player is now on and the
+  switch's `switch_seq` (the deprecated `releaseSwitchingGuard()` reads
+  `activeTrack` instead).
+- `player.setResetLatencyOnLanding(abr.settings.controller.latencyResetOnLanding)`
+  (the resolved value; `min` pins it false).
+- Player metrics consumed: `bandwidthBps`, `sampleCount`, `samplesByTrack`
+  (recommended: per-track counts keyed by THROUGHPUT_SAMPLE.track),
+  `bufferSeconds`, `bufferContigSeconds`, `activeTrack`, `totalFrames`,
+  `playheadMs` and `latestSeamPtsMs` (the seam exemption; absent → the
+  groups-since-landing fallback), and `player.lastSwitchSeq` after each
+  `switchTrack` call; for
+  `grid` also `latencyRecentMeanMs`, `latencyOlderMeanMs` (undefined until the
+  latency window is full) and `targetShiftMs` (C6; without the means
+  LatencyTrendRule falls back to the raw ratio), `playbackRate`,
+  `droppedFrames`, and `probeTrackBandwidth` returning `{bps, dtMs}` per the
+  M18 contract in `ProbeManager.ts`.
+
 ## 1. The loop
 
 ```
@@ -39,7 +322,9 @@ Responsibilities are split three ways:
 
 The controller never looks at bitrates itself except to label a decision
 `auto-upgrade` / `auto-downgrade` / `auto-emergency` (the last when the
-rule's reason contains "emergency") and to size the probe.
+chosen request came from EmergencyBufferRule, i.e. only in `min`; it used to
+match "emergency" in the reason text, which no active rule produced) and to
+size the probe.
 
 ## 2. The signals (what the rules see)
 
@@ -83,7 +368,8 @@ exists, so a 10 s client tops out near 10 s and will never reach 18 s.
 
 `ProbeManager` + `player.probeTrackBandwidth`. Whenever the client is not
 on the top rung, at most every 2 s, the controller subscribes to the
-relay's synthetic `.probe:<bytes>:0` track. Size is
+relay's synthetic `.probe:<bytes>:0` track (`grid` and `baseline` only;
+`min` never probes). Size is
 
 ```
 probe_bits = 2 s * (b[i+1] - b[i] + tracksize)
@@ -92,8 +378,12 @@ probe_bits = 2 s * (b[i+1] - b[i] + tracksize)
 where `tracksize` is the bitrate gap left by the previous switch (Kuo
 Algorithm 1). The relay sends that many zero bytes in 4 KB objects at
 lowest priority and ends the subscription; the client reads until the
-stream ends and reports `(video bytes + probe bytes) * 8 / elapsed`. The
-value is valid for 5 s, then reads as 0. Only `ProbeRule` uses it.
+stream ends and reports `bps = probe bytes * 8 / (lastObjectAt −
+firstObjectAt)` over the arrival span of the burst (M18; the shipped
+`(video + probe bytes) * 8 / elapsed` included the subscribe round trip and
+a fixed 250 ms idle in the denominator and capped the reading near 2.7 Mbps
+with a 64 KB probe). The value is valid for 5 s, then reads as 0. Only
+`ProbeRule` uses it.
 
 ### 2.4 Per-frame latency trend: `latencyTrendRatio`
 
@@ -111,7 +401,8 @@ rises during and after any backlog delivery even though the link is idle.
   1.05 when the playhead is more than 0.1 s further from the buffer end
   than its target (0.6 s for live-edge, the shift for time-shifted) and to
   0.95 when closer; it also seeks across buffer holes.
-- `segmentDurationS`: hard-coded 1 (our GOP is 1 s).
+- `segmentDurationS`: `controller.segmentDurationS`, the catalog GOP in
+  seconds (default 1).
 - `isLowLatency`: hard-coded false; low-latency mode is instead inferred
   from L2A/LoLP being active.
 - `switchHistory`: the last 60 decisions (from, to, reason, buffer, fast EMA).
@@ -146,6 +437,11 @@ before connect.
 Because a time-shifted client's buffer is capped by its shift, the two
 18 s thresholds are unreachable for it. Section 6 shows what that does.
 
+`settings.controller` (`ControllerSettings`) adds `arm` (`min` | `grid` |
+`baseline`, URL `?controllerArm=`), the `min` constants `upDwellGroups` (3)
+and `historyIgnoreGroupsAfterLanding` (2), `segmentDurationS` (catalog GOP,
+default 1) and the ablation knobs of section 9.
+
 ## 4. Arbitration and strategy
 
 `AbrRulesCollection.evaluate` runs every active rule; `getMinSwitchRequest`
@@ -153,7 +449,9 @@ then picks, **from the highest priority tier that has any request, the
 lowest representation index**. Priorities are STRONG (1), DEFAULT (0.5),
 WEAK (0). So one STRONG down-vote beats any number of DEFAULT up-votes, and
 among equals the most conservative rung wins; a rule that abstains has no
-say. Rules cannot veto a _down_-switch.
+say. Rules cannot veto a _down_-switch. At equal index and tier the first rule
+in registration order supplies the reason and the others are recorded as
+tied (`ABR_TICK.chosen.tied`, `ABR_DECISION.tied_rules`).
 
 Exclusivity: in DYNAMIC mode `BolaRule` runs only while `usingBola` is
 true and `ThroughputRule` only while it is false (dash.js hysteresis: on at
@@ -206,11 +504,13 @@ on a live-edge client it engages only if the buffer ever grows past 18 s.
 
 ### ProbeRule
 
-If a probe result is fresh (< 5 s) and `probe × safetyFactor (0.8) ≥`
-next rung's bitrate, ask for exactly the next rung. Never down. The
-probe measures the link (video + probe bytes), so on a fat link it
-permits every step of the climb; on a saturated link it still returns a
-number, just a small one.
+A veto since M18. If a probe result is fresh (< 5 s) and
+`probe × safetyFactor (0.8) <` the next rung's bitrate, it asks for the
+_active_ rung (DEFAULT), which the arbiter turns into "stay" against any
+DEFAULT up-vote; with headroom it abstains and ThroughputRule decides how far
+to climb. Never down. The shipped rule proposed exactly the next rung, which
+under the min-index arbiter limited a strong probe's climb to one rung and let
+a weak probe's multi-rung climb through.
 
 ### InsufficientBufferRule
 
@@ -237,8 +537,12 @@ never until things are already bad.
 
 ### LatencyTrendRule
 
-If `latencyTrendRatio > 1.2` and not on the lowest rung: one rung down,
-STRONG. No state. It is the rule the earlier smoke runs' flip-flop came
+If the latency trend is ≥ 1.2 and not on the lowest rung: one rung down,
+STRONG. No state. Since C6 the trend is formed on `latency − targetShiftMs`
+(the half-window means minus the client's shift) when the player exposes the
+means and the shift; with the means but no shift (or a non-positive corrected
+base) it fires on an absolute rise of `trendDeltaMs` (100 ms); with neither it
+keeps the raw ratio. Off in `min`. It is the rule the earlier smoke runs' flip-flop came
 from: after a native switch the relay replays the target's backlog from
 cache, those objects carry capture stamps up to 10 s old, the recent half
 of the window jumps, the ratio passes 1.2 for a few ticks, and a
@@ -323,7 +627,14 @@ A→B→A reversals in 60 s, most superseded before they were ever visible.
 | BolaRule       | 10 s, 0.99                                                        | MINIMUM_BUFFER_S, placeholder decay                                                                                                                                                               |
 | L2ARule        | 4, 2, 1.5 s                                                       | horizon, REACT, buffer target                                                                                                                                                                     |
 | LoLpRule       | 0.5 s, 0.1                                                        | emergency buffer, SOM learning rate                                                                                                                                                               |
-| context        | 1 s, false                                                        | segmentDurationS, isLowLatency                                                                                                                                                                    |
+| context        | catalog GOP (default 1 s), false                                  | segmentDurationS (`controller.segmentDurationS`), isLowLatency                                                                                                                                    |
+
+The controller's own fixed numbers (tick, guard timeout and cool-down, slow
+start, history length, probe horizon/interval/duration/freshness) live in
+`CONTROLLER_CONSTANTS` (`abr/types.ts`) and, with every setting the arm
+resolves to, are recorded per run by `describeController` in
+`RUN_META.controller` (section 0.3); they are no longer pinned only by the git
+sha.
 
 ## 8. Things to keep in mind before tuning
 
@@ -529,7 +840,9 @@ fewer stalls on PR #1378 (5 s) at 382 kbps, and on native it pins the client
 again (173 kbps, phase-3 rung 0.13) because native's seam holes keep feeding
 drops into the history faster than the guard lets the client retry.
 
-**Frozen controller = `lat-env-veto60`, runner arm `grid`:**
+**Frozen controller = `lat-env-veto60`, runner arm `grid`** (kept only for the
+ablation record since the 2026-10-04 rebuild; the paper controller is `min`,
+section 0):
 `latencyResetOnLanding`, `bufferSignal = envelope`, `switchHistoryMode =
 veto`, `switchHistoryWindowS = 60`; probe floor off, up-guard off. It is the
 smallest set of changes that removes the self-induced loop on both mechanisms

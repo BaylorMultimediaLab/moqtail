@@ -70,6 +70,7 @@ import {
   Tuple,
   MessageParameter,
   Forward,
+  SwitchTransition,
   SubscriberPriority,
   GroupOrderParam,
   SubscriptionFilter,
@@ -101,6 +102,9 @@ import {
   SubscribeResult,
   SwitchSuccess,
   SwitchFailure,
+  DiscardedStreamInfo,
+  PushedReceiver,
+  TrackAliasHolder,
 } from './types'
 import { SendDatagramStream } from './datagram_stream'
 import { logger, LogLevel, setLogLevel, setLogEnabledModules } from '../util/logger'
@@ -148,6 +152,9 @@ import { logger, LogLevel, setLogLevel, setLogEnabledModules } from '../util/log
  * await client.disconnect();
  * ```
  */
+/** How long a data stream waits for the subscription it belongs to be registered. */
+const ALIAS_RESOLUTION_TIMEOUT_MS = 500
+
 export class MOQtailClient {
   /**
    * Namespace prefixes (tuples) the peer has requested announce notifications for via SUBSCRIBE_NAMESPACE.
@@ -203,6 +210,12 @@ export class MOQtailClient {
    * Used to avoid premature state updates.
    */
   readonly pendingStateUpdates: Map<bigint, (newTrackAlias: bigint) => boolean> = new Map()
+  /**
+   * Receivers for tracks the peer pushed with PUBLISH, keyed by the PUBLISH's own
+   * request id (the id a PUBLISH_DONE on that stream is correlated by). Pushed
+   * receivers are not in `requests`, which only holds requests this side issued.
+   */
+  readonly pushedReceivers: Map<bigint, PushedReceiver> = new Map()
 
   /**
    * The bidirectional request stream each locally issued request runs on, keyed by the
@@ -292,19 +305,6 @@ export class MOQtailClient {
    * unsolicited SWITCH_TRANSITION detection is only deferred, not disabled.
    */
   static readonly SWITCH_TOMBSTONE_TTL_MS = 30_000
-  /**
-   * How long an incoming data stream will wait for its routing state before
-   * the missing route is treated as a protocol violation. Control and data
-   * streams have no cross-stream ordering in QUIC, so a data stream can beat
-   * the control message that installs its route — most acutely after a SWITCH,
-   * where the relay opens the catch-up FETCH_HEADER stream (and the target's
-   * SUBGROUP streams) immediately after queueing the PUBLISH. Route
-   * installation is local work that completes in microseconds once the control
-   * message arrives; 2s is a generous bound on control-stream delivery skew.
-   */
-  static readonly DATA_ROUTE_WAIT_TIMEOUT_MS = 2000
-  /** Poll interval for {@link MOQtailClient.DATA_ROUTE_WAIT_TIMEOUT_MS} waits. */
-  static readonly DATA_ROUTE_POLL_INTERVAL_MS = 20
   /** Underlying WebTransport session (set after successful construction in MOQtailClient.new). */
   webTransport!: WebTransport
   /** Validated Setup message the server sent back during handshake (protocol parameters negotiated). */
@@ -317,6 +317,12 @@ export class MOQtailClient {
   dataStreamTimeoutMs?: number
   /** Timeout (ms) for control stream read operations; undefined =\> no explicit timeout. */
   controlStreamTimeoutMs?: number
+  /**
+   * How long an incoming data stream waits for its track alias to be claimed before
+   * it is discarded as unrouted (ms). A data stream can overtake the SUBSCRIBE_OK (or
+   * PUBLISH) that names its alias, since the two travel on different streams.
+   */
+  trackAliasResolutionTimeoutMs: number = ALIAS_RESOLUTION_TIMEOUT_MS
 
   /** Flag indicating the client has been disconnected/destroyed and cannot accept further API calls. */
   #isDestroyed = false
@@ -388,6 +394,15 @@ export class MOQtailClient {
    * Informational event.
    */
   onDataSent?: (data: SubgroupObject | SubgroupHeader | FetchObject | FetchHeader) => void
+
+  /**
+   * Invoked when an incoming data stream is dropped without its objects being
+   * delivered, with the reason and the bytes it had cost (M15). Today the one reason
+   * is `unrouted`: no subscription claimed the stream's track alias. The stream is
+   * cancelled with STOP_SENDING(CANCELLED) before this fires.
+   * Accounting event: lets an application count link usage it never consumed.
+   */
+  onStreamDiscarded?: (info: DiscardedStreamInfo) => void
 
   /**
    * General-purpose error callback for surfaced exceptions not thrown to caller synchronously.
@@ -1177,9 +1192,7 @@ export class MOQtailClient {
           'MOQtailClient',
           `subscribe: SUBSCRIBE_OK requestId=${request.requestId} trackAlias=${response.trackAlias}`,
         )
-        this.subscriptions.set(response.trackAlias, request)
-        this.subscriptionAliasMap.set(request.requestId, response.trackAlias)
-        this.aliasFullTrackNameMap.set(response.trackAlias, fullTrackName)
+        this.claimTrackAlias(response.trackAlias, request)
         return {
           requestId: msg.requestId,
           stream: request.stream,
@@ -1234,14 +1247,13 @@ export class MOQtailClient {
   async unsubscribe(requestId: bigint | number): Promise<void> {
     this.#ensureActive()
     if (typeof requestId === 'number') requestId = BigInt(requestId)
-    let cleanupData: { requestId: bigint; trackAlias: bigint; subscription: SubscribeRequest } | null = null
+    let cleanupData: { requestId: bigint; subscription: SubscribeRequest } | null = null
 
     try {
       if (this.requests.has(requestId)) {
         const subscription = this.requests.get(requestId)!
         if (subscription instanceof SubscribeRequest) {
-          const trackAlias = this.subscriptionAliasMap.get(requestId)!
-          cleanupData = { requestId, trackAlias, subscription }
+          cleanupData = { requestId, subscription }
 
           // Draft-18 §3.3.2: there is no UNSUBSCRIBE. Resetting the subscription's
           // request stream is what tells the publisher to stop, and the code it reads
@@ -1267,14 +1279,17 @@ export class MOQtailClient {
           await pushed.reset(StreamResetCode.Cancelled)
         }
 
-        const receiver = this.subscriptions.get(trackAlias)
+        // The receiver registered for this PUBLISH (pushedReceivers is keyed by its
+        // request id); the alias route is released only if this receiver still owns
+        // it (M16: the same track's alias may already belong to a newer receiver).
+        const receiver = this.pushedReceivers.get(requestId) ?? this.subscriptions.get(trackAlias)
         try {
           receiver?.controller?.close()
         } catch {
           // Stream already closed/errored — cleanup proceeds regardless.
         }
-        this.subscriptions.delete(trackAlias)
-        this.aliasFullTrackNameMap.delete(trackAlias)
+        this.pushedReceivers.delete(requestId)
+        if (receiver) this.releaseTrackAlias(receiver)
         this.subscriptionAliasMap.delete(requestId)
         if (receiver?.pseudoRequestId !== undefined) {
           this.subscriptionAliasMap.delete(receiver.pseudoRequestId)
@@ -1290,8 +1305,7 @@ export class MOQtailClient {
     } finally {
       if (cleanupData) {
         this.requests.delete(cleanupData.requestId)
-        this.subscriptions.delete(cleanupData.trackAlias)
-        this.aliasFullTrackNameMap.delete(cleanupData.trackAlias)
+        this.releaseTrackAlias(cleanupData.subscription)
         this.requestIdMap.removeMappingByRequestId(cleanupData.requestId)
       }
     }
@@ -1869,24 +1883,75 @@ export class MOQtailClient {
     // 1. Map the request ID to the full track name so the parser knows what track this is
     this.requestIdMap.addMapping(msg.requestId, msg.fullTrackName)
 
-    // 2. Map the request ID to the alias
-    this.subscriptionAliasMap.set(msg.requestId, msg.trackAlias)
-
-    this.aliasFullTrackNameMap.set(msg.trackAlias, msg.fullTrackName)
-
-    // 3. Create a pseudo-subscription object that mimics a SubscribeRequest
+    // 2. Create a pseudo-subscription object that mimics a SubscribeRequest
     // This perfectly matches the shape #handleRecvStreams expects
-    const receiver = {
+    const receiver: PushedReceiver = {
       requestId: msg.requestId,
-      streamsAccepted: 0,
+      fullTrackName: msg.fullTrackName,
+      streamsAccepted: 0n,
+      expectedStreams: undefined,
       largestLocation: undefined,
       controller: streamController,
     }
 
-    // 4. Register the receiver in the main routing table using the publisher's alias
-    this.subscriptions.set(msg.trackAlias, receiver)
+    // 3. Register the receiver in the main routing table using the publisher's alias,
+    // and under the PUBLISH's id for the PUBLISH_DONE that completes it.
+    this.claimTrackAlias(msg.trackAlias, receiver)
+    this.pushedReceivers.set(msg.requestId, receiver)
 
     return stream
+  }
+
+  /**
+   * Records that `holder` now owns `trackAlias`: incoming data streams for that alias
+   * route to it, and its request id maps to the alias (M16, ported from the pr1674
+   * shape). Exposed for the request-stream handlers; applications do not call it.
+   */
+  claimTrackAlias(trackAlias: bigint, holder: TrackAliasHolder): void {
+    this.subscriptions.set(trackAlias, holder)
+    this.subscriptionAliasMap.set(holder.requestId, trackAlias)
+    this.aliasFullTrackNameMap.set(trackAlias, holder.fullTrackName)
+  }
+
+  /**
+   * Drops `holder`'s alias route, but only if `holder` still owns the alias. Relay
+   * aliases are stable per track, so on A to B to A the second A subscription is
+   * handed the alias the first one had; the first one's late completion must leave
+   * the second one's route alone (M16).
+   */
+  releaseTrackAlias(holder: TrackAliasHolder): void {
+    const trackAlias = this.subscriptionAliasMap.get(holder.requestId)
+    this.subscriptionAliasMap.delete(holder.requestId)
+    if (trackAlias === undefined) return
+    if (this.subscriptions.get(trackAlias) !== holder) return
+    this.subscriptions.delete(trackAlias)
+    this.aliasFullTrackNameMap.delete(trackAlias)
+  }
+
+  /**
+   * Completes a subscription or pushed receiver once PUBLISH_DONE has named its
+   * stream count and that many data streams have ended: closes its object stream and
+   * releases its alias route. Returns whether it completed. Called from the
+   * PUBLISH_DONE handler and from the end of each data stream, whichever comes last.
+   */
+  completeIfDone(holder: SubscribeRequest | PushedReceiver): boolean {
+    if (holder.expectedStreams === undefined) return false
+    if (BigInt(holder.streamsAccepted) !== BigInt(holder.expectedStreams)) return false
+    try {
+      holder.controller?.close()
+    } catch {
+      // already closed or errored
+    }
+    this.releaseTrackAlias(holder)
+    if (holder instanceof SubscribeRequest) {
+      this.requests.delete(holder.requestId)
+    } else {
+      for (const [publishRequestId, receiver] of this.pushedReceivers) {
+        if (receiver === holder) this.pushedReceivers.delete(publishRequestId)
+      }
+    }
+    logger.debug('MOQtailClient', `subscription ${holder.requestId} completed after ${holder.expectedStreams} streams`)
+    return true
   }
 
   // TODO: Each announced track should checked against ongoing subscribe_namespace
@@ -2471,18 +2536,18 @@ export class MOQtailClient {
   // TODO: Handle request cancellation. Cancel streams are expected to receive some on-fly objects.
   // Do a timeout? Wait for certain amount of objects?
   /**
-   * Poll `lookup` until it yields a value or the route-wait deadline passes.
-   * Used by the data-stream handler to tolerate data streams racing ahead of
-   * the control message that installs their routing state. Each
-   * data stream is handled on its own task, so waiting here blocks nothing
-   * else. A genuinely bogus stream still ends in a protocol violation — just
-   * after the deadline instead of instantly.
+   * Poll `lookup` until it yields a value or {@link MOQtailClient.trackAliasResolutionTimeoutMs}
+   * passes. Used by the data-stream handler to tolerate data streams racing ahead of
+   * the control message that installs their routing state (a SUBSCRIBE_OK, or after
+   * a SWITCH the relay's PUBLISH: the relay opens the catch-up FETCH_HEADER stream and
+   * the target's SUBGROUP streams right after it). Each data stream is handled on its
+   * own task, so waiting here blocks nothing else.
    */
   async #waitForDataRoute<T>(lookup: () => T | undefined): Promise<{ value: T } | undefined> {
-    const deadline = Date.now() + MOQtailClient.DATA_ROUTE_WAIT_TIMEOUT_MS
+    const deadline = Date.now() + this.trackAliasResolutionTimeoutMs
     let result = lookup()
     while (result === undefined && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, MOQtailClient.DATA_ROUTE_POLL_INTERVAL_MS))
+      await new Promise((resolve) => setTimeout(resolve, 10))
       result = lookup()
     }
     // Boxed on purpose: SubscribeRequest is a thenable (it implements
@@ -2690,19 +2755,32 @@ export class MOQtailClient {
             if (subgroupTimeoutId !== undefined) clearTimeout(subgroupTimeoutId)
           }
 
-          // Subscribe Cleanup
-          if (subscription.expectedStreams && subscription.expectedStreams === subscription.streamsAccepted) {
-            subscription.controller?.close()
-            this.subscriptions.delete(header.trackAlias)
-            this.requests.delete(subscription.requestId)
-          }
+          // Subscribe Cleanup: the last expected stream completes the subscription.
+          this.completeIfDone(subscription)
           return
         }
 
-        throw new ProtocolViolationError(
+        // Unrouted (M15): nothing claimed this alias in time. Draining the stream to
+        // its end would spend link capacity on media nobody will consume and count it
+        // nowhere, so tell the peer to stop (STOP_SENDING) and report what it cost.
+        // Not a protocol violation: the relay may legitimately still be flushing
+        // streams of a subscription this side has just released.
+        await recvStream.stopSending(StreamResetCode.Cancelled)
+        reader.releaseLock()
+        const info: DiscardedStreamInfo = {
+          reason: 'unrouted',
+          trackAlias: header.trackAlias,
+          groupId: header.groupId,
+          subgroupId: header.subgroupId,
+          fullTrackName: this.aliasFullTrackNameMap.get(header.trackAlias),
+          bytes: recvStream.bytesReceived,
+        }
+        logger.warn(
           'MOQtailClient',
-          `No subscription for received track alias ${header.trackAlias} (groupId=${header.groupId})`,
+          `discarding unrouted data stream alias=${info.trackAlias} group=${info.groupId} bytes=${info.bytes}`,
         )
+        this.onStreamDiscarded?.(info)
+        return
       }
     } catch (error) {
       //this.disconnect()
@@ -3353,6 +3431,194 @@ if (import.meta.vitest) {
       expect(incoming.messages).toHaveLength(0)
       expect(streamResetCodeOf(incoming.abortReason)).toBe(StreamResetCode.InternalError)
       expect(streamResetCodeOf(incoming.cancelReason)).toBe(StreamResetCode.InternalError)
+
+      await client.disconnect()
+    })
+
+    /** Wire bytes of one subgroup stream: header plus one object with `payloadBytes` of payload. */
+    function subgroupStreamBytes(trackAlias: bigint, groupId: bigint, payloadBytes: number): Uint8Array {
+      const header = new SubgroupHeader(
+        SubgroupHeaderType.fromProperties(false, 0, false),
+        trackAlias,
+        groupId,
+        0n,
+        128,
+      )
+      const object = SubgroupObject.newWithPayload(0, null, new Uint8Array(payloadBytes))
+      const headerBytes = header.serialize().toUint8Array()
+      const objectBytes = object.serialize(undefined).toUint8Array()
+      const bytes = new Uint8Array(headerBytes.length + objectBytes.length)
+      bytes.set(headerBytes)
+      bytes.set(objectBytes, headerBytes.length)
+      return bytes
+    }
+
+    // M15: a stream whose alias has no route used to be drained off the wire and
+    // dropped silently; now it is cancelled (STOP_SENDING) and reported with the
+    // bytes it cost, so every arm counts discarded media on the same basis.
+    it('cancels a data stream for an unrouted alias with STOP_SENDING and reports its bytes (M15)', async () => {
+      const { client, transport } = await connected()
+      client.trackAliasResolutionTimeoutMs = 20
+      const discarded: DiscardedStreamInfo[] = []
+      client.onStreamDiscarded = (info) => discarded.push(info)
+
+      const bytes = subgroupStreamBytes(42n, 5n, 100)
+      transport.openIncomingUniStream(bytes)
+
+      await vi.waitFor(() => expect(discarded).toHaveLength(1))
+      expect(discarded[0]).toMatchObject({ reason: 'unrouted', trackAlias: 42n, groupId: 5n, bytes: bytes.length })
+      expect(discarded[0]!.fullTrackName).toBeUndefined()
+      await vi.waitFor(() => expect(transport.uniCancelReasons).toHaveLength(1))
+      expect(streamResetCodeOf(transport.uniCancelReasons[0])).toBe(StreamResetCode.Cancelled)
+
+      await client.disconnect()
+    })
+
+    // SWITCH PR #1378 failure discipline (the M16 counterpart on this branch): a
+    // refused SWITCH is answered by a relay-opened PUBLISH (Forward 0,
+    // SWITCH_TRANSITION {0, 0}) followed by PUBLISH_DONE with the status. The live
+    // subscription is left exactly as it was, and a second SWITCH on it works.
+    it('keeps the live subscription when the relay refuses a SWITCH (failure PUBLISH)', async () => {
+      const { client, transport } = await connected()
+      const subscribing = client.subscribe({
+        fullTrackName: ftn,
+        filterType: FilterType.LatestObject,
+        forward: true,
+        groupOrder: GroupOrder.Original,
+        priority: 0,
+      })
+      const subscribeStream = await openedStream(transport, 0)
+      const subscribeId = (subscribeStream.messages[0] as Subscribe).requestId
+      subscribeStream.respond(SubscribeOk.create(7n, [], []))
+      await subscribing
+
+      const otherFtn = FullTrackName.tryNew('room/alice', 'video-hi')
+      const switching = client.switch({
+        fullTrackName: otherFtn,
+        subscriptionRequestId: subscribeId,
+        minimumSwitchingGroupId: 5n,
+      })
+      await vi.waitFor(() => expect(subscribeStream.messages).toHaveLength(2))
+      expect(subscribeStream.messages[1]).toBeInstanceOf(Switch)
+      const failure = transport.openIncomingBiStream()
+      failure.respond(new Publish(11n, otherFtn, 8n, [new Forward(false), new SwitchTransition(0n, 0n)], []))
+      failure.respond(new PublishDone(PublishDoneStatusCode.Timeout, 0n, new ReasonPhrase('switch: NoCommonBoundary')))
+      const refused = await switching
+      expect(refused).toBeInstanceOf(SwitchFailure)
+      expect((refused as SwitchFailure).statusCode).toBe(PublishDoneStatusCode.Timeout)
+
+      // The subscription is still live under its original id, alias and name ...
+      const live = client.requests.get(subscribeId)
+      expect(live).toBeInstanceOf(SubscribeRequest)
+      expect(client.subscriptions.get(7n)).toBe(live)
+      expect(client.subscriptionAliasMap.get(subscribeId)).toBe(7n)
+      expect((live as SubscribeRequest).fullTrackName.toString()).toBe(ftn.toString())
+
+      // ... and a second SWITCH on it is still possible and can succeed.
+      const switchingAgain = client.switch({
+        fullTrackName: otherFtn,
+        subscriptionRequestId: subscribeId,
+        minimumSwitchingGroupId: 5n,
+      })
+      await vi.waitFor(() => expect(subscribeStream.messages).toHaveLength(3))
+      const success = transport.openIncomingBiStream()
+      success.respond(new Publish(13n, otherFtn, 8n, [new Forward(true), new SwitchTransition(6n, 7n)], []))
+      const landed = await switchingAgain
+      expect(landed).not.toBeInstanceOf(SwitchFailure)
+      expect((landed as SwitchSuccess).requestId).toBe(13n)
+      expect((landed as SwitchSuccess).switchTransition.switchingGroupId).toBe(6n)
+      expect(client.subscriptionAliasMap.get(13n)).toBe(8n)
+
+      await client.disconnect()
+    })
+
+    // Transport fairness (C3): the SWITCH carries the subscriber priority and group
+    // order on the wire next to the Minimum Switching Group ID; per PR #1378 they are
+    // the target PUBLISH's complete parameter set.
+    it('sends the SWITCH parameters and the floor on the wire', async () => {
+      const { client, transport } = await connected()
+      const subscribing = client.subscribe({
+        fullTrackName: ftn,
+        filterType: FilterType.LatestObject,
+        forward: true,
+        groupOrder: GroupOrder.Ascending,
+        priority: 0,
+      })
+      const subscribeStream = await openedStream(transport, 0)
+      const subscribe = subscribeStream.messages[0] as Subscribe
+      subscribeStream.respond(SubscribeOk.create(7n, [], []))
+      await subscribing
+
+      const target = FullTrackName.tryNew('room/alice', 'video-hi')
+      const switching = client.switch({
+        fullTrackName: target,
+        subscriptionRequestId: subscribe.requestId,
+        minimumSwitchingGroupId: 42n,
+        parameters: [new SubscriberPriority(0), new GroupOrderParam(GroupOrder.Ascending)],
+      })
+      await vi.waitFor(() => expect(subscribeStream.messages).toHaveLength(2))
+      const sw = subscribeStream.messages[1] as Switch
+      expect(sw.minimumSwitchingGroupId).toBe(42n)
+      expect(sw.parameters).toEqual([
+        new SubscriberPriority(0).toKeyValuePair(),
+        new GroupOrderParam(GroupOrder.Ascending).toKeyValuePair(),
+      ])
+      const answer = transport.openIncomingBiStream()
+      answer.respond(new Publish(21n, target, 8n, [new Forward(true), new SwitchTransition(42n, 43n)], []))
+      await switching
+      await client.disconnect()
+    })
+
+    // M16: relay aliases are stable per track, so A to B to A hands the second A
+    // subscription the alias the first one had. The first one's late completion
+    // must not delete the route the second one now owns.
+    it('releases a track alias only while the releasing holder still owns it (M16)', async () => {
+      const { client } = await connected()
+      const first = { requestId: 2n, fullTrackName: ftn, streamsAccepted: 0n, largestLocation: undefined }
+      const second = { requestId: 4n, fullTrackName: ftn, streamsAccepted: 0n, largestLocation: undefined }
+
+      client.claimTrackAlias(7n, first)
+      client.claimTrackAlias(7n, second)
+      client.releaseTrackAlias(first)
+      expect(client.subscriptions.get(7n)).toBe(second)
+      expect(client.aliasFullTrackNameMap.get(7n)?.toString()).toBe(ftn.toString())
+      expect(client.subscriptionAliasMap.has(2n)).toBe(false)
+      expect(client.subscriptionAliasMap.get(4n)).toBe(7n)
+
+      client.releaseTrackAlias(second)
+      expect(client.subscriptions.has(7n)).toBe(false)
+      expect(client.aliasFullTrackNameMap.has(7n)).toBe(false)
+      expect(client.subscriptionAliasMap.has(4n)).toBe(false)
+
+      await client.disconnect()
+    })
+
+    // M16: PUBLISH_DONE for a pushed (relay-initiated PUBLISH) receiver was a no-op,
+    // because pushed receivers live outside `requests`. The receiver's stream never
+    // closed and its alias route was never released.
+    it('completes a pushed receiver on PUBLISH_DONE once all its streams have arrived (M16)', async () => {
+      const { client, transport } = await connected()
+      const pushed: ReadableStream<MoqtObject>[] = []
+      client.onPeerPublish = (_msg, stream) => pushed.push(stream)
+
+      const incoming = transport.openIncomingBiStream()
+      incoming.respond(new Publish(1n, ftn, 9n, [], []))
+      await vi.waitFor(() => expect(incoming.messages).toHaveLength(1))
+      expect(incoming.messages[0]).toBeInstanceOf(RequestOk)
+      expect(client.subscriptions.has(9n)).toBe(true)
+      expect(pushed).toHaveLength(1)
+
+      const dataStream = transport.openIncomingUniStream(subgroupStreamBytes(9n, 0n, 10))
+      const reader = pushed[0]!.getReader()
+      const { value } = await reader.read()
+      expect(value?.location.group).toBe(0n)
+      dataStream.close()
+      incoming.respond(new PublishDone(PublishDoneStatusCode.TrackEnded, 1n, new ReasonPhrase('done')))
+
+      const end = await reader.read()
+      expect(end.done).toBe(true)
+      await vi.waitFor(() => expect(client.subscriptions.has(9n)).toBe(false))
+      expect(client.aliasFullTrackNameMap.has(9n)).toBe(false)
 
       await client.disconnect()
     })

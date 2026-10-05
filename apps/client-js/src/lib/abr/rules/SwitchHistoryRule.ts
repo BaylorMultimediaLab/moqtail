@@ -1,5 +1,5 @@
 import { SwitchRequestPriority, DEFAULT_ABR_SETTINGS } from '../types';
-import type { AbrRule, RulesContext, SwitchRequest } from '../types';
+import type { AbrRule, RulesContext, SwitchEvent, SwitchRequest } from '../types';
 
 interface TrackStats {
   drops: number;
@@ -27,10 +27,29 @@ export class SwitchHistoryRule implements AbrRule {
     this.trackStats = new Map();
     const windowS = abrSettings.controller?.switchHistoryWindowS ?? 0;
     const cutoff = windowS > 0 ? Date.now() - windowS * 1000 : -Infinity;
+    // A drop decided while the playhead was at a seam is the seam (the hole or
+    // the catch-up every mechanism produces at a switch), not evidence against
+    // the rung (M17). The seam's region runs from the hole in front of it to
+    // ignoreGroups group durations of media past it, wherever the playhead
+    // meets it: about one group after the landing at the live edge, about one
+    // shift after it on a time-shifted client (F2). 0 = count every drop.
+    const ignoreGroups = abrSettings.controller?.historyIgnoreGroupsAfterLanding ?? 0;
+    const seamWindowMs =
+      ignoreGroups * (context.segmentDurationS > 0 ? context.segmentDurationS : 1) * 1000;
+    const atSeam = (event: SwitchEvent): boolean => {
+      if (ignoreGroups <= 0) return false;
+      if (event.msPastSeam !== undefined) {
+        // null: the playhead was in no seam region.
+        return event.msPastSeam !== null && event.msPastSeam <= seamWindowMs;
+      }
+      // A player that reports no seams: completed groups since the landing.
+      return event.groupsSinceLanding !== undefined && event.groupsSinceLanding <= ignoreGroups;
+    };
 
     for (const event of switchHistory) {
       if (event.ts < cutoff) continue;
       if (event.reason === 'auto-downgrade' || event.reason === 'auto-emergency') {
+        if (atSeam(event)) continue;
         // Downgrade/emergency: record a drop against the track being left
         const stats = this.trackStats.get(event.fromTrack) ?? { drops: 0, noDrops: 0 };
         stats.drops += 1;

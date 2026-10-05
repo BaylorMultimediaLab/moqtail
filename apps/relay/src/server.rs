@@ -17,7 +17,6 @@ mod client_manager;
 mod config;
 mod errors;
 mod events;
-mod holding_subscribes;
 mod message_handlers;
 mod object_logger;
 mod prefix_subscription;
@@ -30,6 +29,8 @@ mod subscription_manager;
 mod switch_delivery;
 mod switch_guard;
 mod switch_selection;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod token_logger;
 mod track;
 mod track_cache;
@@ -111,22 +112,7 @@ impl Server {
           _ = ticker.tick() => {
             let conns: Vec<Arc<MOQTClient>> = clients.read().await.values().cloned().collect();
             for c in conns {
-              let st = c.connection.stats();
-              events::emit(
-                "CONN_STATS",
-                serde_json::json!({
-                  "conn": c.connection_id,
-                  "transport": format!("{:?}", c.transport_kind),
-                  "rtt_ms": st.path.rtt.as_secs_f64() * 1000.0,
-                  "cwnd": st.path.cwnd,
-                  "lost_packets": st.path.lost_packets,
-                  "lost_bytes": st.path.lost_bytes,
-                  "sent_packets": st.path.sent_packets,
-                  "congestion_events": st.path.congestion_events,
-                  "udp_tx_bytes": st.udp_tx.bytes,
-                  "udp_rx_bytes": st.udp_rx.bytes,
-                }),
-              );
+              events::emit("CONN_STATS", conn_stats_record(&c));
             }
             let tracks: Vec<_> = track_manager.tracks.read().await.values().cloned().collect();
             for track in tracks {
@@ -177,6 +163,9 @@ impl Server {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     if events::enabled() {
+      // Once per run: the resolved configuration (congestion controller, timeouts,
+      // cache size, quinn defaults), so a bundle's identity is what the relay ran with.
+      events::emit("RELAY_CONFIG", self.app_config.event_record());
       self.spawn_cache_stats_task(shutdown_rx.clone());
     }
     // Only used to correlate log lines, so any unique value will do.
@@ -226,6 +215,9 @@ impl Server {
       },
       _ = sigterm.recv() => {
         info!("SIGTERM received, draining (GOAWAY, timeout {}ms)...", DRAIN_TIMEOUT_MS);
+        // The runner may follow up with SIGKILL before the drain ends; everything
+        // recorded up to the stop request is on disk first.
+        events::flush();
         self.draining.store(true, Ordering::Relaxed);
         self.broadcast_goaway(DRAIN_TIMEOUT_MS).await;
         // Keep accepting while draining; a second Ctrl-C cuts it short.
@@ -240,6 +232,7 @@ impl Server {
     for accept_loop in accept_loops {
       let _ = accept_loop.await;
     }
+    events::flush();
     Ok(())
   }
 
@@ -305,6 +298,41 @@ impl Server {
   }
 }
 
+/// One CONN_STATS record: quinn's path statistics for the relay's send side of
+/// this client's connection, and the congestion controller's own state.
+///
+/// rtt_ms is quinn's smoothed RTT. ssthresh is CUBIC's slow start threshold in
+/// bytes (null for BBR, and for CUBIC before its first congestion event, while it
+/// is unbounded). bbr_pacing_rate_bps is BBR's model
+/// rate (null for CUBIC); quinn's connection pacer does not use it. pacer_rate_bps
+/// is the rate quinn's pacer actually refills at for every controller:
+/// 1.25 x cwnd / smoothed RTT. quinn does not expose whether the connection is
+/// application-limited; udp_tx_ios < udp_tx_datagrams means GSO batching is on.
+fn conn_stats_record(c: &MOQTClient) -> serde_json::Value {
+  let st = c.connection.stats();
+  let cc = c.connection.congestion_metrics();
+  let rtt_s = st.path.rtt.as_secs_f64();
+  let pacer_rate_bps = (rtt_s > 0.0).then(|| (1.25 * st.path.cwnd as f64 * 8.0 / rtt_s) as u64);
+  serde_json::json!({
+    "conn": c.connection_id,
+    "transport": format!("{:?}", c.transport_kind),
+    "rtt_ms": rtt_s * 1000.0,
+    "cwnd": st.path.cwnd,
+    "ssthresh": cc.ssthresh.filter(|t| *t != u64::MAX),
+    "bbr_pacing_rate_bps": cc.model_pacing_rate_bps,
+    "pacer_rate_bps": pacer_rate_bps,
+    "lost_packets": st.path.lost_packets,
+    "lost_bytes": st.path.lost_bytes,
+    "sent_packets": st.path.sent_packets,
+    "congestion_events": st.path.congestion_events,
+    "current_mtu": st.path.current_mtu,
+    "udp_tx_bytes": st.udp_tx.bytes,
+    "udp_tx_datagrams": st.udp_tx.datagrams,
+    "udp_tx_ios": st.udp_tx.ios,
+    "udp_rx_bytes": st.udp_rx.bytes,
+  })
+}
+
 fn init_logging(log_dir: &str) {
   let env_filter = EnvFilter::builder()
     .with_default_directive(LevelFilter::INFO.into())
@@ -322,4 +350,74 @@ fn init_logging(log_dir: &str) {
     .with_env_filter(env_filter)
     .with_writer(non_blocking.and(std::io::stdout))
     .init();
+}
+
+#[cfg(test)]
+mod tests_conn_stats {
+  use super::*;
+  use crate::server::config::{AppConfig, Cli};
+  use crate::server::test_support::{quic_pair_with_server_transport, relay_client};
+  use clap::Parser;
+
+  /// CONN_STATS carries what a preflight needs to tell a congestion-limited
+  /// connection from an idle or loss-bound one, for both controllers.
+  #[tokio::test]
+  async fn conn_stats_carries_controller_state() {
+    for (cc, has_bbr_rate) in [("cubic", false), ("bbr", true)] {
+      let config = AppConfig::from_cli(Cli::parse_from(["relay", "--congestion-controller", cc]));
+      let (peer, server) =
+        quic_pair_with_server_transport(Some(config.transport_config().unwrap())).await;
+      let client = relay_client(77, server);
+      let mut send = client.connection.open_uni().await.unwrap();
+      let reader = tokio::spawn(async move {
+        let mut recv = peer.accept_uni().await.unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(Some(_)) = recv.read(&mut buf).await {}
+        peer
+      });
+      send.write_all(&vec![1u8; 256 * 1024]).await.unwrap();
+      send.finish().await.unwrap();
+      let _peer = reader.await.unwrap();
+
+      let r = conn_stats_record(&client);
+      for key in [
+        "conn",
+        "transport",
+        "rtt_ms",
+        "cwnd",
+        "ssthresh",
+        "bbr_pacing_rate_bps",
+        "pacer_rate_bps",
+        "lost_packets",
+        "lost_bytes",
+        "sent_packets",
+        "congestion_events",
+        "current_mtu",
+        "udp_tx_bytes",
+        "udp_tx_datagrams",
+        "udp_tx_ios",
+        "udp_rx_bytes",
+      ] {
+        assert!(r.get(key).is_some(), "{cc}: CONN_STATS lacks {key}");
+      }
+      if cc == "bbr" {
+        assert!(r["ssthresh"].is_null(), "{cc}: {r}");
+      } else {
+        // Loopback, no loss: still unbounded, recorded as null.
+        assert!(
+          r["ssthresh"].is_null() || r["ssthresh"].is_u64(),
+          "{cc}: {r}"
+        );
+      }
+      assert_eq!(r["bbr_pacing_rate_bps"].is_u64(), has_bbr_rate, "{cc}: {r}");
+      let cwnd = r["cwnd"].as_f64().unwrap();
+      let rtt_s = r["rtt_ms"].as_f64().unwrap() / 1000.0;
+      let pacer = r["pacer_rate_bps"].as_f64().unwrap();
+      assert!(
+        (pacer - 1.25 * cwnd * 8.0 / rtt_s).abs() <= 1.0,
+        "{cc}: {r}"
+      );
+      assert!(r["udp_tx_datagrams"].as_u64().unwrap() > 100, "{cc}: {r}");
+    }
+  }
 }

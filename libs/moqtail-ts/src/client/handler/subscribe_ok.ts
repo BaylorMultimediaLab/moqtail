@@ -37,6 +37,9 @@ export const handlerSubscribeOk: RequestStreamMessageHandler<SubscribeOk> = asyn
         track.trackProperties = msg.trackProperties
       }
     }
+    // A SUBSCRIBE_OK on this stream answers the SWITCH in flight when there is one
+    // (M16), otherwise the SUBSCRIBE itself.
+    if (request.resolveSwitch(msg)) return
     logger.debug(
       'handler/subscribe_ok',
       `requestId=${requestId} — resolving SubscribeRequest ftn="${request.fullTrackName}"`,

@@ -566,7 +566,7 @@ pub(crate) async fn forward_publish_downstream(
   track_arc: Arc<RwLock<Track>>,
   context: Arc<SessionContext>,
 ) {
-  let (send, recv) = match subscriber.connection.open_bi().await {
+  let (send, recv) = match subscriber.connection.open_request_stream().await {
     Ok(streams) => streams,
     Err(e) => {
       error!("Failed to open downstream publish stream: {:?}", e);
