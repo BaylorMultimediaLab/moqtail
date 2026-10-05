@@ -1223,6 +1223,26 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "session_destroyed": any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR")),
     }
     out["switches"]["skipped_not_landed"] = out["switches"]["skipped_not_sent"]  # legacy name
+    # pr1378 (R6 D5, R7-D2): old-track objects held while a SWITCH was unanswered,
+    # released per switch (SWITCH_HOLD_RELEASED.outcome: ok, failed, bound-bytes,
+    # bound-time). A tripped bound appends everything held, including objects at or
+    # above G_switch, so bound_trips must be 0 for the hold to have done its job.
+    # None on bundles without the record (native arms, pr1378 before R6).
+    holds = by("SWITCH_HOLD_RELEASED")
+    if holds:
+        by_outcome: dict[str, int] = {}
+        for r in holds:
+            by_outcome[r.get("outcome") or "unknown"] = by_outcome.get(r.get("outcome") or "unknown", 0) + 1
+        out["switches"]["hold_released"] = {
+            "count": len(holds),
+            "by_outcome": by_outcome,
+            "bound_trips": sum(1 for r in holds if str(r.get("outcome") or "").startswith("bound-")),
+            "held_ms": stats([r.get("held_ms") for r in holds]),
+            "appended_objects": sum(r.get("appended") or 0 for r in holds),
+            "dropped_post_seam": sum(r.get("dropped_post_seam") or 0 for r in holds),
+        }
+    else:
+        out["switches"]["hold_released"] = None
     # pr1378 data routes (player): the replaced subscription is read until done (P1);
     # its objects at or above G_switch are dropped as post-seam (P2); PUBLISH_DONE by role.
     post_seam = [r for r in drops if r.get("reason") == "post-seam"]

@@ -191,6 +191,14 @@ class SwitchIdentity(TmpRun):
         s = analyze.analyze(write_run(self.dir, client))
         self.assertEqual(s["switches"]["list"][0]["switch_visibility_delay_ms"], 2750.0)
 
+    def test_no_hold_records_summarise_as_none(self):
+        # Bundles without SWITCH_HOLD_RELEASED (every native run, pr1378 before R6).
+        A, B = R[0], R[4]
+        client = startup(A) + switch(1, T0 + 1000, A, B)
+        client += samples(T0, T0 + 6000, lambda t: A)
+        s = analyze.analyze(write_run(self.dir, client))
+        self.assertIsNone(s["switches"]["hold_released"])
+
     def test_switch_seq_join_and_superseded_record(self):
         A, B = R[0], R[4]
         client = startup(A)
@@ -1152,6 +1160,8 @@ class Pr1378Records(TmpRun):
                switch_in_flight=True, pending_switch_seq=1),
             ev("DROP_STALE", t1 + 200, track=A, group=16, object=0, bytes=4000, reason="post-seam", seam_group=16, switch_seq=1),
             ev("DROP_STALE", t1 + 210, track=A, group=16, object=1, bytes=1000, reason="post-seam", seam_group=16, switch_seq=1),
+            ev("SWITCH_HOLD_RELEASED", t1 + 60, switch_seq=1, outcome="ok", floor=15, seam_group=16, held_objects=3,
+               held_bytes=9000, held_ms=58.0, appended=1, dropped_post_seam=2),
             ev("SWITCH_SOURCE_RELEASED", t1 + 500, switch_seq=1, request_id=0, track=A, reason="publish-done-idle", seam_group=16,
                held_ms=440.0, publish_done=True, objects_after_switch_ok=12, post_seam_dropped=2),
             ev("SWITCH_FIRST_OBJECT", t1 + 510, switch_seq=1, **{"from": A, "to": B}, group=16, object=0, landed_on_keyframe=True),
@@ -1167,6 +1177,8 @@ class Pr1378Records(TmpRun):
             ev("SWITCH_SENT", t2, switch_seq=2, **{"from": B, "to": A}, request_id=None, old_request_id=7,
                switch_floor="next-group", minimum_switching_group=30, playhead_ms=t2 - T0, last_received_group=29),
             ev("SWITCH_SKIPPED", t2 + 100, switch_seq=3, **{"from": B, "to": R[1]}, reason="switch in flight", pending_request_id=7),
+            ev("SWITCH_HOLD_RELEASED", t2 + 3000, switch_seq=2, outcome="bound-time", floor=30, seam_group=None,
+               held_objects=2, held_bytes=4000, held_ms=3000.0, appended=2, dropped_post_seam=0),
             ev("SWITCH_ERROR", t2 + 3050, switch_seq=2, to=A, request_id=None, status=10, reason="switch: NoCommonBoundary",
                failure="NoCommonBoundary", rtt_ms=3050),
         ]
@@ -1219,6 +1231,16 @@ class Pr1378Records(TmpRun):
         self.assertEqual(routes["released"]["by_reason"], {"publish-done-idle": 1})
         self.assertEqual(routes["released"]["held_ms"]["p50"], 440.0)
         self.assertEqual(routes["publish_done_recv"], {"current": 1})
+
+    # R7-D2: a hold released by a tripped bound (it appends the held objects at or
+    # above G_switch, the duplicate the hold exists to remove) is visible per run.
+    def test_hold_released_by_outcome(self):
+        hold = analyze.analyze(self.bundle())["switches"]["hold_released"]
+        self.assertEqual(hold["count"], 2)
+        self.assertEqual(hold["by_outcome"], {"ok": 1, "bound-time": 1})
+        self.assertEqual(hold["bound_trips"], 1)
+        self.assertEqual(hold["appended_objects"], 3)
+        self.assertEqual(hold["dropped_post_seam"], 2)
 
     def test_validates(self):
         p = subprocess.run([sys.executable, str(EXPERIMENTS / "validate.py"), str(self.bundle()), "--no-write"],

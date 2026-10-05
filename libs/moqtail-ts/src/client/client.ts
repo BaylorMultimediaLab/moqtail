@@ -57,6 +57,7 @@ import {
   RequestIdMap,
 } from '../model/data'
 import { FrozenByteBuffer } from '../model/common/byte_buffer'
+import { KeyValuePair } from '../model/common/pair'
 import { ObjectDeliveryTimeoutProperty, TrackProperty } from '../model/property/track_property'
 import { RecvStream } from './data_stream'
 import {
@@ -74,6 +75,8 @@ import {
   GroupOrderParam,
   SubscriptionFilter,
   StreamResetCode,
+  TerminationCode,
+  TerminationError,
   resolveTransportUrl,
 } from '../model'
 import { Track } from './track/track'
@@ -1818,7 +1821,8 @@ export class MOQtailClient {
    * receiver with request id `requestId` that is still open and whose group is at
    * or above `fromGroup` (every open stream when `fromGroup` is omitted). Each one
    * ends with {@link DataStreamEndInfo.end} `stopped`; objects it had already
-   * delivered stay on the receiver's object stream. Returns how many it stopped.
+   * delivered stay on the receiver's object stream, and objects it yields after the
+   * stop (already parsed off the wire) are discarded. Returns how many it stopped.
    */
   async stopDataStreams(requestId: bigint, fromGroup?: bigint): Promise<number> {
     const stops: Promise<void>[] = []
@@ -1834,9 +1838,9 @@ export class MOQtailClient {
 
   /**
    * Ends the receiver with request id `requestId` (a SUBSCRIBE or a pushed PUBLISH
-   * receiver) on the application's word that it has everything it needs: its alias
-   * route is released (streams that arrive later take the unrouted path), every
-   * stream still open on it is stopped ({@link MOQtailClient.stopDataStreams}), and
+   * receiver) on the application's word that it has everything it needs: every
+   * stream still open on it is stopped ({@link MOQtailClient.stopDataStreams}), its
+   * alias route is released (streams that arrive later take the unrouted path), and
    * its object stream is closed, so a reader still gets every object already
    * enqueued and then the end. The request itself stays known, so
    * {@link MOQtailClient.unsubscribe} still cancels it. Returns whether a receiver
@@ -1846,8 +1850,12 @@ export class MOQtailClient {
     const request = this.requests.get(requestId)
     const holder = request instanceof SubscribeRequest ? request : this.pushedReceivers.get(requestId)
     if (holder === undefined) return false
+    // Stop the open streams before the route goes (R7-D5): an object already parsed
+    // on one of them is then discarded as a stopped stream's, not looked up against
+    // an alias that no longer names a track.
+    const stopping = this.stopDataStreams(requestId)
     this.releaseTrackAlias(holder)
-    await this.stopDataStreams(requestId)
+    await stopping
     try {
       holder.controller?.close()
     } catch {
@@ -2406,7 +2414,13 @@ export class MOQtailClient {
    * the first message started.
    */
   async #dispatchIncomingRequestStream(requestStream: RequestStream): Promise<void> {
-    const first = await requestStream.next()
+    let first: ControlMessage | undefined
+    try {
+      first = await requestStream.next()
+    } catch (error) {
+      await this.#requestStreamReadFailed(error)
+      return
+    }
     if (!first) return
 
     if (!ControlMessageType.isFirst(first.getType())) {
@@ -2433,7 +2447,8 @@ export class MOQtailClient {
         msg = await requestStream.next()
       }
     } catch (error) {
-      logger.error('MOQtailClient', 'incoming request stream failed', error)
+      if (isMalformedMessage(error)) await this.#requestStreamReadFailed(error)
+      else logger.error('MOQtailClient', 'incoming request stream failed', error)
     } finally {
       // The peer closed or reset the stream: cancel whatever it was serving. Every
       // First-marked type carries a request id, but the union as a whole does not.
@@ -2444,6 +2459,22 @@ export class MOQtailClient {
       }
       await requestStream.close()
     }
+  }
+
+  /**
+   * A peer-opened request stream could not be read (R7-D4). A message that fails to
+   * parse (the request stream reports a PROTOCOL_VIOLATION, e.g. a known parameter
+   * with an invalid value) closes the session, as the protocol requires; it used to
+   * surface as an unhandled rejection with the session left up. Any other failure
+   * (the peer reset the stream) is logged.
+   */
+  async #requestStreamReadFailed(error: unknown): Promise<void> {
+    if (isMalformedMessage(error)) {
+      logger.error('MOQtailClient', 'malformed message on a peer request stream; closing the session', error)
+      await this.disconnect(new ProtocolViolationError('MOQtailClient', error.context))
+      return
+    }
+    logger.warn('MOQtailClient', 'peer request stream failed', error)
   }
 
   // TODO: Handle request cancellation. Cancel streams are expected to receive some on-fly objects.
@@ -2560,6 +2591,9 @@ export class MOQtailClient {
           let stoppedHere = false
           let objectsDelivered = 0
           let lastSubgroupId: bigint | undefined = header.subgroupId
+          // The track this stream belongs to, fixed when it is routed (R7-D5): the
+          // receiver may release its alias while the stream is still being read.
+          const streamFullTrackName = this.aliasFullTrackNameMap.get(header.trackAlias) ?? subscription.fullTrackName
           let openStreams = this.#openDataStreams.get(subscription)
           if (!openStreams) {
             openStreams = new Set()
@@ -2592,6 +2626,10 @@ export class MOQtailClient {
               }
               if (nextObject) {
                 if (nextObject instanceof SubgroupObject) {
+                  // A stopped stream's objects that were parsed before the stop took
+                  // effect are not delivered: the receiver asked for the stream to
+                  // end (and may already have closed its object stream).
+                  if (stoppedHere) continue
                   // TODO: validate if it's a valid subgroup object
                   if (!firstObjectId) {
                     firstObjectId = nextObject.objectId
@@ -2605,20 +2643,12 @@ export class MOQtailClient {
                     subgroupId = header.subgroupId ?? null
                   }
 
-                  const fullTrackName = this.aliasFullTrackNameMap.get(header.trackAlias)
-                  if (!fullTrackName) {
-                    throw new ProtocolViolationError(
-                      'MOQtailClient',
-                      `No full track name for received track alias ${header.trackAlias} (groupId=${header.groupId})`,
-                    )
-                  }
-
                   const moqtObject = MoqtObject.fromSubgroupObject(
                     nextObject,
                     header.groupId,
                     header.publisherPriority,
                     subgroupId,
-                    fullTrackName,
+                    streamFullTrackName,
                   )
                   if (!subscription.largestLocation) subscription.largestLocation = moqtObject.location
                   if (subscription.largestLocation.compare(moqtObject.location) == -1)
@@ -2690,6 +2720,11 @@ export class MOQtailClient {
       throw error
     }
   }
+}
+
+/** A request stream's deserialization failure: the peer sent a malformed message. */
+function isMalformedMessage(error: unknown): error is TerminationError {
+  return error instanceof TerminationError && error.terminationCode === TerminationCode.PROTOCOL_VIOLATION
 }
 
 if (import.meta.vitest) {
@@ -3113,6 +3148,26 @@ if (import.meta.vitest) {
       // Without the properties the same exchange resolves; see the request-per-stream
       // test above.
       await expect(announcing).rejects.toThrow()
+    })
+
+    // R7-D4 (shared half): a peer-opened request stream whose first message fails to
+    // parse (here a PUBLISH whose FORWARD parameter is 2: a known parameter with an
+    // invalid value is a PROTOCOL_VIOLATION) used to be an unhandled rejection that
+    // left the session up. It closes the session, as the protocol requires.
+    it('closes the session when a peer request stream opens with a malformed message (R7-D4)', async () => {
+      const { client, transport } = await connected()
+      const terminated: unknown[] = []
+      client.onSessionTerminated = (reason) => terminated.push(reason)
+      const pushed: unknown[] = []
+      client.onPeerPublish = (msg) => pushed.push(msg)
+      const badForward = {
+        toKeyValuePair: () => KeyValuePair.tryNewVarInt(Forward.TYPE, 2n),
+      } as unknown as Forward
+      const incoming = transport.openIncomingBiStream()
+      incoming.respond(new Publish(1n, ftn, 9n, [badForward], []))
+      await vi.waitFor(() => expect(terminated).toHaveLength(1))
+      expect(String((terminated[0] as Error).message)).toMatch(/FORWARD must be 0 or 1/)
+      expect(pushed).toHaveLength(0)
     })
 
     it('answers a peer-opened request stream on that stream', async () => {
@@ -3678,6 +3733,31 @@ if (import.meta.vitest) {
 
       transport.openIncomingUniStream(subgroupStreamBytes(9n, 7n, 10))
       await vi.waitFor(() => expect(discarded).toHaveLength(1), { timeout: 2000 })
+      await client.disconnect()
+    })
+
+    // R7-D5: finishReceiver used to release the alias before stopping the streams
+    // still open on the receiver, so an object already parsed on one of them (at
+    // or above the seam) failed the alias lookup and was thrown as a protocol
+    // violation. The stopped stream's objects are now discarded quietly.
+    it('discards an object parsed on a stream finishReceiver stops without a protocol error (R7-D5)', async () => {
+      const { client, transport } = await connected()
+      const errors = vi.spyOn(logger, 'error')
+      const ends: DataStreamEndInfo[] = []
+      client.onDataStreamEnded = (info) => ends.push(info)
+      const { reader } = await pushedReceiver(transport, client)
+      const open = transport.openIncomingUniStream(subgroupStreamBytes(9n, 6n, 10))
+      expect((await reader.read()).value?.location.group).toBe(6n)
+
+      // The next object is on the wire when the application finishes the receiver.
+      open.enqueue(nextObjectBytes(1, 10, 0n))
+      expect(await client.finishReceiver(1n)).toBe(true)
+      expect(((await readWithin(reader, 500)) as ReadableStreamReadResult<MoqtObject>).done).toBe(true)
+      await vi.waitFor(() => expect(ends).toHaveLength(1))
+      expect(ends[0]).toMatchObject({ groupId: 6n, end: 'stopped', objects: 1 })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(errors).not.toHaveBeenCalled()
+      errors.mockRestore()
       await client.disconnect()
     })
   })
