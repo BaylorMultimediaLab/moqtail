@@ -48,6 +48,7 @@ definitions"). In short, per run and over the last client session:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 import json
 import math
@@ -829,6 +830,9 @@ def feedback_windows(switches: list[dict], by, window_s: float) -> dict:
             "pre_latency_mean_ms": stats([p["pre_latency_ms"].get("mean") for p in per if p["pre_latency_ms"].get("n")]),
         },
     }
+
+
+APPEND_ORDER_REASONS = ("behind-append-front", "abandoned-gap", "track-changed")
 
 
 def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offset_hold_s: float = 5.0,
@@ -1643,7 +1647,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                  "pre_keyframe": sum(1 for r in drops if r.get("reason") == "pre-keyframe"),
                  # library-level discard of a stream whose alias has no route (2026-10 contract)
                  "unrouted": sum(1 for r in drops if r.get("reason") == "unrouted"),
-                 "unrouted_bytes": sum(r.get("bytes") or 0 for r in drops if r.get("reason") == "unrouted")}
+                 "unrouted_bytes": sum(r.get("bytes") or 0 for r in drops if r.get("reason") == "unrouted"),
+                 # the decode-order scheduler (2026-10-05): late frames behind the append
+                 # front, frames given up with a gap that did not fill, frames held when
+                 # the stream changed track; `waited_ms` on the held ones
+                 "append_order": {reason: sum(1 for r in drops if r.get("reason") == reason)
+                                  for reason in APPEND_ORDER_REASONS},
+                 "by_reason": {str(k): v for k, v in sorted(Counter(r.get("reason") or "stale-track" for r in drops).items())}}
     out["discarded"] = discarded
     if objs:
         per_group: dict[tuple, set] = {}

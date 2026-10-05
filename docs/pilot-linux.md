@@ -1122,6 +1122,36 @@ Expected: every run PASS. Shaped sessions now last 90 s (`samples` ≥ 324),
 each seam, and no `DROP_STALE{earlier-subscription}` should be needed often (it
 is the guard, reported per run).
 
+### 11h. The preflight a third time (2026-10-05)
+
+The second preflight (`results-linux-2026-10-05/preflight2`) passed 36 of 36
+runs, and every fix of 11g shows in the data: 90 s sessions with the steps at
+30 and 60 s of session time, no unrouted bytes on pr1378 (1.9 MB before), the
+1.5 Mbit/s step delivered at 1.41-1.43 Mbit/s on every arm, no landing below a
+relay start, no decoder error. It also showed a defect no check caught: about
+1 % of groups that the player appended in full were only partly in the
+buffer, on every arm, around the capacity steps and switch seams. Objects were
+appended in arrival order; after a retransmission (or next to a catch-up)
+arrival is not decode order, and MSE then drops the rest of the group up to the
+next keyframe (the relay counted 31 lost packets and an 818 ms RTT in the
+second before one such group). The player now appends in decode order (contract,
+"Decode-order appends").
+
+Run the same preflight again (11f steps 1 to 4) after moving the second round
+aside:
+
+```sh
+cd ~/Documents/Baylor\ Research/moqtail
+mv results results-preflight2-$(date +%Y%m%d); mkdir -p results logs
+git fetch origin && git checkout harness && git reset --hard origin/harness
+# then 11f step 1 (clean state, cache check), step 2 (`preflight 3`), steps 3 and 4
+```
+
+Expected: every run PASS as before; `pf-append-order` reports the scheduler's
+drops (few, and only around losses) and the most frames it held; buffered
+ranges with sub-group holes become rare and, where they remain, match a
+`DROP_STALE{abandoned-gap}`.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
