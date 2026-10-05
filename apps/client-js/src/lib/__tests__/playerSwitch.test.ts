@@ -211,15 +211,76 @@ describe('Player.switchTrack: the replaced subscription keeps being read (P1, au
     const { player } = await makePlayer({ switchResult: async () => switchSuccess(42n, 5n, 6n) });
     await player.switchTrack('720p');
     expect(player.videoRoutes()).toEqual([
-      { requestId: 1n, trackName: '360p', seamGroup: 5n },
-      { requestId: 42n, trackName: '720p', seamGroup: null },
+      { requestId: 1n, trackName: '360p', seamGroup: 5n, publishDone: false },
+      { requestId: 42n, trackName: '720p', seamGroup: null, publishDone: false },
     ]);
   });
 
   it('a refused switch queues nothing', async () => {
     const { player } = await makePlayer({ switchResult: async () => refusal() });
     await player.switchTrack('720p');
-    expect(player.videoRoutes()).toEqual([{ requestId: 1n, trackName: '360p', seamGroup: null }]);
+    expect(player.videoRoutes()).toEqual([
+      { requestId: 1n, trackName: '360p', seamGroup: null, publishDone: false },
+    ]);
+  });
+});
+
+describe("Player.handlePublishDone: the replaced subscription's PUBLISH_DONE (P5, audit M6)", () => {
+  let emitted: Emitted;
+  beforeEach(() => {
+    emitted = [];
+    vi.spyOn(events, 'emit').mockImplementation((e, f) => {
+      emitted.push([e, (f ?? {}) as Record<string, unknown>]);
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  const done = { statusCode: 0x5, streamCount: 3n };
+
+  it('arriving while the SWITCH is pending, it marks the subscription the switch replaces', async () => {
+    let release!: () => void;
+    const { player } = await makePlayer({
+      switchResult: () =>
+        new Promise(resolve => {
+          release = () => resolve(switchSuccess(42n, 5n, 6n));
+        }),
+    });
+    const switching = player.switchTrack('720p');
+    // Close-After-Switch: the relay ends the source before it opens the target PUBLISH.
+    player.handlePublishDone(done, 1n);
+    const rec = emitted.find(([e]) => e === 'PUBLISH_DONE_RECV')![1];
+    expect(rec).toMatchObject({
+      request_id: 1n,
+      role: 'current',
+      switch_in_flight: true,
+      pending_switch_seq: player.lastSwitchSeq,
+      stream_count: 3,
+    });
+    release();
+    await switching;
+    expect(player.videoRoutes()[0]).toMatchObject({ requestId: 1n, publishDone: true });
+  });
+
+  it('arriving after SWITCH_OK, it is the replaced subscription', async () => {
+    const { player } = await makePlayer({ switchResult: async () => switchSuccess(42n, 5n, 6n) });
+    await player.switchTrack('720p');
+    player.handlePublishDone(done, 1n);
+    expect(emitted.find(([e]) => e === 'PUBLISH_DONE_RECV')![1]).toMatchObject({
+      request_id: 1n,
+      role: 'replaced',
+      switch_in_flight: false,
+    });
+    expect(player.videoRoutes()[0]).toMatchObject({ requestId: 1n, publishDone: true });
+  });
+
+  it('for the current subscription with no switch pending, the source is gone', async () => {
+    const { player } = await makePlayer();
+    player.handlePublishDone(done, 1n);
+    expect(emitted.find(([e]) => e === 'PUBLISH_DONE_RECV')![1]).toMatchObject({
+      role: 'current',
+      switch_in_flight: false,
+      pending_switch_seq: null,
+    });
   });
 });
 

@@ -508,12 +508,8 @@ export class Player {
       );
     };
 
-    // PUBLISH_DONE on a video subscription: a subscription a SWITCH replaced
-    // is released once it is done (lib/switchSources.ts).
-    this.client.onPeerPublishDone = (_msg, requestId) => {
-      const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
-      vs?.pump?.publishDone(requestId);
-    };
+    // PUBLISH_DONE on a subscription (P5).
+    this.client.onPeerPublishDone = (msg, requestId) => this.handlePublishDone(msg, requestId);
 
     // Debug-only escape hatch: lets the network test harness force a SWITCH
     // without going through the AbrController. Used by Slice C/Phase B E2Es
@@ -1407,15 +1403,65 @@ export class Player {
   }
 
   /**
+   * PUBLISH_DONE for `requestId` (P5, audit M6), called by the library before it
+   * completes that subscription. For the subscription a SWITCH replaces it
+   * starts the release of that route (lib/switchSources.ts); the relay sends it
+   * at Close-After-Switch, before it opens the target PUBLISH, so it usually
+   * arrives while the switch is still pending (`role: 'current'`,
+   * `switch_in_flight: true`), else after SWITCH_OK (`role: 'replaced'`). For
+   * the current subscription with no switch pending the relay has ended the
+   * source: a late SWITCH success after the library's response deadline (the
+   * target was declined), or the track ended; logged, the player keeps its
+   * state.
+   */
+  handlePublishDone(msg: { statusCode: unknown; streamCount: bigint }, requestId: bigint): void {
+    const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    if (!vs) return;
+    const route = vs.pump?.find(requestId);
+    vs.pump?.publishDone(requestId);
+    const role =
+      route?.replacedAt !== undefined
+        ? 'replaced'
+        : requestId === vs.requestId
+          ? 'current'
+          : route
+            ? 'queued'
+            : 'other';
+    const switchInFlight = vs.switchInFlight === true;
+    events.emit('PUBLISH_DONE_RECV', {
+      request_id: requestId,
+      track: route?.trackName ?? (role === 'current' ? vs.trackName : null),
+      status: Number(msg.statusCode),
+      stream_count: Number(msg.streamCount),
+      role,
+      switch_in_flight: switchInFlight,
+      pending_switch_seq: vs.pendingSwitch?.record.seq ?? null,
+    });
+    if (role === 'current' && !switchInFlight) {
+      logger.warn(
+        'media',
+        `PUBLISH_DONE for the current subscription ${requestId} with no switch pending: ` +
+          'the relay ended the source (late SWITCH success or track end)',
+      );
+    }
+  }
+
+  /**
    * The video stream's data routes in pipe order (pr1378, lib/switchSources.ts):
    * request id, track and the seam group once a SWITCH replaced it. For tests.
    */
-  videoRoutes(): Array<{ requestId: bigint; trackName: string; seamGroup: bigint | null }> {
+  videoRoutes(): Array<{
+    requestId: bigint;
+    trackName: string;
+    seamGroup: bigint | null;
+    publishDone: boolean;
+  }> {
     const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     return (vs?.pump?.routes() ?? []).map(r => ({
       requestId: r.requestId,
       trackName: r.trackName,
       seamGroup: r.seamGroup ?? null,
+      publishDone: r.publishDoneAt !== undefined,
     }));
   }
 

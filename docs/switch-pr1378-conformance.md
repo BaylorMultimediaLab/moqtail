@@ -212,3 +212,12 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   reached the write handler before SWITCH_OK cannot be recognised and is still
   appended (residual): the source keeps forwarding while selection waits and
   is bounded at the seam only at the hand-over.
+- **PUBLISH_DONE for the replaced subscription (P5, audit M6).** The player
+  handles every PUBLISH_DONE on a video subscription (`handlePublishDone`):
+  for the subscription a SWITCH replaces it starts that route's release (P1)
+  and it is logged as `PUBLISH_DONE_RECV`. The relay sends Close-After-Switch
+  before it opens the target PUBLISH, so it normally arrives while the switch
+  is still pending (`role: current`, `switch_in_flight: true`). A PUBLISH_DONE
+  for the current subscription with no switch pending (the late-success case
+  above, or the track ending) is logged with a warning; the player does not
+  re-subscribe.
