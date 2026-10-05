@@ -309,6 +309,41 @@ describe('SourcePump (R6 D2): a replaced route is released when its below-seam s
     ac.abort();
   });
 
+  it('a route the library already completed keeps every queued object when it is done', async () => {
+    const { pump, a, out, released, receivers, ac } = setup();
+    // The library completed the receiver (its PUBLISH_DONE count was met) and
+    // closed its stream with objects still queued: finishReceiver finds nothing.
+    receivers.delete(1n);
+    a.push(obj('A', 4, 0));
+    a.push(obj('A', 4, 1));
+    a.close();
+    const b = feed();
+    pump.replace(1n, 5n, { stream: b.stream, requestId: 2n, trackName: 'B' }, 1n);
+    pump.streamEnded(ended(1n, 4));
+    pump.publishDone(1n);
+    b.push(obj('B', 5));
+    await settle();
+    expect(out.written).toEqual(['A:4', 'A:4', 'B:5']);
+    expect(released).toEqual([[1n, 'drained']]);
+    ac.abort();
+  });
+
+  it('a decided route whose stream never ends is cut after RETIRE_MAX_MS', async () => {
+    const { pump, a, released, receivers, advance, ac } = setup();
+    receivers.delete(1n); // finishReceiver cannot close it
+    a.push(obj('A', 4));
+    const b = feed();
+    pump.replace(1n, 5n, { stream: b.stream, requestId: 2n, trackName: 'B' }, 0n);
+    pump.publishDone(1n);
+    await settle();
+    expect(released).toEqual([]);
+    advance(6000);
+    pump.tick();
+    await settle();
+    expect(released).toEqual([[1n, 'drained']]);
+    ac.abort();
+  });
+
   it('B counts streams: two subgroups of one group both have to end', async () => {
     const { pump, a, released, ac } = setup();
     const b = feed();

@@ -266,12 +266,10 @@ export class SourcePump {
       this.#cut(source);
       return;
     }
-    void this.#onFinish(source).then(
-      finished => {
-        if (!finished) this.#cut(source);
-      },
-      () => this.#cut(source),
-    );
+    // false: the library no longer knows the receiver, i.e. it already completed
+    // it and closed its stream, which still delivers what it queued. Not cut: a
+    // route that never ends is cut by tick() (RETIRE_MAX_MS after the decision).
+    void this.#onFinish(source).catch(() => {});
   }
 
   /** Stops piping `source` now (or, if it is not piped yet, as soon as it would be). */
@@ -318,6 +316,16 @@ export class SourcePump {
    */
   tick(): void {
     const now = this.#now();
+    // Safety: a route being piped whose release was decided but whose stream has
+    // not ended (the library could not finish it) is cut after RETIRE_MAX_MS.
+    const head = this.#queue[0];
+    if (
+      head?.releaseDecidedAt !== undefined &&
+      head.releaseReason !== 'cap' &&
+      now - head.releaseDecidedAt >= RETIRE_MAX_MS
+    ) {
+      this.#cut(head);
+    }
     for (const source of this.#queue) {
       if (source.replacedAt === undefined || source.releaseReason !== undefined) continue;
       if (source.publishDoneAt !== undefined) {
