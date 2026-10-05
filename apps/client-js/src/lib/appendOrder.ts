@@ -132,6 +132,31 @@ export class AppendOrder<T> {
   }
 
   /**
+   * The stream is about to continue on another track (a switch lands): the gap is
+   * given up now, as at its deadline, so the held frames of the current track that
+   * can still be appended (from the earliest held keyframe on) go into the buffer
+   * before the new track's init segment; only those before that keyframe are
+   * dropped. Then the order starts afresh (`reset`). Review 2026-10-05: dropping
+   * every held frame at the landing left a hole below the seam (a group held behind
+   * a retransmission when the target's first object arrived).
+   */
+  flush(now: number): OrderAction<T>[] {
+    const out: OrderAction<T>[] = [];
+    if (this.#held.length > 0) {
+      const k = this.#held.findIndex(f => f.isSync);
+      if (k >= 0) {
+        for (const frame of this.#held.splice(0, k)) {
+          out.push({ kind: 'drop', frame, reason: 'abandoned-gap', held: true });
+        }
+        const key = this.#held.shift()!;
+        this.#append(key, true, now, out);
+        this.#drain(now, out);
+      }
+    }
+    return [...out, ...this.reset()];
+  }
+
+  /**
    * The stream continues on another track (a switch landed, a new init segment):
    * the held frames cannot be continued and the next frame starts afresh.
    */
