@@ -47,6 +47,7 @@ export const handlerPublishDone: RequestStreamMessageHandler<PublishDone> = asyn
     return
   }
   holder.expectedStreams = msg.streamCount
-  // Every stream may already have arrived; otherwise the last one to end completes it.
+  // Every stream may already have ended; otherwise the last one to end completes it
+  // (D1: a stream counts once it has ended, not once it has been seen).
   client.completeIfDone(holder)
 }

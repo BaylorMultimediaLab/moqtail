@@ -40,8 +40,11 @@ export class SubscribeRequest implements PromiseLike<SubscribeOk | RequestError>
   subscribeParameters: MessageParameter[]
   earlyDiscardPolicy: EarlyDiscardPolicyConfig | undefined
   largestLocation: Location | undefined // Updated on each received object
+  /** Data streams routed to this subscription (header read). */
   streamsAccepted: bigint = 0n
-  expectedStreams: bigint | undefined // Defined upon SUBSCRIBE_DONE
+  /** Of those, the streams whose ingest has ended (FIN, reset or stopped). */
+  streamsEnded: bigint = 0n
+  expectedStreams: bigint | undefined // Defined upon PUBLISH_DONE
   readonly controller!: ReadableStreamDefaultController<MoqtObject>
   readonly stream: ReadableStream<MoqtObject>
   /**

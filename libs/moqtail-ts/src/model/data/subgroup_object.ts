@@ -64,7 +64,12 @@ export class SubgroupObject {
     // the first object's object id is encoded as is
     // for the subsequent objects, the object id is encoded
     // as the delta to the previous object id
-    let objectIdDelta = previousObjectId ? this.objectId - previousObjectId - BigInt(1) : this.objectId
+    // `previousObjectId` 0n is a real previous id (object 0), not "absent": compare
+    // with undefined, as deserialize does. Object ids within a subgroup increase.
+    if (previousObjectId !== undefined && this.objectId <= previousObjectId) {
+      throw new RangeError(`SubgroupObject.serialize: object id ${this.objectId} does not follow ${previousObjectId}`)
+    }
+    const objectIdDelta = previousObjectId !== undefined ? this.objectId - previousObjectId - BigInt(1) : this.objectId
 
     const buf = new ByteBuffer()
     buf.putVI(objectIdDelta)
@@ -121,6 +126,17 @@ if (import.meta.vitest) {
       expect(parsed.properties).toEqual(properties)
       expect(parsed.payload).toEqual(payload)
       expect(frozen.remaining).toBe(0)
+    })
+    test('object 1 after object 0 round-trips (previous id 0n is not absent)', () => {
+      const payload = new TextEncoder().encode('x')
+      const frozen = SubgroupObject.newWithPayload(1n, null, payload).serialize(0n)
+      const parsed = SubgroupObject.deserialize(frozen, false, 0n)
+      expect(parsed.objectId).toBe(1n)
+    })
+    test('a non-increasing object id is rejected', () => {
+      const payload = new TextEncoder().encode('x')
+      expect(() => SubgroupObject.newWithPayload(3n, null, payload).serialize(3n)).toThrow(RangeError)
+      expect(() => SubgroupObject.newWithPayload(2n, null, payload).serialize(5n)).toThrow(RangeError)
     })
     test('serializes empty properties as absent', () => {
       const objectId = 10n

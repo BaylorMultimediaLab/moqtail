@@ -277,6 +277,12 @@ def measured_warmup(first_group_ts_ms: float | None, spawned_at_s: float) -> flo
         return None
 
 
+def validate_command(out: Path, final: bool, preflight: bool) -> list[str]:
+    """The validator invocation for a finished run."""
+    return ([sys.executable, str(HERE / "validate.py"), str(out)]
+            + (["--final"] if final else []) + (["--preflight"] if preflight else []))
+
+
 def aborted_validation(final: bool) -> dict:
     """validation.json for a run that did not complete; analyze/compare exclude it (M20)."""
     return {"passed": False, "final": final, "failed": ["aborted"], "checks": []}
@@ -870,6 +876,10 @@ def main() -> int:
     ap.add_argument("--label", default="", help="free-text label appended to the run id")
     ap.add_argument("--results", type=Path, default=ROOT / "results")
     ap.add_argument("--no-analyze", action="store_true")
+    ap.add_argument("--preflight", action="store_true",
+                    help="validate with the apparatus invariants of docs/rebuild-2026-10-04.md (Preflight); "
+                         "a run that fails one is invalid. Use with experiments/profiles/preflight_step.json "
+                         "and unshaped.json before any batch")
     ap.add_argument("--final", action="store_true",
                     help="paper-quality run: refuse a dirty worktree up front and validate with --final")
     ap.add_argument("--no-rust-build", action="store_true",
@@ -1235,10 +1245,10 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         print(f"[run] wrote {out / 'run_meta.json'}")
         if not args.no_analyze and exit_code == 0:
             subprocess.run([sys.executable, str(HERE / "analyze.py"), str(out), "--quiet"], check=False)
-            vcmd = [sys.executable, str(HERE / "validate.py"), str(out)] + (["--final"] if args.final else [])
+            vcmd = validate_command(out, args.final, args.preflight)
             print("[run] validation:")
             v = subprocess.run(vcmd, check=False)
-            meta["validity"] = {"passed": v.returncode == 0, "final": args.final}
+            meta["validity"] = {"passed": v.returncode == 0, "final": args.final, "preflight": args.preflight}
             (out / "run_meta.json").write_text(json.dumps(meta, indent=2))
             if v.returncode != 0:
                 print(f"[run] WARNING: validation FAILED; the run is marked invalid (see {out / 'validation.json'})")
