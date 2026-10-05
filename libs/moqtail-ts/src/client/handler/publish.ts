@@ -183,12 +183,15 @@ export const handlerPublish: RequestStreamMessageHandler<Publish> = async (clien
     }
     // SWITCH PR #1378: "If a PUBLISH contains a SWITCH_TRANSITION parameter but no
     // pending SWITCH exists for that target Track, the receiver MUST close
-    // the session with PROTOCOL_VIOLATION." Throwing propagates to the
-    // request-stream loop, which disconnects the session.
-    throw new ProtocolViolationError(
-      'handlerPublish',
-      `PUBLISH for ${switchKey} carries SWITCH_TRANSITION but no SWITCH is pending`,
+    // the session with PROTOCOL_VIOLATION." The request-stream loop only logs a
+    // handler's error, so the session is closed here explicitly.
+    await client.disconnect(
+      new ProtocolViolationError(
+        'handlerPublish',
+        `PUBLISH for ${switchKey} carries SWITCH_TRANSITION but no SWITCH is pending`,
+      ),
     )
+    return
   }
 
   if (isFailure) {

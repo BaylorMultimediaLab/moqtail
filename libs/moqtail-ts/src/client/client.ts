@@ -4014,6 +4014,23 @@ if (import.meta.vitest) {
       expect(pushed).toHaveLength(0)
     })
 
+    // PR #1378: a PUBLISH carrying SWITCH_TRANSITION with no pending SWITCH (and no
+    // tombstone of a switch that hit the local deadline) MUST close the session with
+    // PROTOCOL_VIOLATION. The handler used to throw, which the request-stream loop
+    // only logs, so the session stayed up.
+    it('closes the session on an unsolicited SWITCH_TRANSITION PUBLISH', async () => {
+      const { client, transport } = await connected()
+      const terminated: unknown[] = []
+      client.onSessionTerminated = (reason) => terminated.push(reason)
+      const pushed: unknown[] = []
+      client.onPeerPublish = (msg) => pushed.push(msg)
+      const otherFtn = FullTrackName.tryNew('room/alice', 'video-hi')
+      const answer = transport.openIncomingBiStream()
+      answer.respond(new Publish(13n, otherFtn, 8n, [new Forward(true), new SwitchTransition(6n, 7n)], []))
+      await vi.waitFor(() => expect(terminated).toHaveLength(1))
+      expect(pushed).toHaveLength(0)
+    })
+
     // Transport fairness (C3): the SWITCH carries the subscriber priority and group
     // order on the wire next to the Minimum Switching Group ID; per PR #1378 they are
     // the target PUBLISH's complete parameter set.

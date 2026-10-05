@@ -51,8 +51,10 @@ that matches a live tombstone as a \_late* answer, not an _unsolicited_ one
   exposed to the application.
 
 A SWITCH_TRANSITION PUBLISH with **no** live tombstone remains a
-PROTOCOL_VIOLATION exactly as the spec requires: liberal acceptance is
-deferred by the TTL, never disabled.
+PROTOCOL_VIOLATION exactly as the spec requires: the handler closes the
+session itself (`client.disconnect(ProtocolViolationError)`), because the
+request-stream loop only logs a handler's error and disconnects only on a
+parse failure. Liberal acceptance is deferred by the TTL, never disabled.
 
 **Consequence applications must know (late success).** The relay _completed_
 the switch: Close-After-Switch already terminated the current subscription on
