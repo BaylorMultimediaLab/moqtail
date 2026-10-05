@@ -145,3 +145,20 @@ range ahead of the playhead)`, so the switch lands as close to live as
   PUBLISH opens, with `start_group` = G_switch and the target's live edge;
   `SWITCH_FAILED` carries the failure kind and status code. The shared record
   schema is in `docs/measurement-schema.md`.
+
+## Rebuild changes (2026-10-04, audit C3, M5, M6)
+
+Each entry names the behaviour as it is now; the audit ids are in the commit
+messages.
+
+- **Attach before terminate (P4).** Once the publish claim is won the relay
+  attaches the target subscription first (it forwards nothing until its
+  PUBLISH is out: `mark_alias_announced`), then bounds the source at
+  `G_switch - 1`, sends PUBLISH_DONE(SUBSCRIPTION_ENDED) on the source's
+  request stream and ends it (Close-After-Switch:
+  `switch_delivery::hand_over_to_target`). A target that cannot be attached
+  (the connection already holds a subscription on it, which includes a SWITCH
+  to the current track) is answered with the PublishBuildFailed failure PUBLISH
+  and the source is untouched, as the PR's failure discipline requires. The
+  former undo path (restoring the source's end group after it had already been
+  torn down) is gone.

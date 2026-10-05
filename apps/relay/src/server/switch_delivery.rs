@@ -434,15 +434,10 @@ pub(crate) async fn poll_select_switch_group(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SeamBoundUndo {
-  pub prior_end_group: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DrainOutcome {
   /// All source Objects in Groups below `g_switch` were delivered. The source
   /// is NOT yet bounded at the seam: the caller must first win the publish
-  /// claim and only then apply the bound via [`apply_seam_bound`].
+  /// claim and attach the target; [`hand_over_to_target`] then applies the bound.
   Drained,
   /// The drain did not finish within the T_switch deadline; the source is left
   /// unchanged and the caller aborts with TIMEOUT.
@@ -510,47 +505,26 @@ pub(crate) async fn drain_source_below(
 }
 
 /// Bound the source at the seam so it does not forward Groups >= G_switch
-/// concurrently with the target before teardown.
+/// concurrently with the target before teardown. Applied only after the target
+/// is attached (`hand_over_to_target`), so it is never undone.
 pub(crate) async fn apply_seam_bound(
   current_track: &Arc<RwLock<Track>>,
   connection_id: usize,
   g_switch: u64,
-) -> Option<SeamBoundUndo> {
-  let bound = seam_end_group_bound(g_switch)?;
-  let sub_arc = current_track
-    .read()
-    .await
-    .get_subscription(connection_id)
-    .await?;
-  let prior_end_group = {
-    let sub = sub_arc.read().await;
-    let mut state = sub.subscription_state.write().await;
-    let prior = state.end_group;
-    state.end_group = Some(bound);
-    prior
-  };
-  Some(SeamBoundUndo { prior_end_group })
-}
-
-pub(crate) async fn restore_source_end_group(
-  current_track: &Arc<RwLock<Track>>,
-  connection_id: usize,
-  prior_end_group: Option<u64>,
 ) {
-  if let Some(sub_arc) = current_track
+  let Some(bound) = seam_end_group_bound(g_switch) else {
+    return;
+  };
+  let Some(sub_arc) = current_track
     .read()
     .await
     .get_subscription(connection_id)
     .await
-  {
-    sub_arc
-      .read()
-      .await
-      .subscription_state
-      .write()
-      .await
-      .end_group = prior_end_group;
-  }
+  else {
+    return;
+  };
+  let sub = sub_arc.read().await;
+  sub.subscription_state.write().await.end_group = Some(bound);
 }
 
 /// Close-After-Switch: drop the relay's state for the replaced subscription
@@ -625,6 +599,63 @@ pub(crate) async fn terminate_source(
     // Streams at/above the seam are reset; streams below it finish and deliver.
     sub.cancel_from_group(g_switch).await;
   }
+}
+
+/// Attaches the target subscription for `live_sub` to `target_track`. `None`
+/// when it cannot be attached (the connection already holds a subscription on
+/// the target). The attached subscription forwards nothing until its PUBLISH
+/// has gone out (`mark_alias_announced` in `forward_publish_downstream`).
+pub(crate) async fn attach_switch_target(
+  subscriber: &Arc<MOQTClient>,
+  target_track: &Arc<RwLock<Track>>,
+  live_sub: Subscribe,
+) -> Option<Arc<RwLock<Subscription>>> {
+  let track = target_track.read().await;
+  match track
+    .add_subscription(subscriber.clone(), live_sub, false)
+    .await
+  {
+    Ok(subscription) => {
+      subscriber
+        .subscriptions
+        .add_subscription(track.full_track_name.clone(), Arc::downgrade(&subscription))
+        .await;
+      Some(subscription)
+    }
+    Err(_) => None,
+  }
+}
+
+/// The hand-over from the source to the target once the publish claim is won,
+/// attach first (audit M6): the target subscription is attached, then the source
+/// is bounded at the seam and ended (Close-After-Switch). `None` = the target
+/// could not be attached; nothing has touched the source then, so the
+/// PublishBuildFailed answer's "current subscription untouched" holds.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn hand_over_to_target(
+  subscriber: &Arc<MOQTClient>,
+  target_track: &Arc<RwLock<Track>>,
+  live_sub: Subscribe,
+  current_track: &Arc<RwLock<Track>>,
+  current_full_track_name: &FullTrackName,
+  current_sub_req_id: u64,
+  g_switch: u64,
+) -> Option<Arc<RwLock<Subscription>>> {
+  let connection_id = subscriber.connection_id;
+  let subscription = attach_switch_target(subscriber, target_track, live_sub).await?;
+  // Bound the source at the seam so it forwards no Group >= G_switch while it
+  // is being ended, then end it.
+  apply_seam_bound(current_track, connection_id, g_switch).await;
+  terminate_source(
+    subscriber,
+    current_track,
+    current_full_track_name,
+    connection_id,
+    current_sub_req_id,
+    g_switch,
+  )
+  .await;
+  Some(subscription)
 }
 
 /// The publisher priority the relay assumes for a track's objects; kept so the
@@ -790,5 +821,101 @@ mod tests_switch_seam_helpers {
       "AbsoluteStart must set is_joining so the cache replay covers the \
        already-received head of the start group"
     );
+  }
+}
+
+/// P4 (audit M6): the hand-over attaches the target before it ends the source,
+/// so a target that cannot be attached leaves the source exactly as it was.
+#[cfg(test)]
+mod tests_switch_hand_over {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, quic_pair, relay_client, subscribe, test_track,
+  };
+
+  fn latest(request_id: u64, track: &str) -> Subscribe {
+    Subscribe::new_latest_object(
+      request_id,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8(track),
+      vec![MessageParameter::new_forward(true)],
+    )
+  }
+
+  fn live_sub(request_id: u64) -> Subscribe {
+    build_switch_live_sub(
+      request_id,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      4,
+      6,
+      vec![],
+    )
+  }
+
+  #[tokio::test]
+  async fn a_target_that_cannot_be_attached_leaves_the_source_untouched() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(61, server);
+    let current = Arc::new(RwLock::new(test_track(1, "video-360p")));
+    let target = Arc::new(RwLock::new(test_track(2, "video-720p")));
+    subscribe(
+      &*current.read().await,
+      &client,
+      latest(1, "video-360p"),
+      false,
+    )
+    .await;
+    // The connection already holds the target track: the attach fails.
+    subscribe(
+      &*target.read().await,
+      &client,
+      latest(3, "video-720p"),
+      false,
+    )
+    .await;
+    let name = current.read().await.full_track_name.clone();
+
+    let out = hand_over_to_target(&client, &target, live_sub(5), &current, &name, 1, 4).await;
+
+    assert!(out.is_none(), "the attach must fail");
+    let source = current
+      .read()
+      .await
+      .get_subscription(61)
+      .await
+      .expect("the source must still be attached");
+    let source = source.read().await;
+    assert!(!source.is_finished().await, "the source must not be ended");
+    assert_eq!(
+      source.subscription_state.read().await.end_group,
+      None,
+      "the source must not be bounded at the seam"
+    );
+    assert!(client.subscriptions.get_subscription(&name).await.is_some());
+  }
+
+  #[tokio::test]
+  async fn a_hand_over_attaches_the_target_and_ends_the_source() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(62, server);
+    let current = Arc::new(RwLock::new(test_track(1, "video-360p")));
+    let target = Arc::new(RwLock::new(test_track(2, "video-720p")));
+    let source = subscribe(
+      &*current.read().await,
+      &client,
+      latest(1, "video-360p"),
+      false,
+    )
+    .await;
+    let name = current.read().await.full_track_name.clone();
+
+    let out = hand_over_to_target(&client, &target, live_sub(5), &current, &name, 1, 4).await;
+
+    let attached = out.expect("the target must be attached");
+    assert_eq!(attached.read().await.request_id, 5);
+    assert!(target.read().await.get_subscription(62).await.is_some());
+    assert!(current.read().await.get_subscription(62).await.is_none());
+    assert!(source.read().await.is_finished().await);
   }
 }

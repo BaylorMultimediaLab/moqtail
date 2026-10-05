@@ -1549,10 +1549,10 @@ async fn handle_switch_message(
   // reports via PUBLISH_DONE, leaving the current subscription untouched on
   // failure -- no ProtocolViolation disconnect.
   use crate::server::switch_delivery::{
-    DrainOutcome, SeamBoundUndo, SelectOutcome, apply_seam_bound, build_switch_live_sub,
-    drain_source_below, poll_select_switch_group, restore_source_end_group, send_switch_failure,
-    send_switch_publish, spawn_switch_catchup_stream, switch_catchup_priority,
-    switch_subscriber_priority, switch_target_parameters, terminate_source,
+    DrainOutcome, SelectOutcome, build_switch_live_sub, drain_source_below, hand_over_to_target,
+    poll_select_switch_group, send_switch_failure, send_switch_publish,
+    spawn_switch_catchup_stream, switch_catchup_priority, switch_subscriber_priority,
+    switch_target_parameters,
   };
   use crate::server::switch_guard::{AdmitResult, ClaimResult, SwitchFailure};
   use moqtail::model::parameter::switch_transition::SwitchTransition;
@@ -1865,11 +1865,7 @@ async fn handle_switch_message(
       }
     }
 
-    // (1c) Claim won: bound the source at the seam so it does not forward
-    // Groups >= G_switch concurrently with the target before teardown.
-    let drain_undo = apply_seam_bound(&current_track_arc, connection_id, g_switch).await;
-
-    // (1d) Re-read the target's live edge NOW -- the draft pins
+    // (1c) Re-read the target's live edge NOW -- the draft pins
     // SWITCH_TRANSITION's Live Edge Group ID to the live edge "at the time the
     // PUBLISH is opened". largest_location is monotonic, so it is >= the
     // selection-time snapshot and g_switch <= live edge holds.
@@ -1892,38 +1888,28 @@ async fn handle_switch_message(
       target_parameters.clone(),
     );
 
-    // (3) Close-After-Switch: terminate the source with PUBLISH_DONE on the
-    // current Request ID and drop relay state.
-    terminate_source(
+    // (3) Attach the target, then Close-After-Switch (audit M6, attach before
+    // terminate): the target subscription is attached first (it forwards nothing
+    // until its PUBLISH is out), then the source is bounded at the seam, ended
+    // with PUBLISH_DONE(SUBSCRIPTION_ENDED) on its request stream and dropped. A
+    // target that cannot be attached is answered PublishBuildFailed with the
+    // source untouched.
+    let catchup_priority = switch_catchup_priority(subscriber_priority);
+    let Some(subscription) = hand_over_to_target(
       &client,
+      &target_track_arc,
+      live_sub.clone(),
       &current_track_arc,
       &current_full_track_name,
-      connection_id,
       current_sub_req_id,
       g_switch,
     )
-    .await;
-
-    // (4) Attach the live subscription on the target Track (objects from the
-    // live edge onward, on SUBGROUP streams) + relay-side request mapping. The
-    // catch-up stream's priority sits above every live group of the target.
-    let catchup_priority = switch_catchup_priority(subscriber_priority);
-    let subscription = {
-      let target_track = target_track_arc.read().await;
-      if !add_subscription(live_sub.clone(), &target_track, client.clone(), false).await {
-        error!(
-          "switch: could not attach the target subscription for {:?}",
-          target_full_track_name
-        );
-      }
-      target_track.get_subscription(connection_id).await
-    };
-    let Some(subscription) = subscription else {
-      // The seam bound on the (already terminated) source is moot; report the
-      // failure so the subscriber does not wait for a PUBLISH that never comes.
-      if let Some(SeamBoundUndo { prior_end_group }) = drain_undo {
-        restore_source_end_group(&current_track_arc, connection_id, prior_end_group).await;
-      }
+    .await
+    else {
+      error!(
+        "switch: could not attach the target subscription for {:?}; source untouched",
+        target_full_track_name
+      );
       send_switch_failure(
         &client,
         target_request_id,
@@ -1956,7 +1942,7 @@ async fn handle_switch_message(
     // PUBLISH-created track's publisher may need to be told to forward.
     super::publish_handler::ensure_upstream_forwarding(&target_track_arc, &context).await;
 
-    // (5) Open the target PUBLISH on its own request stream, carrying
+    // (4) Open the target PUBLISH on its own request stream, carrying
     // SWITCH_TRANSITION { G_switch, live edge }. The subscription's alias is
     // announced by that PUBLISH, so live forwarding starts once it is out.
     send_switch_publish(
@@ -1972,7 +1958,7 @@ async fn handle_switch_message(
     )
     .await;
 
-    // (6) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
+    // (5) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
     spawn_switch_catchup_stream(
       client.clone(),
       target_track_arc.clone(),
@@ -1982,7 +1968,7 @@ async fn handle_switch_message(
       catchup_priority,
     );
 
-    // (7) Release the in-flight guard.
+    // (6) Release the in-flight guard.
     client
       .switch_in_flight
       .lock()
