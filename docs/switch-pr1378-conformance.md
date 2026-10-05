@@ -187,31 +187,67 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   `SWITCH_ERROR.failure` names which, from the relay's reason phrase
   (`switch: <kind>`), and `ClientTimeout` marks the library's own response
   deadline (no relay answer at all).
-- **The replaced subscription is read until it is done (P1, audit M5).** The
-  PR has the relay deliver every current-track object below G_switch before
-  PUBLISH_DONE(SUBSCRIPTION_ENDED); the player used to stop reading the old
-  subscription at SWITCH_OK, so those objects crossed the link and were never
-  used. The player now queues the target PUBLISH's stream behind the old one
-  (`apps/client-js/src/lib/switchSources.ts`) and keeps feeding the old one to
-  the write handler until its stream closes (the library completes it once
-  PUBLISH_DONE's stream count is met), or, after its PUBLISH_DONE, until no
-  object has come from it for 300 ms (streams the relay reset at or above the
-  seam may never reach the client, so the count is not always met), or 6 s
-  after SWITCH_OK without a PUBLISH_DONE. It then releases the old receiver
-  (`unsubscribe`), so late streams take the library's unrouted path
-  (STOP_SENDING, `DROP_STALE{unrouted}`). The switch therefore lands after the
-  old track's tail, in play order. `SWITCH_SOURCE_RELEASED` records each
-  release. `onPeerPublishDone` now names the request id of the subscription
-  the PUBLISH_DONE ends.
+- **The replaced subscription is read until it is done (P1, audit M5; review
+  R6 D1-D3).** The PR has the relay deliver every current-track object below
+  G_switch before PUBLISH_DONE(SUBSCRIPTION_ENDED); the player used to stop
+  reading the old subscription at SWITCH_OK, so those objects crossed the link
+  and were never used. The player now queues the target PUBLISH's stream behind
+  the old one (`apps/client-js/src/lib/switchSources.ts`) and keeps feeding the
+  old one to the write handler until it is done, structurally:
+
+  > Done(S) ⇔ PUBLISH_DONE(S) received ∧ G_switch known (SWITCH_OK) ∧ B of S's
+  > data streams below G_switch have ended (FIN or reset) ∧ S's own catch-up
+  > stream has ended (if S was itself a switch target with one).
+
+  B comes from the relay (the project-local SWITCH_TRANSITION field below).
+  Ended streams are a subset of the seen ones, which are a subset of the B the
+  relay opened, so "B ended" means every below-seam stream was seen and ended.
+  The library reports each routed stream's end (`onDataStreamEnded`) after its
+  last object is queued; on Done the player calls `finishReceiver`, which stops
+  (STOP_SENDING) S's streams still open (at or above the seam), releases its
+  alias route (late streams take the unrouted path, `DROP_STALE{unrouted}`) and
+  closes S's object stream after the objects already queued, so nothing below
+  the seam is lost; S is then released as `drained` and unsubscribed. The switch
+  therefore lands right after the old track's tail, in play order. Fallbacks:
+  `drain-timeout`, when B is absent (a relay without the field) or Done is not
+  reached (a below-seam stream reset upstream before its header never shows
+  up), 2 s after the later of PUBLISH_DONE, SWITCH_OK and the last below-seam
+  object or stream end; `cap`, 6 s after SWITCH_OK without a PUBLISH_DONE. A
+  PUBLISH_DONE before SWITCH_OK waits for it; B = 0 is done at PUBLISH_DONE. A
+  route whose stream ends while the SWITCH replacing it is still unanswered
+  (common at the live edge: the library completes it at its PUBLISH_DONE, which
+  precedes the target PUBLISH) is reported as `closed-before-ok` with that
+  switch's seq. Failed, late-success and superseded switches never set G_switch
+  on a route and keep their release paths. This replaced a 300 ms quiet period
+  after PUBLISH_DONE, which delayed about 40 % of time-shifted landings by
+  150-250 ms (and with them the controller's guard release) and could release
+  before a below-seam tail held up by loss. `SWITCH_SOURCE_RELEASED` records
+  each release with its reason and B. `onPeerPublishDone` names the request id
+  of the subscription the PUBLISH_DONE ends.
+
+  The library completes a receiver on its own once PUBLISH_DONE's Stream Count
+  of its streams have **ended** and none routed to it is still open (D1: it used
+  to count accepted streams, and a PUBLISH_DONE that overtook the tail of a
+  still-open stream closed the receiver and lost the tail; probes were exposed
+  too, the relay sends a probe's PUBLISH_DONE right after SUBSCRIBE_OK). For a
+  replaced subscription that is often never reached, which is why Done above
+  uses B, not the Stream Count.
+
 - **Old-track objects at or above G_switch are dropped once it is known (P2,
-  audit M6).** From SWITCH_OK (which carries SWITCH_TRANSITION) the write
-  handler drops every object of the replaced subscription with group >=
-  G_switch as `DROP_STALE{reason: post-seam}`: the target's catch-up delivers
-  that span on the new track, and appending both put two representations in
-  one span of the SourceBuffer. An old-track object at or above G_switch that
-  reached the write handler before SWITCH_OK cannot be recognised and is still
-  appended (residual): the source keeps forwarding while selection waits and
-  is bounded at the seam only at the hand-over.
+  audit M6; review R6 D5).** From SWITCH_OK (which carries SWITCH_TRANSITION)
+  the write handler drops every object of the replaced subscription with group
+  > = G_switch as `DROP_STALE{reason: post-seam}`: the target's catch-up delivers
+  > that span on the new track, and appending both put two representations in
+  > one span of the SourceBuffer. Before SWITCH_OK only the floor the player sent
+  > is known (G_switch >= floor; the source keeps forwarding while selection
+  > waits and is bounded at the seam only at the hand-over), so objects of the
+  > replaced route with group >= floor are held, in arrival order, until the
+  > answer: SWITCH_OK appends those below G_switch and drops the rest
+  > (`DROP_STALE{post-seam, held: true}`); a failure or refusal appends them all.
+  > The hold is bounded by 4 MiB and by T_switch (3 s); a tripped bound appends
+  > everything held and is logged. `SWITCH_HOLD_RELEASED` records each hold that
+  > held something. (Until R6 these objects were appended, 1-3 frames in
+  > practice, biasing `media_seam_gap_ms` by -42..-125 ms.)
 - **PUBLISH_DONE for the replaced subscription (P5, audit M6).** The player
   handles every PUBLISH_DONE on a video subscription (`handlePublishDone`):
   for the subscription a SWITCH replaces it starts that route's release (P1)
@@ -244,3 +280,51 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   the replaced subscription's request id, and summarises the floor
   (`switches.floor`), failures by kind (`switches.failures`) and the data
   routes (`switch_routes`).
+
+## Review R6 notes (2026-10-04)
+
+- **Deviation, deliberate: a project-local third SWITCH_TRANSITION field.** The
+  PR's SWITCH_TRANSITION value is `{Switching Group ID (i), Live Edge Group ID
+(i)}`. This relay appends `Below-Seam Streams (i)` (B): the number of SUBGROUP
+  data streams it opened on the replaced subscription for Groups below G_switch,
+  finished, reset and open ones alike, read at the hand-over once the source is
+  ended (`Subscription::opened_streams_below`, a per-group open counter that is
+  kept for the subscription's lifetime; `send_stream_last_object_ids` forgets a
+  stream once it ends). Encoding: the varints back to back in the bytes-valued
+  parameter `0x73`; a two-varint value (the PR's form, and this project's before
+  R6) still decodes in both libraries, with B absent, and the player then falls
+  back to `drain-timeout`; anything after the third varint is malformed. The
+  failure PUBLISH still carries `{0, 0}` without B. B is also on
+  `SWITCH_PROMOTED.below_seam_streams`. PUBLISH_DONE's Stream Count is left
+  exactly as the spec defines it.
+- **"Delivered" before PUBLISH_DONE means written to QUIC.** The PR has the
+  relay deliver every object below G_switch before PUBLISH_DONE. The relay's
+  drain (`drain_source_below`) waits until the source's last sent location (which
+  advances only on a successful write) reaches the last object below the seam it
+  holds, i.e. until every such object has been written to its QUIC stream, not
+  until the subscriber has received it. PUBLISH_DONE can therefore overtake the
+  tail of a below-seam stream on the wire; the subscriber side (D1 above) waits
+  for the streams to end rather than for the message.
+- **PUBLISH_DONE Stream Count includes streams reset before their first byte.**
+  The count is incremented when the relay opens a stream (the header is queued
+  with it). Close-After-Switch resets the source's streams at or above the seam
+  right after PUBLISH_DONE; a reset stream whose header had not left yet never
+  reaches the subscriber, yet it is counted. That is spec-exact (the publisher
+  opened it) and is why the player's release uses B, not the Stream Count.
+- **Gap: cancelling a pushed current subscription does not reach the cancel
+  race.** The PR's cancel race (the subscriber cancels the Current Subscribe
+  Request ID while a SWITCH is in flight: the relay abandons the switch) is
+  implemented in `cancel_subscription`, which the session calls when a
+  SUBSCRIBE's request stream is closed or reset. The request stream of a PUBLISH
+  the relay pushed (a switch target, now the current subscription) is served by
+  `forward_publish_downstream` (`message_handlers/publish_handler.rs`), whose
+  read loop ends on `Err(_) => break` without calling `cancel_subscription`:
+  resetting it neither abandons an in-flight SWITCH nor tears the subscription
+  down (it forwards until the connection closes). No effect in the experiments,
+  checked against every `unsubscribe` call in `apps/client-js/src/lib/player.ts`
+  and the library: the player cancels a pushed subscription only (a) as a
+  replaced route after its switch succeeded, when the relay has already ended
+  it (Close-After-Switch), (b) at dispose, followed at once by the session's
+  disconnect, and (c) in the library's late-success path, for a target the
+  player never adopted and so never names in a SWITCH. It never cancels a pushed
+  current subscription while a SWITCH could be in flight on it.
