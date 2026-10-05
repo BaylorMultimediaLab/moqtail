@@ -99,6 +99,11 @@ pub type SendStreamList = Vec<SendStreamLock>;
 
 // Per-request response channels, sharded like the send-stream map so a
 // register/lookup only locks one partition.
+/// Resolves when the peer has acknowledged a FIN'd stream (`Ok`), stopped it, or the
+/// connection failed ([`TransportSendStream::finish_detached`]).
+pub type FinishAck =
+  std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TransportWriteError>> + Send>>;
+
 pub type ResponseSenderMap = HashMap<u64, mpsc::UnboundedSender<ControlMessage>>;
 pub type ResponseSenderList = Vec<Arc<RwLock<ResponseSenderMap>>>;
 
@@ -421,38 +426,46 @@ impl MOQTClient {
     Ok(send_stream.clone())
   }
 
-  // Remove the stream from the map and finish it
-  // if the stream is found, return true, else false
-  pub async fn close_stream(&self, stream_id: &StreamId) -> Result<bool> {
-    let stream = self.remove_stream_by_stream_id(stream_id).await;
-
-    if let Some(send_stream) = stream {
-      // gracefully close the stream
-      let mut stream = send_stream.lock().await;
-
-      // gracefully close the stream
-      // No new data may be written after calling this method.
-      // Completes when the peer has acknowledged all sent data, retransmitting data as needed.
-      stream
-        .finish()
-        .await
-        .map_err(|e| {
-          error!(
-            "close_stream | Failed to finish send stream ({}): {:?} connection_id: {}",
-            stream_id, e, self.connection_id
-          );
-          anyhow::anyhow!("Failed to finish send stream ({}): {:?}", stream_id, e)
-        })
-        .map(|_| true)
-    } else {
-      // it is possible that no stream was created for this stream id
-      // because the subscription can be in no forwarding state
+  /// Removes the stream from the send-stream map and sends FIN without waiting for
+  /// the peer. Returns the stream, which can still be reset until the peer has
+  /// acknowledged it, and the future that resolves on that acknowledgement
+  /// ([`TransportSendStream::finish_detached`]); `None` when no stream is open under
+  /// this id (the subscription may never have forwarded on it).
+  pub async fn begin_close_stream(
+    &self,
+    stream_id: &StreamId,
+  ) -> Result<Option<(Arc<Mutex<TransportSendStream>>, FinishAck)>> {
+    let Some(send_stream) = self.remove_stream_by_stream_id(stream_id).await else {
       debug!(
         "close_stream | Send stream not found for {} connection_id: {}",
         stream_id, self.connection_id
       );
-      Ok(false)
-    }
+      return Ok(None);
+    };
+    let ack = send_stream.lock().await.finish_detached().map_err(|e| {
+      error!(
+        "close_stream | Failed to finish send stream ({}): {:?} connection_id: {}",
+        stream_id, e, self.connection_id
+      );
+      anyhow::anyhow!("Failed to finish send stream ({}): {:?}", stream_id, e)
+    })?;
+    Ok(Some((send_stream, Box::pin(ack))))
+  }
+
+  /// Removes the stream from the map, sends FIN and waits until the peer has
+  /// acknowledged everything. `Ok(true)` when the stream was found, `Ok(false)` when
+  /// none was open under this id.
+  pub async fn close_stream(&self, stream_id: &StreamId) -> Result<bool> {
+    let Some((_stream, ack)) = self.begin_close_stream(stream_id).await? else {
+      return Ok(false);
+    };
+    ack.await.map(|_| true).map_err(|e| {
+      error!(
+        "close_stream | Failed to finish send stream ({}): {:?} connection_id: {}",
+        stream_id, e, self.connection_id
+      );
+      anyhow::anyhow!("Failed to finish send stream ({}): {:?}", stream_id, e)
+    })
   }
 
   // Just remove the stream from the stream_map

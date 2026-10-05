@@ -208,6 +208,34 @@ impl TransportSendStream {
     }
   }
 
+  /// Sends FIN without waiting for the peer, and returns a future that resolves once
+  /// the peer has acknowledged everything (`Ok`), stopped the stream
+  /// (`Err(ClosedOrStopped)`), or the connection failed (`Err(Other)`). Until that
+  /// future resolves the stream can still be [`reset`](Self::reset): a reset after FIN
+  /// abandons whatever has not been sent yet. [`finish`](Self::finish) holds the
+  /// stream until the acknowledgement, so a finished stream's queued bytes were
+  /// delivered however stale they had become.
+  pub fn finish_detached(
+    &mut self,
+  ) -> Result<
+    impl std::future::Future<Output = Result<(), TransportWriteError>> + Send + 'static,
+    TransportWriteError,
+  > {
+    let quic: &mut quinn::SendStream = match self {
+      Self::WebTransport(s) => s.quic_stream_mut(),
+      Self::Quic(s) | Self::WebTransportPrioritised(s) => s,
+    };
+    quic.finish().map_err(TransportWriteError::from)?;
+    let stopped = quic.stopped();
+    Ok(async move {
+      match stopped.await {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(TransportWriteError::ClosedOrStopped),
+        Err(e) => Err(TransportWriteError::Other(format!("{e:?}"))),
+      }
+    })
+  }
+
   pub async fn flush(&mut self) -> Result<(), TransportWriteError> {
     let result = match self {
       Self::WebTransport(s) => s.flush().await,
