@@ -36,7 +36,6 @@ use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::publish::Publish;
 use moqtail::model::control::publish_done::PublishDone;
 use moqtail::model::control::subscribe::Subscribe;
-use moqtail::model::data::constant::DEFAULT_PUBLISHER_PRIORITY;
 use moqtail::model::data::fetch_header::FetchHeader;
 use moqtail::model::data::fetch_object::{FetchObject, FetchObjectContext};
 use moqtail::model::data::full_track_name::FullTrackName;
@@ -58,38 +57,67 @@ use crate::server::track_cache::CacheConsumeEvent;
 
 const SWITCH_DRAIN_POLL: Duration = Duration::from_millis(50);
 
-/// QUIC send priority for the catch-up FETCH_HEADER stream. Subgroup streams
-/// are scheduled in per-(subscriber priority, publisher priority) bands with
-/// lower group ids ranking higher (`compute_stream_priority`); the catch-up
-/// range precedes every live group of the target, so it takes the top of the
-/// highest publisher band for this subscriber -- the draft's SHOULD that the
-/// catch-up outrank the target's concurrent SUBGROUP streams.
-pub(crate) fn switch_catchup_priority(subscriber_priority: u8) -> i32 {
-  compute_stream_priority(subscriber_priority, 0, GroupOrder::Ascending, 0)
+/// QUIC send priority for the catch-up FETCH_HEADER stream (audit M6, R3-D2):
+/// the slot a subgroup stream of group `g_switch` gets in the switch's own band,
+/// `compute_stream_priority(subscriber priority, publisher priority at G_switch,
+/// group order, G_switch)`, the same rule as every FETCH response stream
+/// (`fetch_handler::fetch_stream_priority`). With ascending order that is above
+/// every live group of the target (all >= the live edge > G_switch: the draft's
+/// SHOULD that the catch-up outrank the target's concurrent SUBGROUP streams) and
+/// below the replaced subscription's streams of groups < G_switch, which play
+/// first. It used to take the top of the publisher-0 band, above that remainder,
+/// which inverted play order.
+pub(crate) fn switch_catchup_priority(
+  subscriber_priority: u8,
+  group_order: GroupOrder,
+  publisher_priority: u8,
+  g_switch: u64,
+) -> i32 {
+  compute_stream_priority(
+    subscriber_priority,
+    publisher_priority,
+    group_order,
+    g_switch,
+  )
 }
 
-/// The subscriber priority a switch's target subscription runs at: the SWITCH's
-/// own SUBSCRIBER_PRIORITY parameter, else the protocol default.
-pub(crate) fn switch_subscriber_priority(params: &[MessageParameter]) -> u8 {
-  params
+/// The subscriber priority and group order a switch runs at (audit C3/M6): the
+/// SWITCH's own SUBSCRIBER_PRIORITY and GROUP_ORDER parameters, else those of the
+/// subscription it replaces (as the native arm's switched subscription does).
+pub(crate) fn switch_scheduling(
+  params: &[MessageParameter],
+  inherited: (u8, GroupOrder),
+) -> (u8, GroupOrder) {
+  let priority = params
     .iter()
     .find_map(|p| match p {
       MessageParameter::SubscriberPriority { priority } => Some(*priority),
       _ => None,
     })
-    .unwrap_or(128)
+    .unwrap_or(inherited.0);
+  let order = params
+    .iter()
+    .find_map(|p| match p {
+      MessageParameter::GroupOrder { order } => Some(*order),
+      _ => None,
+    })
+    .unwrap_or(inherited.1);
+  (priority, order)
 }
 
 /// Deserialize a SWITCH's raw parameter list into typed message parameters,
 /// dropping anything unknown: per SWITCH PR #1378 this set IS the complete
-/// parameter set for the target PUBLISH (nothing is inherited from the current
-/// subscription), and the transport-level fields the relay owns (Forward,
-/// LargestObject, the SubscriptionFilter, SWITCH_TRANSITION) are restated by the
-/// relay below, never taken from the subscriber.
+/// parameter set for the target PUBLISH, and the transport-level fields the relay
+/// owns (Forward, LargestObject, the SubscriptionFilter, SWITCH_TRANSITION) are
+/// restated by the relay below, never taken from the subscriber. Subscriber
+/// priority and group order are the one exception (see `switch_scheduling`): a
+/// SWITCH that omits them runs at the replaced subscription's, so the target
+/// subscription and its catch-up stay in the source's band.
 pub(crate) fn switch_target_parameters(
   raw: &[moqtail::model::common::pair::KeyValuePair],
+  inherited: (u8, GroupOrder),
 ) -> Vec<MessageParameter> {
-  raw
+  let mut params: Vec<MessageParameter> = raw
     .iter()
     .filter_map(|kvp| MessageParameter::deserialize(kvp).ok())
     .filter(|p| {
@@ -101,7 +129,26 @@ pub(crate) fn switch_target_parameters(
           | MessageParameter::SwitchTransition { .. }
       )
     })
-    .collect()
+    .collect();
+  let (priority, order) = switch_scheduling(&params, inherited);
+  params.set_param(MessageParameter::new_subscriber_priority(priority));
+  params.set_param(MessageParameter::new_group_order(order));
+  params
+}
+
+/// The request stream a switch-failure PUBLISH goes out on, opened at
+/// `CONTROL_STREAM_PRIORITY` before its first byte like every request stream the
+/// relay opens (R3-D2, R3-D6).
+pub(crate) async fn open_switch_failure_stream(
+  subscriber: &MOQTClient,
+) -> Result<
+  (
+    moqtail::transport::connection::TransportSendStream,
+    moqtail::transport::connection::TransportRecvStream,
+  ),
+  moqtail::transport::connection::TransportConnectionError,
+> {
+  subscriber.connection.open_request_stream().await
 }
 
 /// Open the target PUBLISH toward the subscriber on its own request stream and
@@ -202,7 +249,7 @@ pub(crate) async fn send_switch_failure(
     .unwrap_or_else(|_| ReasonPhrase::try_new(String::new()).unwrap());
   let done = PublishDone::new(failure.status_code(), 0, reason);
 
-  let (send, recv) = match subscriber.connection.open_bi().await {
+  let (send, recv) = match open_switch_failure_stream(subscriber).await {
     Ok(streams) => streams,
     Err(e) => {
       error!("switch failure: could not open a request stream toward the subscriber: {e:?}");
@@ -658,11 +705,6 @@ pub(crate) async fn hand_over_to_target(
   Some(subscription)
 }
 
-/// The publisher priority the relay assumes for a track's objects; kept so the
-/// catch-up priority doc above has a single source of truth for the default.
-#[allow(dead_code)]
-pub(crate) const CATCHUP_DEFAULT_PUBLISHER_PRIORITY: u8 = DEFAULT_PUBLISHER_PRIORITY;
-
 #[cfg(test)]
 mod tests_switch_seam_helpers {
   use super::*;
@@ -754,15 +796,12 @@ mod tests_switch_seam_helpers {
 
   #[test]
   fn catchup_priority_outranks_every_live_group_of_the_target() {
-    // The live subgroup streams of the target sit in the (sub, pub) band with
-    // group ids >= 0; the catch-up takes the top of the pub=0 band, which is
-    // at or above every band value a live stream can get.
+    // The target's live subgroup streams carry groups >= the live edge > G_switch,
+    // in the same (sub, pub) band.
     for pub_prio in [0u8, 1, 4, 128, 255] {
-      for group in [0u64, 1, 100, 65_535] {
-        assert!(
-          switch_catchup_priority(128)
-            >= compute_stream_priority(128, pub_prio, GroupOrder::Ascending, group)
-        );
+      let catchup = switch_catchup_priority(0, GroupOrder::Ascending, pub_prio, 10);
+      for group in [11u64, 12, 100, 65_535] {
+        assert!(catchup > compute_stream_priority(0, pub_prio, GroupOrder::Ascending, group));
       }
     }
   }
@@ -772,7 +811,42 @@ mod tests_switch_seam_helpers {
     // A higher-priority subscriber (lower value) keeps outranking the
     // catch-up of a lower-priority one.
     assert!(
-      compute_stream_priority(0, 255, GroupOrder::Ascending, 65_535) > switch_catchup_priority(128)
+      compute_stream_priority(0, 255, GroupOrder::Ascending, 65_535)
+        > switch_catchup_priority(128, GroupOrder::Ascending, 0, 0)
+    );
+  }
+
+  /// P3 (audit M6): the catch-up [G_switch, live_edge) plays after the source's
+  /// groups below G_switch, so the source remainder (same subscriber band after
+  /// C3, uniform publisher priority) must outrank it.
+  #[test]
+  fn catchup_ranks_below_the_source_remainder_and_above_the_target_live_groups() {
+    let (sub, publisher, g_switch, live_edge) = (0u8, 128u8, 10u64, 12u64);
+    let catchup = switch_catchup_priority(sub, GroupOrder::Ascending, publisher, g_switch);
+    assert!(
+      catchup < compute_stream_priority(sub, publisher, GroupOrder::Ascending, g_switch - 1),
+      "the source's group below the seam must go first"
+    );
+    assert!(catchup > compute_stream_priority(sub, publisher, GroupOrder::Ascending, live_edge));
+    assert_eq!(
+      catchup,
+      compute_stream_priority(sub, publisher, GroupOrder::Ascending, g_switch)
+    );
+  }
+
+  #[test]
+  fn switch_parameters_win_and_the_replaced_subscription_fills_the_rest() {
+    let carried = vec![
+      MessageParameter::new_subscriber_priority(0),
+      MessageParameter::new_group_order(GroupOrder::Descending),
+    ];
+    assert_eq!(
+      switch_scheduling(&carried, (128, GroupOrder::Ascending)),
+      (0, GroupOrder::Descending)
+    );
+    assert_eq!(
+      switch_scheduling(&[], (7, GroupOrder::Ascending)),
+      (7, GroupOrder::Ascending)
     );
   }
 
@@ -787,9 +861,15 @@ mod tests_switch_seam_helpers {
         .try_into()
         .unwrap(),
     ];
-    let params = switch_target_parameters(&raw);
-    assert_eq!(params, vec![MessageParameter::new_delay_groups(3)]);
-    assert_eq!(switch_subscriber_priority(&params), 128);
+    let params = switch_target_parameters(&raw, (0, GroupOrder::Ascending));
+    assert_eq!(
+      params,
+      vec![
+        MessageParameter::new_delay_groups(3),
+        MessageParameter::new_subscriber_priority(0),
+        MessageParameter::new_group_order(GroupOrder::Ascending),
+      ]
+    );
   }
 
   // ---- build_switch_live_sub ----
@@ -917,5 +997,23 @@ mod tests_switch_hand_over {
     assert!(target.read().await.get_subscription(62).await.is_some());
     assert!(current.read().await.get_subscription(62).await.is_none());
     assert!(source.read().await.is_finished().await);
+  }
+}
+
+/// P3 (R3-D2/D6): the failure PUBLISH's request stream is a control-priority
+/// stream from its first byte (it used to open at quinn's default 0, below every
+/// video stream of a priority-0 subscriber).
+#[cfg(test)]
+mod tests_switch_failure_stream {
+  use super::*;
+  use crate::server::test_support::{quic_pair, relay_client};
+  use moqtail::transport::connection::CONTROL_STREAM_PRIORITY;
+
+  #[tokio::test]
+  async fn the_failure_publish_stream_opens_at_the_control_priority() {
+    let (_peer, server) = quic_pair().await;
+    let client = relay_client(71, server);
+    let (send, _recv) = open_switch_failure_stream(&client).await.expect("open");
+    assert_eq!(send.priority(), Some(CONTROL_STREAM_PRIORITY));
   }
 }

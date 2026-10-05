@@ -512,6 +512,18 @@ impl TrackCache {
     Some(Location::new(group_id, object_id))
   }
 
+  /// Publisher priority of the first cached object of `group_id` (the subgroup
+  /// header's), or `None` when the group is not cached. The switch catch-up
+  /// stream is scheduled with it (audit M6).
+  pub async fn publisher_priority_of_group(&self, group_id: u64) -> Option<u8> {
+    let objects_arc = self
+      .cache
+      .get(&CacheKey::new(self.relay_track_id, group_id))
+      .await?;
+    let objects = objects_arc.read().await;
+    objects.first().map(|o| o.publisher_priority)
+  }
+
   /// Returns the set of group_ids currently cached for this track.
   ///
   /// Feeds the SWITCH handler's `compute_switch_group` (PR #1378): the relay

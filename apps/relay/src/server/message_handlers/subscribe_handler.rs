@@ -23,6 +23,7 @@ use bytes::Bytes;
 use core::result::Result;
 use moqtail::model::common::location::Location;
 use moqtail::model::control::constant::FilterType;
+use moqtail::model::control::constant::GroupOrder;
 use moqtail::model::control::constant::PublishDoneStatusCode;
 use moqtail::model::control::publish_done::PublishDone;
 use moqtail::model::control::request_error::RequestError;
@@ -1551,7 +1552,7 @@ async fn handle_switch_message(
   use crate::server::switch_delivery::{
     DrainOutcome, SelectOutcome, build_switch_live_sub, drain_source_below, hand_over_to_target,
     poll_select_switch_group, send_switch_failure, send_switch_publish,
-    spawn_switch_catchup_stream, switch_catchup_priority, switch_subscriber_priority,
+    spawn_switch_catchup_stream, switch_catchup_priority, switch_scheduling,
     switch_target_parameters,
   };
   use crate::server::switch_guard::{AdmitResult, ClaimResult, SwitchFailure};
@@ -1679,8 +1680,26 @@ async fn handle_switch_message(
 
   // Per SWITCH PR #1378 the SWITCH's parameter set is the complete parameter set
   // for the target PUBLISH; the relay restates the transport fields it owns.
-  let target_parameters = switch_target_parameters(&switch_message.subscribe_parameters);
-  let subscriber_priority = switch_subscriber_priority(&target_parameters);
+  // Subscriber priority and group order fall back to the replaced
+  // subscription's when the SWITCH omits them (audit C3/M6; the player always
+  // sends both).
+  let inherited = {
+    let source = current_track_arc
+      .read()
+      .await
+      .get_subscription(context.connection_id)
+      .await;
+    match source {
+      Some(source) => {
+        let source = source.read().await;
+        let state = source.subscription_state.read().await;
+        (state.subscriber_priority, state.group_order)
+      }
+      None => (128, GroupOrder::Ascending),
+    }
+  };
+  let target_parameters = switch_target_parameters(&switch_message.subscribe_parameters, inherited);
+  let (subscriber_priority, group_order) = switch_scheduling(&target_parameters, inherited);
 
   // Strict ordering (soft switch): identify G_switch, drain the source Track's
   // Objects in Groups below it, THEN terminate the source, attach the target
@@ -1894,7 +1913,6 @@ async fn handle_switch_message(
     // with PUBLISH_DONE(SUBSCRIPTION_ENDED) on its request stream and dropped. A
     // target that cannot be attached is answered PublishBuildFailed with the
     // source untouched.
-    let catchup_priority = switch_catchup_priority(subscriber_priority);
     let Some(subscription) = hand_over_to_target(
       &client,
       &target_track_arc,
@@ -1958,7 +1976,22 @@ async fn handle_switch_message(
     )
     .await;
 
-    // (5) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream.
+    // (5) Catch-up range [G_switch, live edge) on a FETCH_HEADER stream, in the
+    // switch's band at G_switch: below the source's groups < G_switch, above
+    // every live group of the target (audit M6).
+    let publisher_priority = target_track_arc
+      .read()
+      .await
+      .cache
+      .publisher_priority_of_group(g_switch)
+      .await
+      .unwrap_or(moqtail::model::data::constant::DEFAULT_PUBLISHER_PRIORITY);
+    let catchup_priority = switch_catchup_priority(
+      subscriber_priority,
+      group_order,
+      publisher_priority,
+      g_switch,
+    );
     spawn_switch_catchup_stream(
       client.clone(),
       target_track_arc.clone(),

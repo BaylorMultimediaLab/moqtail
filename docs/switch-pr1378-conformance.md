@@ -162,3 +162,19 @@ messages.
   and the source is untouched, as the PR's failure discipline requires. The
   former undo path (restoring the source's end group after it had already been
   torn down) is gone.
+- **Catch-up priority and the switch's scheduling parameters (P3).** The
+  catch-up FETCH_HEADER stream is scheduled like any FETCH response stream:
+  `compute_stream_priority(subscriber priority, publisher priority of the
+  target's group G_switch, group order, G_switch)`. With ascending order that
+  is above every live group of the target (the PR's SHOULD) and below the
+  replaced subscription's streams of groups < G_switch, which play first (it
+  used to take the top of the publisher-0 band, above that remainder). The
+  subscriber priority and group order come from the SWITCH's
+  SUBSCRIBER_PRIORITY / GROUP_ORDER parameters; a SWITCH that omits them runs
+  at the replaced subscription's values, which the relay also writes into the
+  target PUBLISH's parameters. **Deviation, deliberate:** the PR says nothing
+  is inherited; the two scheduling fields are, so a parameterless SWITCH
+  cannot drop the target below the source's band (audit C3). The player sends
+  both on every SWITCH, so in the experiments nothing is actually inherited.
+  The failure PUBLISH's request stream opens at `CONTROL_STREAM_PRIORITY`
+  before its first byte, like every request stream the relay opens.
