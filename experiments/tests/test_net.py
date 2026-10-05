@@ -866,6 +866,21 @@ class NativeFixedArm(unittest.TestCase):
         self.assertIn("--native-status-before-subscribe", rust_long_flags(rs))
 
 
+class PreflightWiring(unittest.TestCase):
+    def test_validate_command_passes_preflight_and_final(self):
+        out = Path("/tmp/run")
+        self.assertNotIn("--preflight", rx.validate_command(out, False, False))
+        cmd = rx.validate_command(out, True, True)
+        self.assertEqual(cmd[-2:], ["--final", "--preflight"])
+        self.assertTrue(cmd[1].endswith("validate.py"))
+
+    def test_preflight_profile_steps_leave_room_for_the_delivery_check(self):
+        prof = json.loads((Path(rx.__file__).parent / "profiles" / "preflight_step.json").read_text())
+        ats = [s["at_s"] for s in prof["steps"]]
+        self.assertEqual(ats, [0, 30, 60])
+        self.assertEqual([s["rate_mbps"] for s in prof["steps"]], [6, 1.5, 6])
+
+
 class NativeFixedArmBranch(unittest.TestCase):
     """R5 D-1: the branch guard and the missing-flag message must name the same branch."""
 
