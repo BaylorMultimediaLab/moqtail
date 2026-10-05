@@ -354,10 +354,17 @@ export function unroutedDropFields(
     track: info.fullTrackName ? new TextDecoder().decode(info.fullTrackName.name) : null,
     current: state.current,
     pending: state.pending,
-    group: Number(info.groupId),
+    group: info.groupId !== undefined ? Number(info.groupId) : null,
     subgroup: info.subgroupId !== undefined ? Number(info.subgroupId) : null,
-    track_alias: Number(info.trackAlias),
+    track_alias: info.trackAlias !== undefined ? Number(info.trackAlias) : null,
     bytes: info.bytes,
+    // A FETCH_HEADER stream no FETCH or PUBLISH receiver claims (P7, pr1378).
+    ...(info.streamType === 'fetch'
+      ? {
+          stream_type: 'fetch',
+          request_id: info.requestId !== undefined ? Number(info.requestId) : null,
+        }
+      : {}),
   };
 }
 
@@ -503,7 +510,7 @@ export class Player {
       // stream's next THROUGHPUT_SAMPLE as unrouted_bytes (F6).
       vs?.tracker.recordDiscardedBytes(
         info.bytes,
-        info.groupId,
+        info.groupId ?? -1n,
         typeof fields.track === 'string' ? fields.track : null,
       );
     };

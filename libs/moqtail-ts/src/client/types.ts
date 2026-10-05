@@ -78,8 +78,19 @@ export interface PushedReceiver extends TrackAliasHolder {
  */
 export type DiscardedStreamInfo = {
   reason: 'unrouted'
-  trackAlias: bigint
-  groupId: bigint
+  /**
+   * `subgroup`: a SUBGROUP stream whose alias has no route. `fetch`: a FETCH_HEADER
+   * stream whose request id names no FETCH of this client and no PUBLISH receiver
+   * (P7; e.g. a switch catch-up for a target already released). Absent on reports
+   * from before the field existed: `subgroup`.
+   */
+  streamType?: 'subgroup' | 'fetch'
+  /** The FETCH_HEADER's request id (`fetch` streams). */
+  requestId?: bigint
+  /** The SUBGROUP header's alias; undefined for a `fetch` stream. */
+  trackAlias: bigint | undefined
+  /** The SUBGROUP header's group; undefined for a `fetch` stream. */
+  groupId: bigint | undefined
   subgroupId: bigint | undefined
   /** The name the alias last mapped to, if the client still remembers it. */
   fullTrackName: FullTrackName | undefined

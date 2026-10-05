@@ -221,3 +221,11 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   for the current subscription with no switch pending (the late-success case
   above, or the track ending) is logged with a warning; the player does not
   re-subscribe.
+- **Unrouted catch-up streams (P7, library).** A FETCH_HEADER stream whose
+  request id names no FETCH of this client and no PUBLISH receiver (after the
+  route-wait window) used to be a PROTOCOL_VIOLATION that closed the session.
+  It now takes the unrouted path like a SUBGROUP stream: STOP_SENDING(CANCELLED)
+  and a discard report (`streamType: 'fetch'`, `requestId`), logged by the
+  player as `DROP_STALE{unrouted, stream_type: fetch}`. This is the catch-up of
+  a switch whose target the client has already released (e.g. the late-success
+  path, or a target superseded before its catch-up arrived).

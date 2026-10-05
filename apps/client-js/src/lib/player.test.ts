@@ -357,6 +357,35 @@ describe('unroutedDropFields', () => {
       ),
     ).toMatchObject({ track: null, subgroup: null, pending: '720p', bytes: 10 });
   });
+
+  it('reports an unrouted FETCH_HEADER stream by its request id (P7)', () => {
+    expect(
+      unroutedDropFields(
+        {
+          reason: 'unrouted',
+          streamType: 'fetch',
+          requestId: 99n,
+          trackAlias: undefined,
+          groupId: undefined,
+          subgroupId: undefined,
+          fullTrackName: undefined,
+          bytes: 12,
+        },
+        { current: '480p', pending: null },
+      ),
+    ).toEqual({
+      reason: 'unrouted',
+      track: null,
+      current: '480p',
+      pending: null,
+      group: null,
+      subgroup: null,
+      track_alias: null,
+      bytes: 12,
+      stream_type: 'fetch',
+      request_id: 99,
+    });
+  });
 });
 
 // Transport fairness: the relay schedules by subscriber priority, then group

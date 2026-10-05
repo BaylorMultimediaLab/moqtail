@@ -48,6 +48,7 @@ import {
 import {
   Datagram,
   FetchHeader,
+  FetchHeaderType,
   FetchObject,
   FullTrackName,
   MoqtObject,
@@ -2673,7 +2674,28 @@ export class MOQtailClient {
           return
         }
 
-        throw new ProtocolViolationError('MOQtailClient', 'No request for received request id')
+        // Unrouted (P7): no FETCH of this client and no PUBLISH receiver claims this
+        // request id (e.g. the catch-up of a switch target the client already
+        // released). Like an unrouted subgroup stream (M15), not a protocol
+        // violation: stop it and report what it cost.
+        await recvStream.stopSending(StreamResetCode.Cancelled)
+        reader.releaseLock()
+        const fetchInfo: DiscardedStreamInfo = {
+          reason: 'unrouted',
+          streamType: 'fetch',
+          requestId: header.requestId,
+          trackAlias: undefined,
+          groupId: undefined,
+          subgroupId: undefined,
+          fullTrackName: undefined,
+          bytes: recvStream.bytesReceived,
+        }
+        logger.warn(
+          'MOQtailClient',
+          `discarding unrouted fetch stream requestId=${header.requestId} bytes=${fetchInfo.bytes}`,
+        )
+        this.onStreamDiscarded?.(fetchInfo)
+        return
       } else {
         // Same control-vs-data race as the catch-up path above: after a SWITCH
         // the target track's SUBGROUP streams can arrive before the PUBLISH
@@ -2773,6 +2795,7 @@ export class MOQtailClient {
         reader.releaseLock()
         const info: DiscardedStreamInfo = {
           reason: 'unrouted',
+          streamType: 'subgroup',
           trackAlias: header.trackAlias,
           groupId: header.groupId,
           subgroupId: header.subgroupId,
@@ -3475,6 +3498,34 @@ if (import.meta.vitest) {
       await vi.waitFor(() => expect(transport.uniCancelReasons).toHaveLength(1))
       expect(streamResetCodeOf(transport.uniCancelReasons[0])).toBe(StreamResetCode.Cancelled)
 
+      await client.disconnect()
+    })
+
+    // P7 (pr1378): a FETCH_HEADER stream whose request id has no route (no FETCH of
+    // this client, no PUBLISH receiver: e.g. the catch-up of a switch whose target
+    // the client already released) used to be a ProtocolViolation that closed the
+    // session. It is an unrouted stream like any other: STOP_SENDING and a report.
+    it('cancels a FETCH_HEADER stream with no route and reports it as unrouted (P7)', async () => {
+      const { client, transport } = await connected()
+      client.trackAliasResolutionTimeoutMs = 20
+      const discarded: DiscardedStreamInfo[] = []
+      client.onStreamDiscarded = (info) => discarded.push(info)
+
+      const bytes = new FetchHeader(FetchHeaderType.Type0x05, 99n).serialize().toUint8Array()
+      transport.openIncomingUniStream(bytes)
+
+      await vi.waitFor(() => expect(discarded).toHaveLength(1))
+      expect(discarded[0]).toMatchObject({
+        reason: 'unrouted',
+        streamType: 'fetch',
+        requestId: 99n,
+        trackAlias: undefined,
+        groupId: undefined,
+        bytes: bytes.length,
+      })
+      await vi.waitFor(() => expect(transport.uniCancelReasons).toHaveLength(1))
+      expect(streamResetCodeOf(transport.uniCancelReasons[0])).toBe(StreamResetCode.Cancelled)
+      expect(client.webTransport).toBeDefined()
       await client.disconnect()
     })
 
