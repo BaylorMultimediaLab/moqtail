@@ -32,6 +32,9 @@
  * nothing below the seam has come from S for `DRAIN_TIMEOUT_MS`. `cap`: no
  * PUBLISH_DONE within `RETIRE_MAX_MS` of SWITCH_OK. `closed`: S's stream ended on
  * its own (the library completed it) before the condition could be evaluated.
+ * `closed-before-ok` (R6 D3): S's stream ended while a SWITCH replacing it was
+ * still unanswered (common at the live edge: the library completes S at its
+ * PUBLISH_DONE, which the relay sends before the target PUBLISH).
  * The target's objects wait in their own stream meanwhile, so the write handler
  * sees the old track's tail, then the target.
  */
@@ -49,7 +52,8 @@ export const DRAIN_TIMEOUT_MS = 2000;
  */
 export const RETIRE_MAX_MS = 6000;
 
-export type ReleaseReason = 'closed' | 'drained' | 'drain-timeout' | 'cap' | 'error';
+export type ReleaseReason =
+  'closed' | 'closed-before-ok' | 'drained' | 'drain-timeout' | 'cap' | 'error';
 
 /** The end of one data stream of a route, as the library reports it (onDataStreamEnded). */
 export interface RouteStreamEnd {
@@ -82,6 +86,8 @@ export interface PumpSource {
   releaseDecidedAt?: number;
   /** switch_seq of that switch. */
   replacedBySeq?: number;
+  /** switch_seq of a SWITCH sent on this subscription and not yet answered. */
+  pendingSwitchSeq?: number;
   /** switch_seq of the switch whose PUBLISH opened this route (undefined for the startup one). */
   readonly switchSeq?: number;
   /** When the switch that replaced it was acknowledged (a successor is queued). */
@@ -189,6 +195,18 @@ export class SourcePump {
     this.#queue.push(makeSource(next));
     this.#wake?.();
     if (replaced) this.#evaluate(replaced);
+  }
+
+  /** A SWITCH `seq` naming subscription `requestId` was sent. */
+  switchSent(requestId: bigint, seq: number): void {
+    const source = this.find(requestId);
+    if (source) source.pendingSwitchSeq = seq;
+  }
+
+  /** The SWITCH sent on `requestId` was answered (any outcome). */
+  switchAnswered(requestId: bigint): void {
+    const source = this.find(requestId);
+    if (source) source.pendingSwitchSeq = undefined;
   }
 
   /** PUBLISH_DONE for `requestId`; true when it names a queued source. */
@@ -357,6 +375,15 @@ export class SourcePump {
         head.replacedAt !== undefined
       ) {
         if (this.isDrained(head)) reason = 'drained';
+      }
+      // R6 D3: it ended before the SWITCH replacing it was answered.
+      if (
+        reason === 'closed' &&
+        head.replacedAt === undefined &&
+        head.pendingSwitchSeq !== undefined
+      ) {
+        reason = 'closed-before-ok';
+        head.replacedBySeq = head.pendingSwitchSeq;
       }
       this.#onRelease(head, head.releaseReason ?? reason);
     }

@@ -34,7 +34,7 @@ function sink(pump: () => SourcePump) {
 
 const settle = () => new Promise(r => setTimeout(r, 0));
 
-function setup() {
+function setup(onReleased?: (source: PumpSource) => void) {
   let t = 0;
   const released: Array<[bigint, ReleaseReason]> = [];
   const finished: bigint[] = [];
@@ -45,7 +45,10 @@ function setup() {
     { stream: a.stream, requestId: 1n, trackName: 'A' },
     {
       now: () => t,
-      onRelease: (s: PumpSource, r) => released.push([s.requestId, r]),
+      onRelease: (s: PumpSource, r) => {
+        released.push([s.requestId, r]);
+        onReleased?.(s);
+      },
       onFinish: async (s: PumpSource) => {
         finished.push(s.requestId);
         const receiver = receivers.get(s.requestId);
@@ -344,6 +347,37 @@ describe('SourcePump (R6 D2): a replaced route is released when its below-seam s
       [2n, 'drained'],
     ]);
     expect(out.written).toEqual(['A:4', 'B:5', 'B:6', 'C:7']);
+    ac.abort();
+  });
+});
+
+describe('SourcePump (R6 D3): a route that ends before the SWITCH replacing it is answered', () => {
+  // The reviewer's scenario: at the live edge the library completes the old route
+  // at its PUBLISH_DONE, which the relay sends before the target PUBLISH.
+  it('is released as closed-before-ok with the pending switch_seq', async () => {
+    const seqs: Array<number | undefined> = [];
+    const { pump, a, out, released, ac } = setup(s => seqs.push(s.replacedBySeq));
+    pump.switchSent(1n, 7);
+    a.push(obj('A', 15));
+    a.close();
+    await settle();
+    expect(released).toEqual([[1n, 'closed-before-ok']]);
+    expect(seqs).toEqual([7]);
+    const b = feed();
+    pump.replace(1n, 16n, { stream: b.stream, requestId: 2n, trackName: 'B', switchSeq: 7 }, 1n);
+    b.push(obj('B', 16));
+    await settle();
+    expect(out.written).toEqual(['A:15', 'B:16']);
+    ac.abort();
+  });
+
+  it('a route that closes with no switch pending stays a plain closed', async () => {
+    const { pump, a, released, ac } = setup();
+    pump.switchSent(1n, 7);
+    pump.switchAnswered(1n);
+    a.close();
+    await settle();
+    expect(released).toEqual([[1n, 'closed']]);
     ac.abort();
   });
 });

@@ -2171,6 +2171,7 @@ export class Player {
       buffered_ranges: bufferedPairs.map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}`).join(','),
     });
     videoStruct.switchInFlight = true;
+    videoStruct.pump?.switchSent(subscriptionRequestId, record.seq);
     events.emit('SWITCH_SENT', {
       switch_seq: record.seq,
       from: videoStruct.trackName,
@@ -2307,6 +2308,7 @@ export class Player {
       this.#options.onTrackSwitched?.(videoStruct.trackName, record.seq);
     } finally {
       videoStruct.switchInFlight = false;
+      videoStruct.pump?.switchAnswered(subscriptionRequestId);
     }
     return record.seq;
   }
@@ -2344,14 +2346,17 @@ export class Player {
    * (STOP_SENDING, DROP_STALE{unrouted}).
    */
   #onSourceReleased(source: PumpSource, reason: ReleaseReason): void {
-    if (source.replacedAt === undefined) return;
+    // A route that ended while the SWITCH replacing it was unanswered is reported
+    // too (R6 D3, `closed-before-ok`, with that switch's seq); other routes that
+    // were never replaced are not.
+    if (source.replacedAt === undefined && reason !== 'closed-before-ok') return;
     events.emit('SWITCH_SOURCE_RELEASED', {
       switch_seq: source.replacedBySeq ?? null,
       request_id: source.requestId,
       track: source.trackName,
       reason,
       seam_group: source.seamGroup !== undefined ? Number(source.seamGroup) : null,
-      held_ms: performance.now() - source.replacedAt,
+      held_ms: source.replacedAt !== undefined ? performance.now() - source.replacedAt : null,
       publish_done: source.publishDoneAt !== undefined,
       // R6 D2: the done condition's inputs at release.
       below_seam_streams:
@@ -2364,7 +2369,7 @@ export class Player {
       objects_after_switch_ok: source.objectsAfterReplace,
       post_seam_dropped: source.postSeamDropped,
     });
-    if (reason !== 'closed' && this.client) {
+    if (reason !== 'closed' && reason !== 'closed-before-ok' && this.client) {
       void this.client.unsubscribe(source.requestId).catch(() => {
         // Session closing or already released: nothing left to release.
       });
