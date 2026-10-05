@@ -433,6 +433,21 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       expect(next[0]!.unroutedBytes).toBe(16_000);
       expect(group(t, 21n, 'B', 3000)[0]!.unroutedBytes).toBe(0);
     });
+    it('bytes attached to an open group that closes without a sample are not lost (R4-D4)', () => {
+      // One object (no inter-arrival information): the group closes with no sample.
+      const t = new GoodputTracker(3, 8, 1000);
+      t.recordObject(1000, 5n, { recvAt: 0, track: 'B' });
+      t.recordDiscardedBytes(50_000, 5n, 'B');
+      // Two objects with the same receive stamp (dt = 0): no sample either.
+      t.recordObject(1000, 6n, { recvAt: 3_000, track: 'B' });
+      t.recordDiscardedBytes(20_000, 6n, 'B');
+      t.recordObject(1000, 6n, { recvAt: 3_000, track: 'B', lastInGroup: true });
+      const out = group(t, 7n, 'B', 6_000);
+      expect(out).toHaveLength(1);
+      expect(out[0]!.group).toBe(7n);
+      expect(out[0]!.discardedBytes).toBe(0);
+      expect(out[0]!.unroutedBytes).toBe(70_000);
+    });
   });
 
   describe('highest group received per track (F10)', () => {
