@@ -1087,7 +1087,13 @@ export class Player {
         return {
           // What the playhead can still play without a gap, from the buffer itself:
           // the append front is not it while a fill behind the front is under way.
-          aheadOfPlayheadMs: contiguousBufferAheadS(sourceBuffer.buffered, el.currentTime) * 1000,
+          // Unknown while the playhead is still before the buffer (before the
+          // startup seek): nothing is about to run out there.
+          aheadOfPlayheadMs:
+            sourceBuffer.buffered.length > 0 &&
+            el.currentTime < sourceBuffer.buffered.start(0) - 0.001
+              ? undefined
+              : contiguousBufferAheadS(sourceBuffer.buffered, el.currentTime) * 1000,
           // A late keyframe is worth a discontinuity only if it fills a gap the
           // playhead has yet to play.
           fillsGapAhead: (dtsMs: number) => {
@@ -1313,6 +1319,23 @@ export class Player {
             }
 
             if (route === 'land' && struct.pendingSwitch) {
+              // The source's held frames (a gap behind a retransmission) are below the
+              // seam: what can still be appended goes in now, before anything of the
+              // landing is recorded and before the target's init segment; the order
+              // then starts afresh at the target's keyframe.
+              await perform(order.flush(performance.now()));
+              if (!struct.pendingSwitch) {
+                // The switch was rolled back meanwhile: this object belongs to no route.
+                this.#dropStale(struct, object, objectTrackName, {
+                  track: objectTrackName,
+                  current: struct.trackName,
+                  pending: null,
+                  group: object.location.group,
+                  bytes: object.payload.byteLength,
+                  object: object.location.object,
+                });
+                return;
+              }
               const { initData, mimeType, trackName: newTrackName, record } = struct.pendingSwitch;
               const fromTrack = struct.trackName; // capture BEFORE overwriting
               // The source's last appended frame at the moment the switch lands
@@ -1433,9 +1456,6 @@ export class Player {
                 }
               }
 
-              // A new track: the held frames of the old one cannot follow it, and the
-              // target starts the append order afresh at its keyframe.
-              for (const a of order.reset()) heldDrop(a, performance.now());
               if (!(await applyInit(sourceBuffer, mimeType, initData, newTrackName))) {
                 // Keep the pipeline alive: retry the init before the next object
                 // append and drop this object (it cannot be decoded without it).
