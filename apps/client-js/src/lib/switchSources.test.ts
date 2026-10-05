@@ -78,6 +78,7 @@ function setup(onReleased?: (source: PumpSource) => void) {
     advance: (ms: number) => {
       t += ms;
     },
+    now: () => t,
   };
 }
 
@@ -390,6 +391,140 @@ describe('SourcePump (R6 D2): a replaced route is released when its below-seam s
     ]);
     expect(out.written).toEqual(['A:4', 'B:5', 'B:6', 'C:7']);
     ac.abort();
+  });
+});
+
+describe('SourcePump (R7-D1): a replaced switch target waits for its catch-up only up to the new seam', () => {
+  /**
+   * The reviewer's scenario: T1 (request 2) is itself a switch target whose
+   * catch-up carries [10, 20); switch 2 replaces it at G = 12 while the catch-up
+   * is at group 11. T1's one below-seam SUBGROUP stream (B = 1) ends at t = 100.
+   * The catch-up then delivers 12..19 at 375 ms per group. `catchUp` reports
+   * progress as the library does (onCatchUpProgress) when `reportProgress`.
+   */
+  async function replacedTarget(reportProgress: boolean) {
+    const env = setup();
+    const releasedAt: Array<[bigint, ReleaseReason, number]> = [];
+    const t1 = feed();
+    env.receivers.set(2n, t1);
+    const push = (o: MoqtObject) => {
+      try {
+        t1.push(o);
+      } catch {
+        // closed by finishReceiver: the library discards what is still on the wire
+      }
+    };
+    const catchUp = (group: number) => {
+      push(obj('B', group));
+      if (reportProgress) env.pump.catchUpProgress({ requestId: 2n, groupId: BigInt(group) });
+    };
+    env.pump.replace(
+      1n,
+      10n,
+      { stream: t1.stream, requestId: 2n, trackName: 'B', switchSeq: 1, expectsCatchUp: true },
+      0n,
+    );
+    env.pump.publishDone(1n);
+    await settle();
+    catchUp(10);
+    catchUp(11);
+    await settle();
+    const t2 = feed();
+    env.receivers.set(3n, t2);
+    env.pump.replace(
+      2n,
+      12n,
+      { stream: t2.stream, requestId: 3n, trackName: 'C', switchSeq: 2 },
+      1n,
+    );
+    env.pump.publishDone(2n);
+    env.advance(100);
+    env.pump.streamEnded(ended(2n, 11));
+    await settle();
+    const record = () => {
+      for (const [id, reason] of env.released.slice(releasedAt.length))
+        releasedAt.push([id, reason, env.now()]);
+    };
+    record();
+    return { env, catchUp, record, releasedAt };
+  }
+
+  // The reviewer's measurement (no progress reports, as before R7): the whole
+  // catch-up, groups at or above the seam included, held the release until
+  // drain-timeout at ~2.1 s. Still the fallback when nothing reports progress.
+  it('without progress reports the catch-up holds the release to drain-timeout (the reviewer measurement)', async () => {
+    const { env, catchUp, record, releasedAt } = await replacedTarget(false);
+    for (let g = 12; g < 20; g++) {
+      env.advance(375);
+      catchUp(g);
+      await settle();
+      env.pump.tick();
+      record();
+    }
+    expect(releasedAt.find(r => r[0] === 2n)?.[1]).toBe('drain-timeout');
+    env.ac.abort();
+  });
+
+  it("is released as drained as soon as the catch-up reaches the seam, not at the catch-up's end", async () => {
+    const { env, catchUp, record, releasedAt } = await replacedTarget(true);
+    for (let g = 12; g < 20; g++) {
+      env.advance(375);
+      catchUp(g);
+      await settle();
+      env.pump.tick();
+      record();
+    }
+    // t = 475: the first catch-up object of group 12 (it was 2100 ms, drain-timeout).
+    expect(releasedAt.find(r => r[0] === 2n)).toEqual([2n, 'drained', 475]);
+    expect(env.out.written.filter(l => l.startsWith('B'))).toEqual(['B:10', 'B:11']);
+    expect(env.out.dropped).toEqual(['B:12']);
+    env.ac.abort();
+  });
+
+  it('is released as drained at once when the relay ends the catch-up at the seam', async () => {
+    const { env, record, releasedAt } = await replacedTarget(true);
+    // The relay bounds the replaced target's catch-up at the new seam: its stream
+    // ends after its last object below 12.
+    env.pump.streamEnded(ended(2n, 10, 'fetch'));
+    await settle();
+    record();
+    expect(releasedAt.find(r => r[0] === 2n)).toEqual([2n, 'drained', 100]);
+    expect(env.out.written.filter(l => l.startsWith('B'))).toEqual(['B:10', 'B:11']);
+    env.ac.abort();
+  });
+
+  it('a catch-up still below the seam keeps the release waiting; nothing below the seam is cut', async () => {
+    const { env, catchUp, record, releasedAt } = await replacedTarget(true);
+    // Group 11 of the catch-up keeps arriving (a large group on a slow link).
+    for (let i = 1; i <= 6; i++) {
+      env.advance(500);
+      push11(env, i);
+      env.pump.catchUpProgress({ requestId: 2n, groupId: 11n });
+      await settle();
+      env.pump.tick();
+      record();
+    }
+    expect(releasedAt.find(r => r[0] === 2n)).toBeUndefined();
+    catchUp(12);
+    await settle();
+    record();
+    expect(releasedAt.find(r => r[0] === 2n)?.[1]).toBe('drained');
+    expect(env.out.written.filter(l => l.startsWith('B'))).toEqual([
+      'B:10',
+      'B:11',
+      'B:11',
+      'B:11',
+      'B:11',
+      'B:11',
+      'B:11',
+      'B:11',
+    ]);
+    env.ac.abort();
+
+    function push11(e: typeof env, i: number) {
+      const receiver = e.receivers.get(2n)!;
+      receiver.push(obj('B', 11, i));
+    }
   });
 });
 

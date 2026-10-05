@@ -18,7 +18,15 @@
  *   PUBLISH_DONE(S) received, G_switch known (SWITCH_OK), and the B data
  *   streams the relay opened on S for groups below G_switch have all been seen
  *   and have ended (FIN or reset), and S's own catch-up stream (if S was itself
- *   a switch target with a catch-up) has ended,
+ *   a switch target with a catch-up) has ended or has reached G_switch,
+ *
+ * The catch-up is delivered in ascending group order, so its first object of a
+ * group at or above G_switch proves that everything below the seam it carries
+ * has been delivered (R7-D1: the library reports each group the catch-up
+ * reaches, `catchUpProgress`; waiting for the catch-up's end held the release
+ * for the whole catch-up, the span at or above the seam that is then dropped
+ * included, up to drain-timeout). The relay also ends a replaced target's
+ * catch-up at the new seam, so it normally just ends.
  *
  * where B is the project-local third field of the target PUBLISH's
  * SWITCH_TRANSITION. Since ended streams are a subset of the seen ones, which
@@ -55,6 +63,12 @@ export const RETIRE_MAX_MS = 6000;
 export type ReleaseReason =
   'closed' | 'closed-before-ok' | 'drained' | 'drain-timeout' | 'cap' | 'error';
 
+/** A route's catch-up has delivered its first object of `groupId` (onCatchUpProgress). */
+export interface RouteCatchUpProgress {
+  requestId: bigint;
+  groupId: bigint;
+}
+
 /** The end of one data stream of a route, as the library reports it (onDataStreamEnded). */
 export interface RouteStreamEnd {
   requestId: bigint;
@@ -80,6 +94,12 @@ export interface PumpSource {
   endedStreamGroups: bigint[];
   /** This route is a switch target whose catch-up stream has not ended yet. */
   catchUpPending: boolean;
+  /**
+   * The highest group the route's catch-up has delivered an object of
+   * (onCatchUpProgress, R7-D1). The catch-up is ascending, so once this is at or
+   * above seamGroup nothing below the seam is still to come on it.
+   */
+  catchUpReachedGroup?: bigint;
   /** Last time something of a group (object or stream end) arrived, per group. */
   activityByGroup: Map<bigint, number>;
   /** When the done condition (or a fallback) decided the release. */
@@ -237,14 +257,32 @@ export class SourcePump {
   }
 
   /**
+   * The library reports that a route's catch-up delivered its first object of a
+   * new group (R7-D1). True when it names a queued source.
+   */
+  catchUpProgress(info: RouteCatchUpProgress): boolean {
+    const source = this.find(info.requestId);
+    if (!source) return false;
+    if (source.catchUpReachedGroup === undefined || info.groupId > source.catchUpReachedGroup) {
+      source.catchUpReachedGroup = info.groupId;
+    }
+    source.activityByGroup.set(info.groupId, this.#now());
+    this.#evaluate(source);
+    return true;
+  }
+
+  /**
    * Whether replaced route `source` is done: PUBLISH_DONE came, G_switch and B are
    * known, B of its streams below G_switch have ended and its catch-up (if any)
-   * has ended.
+   * has ended or reached G_switch.
    */
   isDrained(source: PumpSource): boolean {
     const seam = source.seamGroup;
     if (source.publishDoneAt === undefined || seam === undefined) return false;
-    if (source.belowSeamStreams === undefined || source.catchUpPending) return false;
+    if (source.belowSeamStreams === undefined) return false;
+    const catchUpPastSeam =
+      source.catchUpReachedGroup !== undefined && source.catchUpReachedGroup >= seam;
+    if (source.catchUpPending && !catchUpPastSeam) return false;
     const ended = source.endedStreamGroups.filter(g => g < seam).length;
     return BigInt(ended) >= source.belowSeamStreams;
   }

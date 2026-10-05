@@ -26,6 +26,7 @@
 //! - the source-side seam bound, drain wait and Close-After-Switch teardown.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use moqtail::model::common::location::Location;
@@ -382,6 +383,14 @@ pub(crate) fn spawn_switch_catchup_stream(
   let Some((start, end)) = switch_catchup_range(g_switch, live_edge) else {
     return;
   };
+  // Registered before the task runs, so a replacement of this target that comes
+  // before the catch-up's first write still bounds it (R7-D1).
+  let bound = Arc::new(AtomicU64::new(u64::MAX));
+  subscriber
+    .switch_catchup_bounds
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .insert(publish_request_id, bound.clone());
   tokio::spawn(async move {
     let (relay_track_id, mut object_rx) = {
       let track = target_track.read().await;
@@ -403,15 +412,24 @@ pub(crate) fn spawn_switch_catchup_stream(
       Ok(ss) => ss,
       Err(e) => {
         error!("switch catch-up: failed to open stream {stream_id}: {e:?}");
+        unregister_switch_catchup(&subscriber, publish_request_id, &bound);
         return;
       }
     };
 
     let mut prev_ctx: Option<FetchObjectContext> = None;
     let mut object_count: u64 = 0;
+    let mut ended_at_seam: Option<u64> = None;
     while let Some(event) = object_rx.recv().await {
       match event {
         CacheConsumeEvent::Object(object) => {
+          // The target was replaced at a later seam: the rest of the range is at
+          // or above it (ascending order) and the subscriber drops it.
+          let seam = bound.load(Ordering::Acquire);
+          if object.group_id >= seam {
+            ended_at_seam = Some(seam);
+            break;
+          }
           let object_id = object.object_id;
           let fetch_obj = FetchObject::Object(object);
           let serialized = match fetch_obj.serialize(prev_ctx.as_ref(), GroupOrder::Ascending) {
@@ -435,13 +453,59 @@ pub(crate) fn spawn_switch_catchup_stream(
       }
     }
 
+    unregister_switch_catchup(&subscriber, publish_request_id, &bound);
     if let Err(e) = subscriber.close_stream(&stream_id).await {
       warn!("switch catch-up: error closing stream {stream_id}: {e:?}");
     }
-    info!(
-      "switch catch-up: delivered {object_count} objects on {stream_id} for [{g_switch}, {live_edge})"
-    );
+    match ended_at_seam {
+      Some(seam) => info!(
+        "switch catch-up: delivered {object_count} objects on {stream_id} for [{g_switch}, {live_edge}), ended at the next seam {seam}"
+      ),
+      None => info!(
+        "switch catch-up: delivered {object_count} objects on {stream_id} for [{g_switch}, {live_edge})"
+      ),
+    }
   });
+}
+
+fn unregister_switch_catchup(
+  subscriber: &MOQTClient,
+  publish_request_id: u64,
+  bound: &Arc<AtomicU64>,
+) {
+  let mut bounds = subscriber
+    .switch_catchup_bounds
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  if bounds
+    .get(&publish_request_id)
+    .is_some_and(|b| Arc::ptr_eq(b, bound))
+  {
+    bounds.remove(&publish_request_id);
+  }
+}
+
+/// R7-D1: the subscription `publish_request_id` (a switch target) is replaced at
+/// `g_switch`; if its catch-up is still delivering, it stops before `g_switch`
+/// and FINs (ascending order: everything it still holds below the seam is
+/// written first). The span at or above the seam is delivered by the new target,
+/// and the subscriber drops it on the old track; the player used to wait for the
+/// whole catch-up before it released the old route. Not a reset: the catch-up's
+/// objects below the new seam play before it.
+pub(crate) fn bound_switch_catchup(
+  subscriber: &MOQTClient,
+  publish_request_id: u64,
+  g_switch: u64,
+) {
+  if let Some(bound) = subscriber
+    .switch_catchup_bounds
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .get(&publish_request_id)
+  {
+    bound.fetch_min(g_switch, Ordering::AcqRel);
+    info!("switch catch-up of request {publish_request_id}: bounded at the next seam {g_switch}");
+  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,6 +721,9 @@ pub(crate) async fn terminate_source(
     .await
     .get_subscription(connection_id)
     .await;
+
+  // A replaced switch target's catch-up ends at this seam (R7-D1).
+  bound_switch_catchup(subscriber, current_sub_req_id, g_switch);
 
   subscriber
     .subscribe_requests
@@ -1158,6 +1225,89 @@ mod tests_switch_hand_over {
       Some(4),
       "groups 1, 2, 3 (finished) and 4 (open)"
     );
+  }
+}
+
+/// R7-D1: a switch target that is itself replaced before its catch-up is done
+/// has that catch-up ended at the new seam: it FINs after its last object below
+/// the new G_switch instead of delivering the span the subscriber then drops
+/// (and the player waited for, up to drain-timeout).
+#[cfg(test)]
+mod tests_replaced_target_catchup {
+  use super::*;
+  use crate::server::test_support::{publish, quic_pair, relay_client, test_track};
+  use bytes::{Bytes, BytesMut};
+  use moqtail::transport::connection::TransportConnection;
+
+  /// (group, object) of every object on the next uni stream (a FETCH_HEADER
+  /// stream), and whether it ended (false: still open after 500 ms of silence).
+  async fn next_stream_objects(peer: &TransportConnection) -> (Vec<(u64, u64)>, bool) {
+    let mut recv = tokio::time::timeout(Duration::from_secs(5), peer.accept_uni())
+      .await
+      .expect("a stream within 5 s")
+      .unwrap();
+    let mut wire = BytesMut::new();
+    let mut buf = [0u8; 4096];
+    let ended = loop {
+      match tokio::time::timeout(Duration::from_millis(500), recv.read(&mut buf)).await {
+        Ok(Ok(Some(n))) => wire.extend_from_slice(&buf[..n]),
+        Ok(Ok(None)) => break true,
+        Ok(Err(e)) => panic!("read failed: {e:?}"),
+        Err(_) => break false,
+      }
+    };
+    let mut bytes: Bytes = wire.freeze();
+    FetchHeader::deserialize(&mut bytes).expect("FETCH_HEADER");
+    let mut objects = vec![];
+    let mut ctx: Option<FetchObjectContext> = None;
+    while !bytes.is_empty() {
+      let object = FetchObject::deserialize(&mut bytes, ctx.as_ref(), GroupOrder::Ascending)
+        .expect("fetch object");
+      ctx = object.context().or(ctx);
+      if let FetchObject::Object(o) = object {
+        objects.push((o.group_id, o.object_id));
+      }
+    }
+    (objects, ended)
+  }
+
+  async fn target_with_groups(
+    conn: usize,
+  ) -> (TransportConnection, Arc<MOQTClient>, Arc<RwLock<Track>>) {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(conn, server);
+    let track = test_track(2, "video-720p");
+    for g in 10..20 {
+      publish(&track, g, 0).await;
+      publish(&track, g, 1).await;
+    }
+    (peer, client, Arc::new(RwLock::new(track)))
+  }
+
+  /// Without a later switch the catch-up delivers its whole range.
+  #[tokio::test]
+  async fn a_catchup_delivers_its_whole_range() {
+    let (peer, client, target) = target_with_groups(71).await;
+    spawn_switch_catchup_stream(client.clone(), target, 7, 10, 20, 0);
+    let (objects, ended) = next_stream_objects(&peer).await;
+    assert!(ended);
+    assert_eq!(objects.len(), 20, "{objects:?}");
+    assert!(client.switch_catchup_bounds.lock().unwrap().is_empty());
+  }
+
+  /// The catch-up of target 7 ([10, 20)) when 7 is replaced at G_switch = 12:
+  /// groups 10 and 11 only, then FIN.
+  #[tokio::test]
+  async fn terminating_a_target_ends_its_catchup_at_the_new_seam() {
+    let (peer, client, target) = target_with_groups(72).await;
+    spawn_switch_catchup_stream(client.clone(), target.clone(), 7, 10, 20, 0);
+    let name = target.read().await.full_track_name.clone();
+    // Request 7 (the target PUBLISH) is replaced at 12 before its catch-up ran.
+    terminate_source(&client, &target, &name, 72, 7, 12).await;
+    let (objects, ended) = next_stream_objects(&peer).await;
+    assert!(ended, "the catch-up must end (FIN): {objects:?}");
+    assert_eq!(objects, vec![(10, 0), (10, 1), (11, 0), (11, 1)]);
+    assert!(client.switch_catchup_bounds.lock().unwrap().is_empty());
   }
 }
 

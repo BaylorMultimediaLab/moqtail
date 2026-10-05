@@ -555,6 +555,13 @@ export class Player {
       vs?.pump?.streamEnded(info);
     };
 
+    // The group a switch target's catch-up has reached (R7-D1): a replaced target
+    // is done once its catch-up reaches the next seam, not when it ends.
+    this.client.onCatchUpProgress = info => {
+      const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+      vs?.pump?.catchUpProgress(info);
+    };
+
     // Debug-only escape hatch: lets the network test harness force a SWITCH
     // without going through the AbrController. Used by Slice C/Phase B E2Es
     // (see tests/network/scenarios/test_naive_switch_discontinuity.py). Not
@@ -2515,6 +2522,9 @@ export class Player {
           ? source.endedStreamGroups.filter(g => g < source.seamGroup!).length
           : null,
       catch_up_pending: source.catchUpPending,
+      // R7-D1: the highest group its catch-up delivered (null: none reported).
+      catch_up_reached_group:
+        source.catchUpReachedGroup !== undefined ? Number(source.catchUpReachedGroup) : null,
       objects_after_switch_ok: source.objectsAfterReplace,
       post_seam_dropped: source.postSeamDropped,
     });

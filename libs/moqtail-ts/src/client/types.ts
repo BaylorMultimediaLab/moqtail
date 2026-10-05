@@ -141,6 +141,20 @@ export type DataStreamEndInfo = {
 }
 
 /**
+ * Progress of a SWITCH catch-up stream (a relay-opened FETCH_HEADER stream routed
+ * to a pushed PUBLISH receiver): it has delivered its first object of `groupId`,
+ * enqueued on the receiver's object stream. The catch-up is delivered in ascending
+ * group order, so every object of a lower group it carries was enqueued before
+ * this report.
+ */
+export type CatchUpProgressInfo = {
+  /** The request id of the receiver the catch-up is routed to (the PUBLISH's). */
+  requestId: bigint
+  /** The group the catch-up has reached. */
+  groupId: bigint
+}
+
+/**
  * Successful return value from {@link MOQtailClient.subscribe} (and {@link MOQtailClient.switch}).
  *
  * Carries the request id, the object stream, and the relay's `largest_location`

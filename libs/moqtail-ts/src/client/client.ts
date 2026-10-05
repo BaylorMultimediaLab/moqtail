@@ -107,6 +107,7 @@ import {
   DiscardedStreamInfo,
   DataStreamEnd,
   DataStreamEndInfo,
+  CatchUpProgressInfo,
   PushedReceiver,
   TrackAliasHolder,
 } from './types'
@@ -422,6 +423,16 @@ export class MOQtailClient {
    * completion. Exceptions thrown by the callback are logged and swallowed.
    */
   onDataStreamEnded?: (info: DataStreamEndInfo) => void
+
+  /**
+   * Invoked when a SWITCH catch-up stream routed to a pushed receiver delivers its
+   * first object of a new group, after that object was enqueued (R7-D1). The
+   * catch-up runs in ascending group order, so a report of group `g` means every
+   * object below `g` it carries has been enqueued: an application waiting for the
+   * catch-up's content below some group can stop waiting there. Exceptions thrown
+   * by the callback are logged and swallowed.
+   */
+  onCatchUpProgress?: (info: CatchUpProgressInfo) => void
 
   /**
    * General-purpose error callback for surfaced exceptions not thrown to caller synchronously.
@@ -2772,6 +2783,9 @@ export class MOQtailClient {
             openStreams = new Set()
             this.#openDataStreams.set(catchupReceiver, openStreams)
           }
+          // The entry's group follows the group the catch-up is delivering (R7-D1;
+          // it was fixed at 0), so stopDataStreams(requestId, seam) stops a
+          // catch-up that has reached the seam and leaves one still below it.
           const openEntry = {
             groupId: 0n,
             stop: async () => {
@@ -2780,6 +2794,8 @@ export class MOQtailClient {
             },
           }
           openStreams.add(openEntry)
+          const receiverRequestId = this.#receiverRequestId(catchupReceiver)
+          let reachedGroup: bigint | undefined
           try {
             while (true) {
               const { done, value: nextObject } = await reader.read()
@@ -2788,11 +2804,23 @@ export class MOQtailClient {
                 break
               }
               if (nextObject instanceof FetchObject) {
+                // Parsed before a stop took effect: not delivered (R7-D5).
+                if (stoppedHere) continue
                 const moqtObject = MoqtObject.fromFetchObject(nextObject, catchupName)
+                const group = moqtObject.location.group
+                openEntry.groupId = group
                 catchupReceiver.controller?.enqueue(moqtObject)
                 objectsDelivered++
-                firstGroup ??= moqtObject.location.group
+                firstGroup ??= group
                 lastSubgroupId = moqtObject.subgroupId ?? lastSubgroupId
+                if (reachedGroup === undefined || group > reachedGroup) {
+                  reachedGroup = group
+                  try {
+                    this.onCatchUpProgress?.({ requestId: receiverRequestId, groupId: group })
+                  } catch (callbackError) {
+                    logger.error('MOQtailClient', 'onCatchUpProgress callback failed', callbackError)
+                  }
+                }
                 continue
               }
               throw new ProtocolViolationError('MOQtailClient', 'Received subgroup object after fetch header')
@@ -3729,6 +3757,64 @@ if (import.meta.vitest) {
       expect(ends).toHaveLength(1)
       expect(ends[0]).toMatchObject({ requestId: 1n, streamType: 'fetch', groupId: 4n, end: 'fin', objects: 2 })
       expect(client.subscriptions.has(9n)).toBe(false)
+      await client.disconnect()
+    })
+
+    // R7-D1 (pr1378): the catch-up is delivered in ascending group order, so its
+    // first object of a group at or above a later seam proves everything below that
+    // seam has been delivered on it. The library reports each new group the
+    // catch-up reaches, and the stream's open entry follows the group being
+    // delivered, so stopDataStreams(requestId, seam) cuts it once it has passed
+    // the seam (its entry used to stay at group 0, below every seam).
+    it('reports the group the catch-up has reached and stops it from the seam on (R7-D1)', async () => {
+      const { client, transport } = await connected()
+      const progress: CatchUpProgressInfo[] = []
+      client.onCatchUpProgress = (info) => progress.push(info)
+      const ends: DataStreamEndInfo[] = []
+      client.onDataStreamEnded = (info) => ends.push(info)
+      const errors = vi.spyOn(logger, 'error')
+      const pushed: ReadableStream<MoqtObject>[] = []
+      client.onPeerPublish = (_msg, stream) => pushed.push(stream)
+      const incoming = transport.openIncomingBiStream()
+      incoming.respond(new Publish(1n, ftn, 9n, [], []))
+      await vi.waitFor(() => expect(incoming.messages).toHaveLength(1))
+      const reader = pushed[0]!.getReader()
+
+      const header = new FetchHeader(FetchHeaderType.Type0x05, 1n).serialize().toUint8Array()
+      const catchUp = transport.openIncomingUniStream(header)
+      let previous: FetchObject | undefined
+      const send = (group: number, object: number) => {
+        const next = FetchObject.newObject(
+          group,
+          0,
+          object,
+          128,
+          ObjectForwardingPreference.Subgroup,
+          null,
+          new Uint8Array(8),
+        )
+        catchUp.enqueue(next.serialize(previous?.toContext() ?? undefined).toUint8Array())
+        previous = next
+      }
+      send(10, 0)
+      send(10, 1)
+      send(11, 0)
+      for (const group of [10n, 10n, 11n]) expect((await reader.read()).value?.location.group).toBe(group)
+      expect(progress).toEqual([
+        { requestId: 1n, groupId: 10n },
+        { requestId: 1n, groupId: 11n },
+      ])
+      // Still below the seam: nothing at or above group 12 is open.
+      expect(await client.stopDataStreams(1n, 12n)).toBe(0)
+
+      send(12, 0)
+      expect((await reader.read()).value?.location.group).toBe(12n)
+      expect(progress.at(-1)).toEqual({ requestId: 1n, groupId: 12n })
+      expect(await client.stopDataStreams(1n, 12n)).toBe(1)
+      await vi.waitFor(() => expect(ends).toHaveLength(1))
+      expect(ends[0]).toMatchObject({ requestId: 1n, streamType: 'fetch', groupId: 10n, end: 'stopped', objects: 4 })
+      expect(errors).not.toHaveBeenCalled()
+      errors.mockRestore()
       await client.disconnect()
     })
 

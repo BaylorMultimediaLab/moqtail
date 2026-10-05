@@ -145,6 +145,12 @@ pub(crate) struct MOQTClient {
   // entries self-expire at T_switch.
   pub switch_in_flight: Arc<Mutex<SwitchInFlight>>,
 
+  // SWITCH PR #1378 catch-up streams still delivering, keyed by the switch
+  // target's PUBLISH request id: the group the catch-up stops before (u64::MAX =
+  // the end of its range). Lowered to the new G_switch when that target is itself
+  // replaced (R7-D1, `switch_delivery::bound_switch_catchup`).
+  pub switch_catchup_bounds: Arc<std::sync::Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU64>>>>,
+
   // Optional per-connection write rate limiter. All streams of this client share
   // the same bucket so they compete for bandwidth, exercising QUIC stream priority.
   rate_limiter: Option<Arc<Mutex<TokenBucket>>>,
@@ -195,6 +201,7 @@ impl MOQTClient {
       fetch_cancel_senders: Arc::new(RwLock::new(HashMap::new())),
       subscriptions: TrackSubscriptionMap::new(),
       switch_in_flight: Arc::new(Mutex::new(SwitchInFlight::new())),
+      switch_catchup_bounds: Arc::new(std::sync::Mutex::new(HashMap::new())),
       rate_limiter,
     }
   }

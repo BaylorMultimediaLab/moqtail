@@ -197,7 +197,23 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
 
   > Done(S) ⇔ PUBLISH_DONE(S) received ∧ G_switch known (SWITCH_OK) ∧ B of S's
   > data streams below G_switch have ended (FIN or reset) ∧ S's own catch-up
-  > stream has ended (if S was itself a switch target with one).
+  > stream (if S was itself a switch target with one) has ended or has reached
+  > G_switch.
+
+  _Catch-up of a replaced target (review R7 D1)._ The catch-up is delivered in
+  ascending group order, so its first object of a group >= G_switch proves that
+  everything below the seam it carries has been delivered. The library reports
+  each group a catch-up reaches (`onCatchUpProgress`, after the object is
+  queued) and keeps the catch-up's open-stream entry at the group being
+  delivered (it was fixed at 0), so `stopDataStreams(S, G_switch)` and
+  `finishReceiver` cut a catch-up that has passed the seam. Waiting for the
+  catch-up's end used to hold the release for the whole catch-up, the span at or
+  above the seam (dropped anyway) included: up to ~2 s, released as
+  `drain-timeout`. The relay ends it at the source too: when a switch target is
+  itself replaced (`terminate_source`), its catch-up, if still delivering, stops
+  before the new G_switch and FINs (`switch_delivery::bound_switch_catchup`). It
+  is not reset: its objects below the new seam play before it. The released
+  route records `catch_up_reached_group` on `SWITCH_SOURCE_RELEASED`.
 
   B comes from the relay (the project-local SWITCH_TRANSITION field below).
   Ended streams are a subset of the seen ones, which are a subset of the B the
