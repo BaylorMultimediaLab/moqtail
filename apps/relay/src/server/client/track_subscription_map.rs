@@ -40,7 +40,9 @@ impl TrackSubscriptionMap {
     map.insert(track_name, subscription);
   }
 
-  #[allow(dead_code)] // retained accessor; unused after the old-pipeline SWITCH removal
+  // Test-only on this branch: the native SWITCH path that read it is not here
+  // (pr1378 R6 D7); tests use it to check the map.
+  #[cfg(test)]
   pub async fn get_subscription(
     &self,
     track_name: &FullTrackName,
