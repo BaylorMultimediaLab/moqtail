@@ -1077,6 +1077,48 @@ the low step's rate). If every run passes, the grid follows with the
 same loop shape (`step_down_up`, 200 s, 5 repetitions); if not, the
 failing checks say which layer to fix before anything else runs.
 
+### 11g. The preflight again (2026-10-05)
+
+The first preflight (`results-linux-2026-10-05/preflight`, 36 runs) passed every
+unshaped run and failed every shaped one. Four defects, all fixed on every
+branch, with a failing test each:
+
+- the validator's `pf-qdisc` read the step's `tc` commands, and a capacity step
+  is a `tc class change` that names only htb (the kernel tree was right in every
+  run); it now reads the recorded tree and the htb class rate;
+- the runner started the profile and the duration at the browser spawn, so the
+  page load (6.6 s native, 6.9 s pr1378 over the shaped link) shortened every
+  session to ~83.5 s and moved every step earlier, by a different amount per
+  branch (the `samples` failures); both now start at the client's CONNECT_START;
+- the relay could not reset a stream it had already FIN'd: on pr1378 every
+  time-shifted shaped run then received ~1.9 MB of abandoned groups at or above
+  the switch seams (`pf-delivery-rate` 0.7 of the 1.5 Mbit/s step);
+- the relay reuses a track's alias for every subscription to it, so a late
+  object of an earlier subscription to the switch target landed four pr1378
+  switches below their start group, and one run's decoder failed
+  (MEDIA_ERR_DECODE, `pf-terminal`); the player now drops such objects, and
+  the validator has `pf-landing` and `media-error`.
+
+Native and native forward-trigger delivered at the link rate on every step,
+the restore to 6 Mbps included: the BBR stall of fresh-grid-v2 is gone under
+CUBIC.
+
+Run the same preflight again (11f, steps 1 to 4) after moving the first round
+aside:
+
+```sh
+cd ~/Documents/Baylor\ Research/moqtail
+mv results results-preflight1-$(date +%Y%m%d); mkdir -p results logs
+git fetch origin && git checkout harness && git reset --hard origin/harness
+# then 11f step 1 (clean state, cache check), step 2 (`preflight 3`), steps 3 and 4
+```
+
+Expected: every run PASS. Shaped sessions now last 90 s (`samples` ≥ 324),
+`SESSION_START.page_load_s` is recorded per run, pr1378 time-shifted
+`DROP_STALE{unrouted}` falls from ~1.9 MB to the bytes already on the wire at
+each seam, and no `DROP_STALE{earlier-subscription}` should be needed often (it
+is the guard, reported per run).
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
