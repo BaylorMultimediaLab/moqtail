@@ -701,7 +701,9 @@ pub(crate) async fn apply_seam_bound(
 /// FIRST, then tell the subscriber with PUBLISH_DONE(SUBSCRIPTION_ENDED) on that
 /// subscription's request stream. State goes first because the subscriber may
 /// react to the PUBLISH_DONE at once (e.g. another SWITCH naming this Request
-/// ID), and a stale entry would let that pass the Established gate.
+/// ID), and a stale entry would let that pass the Established gate. The
+/// subscription's streams are ended (`cancel_from_group`) before PUBLISH_DONE, so
+/// its Stream Count is final.
 ///
 /// Returns the number of SUBGROUP data streams the replaced subscription opened
 /// for Groups below `g_switch` (finished, reset and open ones), read once the
@@ -749,6 +751,20 @@ pub(crate) async fn terminate_source(
 
   if let Some(sub_arc) = sub_arc {
     let sub = sub_arc.read().await;
+    // Reset the replaced subscription's data streams instead of finishing them.
+    // A finish is a FIN: QUIC delivers everything already queued on the stream.
+    // Above the seam that queue is the old track's backlog, which the subscriber
+    // will discard and which starved the target's streams (delivery diagnostic,
+    // 2026-09-29: 78 of 222 groups cut on the wire): reset those. Below the seam
+    // it is media the subscriber will play before it reaches the seam (a
+    // deep-buffer subscriber on a saturated link has a group or two in flight):
+    // finish those.
+    let (reset_open, reset_finished) = sub.cancel_from_group(g_switch).await;
+    // PUBLISH_DONE after the subscription has finished: no stream can be opened
+    // from here on, and one whose open was under way is already counted, so the
+    // Stream Count is final. Sent before, a below-seam stream opened afterwards was
+    // missing from it and the subscriber dropped it as unrouted (review 2026-10-05
+    // round 2).
     if let Err(e) = sub
       .send_publish_done(
         PublishDoneStatusCode::SubscriptionEnded,
@@ -758,25 +774,13 @@ pub(crate) async fn terminate_source(
     {
       error!("switch teardown: failed to send PUBLISH_DONE: {e:?}");
     }
-    // Reset the replaced subscription's data streams instead of finishing them.
-    // A finish is a FIN: QUIC delivers everything already queued on the stream.
-    // Above the seam that queue is the old track's backlog, which the subscriber
-    // will discard and which starved the target's streams (delivery diagnostic,
-    // 2026-09-29: 78 of 222 groups cut on the wire): reset those. Below the seam
-    // it is media the subscriber will play before it reaches the seam (a
-    // deep-buffer subscriber on a saturated link has a group or two in flight):
-    // finish those.
-    let streams = sub.opened_stream_count();
-    // Streams at/above the seam are reset, FIN'd ones included; streams below it
-    // finish and deliver.
-    let (reset_open, reset_finished) = sub.cancel_from_group(g_switch).await;
     crate::server::events::emit(
       "SWITCH_SOURCE_RESET",
       serde_json::json!({
         "conn": connection_id,
         "request_id": current_sub_req_id,
         "track": crate::server::events::track_name_string(current_full_track_name),
-        "streams_opened": streams,
+        "streams_opened": sub.opened_stream_count(),
         "seam_group": g_switch,
         "reset_open": reset_open,
         "reset_finished": reset_finished,

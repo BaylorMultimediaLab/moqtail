@@ -156,9 +156,12 @@ messages.
 - **Attach before terminate (P4).** Once the publish claim is won the relay
   attaches the target subscription first (it forwards nothing until its
   PUBLISH is out: `mark_alias_announced`), then bounds the source at
-  `G_switch - 1`, sends PUBLISH_DONE(SUBSCRIPTION_ENDED) on the source's
-  request stream and ends it (Close-After-Switch:
-  `switch_delivery::hand_over_to_target`). A target that cannot be attached
+  `G_switch - 1`, ends it (streams below the seam FIN'd, at or above it
+  reset) and then sends PUBLISH_DONE(SUBSCRIPTION_ENDED) on the source's
+  request stream, so its Stream Count is final (Close-After-Switch:
+  `switch_delivery::hand_over_to_target`; review 2026-10-05: the source was
+  removed through a cancel that reset every stream, and PUBLISH_DONE went out
+  before the streams were ended). A target that cannot be attached
   (the connection already holds a subscription on it, which includes a SWITCH
   to the current track) is answered with the PublishBuildFailed failure PUBLISH
   and the source is untouched, as the PR's failure discipline requires. The

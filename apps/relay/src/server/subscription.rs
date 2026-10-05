@@ -1650,6 +1650,10 @@ impl Subscription {
           .unwrap_or_else(|poisoned| poisoned.into_inner())
           .entry(header.group_id)
           .or_insert(0) += 1;
+        // PUBLISH_DONE's Stream Count, counted here for the same reason as B: an
+        // open waiting at the hand-over completes afterwards and the subscriber sees
+        // that stream (review 2026-10-05 round 2).
+        self.opened_stream_count.fetch_add(1, Ordering::Relaxed);
       }
 
       let send_stream = match self
@@ -1671,7 +1675,10 @@ impl Subscription {
 
       // Count every data stream opened for this subscription (PUBLISH_DONE
       // Stream Count), including subgroups that end up carrying no objects.
-      self.opened_stream_count.fetch_add(1, Ordering::Relaxed);
+      // SUBGROUP streams were counted before the open (above).
+      if !matches!(header_info, HeaderInfo::Subgroup { .. }) {
+        self.opened_stream_count.fetch_add(1, Ordering::Relaxed);
+      }
 
       // Register the stream for `finish` to end, unless the subscription finished
       // while this open waited (R7-D3): `finish` sets the flag before it drains the
@@ -2885,11 +2892,11 @@ mod tests_below_seam_count_race {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // The hand-over at G_switch = 3: bound at 2, end, read B.
-    let below_seam = {
+    let (below_seam, publish_done_count) = {
       let sub = sub.read().await;
       sub.subscription_state.write().await.end_group = Some(2);
       sub.finish().await;
-      sub.opened_streams_below(3)
+      (sub.opened_streams_below(3), sub.opened_stream_count())
     };
 
     // Group 1's stream ends; its credit lets the racing open complete.
@@ -2903,6 +2910,13 @@ mod tests_below_seam_count_race {
       while let Ok(Some(_)) = recv.read(&mut buf).await {}
     }
     assert_eq!(seen, 2, "groups 1 and 2 reach the subscriber");
+    // Review 2026-10-05 round 2: PUBLISH_DONE's Stream Count, read at the same
+    // point, must count them too, or the subscriber completes the request with a
+    // stream still to come and drops it as unrouted.
+    assert_eq!(
+      publish_done_count, seen,
+      "PUBLISH_DONE's Stream Count must count every stream the subscriber sees"
+    );
     assert_eq!(
       below_seam, seen,
       "B must count every below-seam stream the subscriber sees"
