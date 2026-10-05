@@ -378,6 +378,20 @@ def gso_evidence(leaf: dict, mtu: int = MTU_BYTES) -> dict:
     return {"max_skb_bytes": maxpkt, "backlog_bytes_per_skb": per_skb, "gso_at_qdisc": verdict}
 
 
+_HTB_CLASS_HEAD = re.compile(r"^class htb (?P<classid>\S+) .*?\brate (?P<rate>\d+(?:\.\d+)?)(?P<unit>[KMG]?)bit\b")
+_RATE_UNIT = {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000}
+
+
+def parse_htb_class_rate(text: str, classid: str = HTB_CLASS) -> int | None:
+    """The rate (bit/s) of htb class `classid` in `tc class show dev X`, None if absent.
+    tc prints the rate with decimal SI units ("1500Kbit", "6Mbit")."""
+    for raw in text.splitlines():
+        m = _HTB_CLASS_HEAD.match(raw.strip())
+        if m and m["classid"] == classid:
+            return round(float(m["rate"]) * _RATE_UNIT[m["unit"]])
+    return None
+
+
 def leaf_stats(show_text: str, shape: Shape, topo: Topology) -> dict:
     """The bottleneck leaf's counters from `tc -s qdisc show dev <host_if>`
     (bytes, packets, drops, backlog, plus fq_codel's extended stats), the GSO
@@ -648,9 +662,16 @@ class NetnsBackend:
             f"{k} {h}" for k, h, _ in expected_tree(shape, self.topo)))
 
     def stats(self) -> dict | None:
+        """`leaf_stats` of the host-side tree, plus on a rate-limited step the htb
+        class's rate as the kernel holds it (`htb_class.rate_bps`): a capacity step
+        is a `tc class change`, which the qdisc listing does not show."""
         if self.topo is None or self.current is None:
             return None
-        return leaf_stats(self.show(stats=True), self.current, self.topo)
+        out = leaf_stats(self.show(stats=True), self.current, self.topo)
+        if self.current.rate_mbps is not None:
+            text = _run(f"tc class show dev {self.host_if}", check=False, quiet=True).stdout
+            out["htb_class"] = {"classid": HTB_CLASS, "rate_bps": parse_htb_class_rate(text)}
+        return out
 
     # -- helpers -------------------------------------------------------------
     def wrap(self, cmd: list[str]) -> list[str]:

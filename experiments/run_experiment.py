@@ -248,7 +248,11 @@ PUBLISHER_REQUIRED_NEW = {"--variant-priority": "128"}
 WARMUP_S = 15.0  # publisher first GROUP_EMIT -> browser start, both client types
 RELAY_READY_TIMEOUT_S = 15.0  # relay.log listening line
 PUBLISHER_READY_TIMEOUT_S = 30.0  # first GROUP_EMIT in publisher-events.jsonl
-CLIENT_STARTUP_TIMEOUT_S = 30.0  # STARTUP in client-events.jsonl after browser spawn
+CLIENT_STARTUP_TIMEOUT_S = 30.0  # STARTUP in client-events.jsonl after the session start
+# CONNECT_START in client-events.jsonl after the browser spawn: the page load. Over a
+# shaped link the dev server's page takes several seconds (6.6 s native, 6.9 s pr1378
+# at 6 Mbit/s + 40 ms in the 2026-10-05 preflight).
+CLIENT_CONNECT_TIMEOUT_S = 60.0
 CACHE_MARGIN_S = 30.0  # refuse duration + warmup + margin > gops_per_variant
 RELAY_LISTENING_NEEDLE = "is running on"  # apps/relay/src/server.rs start(): "<version> is running on N UDP socket(s)"
 
@@ -1107,7 +1111,7 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
 
         # Initial network state, then background flows -----------------------
         steps = profile["steps"]
-        t0: float | None = None  # browser spawn; profile steps are scheduled from it
+        t0: float | None = None  # the client's session start; profile steps are scheduled from it
 
         def apply_step(idx: int) -> None:
             """Apply profile step `idx` (the first call builds and verifies the
@@ -1126,7 +1130,7 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
                                      "qdisc_stats": backend.stats(), "offloads": backend.offloads or None})
         apply_step(0)
         time.sleep(max(0.0, gate - time.time()))
-        bg.start(args.duration + 30)
+        bg.start(args.duration + CLIENT_CONNECT_TIMEOUT_S + 30)  # outlasts the page load and the session
 
         # Browser ------------------------------------------------------------
         url = (f"http://{backend.vite_host}:{args.vite_port}/?run={run_id}&autoConnect=1"
@@ -1159,6 +1163,7 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             os.environ["MOZ_HEADLESS"] = "1"
         if browser_kind(browser) == "firefox":
             refuse_snap_wrapper(browser)
+        spawned = time.time()
         procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed, backend.vite_host, args.vite_port)),
                                  out / "browser.log",
                                  new_session=not backend.detaches_itself)
@@ -1166,11 +1171,27 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
                                     "headless": not args.headed, "cert_pinned": hash_file.exists(),
                                     "warmup_measured_s": measured_warmup(first_group.get("ts"), time.time())})
 
+        # The session clock ------------------------------------------------
+        # The profile and the recording duration run from the client's session start
+        # (CONNECT_START), not from the browser spawn: the page load in between takes a
+        # different time per branch (the client bundles differ) and per link, so a
+        # spawn-anchored profile put every capacity step ~0.35 s earlier in a pr1378
+        # session than in a native one and cut the recorded session short by the
+        # page load (preflight 2026-10-05: 83.5 s of a 90 s run). Step 0 is already in
+        # force for the page load; the record's own `ts` anchors the clock.
+        client_log = ROOT / "logs" / run_id / "client-events.jsonl"
+        connect = wait_record(client_log, "CONNECT_START", CLIENT_CONNECT_TIMEOUT_S, procs["browser"], "browser")
+        if connect is None or not isinstance(connect.get("ts"), (int, float)):
+            raise SystemExit(f"client logged no CONNECT_START within {CLIENT_CONNECT_TIMEOUT_S:g} s of the browser "
+                             f"spawn; see {out / 'browser.log'} and {client_log}")
+        t0 = connect["ts"] / 1000.0
+        rlog.emit("SESSION_START", {"client_connect_start_ts": connect["ts"],
+                                    "page_load_s": round(t0 - spawned, 3),
+                                    "seen_after_s": round(time.time() - t0, 3)})
+
         # Main loop: apply steps on schedule, sample process stats -----------
-        t0 = time.time()
         step_idx = 1
         last_stats = 0.0
-        client_log = ROOT / "logs" / run_id / "client-events.jsonl"
         startup_seen = False
         while time.time() - t0 < args.duration:
             elapsed = time.time() - t0
@@ -1180,10 +1201,11 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             if not startup_seen:
                 if find_record(client_log, "STARTUP") is not None:
                     startup_seen = True
-                    rlog.emit("CLIENT_READY", {"after_browser_spawn_s": round(elapsed, 3)})
+                    rlog.emit("CLIENT_READY", {"after_session_start_s": round(elapsed, 3),
+                                               "after_browser_spawn_s": round(time.time() - spawned, 3)})
                 elif elapsed > CLIENT_STARTUP_TIMEOUT_S:
-                    raise SystemExit(f"client logged no STARTUP within {CLIENT_STARTUP_TIMEOUT_S:g} s of the browser "
-                                     f"spawn; see {out / 'browser.log'} and {client_log}")
+                    raise SystemExit(f"client logged no STARTUP within {CLIENT_STARTUP_TIMEOUT_S:g} s of the session "
+                                     f"start; see {out / 'browser.log'} and {client_log}")
             bg.tick()
             if time.time() - last_stats >= 1.0:
                 last_stats = time.time()
