@@ -31,13 +31,20 @@ export interface StallContext {
  * that does not advance while playing is a stall whether or not the element
  * fired `waiting`). One episode is open at a time.
  *
- * Episodes never overlap (F15). Closing an episode, whether by `playing` or
- * by playhead progress, resets the watchdog's frozen count, so a new frozen
- * episode starts only after a new freeze has been confirmed from that point;
- * and no episode is credited from before the previous STALL_END. Before, a
- * `playing` event without progress closed the episode while the watchdog kept
- * counting, and its next tick reopened one backdated to the original freeze
- * start: one 7.0 s freeze was reported as 6475 + 7011 ms.
+ * Episodes never overlap (F15). A `waiting` episode ends on `playing` or on
+ * playhead progress; a `frozen` episode ends only on playhead progress (a
+ * `playing` event while the playhead stands still does not end a freeze), so
+ * one freeze is one episode, credited from the first frozen tick the watchdog
+ * confirmed. Closing an episode resets the watchdog's frozen count, so a new
+ * frozen episode starts only after a new freeze has been confirmed from that
+ * point, and no episode is credited from before the previous STALL_END.
+ *
+ * History: originally a `playing` event without progress closed the episode
+ * while the watchdog kept counting, and its next tick reopened one backdated
+ * to the original freeze start (one 7.0 s freeze reported as 6475 + 7011 ms,
+ * overlapping). The first fix reset the count on that close, which split one
+ * freeze into two episodes with a ~500 ms hole between them (a 0-7000 ms
+ * freeze became [500, 3000] + [3500, 7000]).
  */
 export class StallTracker {
   #open: { startPerf: number; cause: StallCause; playheadMs: number } | null = null;
@@ -65,8 +72,12 @@ export class StallTracker {
     this.#start('waiting', now);
   }
 
-  /** The element fired `playing`. */
+  /**
+   * The element fired `playing`. Ends a `waiting` episode only: a frozen
+   * episode ends when the playhead moves (watchdogTick), not on the event.
+   */
   playing(now: number): void {
+    if (this.#open?.cause !== 'waiting') return;
     this.#end(now);
   }
 

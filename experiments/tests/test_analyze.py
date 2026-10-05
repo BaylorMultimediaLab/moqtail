@@ -488,9 +488,25 @@ class StallsAndSeeks(TmpRun):
         self.assertEqual(s["starvation"]["total_ms"], 300)   # [9500, 9800) overlaps the starvation episode; before: 0
 
     def test_reopened_frozen_stall_is_not_counted_twice(self):
-        # D5 follow-up (fresh-grid-v2 pr1378 shift10s r0): `playing` closed a frozen stall while
-        # the watchdog still counted frozen ticks, which reopened it backdated to the original
-        # freeze start. The two episodes overlap; the stalled time is their union (7.0 s, not 13.5 s).
+        # The player's current output for one 7.0 s freeze (9.5-16.5 s) during which the element
+        # fired `playing` without playhead progress: `playing` no longer ends a frozen episode, so
+        # there is one STALL_START (logged at the confirming tick, 10.0 s) and one STALL_END at
+        # the progress, credited from the first frozen tick.
+        client = startup()
+        client.append(ev("STALL_START", T0 + 10_000, cause="frozen", playhead_ms=9000, track=R[0]))
+        client.append(ev("STALL_END", T0 + 16_500, cause="frozen", playhead_ms=9000, duration_ms=7000))
+        client += samples(T0, T0 + 20_000, lambda t: R[0])
+        s = analyze.analyze(write_run(self.dir, client))
+        st = s["stalls"]
+        self.assertEqual((st["count"], st["total_ms"], st["max_ms"]), (1, 7000, 7000))
+        self.assertEqual(st["episodes"][0]["ts"], T0 + 9500)
+        self.assertEqual(st["overlapping_merged"], 0)
+
+    def test_old_bundle_overlapping_frozen_stalls_are_merged(self):
+        # Old bundles (before F15, fresh-grid-v2 pr1378 shift10s r0): `playing` closed a frozen
+        # stall while the watchdog still counted frozen ticks, which reopened it backdated to the
+        # original freeze start. The two episodes overlap; the stalled time is their union
+        # (7.0 s, not 13.5 s). The merge stays as a safety net for those bundles.
         client = startup()
         client.append(ev("STALL_START", T0 + 10_000, cause="frozen", playhead_ms=9000, track=R[0]))
         client.append(ev("STALL_END", T0 + 16_000, cause="frozen", playhead_ms=9000, duration_ms=6500))

@@ -241,7 +241,10 @@ def client_connection_id(recs: list[dict], ladder: list[dict]) -> tuple[int | No
 
 def _merge_overlapping(episodes: list[dict]) -> tuple[list[dict], int]:
     """Stall episodes as the union of their intervals: an episode starting before the previous
-    one ended is merged into it (the end is the later of the two). Returns (episodes, merged)."""
+    one ended is merged into it (the end is the later of the two). Returns (episodes, merged).
+    A safety net for old bundles: the player's episodes no longer overlap (F15), and since the
+    second-round fix a `playing` event does not end a frozen episode, so one freeze is one
+    episode."""
     out: list[dict] = []
     merged = 0
     for e in sorted(episodes, key=lambda x: x["ts"]):
