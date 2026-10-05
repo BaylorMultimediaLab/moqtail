@@ -50,6 +50,7 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
                     5 s + target shift of the end; with switch_seq, no terminal inferred without its
                     record (SWITCH_SUPERSEDED); no conflicting, unjoined or duplicate records
   pf-unrouted       DROP_STALE{unrouted} bytes after the first switch settled (reported)
+  pf-append-order   the decode-order scheduler's drops by reason and the most frames it held (reported)
   pf-relay-cc       RELAY_CONFIG.congestion_controller matches the run identity
   pf-qdisc          qdisc_stats on every applied NET_CHANGE; its recorded kernel tree is netem 1: root,
                     and on a rate-limited step htb 2: under 1:1 and bfifo|fq_codel 20: under 2:10
@@ -562,6 +563,13 @@ def main() -> int:
         unrouted = [r for r in by("DROP_STALE") if r.get("reason") == "unrouted" and (settled is None or r["ts"] >= settled)]
         rep.info("pf-unrouted", f"DROP_STALE{{unrouted}} after the first switch settled: {len(unrouted)} objects, "
                                 f"{sum(r.get('bytes') or 0 for r in unrouted)} bytes (expected 0)")
+        order = (summary.get("discarded") or {}).get("append_order")
+        rep.info("pf-append-order",
+                 "decode-order scheduler drops: " + (", ".join(f"{k}={v}" for k, v in order.items()) if order is not None
+                                                      else "not recorded (bundle before 2026-10-05)")
+                 + "; held frames at most " + str(max((r.get("held_frames") or 0 for r in by("SAMPLE")), default=0))
+                 + " (reported: a late frame the player would have appended in arrival order made MSE drop the rest"
+                   " of its group)")
         relay_cfg = next(iter(by("RELAY_CONFIG")), None)
         want_cc = identity.get("congestion_controller") or summary.get("congestion_controller")
         if relay_cfg is None:
