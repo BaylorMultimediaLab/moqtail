@@ -396,7 +396,8 @@ class MSEBuffer {
    * are handled here, with one deferral and one SEEK vocabulary:
    * - `gap`: at the end of its range (or in a hole) with a later range, cross
    *   to it; wait while a fill is landing inside the gap (bounded by
-   *   `rangeJumpNoProgressMs` without append-front progress).
+   *   `rangeJumpNoProgressMs` since the last in-gap append, whether or not
+   *   that append moved the fill front).
    * - `wedge`: frozen for `wedgeFrozenMs` inside a range with data ahead and
    *   no gap to cross; seek to the next group boundary.
    * Nothing is crossed before playback has started (paused element): the
