@@ -40,6 +40,7 @@ export const handlerPublish: RequestStreamMessageHandler<Publish> = async (clien
     requestId: localPseudoRequestId,
     fullTrackName: msg.fullTrackName,
     streamsAccepted: 0n,
+    streamsEnded: 0n,
     expectedStreams: undefined,
     largestLocation: undefined,
     controller: streamController,
