@@ -829,8 +829,31 @@ impl Subscription {
           relay_track_id
         );
 
-        for stream_id in stream_ids.iter() {
-          let res = subscriber.close_stream(stream_id).await;
+        // Every stream is FIN'd at once and the completions (each waits for the
+        // peer's ACK) are awaited together (R7-D6): one stream after another cost
+        // the subscriber a round trip per open stream before the last one ended,
+        // and the switch hand-over waits for the replaced subscription's streams
+        // to end.
+        let mut closing = tokio::task::JoinSet::new();
+        for stream_id in stream_ids.iter().cloned() {
+          let subscriber = subscriber.clone();
+          closing.spawn(async move {
+            let res = subscriber.close_stream(&stream_id).await;
+            (stream_id, res)
+          });
+        }
+        while let Some(joined) = closing.join_next().await {
+          let (stream_id, res) = match joined {
+            Ok(closed) => closed,
+            Err(e) => {
+              warn!(
+                "Background stream cleanup task failed for subscriber={} relay_track_id={} error: {:?}",
+                connection_id, relay_track_id, e
+              );
+              continue;
+            }
+          };
+          let stream_id = &stream_id;
           if let Err(e) = res {
             warn!(
               "Background stream cleanup error for subscriber={} stream_id={} relay_track_id={} error: {:?}",
@@ -2772,5 +2795,86 @@ mod tests_stop_sending {
       .expect("the stream is reopened from the cached header");
     assert_eq!(objects_on(reopened).await, vec![(5, 3), (5, 4)]);
     assert_eq!(first_objects.await.unwrap(), vec![(5, 0), (5, 1)]);
+  }
+}
+
+/// R7-D6: ending a subscription with several data streams open FINs them all at
+/// once, so the subscriber sees every stream end about one round trip after the
+/// finish, not one round trip per stream.
+#[cfg(test)]
+mod tests_finish_streams_concurrently {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, publish, relay_client, subscribe, test_track, webtransport_pair_delayed,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::transport::data_stream_handler::RecvDataStream;
+  use std::time::{Duration, Instant};
+
+  const TRACK: u64 = 1;
+  const STREAMS: u64 = 6;
+  const ONE_WAY: Duration = Duration::from_millis(40);
+
+  #[tokio::test]
+  async fn finish_ends_every_open_stream_within_about_one_round_trip() {
+    let (peer, server) = webtransport_pair_delayed(ONE_WAY).await;
+    let client = relay_client(95, server);
+    let track = test_track(TRACK, "video-720p");
+    let latest = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    );
+    let sub = subscribe(&track, &client, latest, false).await;
+    sub.read().await.mark_alias_announced();
+
+    // One open stream per group: the publisher's streams never close here.
+    for group in 1..=STREAMS {
+      publish(&track, group, 0).await;
+    }
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<Instant>();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    for _ in 0..STREAMS {
+      let recv = tokio::time::timeout(Duration::from_secs(5), peer.accept_uni())
+        .await
+        .expect("stream within 5 s")
+        .expect("stream");
+      let (ended_tx, seen_tx) = (ended_tx.clone(), seen_tx.clone());
+      tokio::spawn(async move {
+        let data = RecvDataStream::new(
+          recv,
+          Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        );
+        while let (_, Some(_)) = data.next_object().await {
+          let _ = seen_tx.send(());
+        }
+        let _ = ended_tx.send(Instant::now());
+      });
+    }
+    for _ in 0..STREAMS {
+      tokio::time::timeout(Duration::from_secs(5), seen_rx.recv())
+        .await
+        .expect("each stream's first object");
+    }
+
+    let finished_at = Instant::now();
+    sub.read().await.finish().await;
+    let mut last_end = finished_at;
+    for _ in 0..STREAMS {
+      let ended = tokio::time::timeout(Duration::from_secs(5), ended_rx.recv())
+        .await
+        .expect("every stream ends")
+        .unwrap();
+      last_end = last_end.max(ended);
+    }
+    let took = last_end - finished_at;
+    // One way to deliver the FINs; sequential closing (each finish awaiting the
+    // peer's ACK before the next FIN) takes about one round trip per stream
+    // (here 40 ms + 5 x 80 ms).
+    assert!(
+      took < 4 * ONE_WAY,
+      "the last of {STREAMS} streams ended {took:?} after finish (one way {ONE_WAY:?})"
+    );
   }
 }

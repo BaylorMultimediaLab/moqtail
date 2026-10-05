@@ -121,6 +121,92 @@ pub(crate) async fn quic_pair_with_transports(
   )
 }
 
+/// A connected (client, server) pair of WebTransport sessions on the loopback, the
+/// transport the relay serves browsers on (data streams are then
+/// `WebTransportPrioritised`, whose `finish` waits for the peer's ACK). Every
+/// datagram in either direction is held for `one_way` by a UDP forwarder between
+/// the two ends, so a round trip takes `2 * one_way` (plus the peer's ACK delay):
+/// for tests whose outcome depends on how many round trips something takes.
+pub(crate) async fn webtransport_pair_delayed(
+  one_way: Duration,
+) -> (TransportConnection, TransportConnection) {
+  use wtransport::endpoint::IntoConnectOptions;
+
+  let server_identity =
+    wtransport::Identity::self_signed(std::iter::once("localhost")).expect("self-signed identity");
+  let server_cert_hash = server_identity.certificate_chain().as_slice()[0].hash();
+  let server_config = wtransport::ServerConfig::builder()
+    .with_bind_address("127.0.0.1:0".parse().unwrap())
+    .with_identity(server_identity)
+    .build();
+  let server_endpoint = wtransport::Endpoint::server(server_config).expect("server endpoint");
+  let server_addr = server_endpoint.local_addr().unwrap();
+
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  tokio::spawn(async move {
+    let incoming = server_endpoint.accept().await;
+    let session_request = incoming.await.expect("session request");
+    let connection = session_request.accept().await.expect("accept");
+    let _ = tx.send((connection, server_endpoint));
+  });
+
+  let forwarder = delaying_forwarder(server_addr, one_way).await;
+  let client_config = wtransport::ClientConfig::builder()
+    .with_bind_address("127.0.0.1:0".parse().unwrap())
+    .with_server_certificate_hashes(vec![server_cert_hash])
+    .build();
+  let client_endpoint = wtransport::Endpoint::client(client_config).expect("client endpoint");
+  let client = client_endpoint
+    .connect(format!("https://{}:{}", forwarder.ip(), forwarder.port()).into_options())
+    .await
+    .expect("connect");
+  let (server, server_endpoint) = rx.await.expect("server side");
+  std::mem::forget(client_endpoint);
+  std::mem::forget(server_endpoint);
+
+  (
+    TransportConnection::WebTransport(client),
+    TransportConnection::WebTransport(server),
+  )
+}
+
+/// Forwards datagrams between the client (learnt from the first datagram that does
+/// not come from `server`) and `server`, each after `one_way`. Returns the address
+/// the client connects to.
+async fn delaying_forwarder(
+  server: std::net::SocketAddr,
+  one_way: Duration,
+) -> std::net::SocketAddr {
+  let socket = Arc::new(
+    tokio::net::UdpSocket::bind("127.0.0.1:0")
+      .await
+      .expect("forwarder socket"),
+  );
+  let addr = socket.local_addr().unwrap();
+  tokio::spawn(async move {
+    let mut client: Option<std::net::SocketAddr> = None;
+    let mut buf = vec![0u8; 65_536];
+    while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+      let to = if from == server {
+        match client {
+          Some(c) => c,
+          None => continue,
+        }
+      } else {
+        client = Some(from);
+        server
+      };
+      let datagram = buf[..n].to_vec();
+      let socket = socket.clone();
+      tokio::spawn(async move {
+        tokio::time::sleep(one_way).await;
+        let _ = socket.send_to(&datagram, to).await;
+      });
+    }
+  });
+  addr
+}
+
 /// An `MOQTClient` the relay would hold for the peer at the other end of `server`.
 pub(crate) fn relay_client(connection_id: usize, server: TransportConnection) -> Arc<MOQTClient> {
   Arc::new(MOQTClient::new(
