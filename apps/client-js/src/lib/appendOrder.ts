@@ -12,8 +12,8 @@
  * most of them around capacity steps and switch seams, on every arm).
  *
  * The scheduler appends a frame when it continues the last appended frame, holds a
- * frame that lies ahead of a gap until the gap fills (bounded by `maxWaitMs` and by
- * the buffer left ahead of the playhead), and drops a frame behind the append front
+ * frame that lies ahead of a gap until the gap fills (given up after `maxWaitMs`
+ * without progress, or when little media is left ahead of the playhead), and drops a frame behind the append front
  * that cannot be appended without discarding what follows it. It decides only; the
  * player appends and drops.
  */
@@ -43,7 +43,10 @@ export type OrderAction<T> =
   | { kind: 'drop'; frame: OrderFrame<T>; reason: OrderReason; held: boolean };
 
 export interface OrderContext {
-  /** Media ahead of the playhead in the buffer (ms); undefined when unknown. */
+  /**
+   * Media ahead of the playhead that it can play without a gap, from the buffer
+   * itself (ms); undefined when unknown.
+   */
   aheadOfPlayheadMs?: number;
   /**
    * Whether a keyframe below the append front at `dtsMs` would fill a gap the
@@ -54,7 +57,7 @@ export interface OrderContext {
 }
 
 export interface AppendOrderOptions {
-  /** Longest a frame waits for a gap to fill (ms). */
+  /** Longest the held frames wait while the gap before them makes no progress (ms). */
   maxWaitMs: number;
   /** Stop waiting once less than this much media is ahead of the playhead (ms). */
   minAheadMs: number;
@@ -68,6 +71,8 @@ export class AppendOrder<T> {
   #frontMs: number | undefined;
   /** Frames waiting for a gap, by decode time. */
   #held: OrderFrame<T>[] = [];
+  /** When the front last advanced (performance.now() ms). */
+  #progressAt = -Infinity;
 
   constructor(opts: Partial<AppendOrderOptions> = {}) {
     this.#opts = { ...DEFAULT_APPEND_ORDER, ...opts };
@@ -82,10 +87,17 @@ export class AppendOrder<T> {
     return this.#frontMs;
   }
 
-  /** When the oldest held frame stops waiting (performance.now() ms); undefined if none. */
+  /**
+   * When the held frames stop waiting (performance.now() ms); undefined if none.
+   * The wait runs from the later of the oldest held frame's arrival and the front's
+   * last advance: a gap that is being filled (a catch-up still delivering) keeps
+   * the frames after it waiting, one that makes no progress for `maxWaitMs` is
+   * given up (review 2026-10-05: a fixed wait gave up slow catch-ups).
+   */
   get nextDeadline(): number | undefined {
     if (this.#held.length === 0) return undefined;
-    return Math.min(...this.#held.map(f => f.arrivedAt)) + this.#opts.maxWaitMs;
+    const oldest = Math.min(...this.#held.map(f => f.arrivedAt));
+    return Math.max(oldest, this.#progressAt) + this.#opts.maxWaitMs;
   }
 
   /** A frame arrived: what to do now, in order (it and any held frames it releases). */
@@ -94,16 +106,16 @@ export class AppendOrder<T> {
     const front = this.#frontMs;
     if (front !== undefined && frame.dtsMs < front - frame.durMs / 2) {
       if (frame.isSync && ctx.fillsGapAhead?.(frame.dtsMs)) {
-        this.#append(frame, false, out);
-        this.#drain(out);
+        this.#append(frame, false, now, out);
+        this.#drain(now, out);
       } else {
         out.push({ kind: 'drop', frame, reason: 'behind-append-front', held: false });
       }
       return out;
     }
     if (front === undefined || this.#continues(frame)) {
-      this.#append(frame, false, out);
-      this.#drain(out);
+      this.#append(frame, false, now, out);
+      this.#drain(now, out);
       return out;
     }
     // Ahead of a gap: hold it, unless waiting is already over.
@@ -132,6 +144,7 @@ export class AppendOrder<T> {
     }));
     this.#held = [];
     this.#frontMs = undefined;
+    this.#progressAt = -Infinity;
     return out;
   }
 
@@ -139,9 +152,10 @@ export class AppendOrder<T> {
     return this.#frontMs !== undefined && Math.abs(frame.dtsMs - this.#frontMs) <= frame.durMs / 2;
   }
 
-  #append(frame: OrderFrame<T>, held: boolean, out: OrderAction<T>[]): void {
+  #append(frame: OrderFrame<T>, held: boolean, now: number, out: OrderAction<T>[]): void {
     out.push({ kind: 'append', frame, held });
     this.#frontMs = frame.dtsMs + frame.durMs;
+    this.#progressAt = now;
   }
 
   #insert(frame: OrderFrame<T>): void {
@@ -151,7 +165,7 @@ export class AppendOrder<T> {
   }
 
   /** Appends held frames that now continue the front; drops those left behind it. */
-  #drain(out: OrderAction<T>[]): void {
+  #drain(now: number, out: OrderAction<T>[]): void {
     while (this.#held.length > 0) {
       const next = this.#held[0]!;
       if (this.#frontMs !== undefined && next.dtsMs < this.#frontMs - next.durMs / 2) {
@@ -159,7 +173,7 @@ export class AppendOrder<T> {
         out.push({ kind: 'drop', frame: next, reason: 'behind-append-front', held: true });
       } else if (this.#continues(next)) {
         this.#held.shift();
-        this.#append(next, true, out);
+        this.#append(next, true, now, out);
       } else {
         return;
       }
@@ -167,8 +181,8 @@ export class AppendOrder<T> {
   }
 
   /**
-   * Waiting is over when the oldest held frame has waited `maxWaitMs` or the
-   * playhead is about to run out of media: the gap is given up. Frames before the
+   * Waiting is over when the gap has made no progress for `maxWaitMs` (see
+   * `nextDeadline`) or the playhead is about to run out of media: the gap is given up. Frames before the
    * earliest held keyframe cannot be appended without one and are dropped; that
    * keyframe and what continues it are appended. Without a held keyframe nothing is
    * appendable yet and the frames keep waiting for one.
@@ -185,7 +199,7 @@ export class AppendOrder<T> {
       out.push({ kind: 'drop', frame, reason: 'abandoned-gap', held: true });
     }
     const key = this.#held.shift()!;
-    this.#append(key, true, out);
-    this.#drain(out);
+    this.#append(key, true, now, out);
+    this.#drain(now, out);
   }
 }
