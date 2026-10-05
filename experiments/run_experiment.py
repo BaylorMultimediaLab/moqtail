@@ -521,8 +521,8 @@ def build_identity(args, *, run_id: str, repeat_index: int, stamp: str, profile:
     }
 
 
-def find_record(path: Path, event: str) -> dict | None:
-    """First JSONL record with `event` in `path`, or None."""
+def find_record(path: Path, event: str, since_ms: float | None = None) -> dict | None:
+    """First JSONL record with `event` in `path` (with `ts` >= `since_ms` when given), or None."""
     if not path.exists():
         return None
     try:
@@ -534,7 +534,8 @@ def find_record(path: Path, event: str) -> dict | None:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("event") == event:
+                if rec.get("event") == event and (
+                        since_ms is None or (isinstance(rec.get("ts"), (int, float)) and rec["ts"] >= since_ms)):
                     return rec
     except OSError:
         return None
@@ -542,11 +543,12 @@ def find_record(path: Path, event: str) -> dict | None:
 
 
 def wait_record(path: Path, event: str, timeout: float, proc: subprocess.Popen | None = None,
-                what: str = "") -> dict | None:
-    """Poll `path` for `event` up to `timeout` s; None on timeout. Raises if `proc` exits meanwhile."""
+                what: str = "", since_ms: float | None = None) -> dict | None:
+    """Poll `path` for `event` (`ts` >= `since_ms` when given) up to `timeout` s; None on
+    timeout. Raises if `proc` exits meanwhile."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        rec = find_record(path, event)
+        rec = find_record(path, event, since_ms)
         if rec is not None:
             return rec
         if proc is not None and proc.poll() is not None:
@@ -1163,6 +1165,14 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             os.environ["MOZ_HEADLESS"] = "1"
         if browser_kind(browser) == "firefox":
             refuse_snap_wrapper(browser)
+        # The client log of this run id must hold this session only: a run id without a
+        # timestamp (--repeat-index) is reused when a condition is rerun, and the dev
+        # server appends to the file. A leftover is moved aside, not deleted.
+        stale = ROOT / "logs" / run_id / "client-events.jsonl"
+        if stale.exists():
+            aside = stale.with_name(f"client-events.stale-{int(time.time())}.jsonl")
+            stale.rename(aside)
+            print(f"[run] moved a previous session's client log aside: {aside}")
         spawned = time.time()
         procs["browser"] = spawn(backend.wrap(browser_command(browser, url, out, args.headed, backend.vite_host, args.vite_port)),
                                  out / "browser.log",
@@ -1180,7 +1190,8 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
         # page load (preflight 2026-10-05: 83.5 s of a 90 s run). Step 0 is already in
         # force for the page load; the record's own `ts` anchors the clock.
         client_log = ROOT / "logs" / run_id / "client-events.jsonl"
-        connect = wait_record(client_log, "CONNECT_START", CLIENT_CONNECT_TIMEOUT_S, procs["browser"], "browser")
+        connect = wait_record(client_log, "CONNECT_START", CLIENT_CONNECT_TIMEOUT_S, procs["browser"], "browser",
+                              since_ms=spawned * 1000.0)
         if connect is None or not isinstance(connect.get("ts"), (int, float)):
             raise SystemExit(f"client logged no CONNECT_START within {CLIENT_CONNECT_TIMEOUT_S:g} s of the browser "
                              f"spawn; see {out / 'browser.log'} and {client_log}")
@@ -1199,7 +1210,7 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
                 apply_step(step_idx)
                 step_idx += 1
             if not startup_seen:
-                if find_record(client_log, "STARTUP") is not None:
+                if find_record(client_log, "STARTUP", since_ms=t0 * 1000.0) is not None:
                     startup_seen = True
                     rlog.emit("CLIENT_READY", {"after_session_start_s": round(elapsed, 3),
                                                "after_browser_spawn_s": round(time.time() - spawned, 3)})
