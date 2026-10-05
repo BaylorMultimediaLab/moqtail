@@ -381,7 +381,10 @@ struct FinishingEntry {
 /// acknowledged, and the reset that covers streams from now on.
 #[derive(Debug, Default)]
 pub(crate) struct FinishingStreams {
-  entries: HashMap<StreamId, FinishingEntry>,
+  /// Keyed by the stream id and the stream's identity: two streams can share an
+  /// id (a subgroup reopened after the subscriber stopped it), and one must not
+  /// displace the other.
+  entries: HashMap<(StreamId, usize), FinishingEntry>,
   /// Set by a reset of the subscription: (group, code). Streams of groups at or
   /// above the group (every stream for 0, FETCH streams included) are reset with
   /// the code instead of FIN'd from then on, so a close racing a reset cannot
@@ -393,6 +396,10 @@ impl FinishingStreams {
   #[cfg(test)]
   pub(crate) fn is_empty(&self) -> bool {
     self.entries.is_empty()
+  }
+
+  fn key(id: &StreamId, stream: &Arc<Mutex<TransportSendStream>>) -> (StreamId, usize) {
+    (id.clone(), Arc::as_ptr(stream) as usize)
   }
 
   fn covered(id: &StreamId, from_group: u64) -> bool {
@@ -408,13 +415,7 @@ impl FinishingStreams {
 
   /// Removes the entry of `id` if it is still `stream`'s.
   fn retire(&mut self, id: &StreamId, stream: &Arc<Mutex<TransportSendStream>>) {
-    if self
-      .entries
-      .get(id)
-      .is_some_and(|e| Arc::ptr_eq(&e.stream, stream))
-    {
-      self.entries.remove(id);
-    }
+    self.entries.remove(&Self::key(id, stream));
   }
 }
 
@@ -1094,20 +1095,20 @@ impl Subscription {
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     {
       let mut finishing = self.finishing_streams.write().await;
-      if finishing
-        .entries
-        .get(stream_id)
-        .is_some_and(|e| Arc::ptr_eq(&e.stream, &stream))
-      {
+      let key = FinishingStreams::key(stream_id, &stream);
+      if finishing.entries.contains_key(&key) {
         return Ok(None);
       }
       if let Some(code) = finishing.reset_code_for(stream_id) {
         drop(finishing);
-        self.subscriber.reset_stream(stream_id, code).await;
+        self
+          .subscriber
+          .reset_stream_matching(stream_id, &stream, code)
+          .await;
         return Ok(None);
       }
       finishing.entries.insert(
-        stream_id.clone(),
+        key,
         FinishingEntry {
           stream: stream.clone(),
           _cancel: cancel_tx,
@@ -1168,15 +1169,15 @@ impl Subscription {
         Some((g, c)) if g <= from_group => (g, c),
         _ => (from_group, code),
       });
-      let ids: Vec<StreamId> = finishing
+      let keys: Vec<(StreamId, usize)> = finishing
         .entries
         .keys()
-        .filter(|id| FinishingStreams::covered(id, from_group))
+        .filter(|(id, _)| FinishingStreams::covered(id, from_group))
         .cloned()
         .collect();
-      ids
+      keys
         .into_iter()
-        .filter_map(|id| finishing.entries.remove(&id).map(|e| (id, e.stream)))
+        .filter_map(|k| finishing.entries.remove(&k).map(|e| (k.0, e.stream)))
         .collect()
     };
     let n = streams.len();

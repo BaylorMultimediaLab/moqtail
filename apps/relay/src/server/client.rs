@@ -529,6 +529,31 @@ impl MOQTClient {
     }
   }
 
+  /// As [`reset_stream`](Self::reset_stream), but only when the stream open under
+  /// `stream_id` is `expected` (not a stream another subscription to the same track
+  /// opened under the same id).
+  pub async fn reset_stream_matching(
+    &self,
+    stream_id: &StreamId,
+    expected: &Arc<Mutex<TransportSendStream>>,
+    code: u64,
+  ) {
+    let stream = {
+      let map = self.get_stream_map(stream_id);
+      let mut streams = map.write().await;
+      let key = stream_id.get_stream_id();
+      match streams.get(key.as_str()) {
+        Some(s) if Arc::ptr_eq(s, expected) => streams.remove(key.as_str()),
+        _ => None,
+      }
+    };
+    if let Some(stream) = stream
+      && let Err(e) = stream.lock().await.reset(code)
+    {
+      warn!("Error resetting data stream {}: {:?}", stream_id, e);
+    }
+  }
+
   pub async fn write_stream_object(
     &self,
     stream_id: &StreamId,
