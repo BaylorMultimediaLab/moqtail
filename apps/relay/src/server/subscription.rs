@@ -890,6 +890,14 @@ impl Subscription {
       self.client_connection_id, self.relay_track_id
     );
 
+    // A promotion whose trigger was handed on or held back but never written ends
+    // with the subscription: its SWITCH_PROMOTED goes out now, trigger_forwarded =
+    // false, not when the last clone of this subscription happens to drop (R5 D-2).
+    let stashed = self.stashed_trigger.lock().unwrap().take();
+    drop(stashed);
+    let pending = self.pending_promotion.lock().unwrap().take();
+    drop(pending.map(PromotionRecord::new));
+
     info!(
       "Subscription finished for subscriber={} relay_track_id={}",
       self.client_connection_id, self.relay_track_id
@@ -3362,6 +3370,38 @@ mod tests_forward_promotion_trigger {
     assert_eq!(p["trigger_group"], GS + 2);
     assert_eq!(p["start_group"], GS + 1);
     assert_eq!(p["trigger_forwarded"], false);
+  }
+
+  /// R5 D-2: a held-back trigger (or a handed-on one) that is never written because
+  /// the subscription finishes first is recorded at the finish, once, false.
+  #[tokio::test]
+  async fn finishing_with_an_unwritten_trigger_records_it_at_once() {
+    let f = switched(47, true, &group(GS, 0..3)).await;
+    let record = |g: u64| {
+      serde_json::json!({"conn": 47, "trigger_group": g, "start_group": GS + 1, "trigger_forwarded": false,
+                         "promoted_ts": crate::server::events::now_ms()})
+    };
+    {
+      let sub = f.new_sub.read().await;
+      *sub.stashed_trigger.lock().unwrap() = Some(StashedTrigger {
+        event: TrackEvent::StreamClosed {
+          stream_id: StreamId::new_subgroup(NEW, GS + 3, Some(0)),
+        },
+        promotion: Some(PromotionRecord::new(record(GS + 3))),
+      });
+      *sub.pending_promotion.lock().unwrap() = Some(record(GS + 4));
+      sub.finish().await;
+    }
+    // Emitted by finish() itself, while the subscription (and its clones) live on.
+    let records = crate::server::events::test_capture::records("SWITCH_PROMOTED", 47);
+    let mut groups: Vec<u64> = records
+      .iter()
+      .map(|r| r["trigger_group"].as_u64().unwrap())
+      .collect();
+    groups.sort();
+    assert_eq!(groups, vec![GS + 3, GS + 4], "{records:?}");
+    assert!(records.iter().all(|r| r["trigger_forwarded"] == false));
+    let _keep_alive = f.new_sub.clone();
   }
 
   /// trigger_forwarded reports the write, not the decision: a trigger chosen for
