@@ -1666,6 +1666,11 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         expected = max(counts) if counts else 0
         dropped: dict[tuple, int] = {}
         for r in drops:
+            # A frame the decode-order scheduler held and later dropped (`waited_ms`)
+            # was logged as OBJECT_RECV on arrival: counting its drop again would
+            # count it twice.
+            if r.get("waited_ms") is not None:
+                continue
             k = (r.get("track"), r.get("group"))
             dropped[k] = dropped.get(k, 0) + 1
         short = sorted(((t, g, len(v), dropped.get((t, g), 0)) for (t, g), v in per_group.items() if len(v) < 0.5 * expected),

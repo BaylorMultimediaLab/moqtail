@@ -163,6 +163,49 @@ function mseKeeps(frames: OrderFrame<string>[]): string[] {
   return kept;
 }
 
+describe('AppendOrder: a gap that is being filled keeps the frames after it waiting', () => {
+  // Review 2026-10-05: a pr1378 catch-up of [50, 53) taking 2.4 s while live group 53
+  // arrives in real time. A fixed 1 s wait gave the catch-up up at the first live
+  // keyframe and lost the rest of it; the wait now runs from the last progress.
+  it('a slow catch-up next to live frames loses nothing', () => {
+    const o = new AppendOrder<string>({ maxWaitMs: 1000, minAheadMs: 300 });
+    const arrivals: Array<[number, OrderFrame<string>]> = [];
+    for (let g = 50; g < 53; g++)
+      for (let i = 0; i < 24; i++) arrivals.push([((g - 50) * 24 + i) * (2400 / 72), f(g, i)]);
+    for (let g = 53; g < 56; g++)
+      for (let i = 0; i < 24; i++) arrivals.push([((g - 53) * 24 + i) * DUR, f(g, i)]);
+    arrivals.sort((a, b) => a[0] - b[0]);
+    const acts: OrderAction<string>[] = [];
+    let t = 0;
+    for (const [now, fr] of arrivals) {
+      for (; t + 100 <= now; t += 100) acts.push(...o.tick(t + 100, { aheadOfPlayheadMs: 10_000 }));
+      acts.push(...at(o, fr, now, { aheadOfPlayheadMs: 10_000 }));
+    }
+    expect(dropped(acts)).toEqual([]);
+    expect(appended(acts)).toEqual(
+      arrivals
+        .map(([, fr]) => fr.item)
+        .sort((a, b) => {
+          const [ga, oa] = a.split('.').map(Number);
+          const [gb, ob] = b.split('.').map(Number);
+          return ga! - gb! || oa! - ob!;
+        }),
+    );
+  });
+
+  it('a later gap gets its own wait after an earlier one was given up', () => {
+    const o = new AppendOrder<string>({ maxWaitMs: 1000 });
+    at(o, f(5, 0), 0);
+    at(o, f(6, 0), 0);
+    at(o, f(6, 1), 0);
+    expect(appended(o.tick(1000))).toEqual(['6.0', '6.1']);
+    // 6.2 never comes; 7.0 must wait its own second, not be released at once.
+    expect(at(o, f(7, 0), 1100)).toEqual([]);
+    expect(o.tick(1999)).toEqual([]);
+    expect(appended(o.tick(2100))).toEqual(['7.0']);
+  });
+});
+
 describe('AppendOrder against the MSE discontinuity rule', () => {
   // Preflight 2026-10-05, pr1378 live-edge r1: group 69's objects 22 and 23 arrive
   // after group 70's first ten (a retransmission on group 69's stream).
