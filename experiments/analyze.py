@@ -15,7 +15,8 @@ definitions"). In short, per run and over the last client session:
                          with ts <= record.ts and matching from AND to; every other
                          unresolved switch it overwrote is superseded). Every switch
                          ends in exactly one ``terminal``: first_frame, superseded,
-                         error or open (run ended first); SWITCH_SKIPPED is an attempt
+                         error or open (run ended first); a switch sent after RUN_END is
+                         not a switch of the run; SWITCH_SKIPPED is an attempt
                          that was never sent, not a switch. Seam statistics
                          (visibility, viewer pause, hole, jump) are computed only
                          over switches with their own SWITCH_FIRST_FRAME.
@@ -40,6 +41,8 @@ definitions"). In short, per run and over the last client session:
 * media_skipped_ms       sum of to - from over gap seeks (``gap``; old reasons
                          ``range-jump`` / ``unwedge``) after the initial window.
 * switches_per_minute    SWITCH_SENT count over ((RUN_END or last SAMPLE) - STARTUP).
+                         Every switch metric counts only switches sent at or before
+                         RUN_END (when there is one).
 """
 
 from __future__ import annotations
@@ -352,10 +355,39 @@ def _fallback_join(joined: list[dict], r: dict, slot: str, diag: dict) -> dict |
     return None
 
 
-def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
+def after_run_end_seqs(recs: list[dict], end_ts: float | None) -> set:
+    """``switch_seq`` of the switches (SWITCH_SENT) and unsent attempts (SWITCH_SKIPPED)
+    issued after ``end_ts`` (RUN_END.ts): not part of the run. Empty without RUN_END."""
+    if end_ts is None:
+        return set()
+    return {r["switch_seq"] for r in recs if r.get("event") in ("SWITCH_SENT", "SWITCH_SKIPPED")
+            and r["ts"] > end_ts and r.get("switch_seq") is not None}
+
+
+def belongs_after_run_end(r: dict, dropped_seqs: set, end_ts: float | None) -> bool:
+    """A switch-related record (switch record, ABR_DECISION, ABR_SWITCH_PHANTOM) of a switch
+    or attempt issued after RUN_END: its ``switch_seq`` is one of them, or it has none and
+    was logged after RUN_END (bundles before ``switch_seq``)."""
+    if end_ts is None:
+        return False
+    seq = r.get("switch_seq")
+    return seq in dropped_seqs if seq is not None else r["ts"] > end_ts
+
+
+def join_switches(recs: list[dict], end_ts: float | None = None) -> tuple[list[dict], dict]:
     """One entry per SWITCH_SENT with every later record of the same switch and its
     terminal state. Join key: ``switch_seq`` when the records carry it, else the
     documented fallback (see ``_fallback_join``).
+
+    A switch sent after ``end_ts`` (RUN_END.ts) is not a switch of the run: its entry is
+    still built, so its own records join it and nothing else (no unjoined or duplicate
+    diagnostics, no wrong fallback join to an earlier switch), but it carries
+    ``after_run_end`` True, has terminal ``after_run_end``, supersedes no switch of the run,
+    and the caller drops it (``diag["after_run_end"]`` counts them). A SWITCH_SUPERSEDED
+    naming such a switch as ``by_switch_seq`` is ignored: the superseded switch is open at
+    the run end. A record that joins nothing and belongs after RUN_END
+    (``belongs_after_run_end``) is counted in ``diag["unjoined_after_run_end"]``, not in
+    ``unjoined``.
 
     SWITCH_SKIPPED is never joined: the player emits it INSTEAD of a SWITCH_SENT, with a
     switch_seq of its own, so it is an attempt that was not sent, not a switch; every
@@ -370,15 +402,19 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
     the run ended). ``terminal_source`` is ``record`` or ``inferred``. Returns
     (switches, diagnostics)."""
     sents = [r for r in recs if r.get("event") == "SWITCH_SENT"]
+    dropped_seqs = after_run_end_seqs(recs, end_ts)
     joined = []
     for i, s in enumerate(sents):
         seq = s.get("switch_seq")
         entry = {"sent": s, "switch_seq": seq if seq is not None else i + 1,
-                 "switch_seq_source": "record" if seq is not None else "fallback"}
+                 "switch_seq_source": "record" if seq is not None else "fallback",
+                 "after_run_end": end_ts is not None and s["ts"] > end_ts}
         entry.update({k: None for k in _SWITCH_RECORD_FIELDS})
         joined.append(entry)
     by_seq = {j["switch_seq"]: j for j in joined if j["switch_seq_source"] == "record"}
-    diag = {"unjoined": {}, "duplicates": {}, "conflicting_terminals": 0, "to_only_joins": 0, "seq_join": bool(by_seq)}
+    dropped_by_seq = {j["switch_seq"] for j in joined if j["after_run_end"]}
+    diag = {"unjoined": {}, "duplicates": {}, "conflicting_terminals": 0, "to_only_joins": 0, "seq_join": bool(by_seq),
+            "after_run_end": sum(1 for j in joined if j["after_run_end"]), "unjoined_after_run_end": 0}
     for r in recs:
         slot = _SWITCH_SLOTS.get(r.get("event"))
         if slot is None:
@@ -389,10 +425,14 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         else:
             target = by_seq.get(seq) if seq is not None else _fallback_join(joined, r, slot, diag)
         if target is None:
-            diag["unjoined"][r["event"]] = diag["unjoined"].get(r["event"], 0) + 1
+            if belongs_after_run_end(r, dropped_seqs, end_ts):
+                diag["unjoined_after_run_end"] += 1
+            else:
+                diag["unjoined"][r["event"]] = diag["unjoined"].get(r["event"], 0) + 1
             continue
         if target[slot] is not None:
-            diag["duplicates"][r["event"]] = diag["duplicates"].get(r["event"], 0) + 1
+            if not target["after_run_end"]:
+                diag["duplicates"][r["event"]] = diag["duplicates"].get(r["event"], 0) + 1
             continue
         target[slot] = r
     for j in joined:
@@ -401,6 +441,11 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         j["landed_ts"] = min(land) if land else None
     for idx, j in enumerate(joined):
         j["superseded_by"], j["terminal_source"] = None, "record"
+        if j["after_run_end"]:
+            j["terminal"] = "after_run_end"
+            continue
+        if j["superseded_rec"] is not None and j["superseded_rec"].get("by_switch_seq") in dropped_by_seq:
+            j["superseded_rec"] = None   # superseded by a switch outside the run: open at its end
         if j["error"] is not None:
             j["terminal"] = "error"
         elif j["first_frame"] is not None:
@@ -413,7 +458,7 @@ def join_switches(recs: list[dict]) -> tuple[list[dict], dict]:
         else:
             later = None
             for k in joined[idx + 1:]:
-                if k["error"] is not None:
+                if k["error"] is not None or k["after_run_end"]:
                     continue
                 if k["landed"] or k["first_frame"] is not None or (not j["landed"] and k["ok"] is not None):
                     later = k
@@ -442,7 +487,8 @@ def _decided_at(r: dict) -> float | None:
     return None
 
 
-def join_decisions(joined: list[dict], recs: list[dict], index_of: dict) -> tuple[list[dict | None], list[dict], dict]:
+def join_decisions(joined: list[dict], recs: list[dict], index_of: dict,
+                   end_ts: float | None = None) -> tuple[list[dict | None], list[dict], dict]:
     """The controller decision behind every switch, and every decision as an event.
 
     Since 2026-10-04 the controller logs ABR_DECISION when the switch LANDS on its target
@@ -463,7 +509,20 @@ def join_decisions(joined: list[dict], recs: list[dict], index_of: dict) -> tupl
     Returns (per-switch attribution or None, decision events, diagnostics). A decision
     event is ``{"ts": decision time, reason, rule_reason, from, to, switch: index | None,
     source}``; decisions and phantoms that joined no switch (pre-2026-10 clients skipped
-    the request without a SWITCH_SENT) are kept as events with ``switch`` None."""
+    the request without a SWITCH_SENT) are kept as events with ``switch`` None.
+
+    Entries of ``joined`` with ``after_run_end`` (switches sent after RUN_END, see
+    ``join_switches``) take part in the join, so their decisions are used up by them, and are
+    then left out: the attribution list covers the other entries only (in order, and
+    ``switch`` indexes that list), and neither their decisions nor loose decisions and
+    phantoms that belong after RUN_END (``belongs_after_run_end``) appear as events or in
+    the diagnostics.
+
+    A switch superseded before it landed (SWITCH_SUPERSEDED ``landed: false``) gets no
+    controller callback, so the controller logs neither ABR_DECISION nor ABR_SWITCH_PHANTOM
+    for it (its pending record is dropped when a newer switch lands); its rule comes from
+    pass 5 (the ABR_TICK of the decision; source ``none`` when the bundle has no ABR_TICK
+    records). One superseded after it landed has its ABR_DECISION from the landing."""
     decisions = [r for r in recs if r.get("event") == "ABR_DECISION"]
     phantoms = [r for r in recs if r.get("event") == "ABR_SWITCH_PHANTOM"]
     ticks = [r for r in recs if r.get("event") == "ABR_TICK"]
@@ -529,13 +588,17 @@ def join_decisions(joined: list[dict], recs: list[dict], index_of: dict) -> tupl
             reason = ("auto-emergency" if ch.get("rule") == "EmergencyBufferRule" else "auto-downgrade") if ti < fi else "auto-upgrade"
             used.add(id(tick))
             out[i] = {"ts": tick["ts"], "reason": reason, "rule_reason": ch.get("reason"), "source": "tick", "record": tick}
+    dropped_seqs = after_run_end_seqs(recs, end_ts)
+    kept = [i for i, j in enumerate(joined) if not j.get("after_run_end")]
+    out = [out[i] for i in kept]
     events = []
-    for i, a in enumerate(out):
+    for k, i in enumerate(kept):
+        a = out[k]
         if a is not None:
             sent = joined[i]["sent"]
             events.append({"ts": a["ts"], "reason": a["reason"], "rule_reason": a["rule_reason"], "from": sent.get("from"),
-                           "to": sent.get("to"), "switch": i, "source": a["source"]})
-    loose = [r for r in decisions + phantoms if id(r) not in used]
+                           "to": sent.get("to"), "switch": k, "source": a["source"]})
+    loose = [r for r in decisions + phantoms if id(r) not in used and not belongs_after_run_end(r, dropped_seqs, end_ts)]
     for r in loose:
         at = _decided_at(r)
         events.append({"ts": at if at is not None else r["ts"], "reason": r.get("reason"), "rule_reason": r.get("rule_reason"),
@@ -952,8 +1015,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     switch_recv = by("SWITCH_RECV")
     promoted = by("SWITCH_PROMOTED")
     drops = by("DROP_STALE")
-    joined, join_diag = join_switches(recs)
-    attribution, decision_events, decision_diag = join_decisions(joined, recs, index_of)
+    # Switches sent after RUN_END are not switches of the run (the switches/min denominator
+    # ends there): join_switches marks them, join_decisions and the list below leave them out.
+    joined, join_diag = join_switches(recs, clip_end)
+    attribution, decision_events, decision_diag = join_decisions(joined, recs, index_of, clip_end)
+    joined = [j for j in joined if not j["after_run_end"]]
+    dropped_seqs = after_run_end_seqs(recs, clip_end)
+    in_run = lambda r: not belongs_after_run_end(r, dropped_seqs, clip_end)  # noqa: E731
     switches = []
     for j, decision in zip(joined, attribution):
         sent = j["sent"]
@@ -1088,11 +1156,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         # SWITCH_SKIPPED: a switch attempt the player did not send (the previous switch had
         # no alias yet). Emitted instead of a SWITCH_SENT, so never a switch (diagnostic).
         "skipped_not_sent": join_diag["unjoined"].get("SWITCH_SKIPPED", 0),
-        "skipped_attempts": len(by("SWITCH_SKIPPED")),
+        "skipped_attempts": sum(1 for r in by("SWITCH_SKIPPED") if in_run(r)),
         "session_destroyed": any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR")),
     }
     out["switches"]["skipped_not_landed"] = out["switches"]["skipped_not_sent"]  # legacy name
-    out["switching"] = switching_diagnostics(switches, by, reversal_window_s, run_duration_s)
+    # Phantoms of attempts after RUN_END are not counted (switching.phantom_switches).
+    by_in_run = lambda ev: [r for r in by(ev) if ev != "ABR_SWITCH_PHANTOM" or in_run(r)]  # noqa: E731
+    out["switching"] = switching_diagnostics(switches, by_in_run, reversal_window_s, run_duration_s)
     out["feedback"] = feedback_windows(switches, by, feedback_window_s)
 
     # Samples: time shift, live edge, bitrate --------------------------------
@@ -1648,7 +1718,7 @@ def to_markdown(s: dict) -> str:
          f"| playback position jump ms (median / abs p95) | {fmt(sw['playback_position_jump_ms'].get('p50'))} / {fmt(sw['abs_playback_position_jump_ms'].get('p95'))} |",
          f"| seam buffer hole ms (median / max) | {fmt(sw['seam_buffer_hole_ms'].get('p50'))} / {fmt(sw['seam_buffer_hole_ms'].get('max'))} |",
          f"| seam dropped source frames (median / max); landed on object 0 | {fmt(sw['seam_dropped_source_frames'].get('p50'))} / {fmt(sw['seam_dropped_source_frames'].get('max'))}; {sw['landed_on_group_start']} of {sw['count']} |",
-         f"| join diagnostics: unjoined / duplicates / conflicting terminals; SWITCH_SKIPPED (not sent) | {sw['join'].get('unjoined')} / {sw['join'].get('duplicates')} / {sw['join'].get('conflicting_terminals')}; {sw['skipped_not_sent']} |",
+         f"| join diagnostics: unjoined / duplicates / conflicting terminals; SWITCH_SKIPPED (not sent); switches after RUN_END (dropped) | {sw['join'].get('unjoined')} / {sw['join'].get('duplicates')} / {sw['join'].get('conflicting_terminals')}; {sw['skipped_not_sent']}; {sw['join'].get('after_run_end', 0)} |",
          f"| playback advancing fraction / longest no-progress s / longest frozen with playable data s | {fmt(s['playback']['advancing_fraction'] and s['playback']['advancing_fraction'] * 100)} % / {fmt((s['playback']['longest_no_progress_ms'] or 0) / 1000)} / {fmt((s['playback'].get('longest_frozen_with_data_ms') or 0) / 1000)} |",
          f"| detection attributable (per change: quiet before t0) | {s['detection_reliable']}; down t2/t4 {fmt(rx['down_t2_ms'])}/{fmt(rx['down_t4_ms'])} ms, up t2 {fmt(rx['up_t2_ms'])} ms (median inter-switch {fmt(s['switching']['median_inter_switch_interval_ms'])} ms) |",
          f"| inter-switch interval ms (median / min); switch span s | {fmt(s['switching']['median_inter_switch_interval_ms'])} / {fmt(s['switching']['min_inter_switch_interval_ms'])}; {fmt(s['switching']['switch_span_s'])} |",

@@ -550,6 +550,56 @@ class StallsAndSeeks(TmpRun):
         self.assertEqual(s["switching"]["switch_span_s"], 1.0)
 
 
+class SwitchesClippedAtRunEnd(TmpRun):
+    """R4-D2: SWITCH_SENT after RUN_END were counted while the switches/min denominator ends at
+    RUN_END. Only switches sent at or before RUN_END are switches of the run; the records of a
+    dropped switch must not join an earlier switch or show up as unjoined/duplicate."""
+
+    def _run(self, with_seq: bool) -> dict:
+        A, B = R[0], R[4]
+        seq = (lambda n: {"switch_seq": n}) if with_seq else (lambda n: {})
+        client = startup(A)
+        client += switch(1, T0 + 10_000, A, B, with_seq=with_seq)
+        client.append(first_frame(T0 + 12_000, A, B, vis_ms=2000.0, seq=1 if with_seq else None))
+        client += switch(2, T0 + 58_000, B, A, land_after_ms=None, with_seq=with_seq)   # open at the run end
+        # After RUN_END (T0 + 60 s): switch 3 is sent, lands, is presented, and supersedes 2.
+        client += switch(3, T0 + 61_000, A, B, with_seq=with_seq)
+        client.append(first_frame(T0 + 61_800, A, B, vis_ms=800.0, seq=3 if with_seq else None))
+        if with_seq:
+            client.append(ev("SWITCH_SUPERSEDED", T0 + 61_050, switch_seq=2, by_switch_seq=3, landed=False))
+        # An attempt after RUN_END that was never sent, and its phantom.
+        client.append(ev("SWITCH_SKIPPED", T0 + 62_000, **{"from": B, "to": A, "reason": "previous switch not landed"}, **seq(4)))
+        client.append(ev("ABR_SWITCH_PHANTOM", T0 + 62_000, **{"from": B, "to": A, "landed": B, "reason": "auto-downgrade",
+                                                               "rule_reason": "throughput", "decided_ts": T0 + 61_999}, **seq(4)))
+        client += samples(T0, T0 + 63_000, lambda t: A)
+        run = [runner("RUN_END", T0 + 60_000, elapsed_s=61.0)]
+        return analyze.analyze(write_run(self.dir, client, run, duration_s=61.0))
+
+    def _check(self, s: dict) -> None:
+        sw = s["switches"]
+        self.assertEqual(sw["count"], 2)                                         # before: 3
+        self.assertEqual([x["switch_seq"] for x in sw["list"]], [1, 2])
+        self.assertAlmostEqual(s["switching"]["switches_per_minute"], 2.0, places=3)   # before: 3.0
+        self.assertEqual(sw["terminals"]["first_frame"], 1)
+        self.assertEqual(sw["terminals"]["open"], 1)                             # 2's superseder is outside the run
+        self.assertEqual(sw["superseded_frac"], 0.0)
+        self.assertEqual(s["switching"]["direction_reversals"], 0)              # before: 1 (2 -> 3, 3 s apart)
+        self.assertEqual(sw["switch_visibility_delay_ms"]["n"], 1)              # before: 2 (3's 800 ms)
+        unjoined = {k: v for k, v in sw["join"]["unjoined"].items()}
+        self.assertEqual(unjoined, {})
+        self.assertEqual(sw["join"]["duplicates"], {})
+        self.assertEqual(sw["join"]["after_run_end"], 1)
+        self.assertEqual((sw["skipped_attempts"], sw["skipped_not_sent"]), (0, 0))
+        self.assertEqual(s["switching"]["phantom_switches"], 0)
+        self.assertEqual((sw["decision_join"]["unjoined_decisions"], sw["decision_join"]["unjoined_phantoms"]), (0, 0))
+
+    def test_switch_records_with_seq(self):
+        self._check(self._run(with_seq=True))
+
+    def test_switch_records_fallback_join(self):
+        self._check(self._run(with_seq=False))
+
+
 class Validity(TmpRun):
     """M20: aborted runs got no validation.json and were counted (`valid is None` passed `is False`)."""
 

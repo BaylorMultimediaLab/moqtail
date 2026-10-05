@@ -215,8 +215,13 @@ through teardown) are outside the run, so SAMPLEs (and with them the
 presented / subscribed weighting, time-shift statistics, `playback` and the
 validator's `samples` check), stall and starvation episodes (one starting
 after `RUN_END` is dropped, one spanning it ends there, an open one is counted
-to it) and gap / wedge seeks are clipped to it. Everything not listed here is a
-diagnostic and lives in `summary.json` / the `diagnostics` block of
+to it), gap / wedge seeks and switches are clipped to it: only a switch whose
+SWITCH_SENT is at or before `RUN_END` counts in any switch metric (count,
+`switches_per_min`, `superseded_frac`, terminals, reversals, seam statistics,
+decision attribution, `phantom_switches`, skipped attempts). A switch sent
+after it is dropped together with its records (`switches.join.after_run_end`
+counts them), and an earlier switch it superseded is `open` at the run end.
+Everything not listed here is a diagnostic and lives in `summary.json` / the `diagnostics` block of
 `compare.py`.
 
 | name                                                                                                              | definition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -308,8 +313,11 @@ Other definitions, unchanged:
   `rule_reason`, `decided_ts`, `t2_decision_ms`, `decision_source`). The
   controller logs `ABR_DECISION` when the switch lands (its `ts` is the landing)
   and `ABR_SWITCH_PHANTOM` when it ends without landing; a switch still pending
-  at the run end has neither. Each switch takes, in this order and each record
-  once: the `ABR_DECISION` with its `switch_seq` (`switch_seq`); else the latest
+  at the run end has neither, and so has a switch superseded before it landed
+  (`SWITCH_SUPERSEDED` with `landed: false`: the controller gets no callback
+  for it and drops its pending record when a newer switch lands), whose rule
+  therefore comes from the `ABR_TICK` pass below. Each switch takes, in this
+  order and each record once: the `ABR_DECISION` with its `switch_seq` (`switch_seq`); else the latest
   `ABR_DECISION` with the same `from` and `to` and `0 ≤ SENT.ts − decided_ts ≤
 1000 ms` (`decided_ts`); else, for clients before 2026-10-04 (no
   `decided_ts`, logged at the decision), the latest with the same `to` and
