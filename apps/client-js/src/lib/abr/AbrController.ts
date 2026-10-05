@@ -9,6 +9,7 @@ import {
   type Track,
   CONTROLLER_CONSTANTS,
   bufferEnvelope,
+  effectiveBufferEnvelopeMs,
   effectiveSegmentDurationS,
   resolveControllerSettings,
 } from './types';
@@ -640,7 +641,7 @@ export class AbrController {
     // ticks may all sit on a trough of the group sawtooth that a full window
     // would have covered with the burst, so the envelope is not yet a level
     // (bufferEnvelopeReady false; EmergencyBufferRule's low branch abstains).
-    const envelopeMs = this.#settings.controller.bufferEnvelopeMs;
+    const envelopeMs = effectiveBufferEnvelopeMs(this.#settings.controller);
     const nowTs = Date.now();
     if (totalFrames > 0) {
       this.#firstFrameTs ??= nowTs;

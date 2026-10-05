@@ -27,9 +27,12 @@
  *
  * with `lowBufferS = 0.5 s` and `sf = 0.7` by default. The envelope
  * (`RulesContext.bufferEnvelopeSeconds`) is the maximum of the contiguous
- * buffer over the last `bufferEnvelopeMs` (1250 ms: one group plus one tick),
- * so the low branch fires only when the buffer stayed below 0.5 s for that
- * whole window, i.e. it is draining, not merely at the trough of a group.
+ * buffer over the last `bufferEnvelopeMs`, by default one group plus one tick
+ * (`segmentDurationS × 1000 + tickMs`: 1250 ms at 1 s GOPs, 2250 ms at 2 s;
+ * effectiveBufferEnvelopeMs), the shortest window that always holds the
+ * level after a group burst. So the low branch fires only when the buffer
+ * stayed below 0.5 s for that whole window, i.e. it is draining, not merely at
+ * the trough of a group.
  *
  * Why the envelope (F1): the publisher sends each group as a burst, so at the
  * live edge the instantaneous contiguous buffer is a per-group sawtooth

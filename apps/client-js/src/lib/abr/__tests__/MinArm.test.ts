@@ -8,6 +8,7 @@ import {
   RULE_ORDER,
   SwitchRequestPriority,
   describeController,
+  effectiveBufferEnvelopeMs,
   resolveControllerSettings,
 } from '../types';
 import type { AbrSettings, ControllerSettings, Track } from '../types';
@@ -164,7 +165,9 @@ describe('min arm: configuration', () => {
     expect(c.arm).toBe('min');
     expect(c.probeMode).toBe('off');
     expect(c.bufferSignal).toBe('envelope');
-    expect(c.bufferEnvelopeMs).toBe(1250);
+    // 0 = one GOP plus one tick (R4-D5).
+    expect(c.bufferEnvelopeMs).toBe(0);
+    expect(effectiveBufferEnvelopeMs(c)).toBe(1250);
     expect(c.switchHistoryMode).toBe('veto');
     expect(c.switchHistoryWindowS).toBe(60);
     expect(c.upDwellGroups).toBe(3);
@@ -739,6 +742,37 @@ describe('min arm: (i) the live-edge sawtooth is not an emergency (F1)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('min arm: the envelope window follows the GOP (R4-D5)', () => {
+  // A draining buffer below 0.5 s from t = 0; the low branch fires once the
+  // whole window (GOP + tick) after the first frame lies below it.
+  const firstEmergencyMs = async (segmentDurationS: number) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      const h = harness(
+        { activeTrack: '1080p', bandwidthBps: 5_000_000, bufferContigSeconds: 1.0 },
+        { settings: minSettings({ segmentDurationS }) },
+      );
+      await h.tick();
+      vi.advanceTimersByTime(250);
+      for (let t = 250; t <= 5_000; t += 250) {
+        await h.tick({ bufferContigSeconds: 0.4 });
+        if (h.switches().length > 0) return t;
+        vi.advanceTimersByTime(250);
+      }
+      return null;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+
+  it('GOP 1 s: 1250 ms; GOP 2 s: 2250 ms', async () => {
+    // The 1.0 s sample at t = 0 leaves the window after GOP + tick.
+    expect(await firstEmergencyMs(1)).toBe(1_500);
+    expect(await firstEmergencyMs(2)).toBe(2_500);
   });
 });
 

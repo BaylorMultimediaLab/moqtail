@@ -199,7 +199,13 @@ export interface ControllerSettings {
    * empty-buffer emergency still uses the instantaneous value.
    */
   bufferSignal: 'instant' | 'envelope';
-  /** Envelope window, ms (one group plus one tick by default). */
+  /**
+   * Envelope window, ms. 0 (default) = one group plus one tick,
+   * `segmentDurationS × 1000 + tickMs` (1250 ms at 1 s GOPs, 2250 ms at 2 s):
+   * the shortest window that always holds the level after a group burst.
+   * See effectiveBufferEnvelopeMs; describeController reports the effective
+   * value.
+   */
   bufferEnvelopeMs: number;
   /**
    * 'on' (shipped): the Algorithm 1 active probe runs whenever the client is
@@ -241,7 +247,7 @@ export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
   latencyResetOnLanding: false,
   switchHistoryMode: 'evict',
   bufferSignal: 'instant',
-  bufferEnvelopeMs: 1250,
+  bufferEnvelopeMs: 0,
   switchHistoryWindowS: 0,
   probeMode: 'on',
   probeMaxBytes: 0,
@@ -339,7 +345,7 @@ export const DEFAULT_ABR_SETTINGS: AbrSettings = {
     L2ARule: { active: false, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     LoLPRule: { active: false, priority: SwitchRequestPriority.DEFAULT, parameters: {} },
     // The min arm's emergency (rules/EmergencyBufferRule.ts): instantaneous
-    // contiguous buffer == 0 -> rung 0; its 1250 ms envelope < lowBufferS ->
+    // contiguous buffer == 0 -> rung 0; its envelope (GOP + tick) < lowBufferS ->
     // highest rung under throughputSafetyFactor x SWMA. Off in baseline and grid.
     EmergencyBufferRule: {
       active: false,
@@ -459,6 +465,16 @@ export function effectiveSegmentDurationS(controller: ControllerSettings): numbe
 }
 
 /**
+ * Envelope window the controller runs, ms: `bufferEnvelopeMs` when set (> 0),
+ * else one group plus one tick (ControllerSettings.bufferEnvelopeMs).
+ */
+export function effectiveBufferEnvelopeMs(controller: ControllerSettings): number {
+  const ms = controller.bufferEnvelopeMs;
+  if (typeof ms === 'number' && Number.isFinite(ms) && ms > 0) return ms;
+  return effectiveSegmentDurationS(controller) * 1000 + CONTROLLER_CONSTANTS.tickMs;
+}
+
+/**
  * RUN_META.controller: the arm and every effective constant, after the arm is
  * resolved, as plain JSON. A run is reproducible from this record alone (the
  * hard-coded numbers used to be pinned only by the git sha).
@@ -558,7 +574,7 @@ export function describeController(settings: AbrSettings): ControllerDescription
     swmaWindowGroups: CONTROLLER_CONSTANTS.swmaWindowGroups,
     bufferSource: isMin ? 'contiguous' : 'total',
     bufferSignal: c.bufferSignal,
-    bufferEnvelopeMs: c.bufferEnvelopeMs,
+    bufferEnvelopeMs: effectiveBufferEnvelopeMs(c),
     upDwellGroups: isMin ? c.upDwellGroups : 0,
     minStartupSamples: CONTROLLER_CONSTANTS.minStartupSamples,
     upGuardSamples: c.upGuardSamples,
