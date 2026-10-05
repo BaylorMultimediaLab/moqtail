@@ -949,6 +949,10 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     switch_recv = by("SWITCH_RECV")
     promoted = by("SWITCH_PROMOTED")
     drops = by("DROP_STALE")
+    # pr1378: the relay's SWITCH_WAIT (selection waited for the floor), joined to a
+    # switch by the subscription it replaces (old_request_id) after its SWITCH_RECV.
+    waits = by("SWITCH_WAIT")
+    used_waits: set[int] = set()
     joined, join_diag = join_switches(recs)
     attribution, decision_events, decision_diag = join_decisions(joined, recs, index_of)
     switches = []
@@ -964,6 +968,13 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
                            or (old_rid is not None and r.get("old_request_id") == old_rid))), None)
         rprom = first(promoted, "SWITCH_PROMOTED", rrecv["ts"] if rrecv else sent["ts"],
                       lambda r: track_matches(r.get("track"), sent.get("to"))) if rrecv else None
+        rwait = None
+        if rrecv is not None and old_rid is not None:
+            rwait = next((w for w in waits if id(w) not in used_waits and w.get("old_request_id") == old_rid
+                          and rrecv["ts"] - 1 <= w["ts"] <= rrecv["ts"] + 10_000
+                          and (w.get("conn") is None or rrecv.get("conn") is None or w.get("conn") == rrecv.get("conn"))), None)
+            if rwait is not None:
+                used_waits.add(id(rwait))
         fi, ti = index_of.get(sent.get("from"), -1), index_of.get(sent.get("to"), -1)
         d = lambda r: (r["ts"] - sent["ts"]) if r else None  # noqa: E731
         presented = j["terminal"] == "first_frame"
@@ -997,8 +1008,22 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
             "relay_promoted_ms": ((rprom.get("promoted_ts") if rprom.get("promoted_ts") is not None else rprom["ts"])
                                   - sent["ts"]) if rprom else None,
             "relay_start_group": rprom.get("start_group") if rprom else None,
-            # pr1378: the Minimum Switching Group the client asked for.
+            # pr1378: the Minimum Switching Group the client asked for, how it was
+            # chosen, the G_switch the relay answered with (SWITCH_OK) and whether
+            # selection waited for the floor (relay SWITCH_WAIT).
             "selected_min_group": j["floor"].get("selected_min_group") if j["floor"] else None,
+            "floor_mode": j["floor"].get("switch_floor") if j["floor"] else None,
+            "recv_floor_group": j["floor"].get("recv_floor_group") if j["floor"] else None,
+            "buffer_floor_group": j["floor"].get("buffer_floor_group") if j["floor"] else None,
+            # G_switch: SWITCH_OK.switching_group (2026-10), else the relay's
+            # SWITCH_PROMOTED.start_group, which is G_switch on pr1378 (older bundles).
+            "switching_group": (ok.get("switching_group") if ok and ok.get("switching_group") is not None
+                                else (rprom.get("start_group") if rprom and j["floor"] else None)),
+            "relay_waited": rwait is not None,
+            "relay_waiting_for": rwait.get("waiting_for") if rwait else None,
+            # pr1378 SWITCH_ERROR.failure: NoCommonBoundary / DrainTimeout / Superseded share
+            # status TIMEOUT; ClientTimeout = no relay answer (library deadline).
+            "failure": (err.get("failure") or err.get("reason")) if err else None,
             # t4: first object of the target arrives at the client.
             "switch_delivery_latency_ms": d(fobj), "t4_group": fobj.get("group") if fobj else None,
             "applied_ms": d(applied),
@@ -1039,6 +1064,14 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         })
     presented_sw = [s for s in switches if s["terminal"] == "first_frame"]
     terminals = {t: sum(1 for s in switches if s["terminal"] == t) for t in TERMINALS}
+    floored = [s for s in switches if s["selected_min_group"] is not None]
+    floor_modes: dict[str, int] = {}
+    for s_ in floored:
+        floor_modes[s_["floor_mode"] or "unknown"] = floor_modes.get(s_["floor_mode"] or "unknown", 0) + 1
+    failures: dict[str, int] = {}
+    for s_ in switches:
+        if s_["terminal"] == "error":
+            failures[s_["failure"] or "unknown"] = failures.get(s_["failure"] or "unknown", 0) + 1
     out["switches"] = {
         "count": len(switches),
         "terminals": terminals,
@@ -1057,6 +1090,22 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "up": sum(1 for s in switches if s["direction"] == "up"),
         "down": sum(1 for s in switches if s["direction"] == "down"),
         "failed": terminals["error"],
+        # Failed switches by kind (pr1378 SWITCH_ERROR.failure, else the reason text).
+        "failures": failures,
+        # pr1378: the Minimum Switching Group per switch (SWITCH_FLOOR). buffer_raised:
+        # the buffer-aware floor lifted it above the receive floor; seam_above_floor_groups:
+        # G_switch (SWITCH_OK) minus the floor; relay_waits: switches whose selection waited.
+        "floor": {
+            "count": len(floored),
+            "modes": floor_modes,
+            "selected_min_group": stats([s_["selected_min_group"] for s_ in floored]),
+            "buffer_raised": sum(1 for s_ in floored if s_["buffer_floor_group"] is not None
+                                 and s_["recv_floor_group"] is not None
+                                 and s_["buffer_floor_group"] > s_["recv_floor_group"]),
+            "seam_above_floor_groups": stats([s_["switching_group"] - s_["selected_min_group"] for s_ in floored
+                                              if s_["switching_group"] is not None]),
+            "relay_waits": sum(1 for s_ in switches if s_["relay_waited"]),
+        } if floored else None,
         "landed": sum(1 for s in switches if s["landed"]),
         # Delivery-side stamps over every landed switch (mechanism metrics).
         "switch_delivery_latency_ms": stats([s["switch_delivery_latency_ms"] for s in switches]),
@@ -1089,6 +1138,27 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
         "session_destroyed": any("destroyed" in str(r.get("reason")) for r in by("SWITCH_ERROR")),
     }
     out["switches"]["skipped_not_landed"] = out["switches"]["skipped_not_sent"]  # legacy name
+    # pr1378 data routes (player): the replaced subscription is read until done (P1);
+    # its objects at or above G_switch are dropped as post-seam (P2); PUBLISH_DONE by role.
+    post_seam = [r for r in drops if r.get("reason") == "post-seam"]
+    released = by("SWITCH_SOURCE_RELEASED")
+    done_recv = by("PUBLISH_DONE_RECV")
+    if post_seam or released or done_recv:
+        by_reason: dict[str, int] = {}
+        for r in released:
+            by_reason[r.get("reason") or "unknown"] = by_reason.get(r.get("reason") or "unknown", 0) + 1
+        roles: dict[str, int] = {}
+        for r in done_recv:
+            roles[r.get("role") or "unknown"] = roles.get(r.get("role") or "unknown", 0) + 1
+        out["switch_routes"] = {
+            "post_seam_drops": {"objects": len(post_seam), "bytes": sum(r.get("bytes") or 0 for r in post_seam)},
+            "released": {"count": len(released), "by_reason": by_reason,
+                         "held_ms": stats([r.get("held_ms") for r in released]),
+                         "objects_after_switch_ok": stats([r.get("objects_after_switch_ok") for r in released])},
+            "publish_done_recv": roles,
+        }
+    else:
+        out["switch_routes"] = None
     out["switching"] = switching_diagnostics(switches, by, reversal_window_s, run_duration_s)
     out["feedback"] = feedback_windows(switches, by, feedback_window_s)
 

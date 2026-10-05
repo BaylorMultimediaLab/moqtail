@@ -234,3 +234,13 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   (never the native-fix flags), selects the floor with `?switchFloor=`, and
   refuses a run whose RELAY_CONFIG does not report `t_switch_ms` = 3000 (or
   reports a native-fix field true).
+- **Records the analysis reads (P9).** `SWITCH_PROMOTED` carries `promoted_ts`
+  (epoch ms of the promotion decision, here the instant the target PUBLISH is
+  opened; the same meaning as on the native arms), so `relay_promoted_ms` is
+  computed alike on every arm. The analyzer joins pr1378's switches by
+  `switch_seq` (SWITCH_FLOOR included; `SWITCH_SENT.request_id` is null),
+  takes G_switch from SWITCH_OK's `switching_group` (older bundles: the
+  relay's `SWITCH_PROMOTED.start_group`), joins the relay's `SWITCH_WAIT` by
+  the replaced subscription's request id, and summarises the floor
+  (`switches.floor`), failures by kind (`switches.failures`) and the data
+  routes (`switch_routes`).

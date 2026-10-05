@@ -295,9 +295,22 @@ Other definitions, unchanged:
   `player` / `analyzer-100ms`), `buffer_hole_behind_ms` (the record's own
   raw value; `seam_buffer_hole_ms` on older records), `seam_behind_playhead`;
   `seam_dropped_source_frames` (source objects discarded within 3 s of landing);
-  `selected_min_group` (pr1378). Delivery-side statistics (`switch_delivery_latency_ms`,
+  `selected_min_group` (pr1378), with `floor_mode`, `recv_floor_group`,
+  `buffer_floor_group` (from SWITCH_FLOOR), `switching_group` (G_switch: SWITCH_OK's
+  `switching_group`, else the relay's SWITCH_PROMOTED `start_group` on older pr1378
+  bundles), `relay_waited` / `relay_waiting_for` (a relay SWITCH_WAIT for the
+  replaced subscription after its SWITCH_RECV) and `failure` (SWITCH_ERROR's
+  `failure`, else its reason). Delivery-side statistics (`switch_delivery_latency_ms`,
   `relay_promoted_ms`, `media_seam_gap_ms`, `seam_ahead_of_playhead_ms`) are over
   every landed switch; seam statistics over own first frames only.
+  `switches.failures` counts failed switches by `failure`; `switches.floor`
+  (pr1378, null without SWITCH_FLOOR records) gives `count`, `modes`,
+  `selected_min_group` stats, `buffer_raised` (the buffer-aware candidate lifted
+  the floor above the receive candidate), `seam_above_floor_groups` (G_switch
+  minus the floor) and `relay_waits`. `switch_routes` (pr1378 player, null
+  without its records) gives `post_seam_drops` (`objects`, `bytes`), `released`
+  (`count`, `by_reason`, `held_ms`, `objects_after_switch_ok`) and
+  `publish_done_recv` (counts by `role`).
   `landed_behind_playhead` counts switches whose seam lay more than half a GOP
   behind the playhead at send.
 - **Switching diagnostics** (`switching`): inter-switch interval median/min,

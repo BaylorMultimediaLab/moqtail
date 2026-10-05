@@ -151,6 +151,31 @@ pub(crate) async fn open_switch_failure_stream(
   subscriber.connection.open_request_stream().await
 }
 
+/// SWITCH_PROMOTED for a switch whose target PUBLISH is being opened: the target
+/// became the subscriber's track. `promoted_ts` (epoch ms) is the promotion
+/// decision, the same meaning as on the native arms (P9); here the record is
+/// emitted at that instant, so it equals the record's `ts`.
+pub(crate) fn switch_promoted_record(
+  conn: usize,
+  relay_track_id: u64,
+  target: &FullTrackName,
+  publish_request_id: u64,
+  switch_transition: &SwitchTransition,
+  live_edge: &Location,
+  promoted_ts: f64,
+) -> serde_json::Value {
+  serde_json::json!({
+    "conn": conn,
+    "relay_track_id": relay_track_id,
+    "track": crate::server::events::track_name_string(target),
+    "request_id": publish_request_id,
+    "start_group": switch_transition.switching_group_id,
+    "live_edge_group": switch_transition.live_edge_group_id,
+    "live_edge_object": live_edge.object,
+    "promoted_ts": promoted_ts,
+  })
+}
+
 /// Open the target PUBLISH toward the subscriber on its own request stream and
 /// serve it there for as long as the switched subscription lives (draft-18
 /// `forward_publish_downstream`): the PUBLISH_OK comes back on it and the
@@ -176,15 +201,15 @@ pub(crate) async fn send_switch_publish(
   };
   crate::server::events::emit(
     "SWITCH_PROMOTED",
-    serde_json::json!({
-      "conn": subscriber.connection_id,
-      "relay_track_id": relay_track_id,
-      "track": crate::server::events::track_name_string(target),
-      "request_id": publish_request_id,
-      "start_group": switch_transition.switching_group_id,
-      "live_edge_group": switch_transition.live_edge_group_id,
-      "live_edge_object": live_edge.object,
-    }),
+    switch_promoted_record(
+      subscriber.connection_id,
+      relay_track_id,
+      target,
+      publish_request_id,
+      &switch_transition,
+      &live_edge,
+      crate::server::events::now_ms(),
+    ),
   );
   let mut parameters = target_parameters.to_vec();
   parameters.set_param(MessageParameter::new_forward(true));
@@ -881,6 +906,27 @@ mod tests_switch_seam_helpers {
       switch_scheduling(&[], (7, GroupOrder::Ascending)),
       (7, GroupOrder::Ascending)
     );
+  }
+
+  #[test]
+  fn switch_promoted_carries_promoted_ts() {
+    let target = FullTrackName {
+      namespace: namespace(),
+      name: track_name(),
+    };
+    let rec = switch_promoted_record(
+      3,
+      2,
+      &target,
+      9,
+      &SwitchTransition::new(16, 17),
+      &loc(17, 4),
+      1_700_000_000_123.0,
+    );
+    assert_eq!(rec["promoted_ts"], 1_700_000_000_123.0);
+    assert_eq!(rec["start_group"], 16);
+    assert_eq!(rec["live_edge_group"], 17);
+    assert_eq!(rec["request_id"], 9);
   }
 
   // ---- switch_target_parameters ----

@@ -1056,3 +1056,128 @@ class RealRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def relay(event: str, ts: float, **fields) -> dict:
+    rec = {"ts": ts, "src": "relay", "event": event, "conn": 3}
+    rec.update(fields)
+    return rec
+
+
+class Pr1378Records(TmpRun):
+    """P9: a pr1378 bundle in the rebuilt format: SWITCH_FLOOR and every switch record
+    carry switch_seq, SWITCH_SENT.request_id is null (the relay allocates the id),
+    SWITCH_OK names the switching group, SWITCH_ERROR the failure kind, the relay
+    emits SWITCH_WAIT and SWITCH_PROMOTED.promoted_ts, the player logs post-seam drops,
+    route releases and PUBLISH_DONE."""
+
+    def bundle(self) -> Path:
+        A, B = R[4], R[2]
+        t1, t2 = T0 + 10_000, T0 + 20_000
+        client = startup(A) + [ev("CLOCK_MAP", T0 - 1100, user_agent="Mozilla/5.0 Firefox/157.0")]
+        # switch 1: next-group floor 15 (buffer floor 15, recv floor 14), relay picks 16
+        client += [
+            ev("SWITCH_FLOOR", t1 - 1, switch_seq=1, switch_floor="next-group", recv_floor_group=14, buffer_floor_group=15,
+               selected_min_group=15, playhead_group=10, buffer_end_s=15.0, buffered_ranges="0.00-15.00"),
+            ev("SWITCH_SENT", t1, switch_seq=1, **{"from": A, "to": B}, request_id=None, old_request_id=0,
+               switch_floor="next-group", minimum_switching_group=15, playhead_ms=t1 - T0, last_received_group=13),
+            ev("SWITCH_OK", t1 + 60, switch_seq=1, to=B, request_id=7, switching_group=16, live_edge_group=17, rtt_ms=60),
+            ev("PUBLISH_DONE_RECV", t1 + 40, request_id=0, track=A, status=5, stream_count=3, role="current",
+               switch_in_flight=True, pending_switch_seq=1),
+            ev("DROP_STALE", t1 + 200, track=A, group=16, object=0, bytes=4000, reason="post-seam", seam_group=16, switch_seq=1),
+            ev("DROP_STALE", t1 + 210, track=A, group=16, object=1, bytes=1000, reason="post-seam", seam_group=16, switch_seq=1),
+            ev("SWITCH_SOURCE_RELEASED", t1 + 500, switch_seq=1, request_id=0, track=A, reason="publish-done-idle", seam_group=16,
+               held_ms=440.0, publish_done=True, objects_after_switch_ok=12, post_seam_dropped=2),
+            ev("SWITCH_FIRST_OBJECT", t1 + 510, switch_seq=1, **{"from": A, "to": B}, group=16, object=0, landed_on_keyframe=True),
+            ev("SWITCH_APPLIED", t1 + 511, switch_seq=1, **{"from": A, "to": B}, group=16, object=0, media_seam_gap_ms=0,
+               seam_ahead_of_playhead_ms=5000, landed_on_group_start=True, landed_on_keyframe=True),
+            ev("SWITCH_FIRST_FRAME", t1 + 5000, switch_seq=1, **{"from": A, "to": B}, switch_visibility_delay_ms=5000.0,
+               playback_position_jump_ms=0.0, viewer_pause_ms=3.0, seam_buffer_hole_ms=0),
+        ]
+        # switch 2: floor above the live edge; the relay waits and answers TIMEOUT
+        client += [
+            ev("SWITCH_FLOOR", t2 - 1, switch_seq=2, switch_floor="next-group", recv_floor_group=30, buffer_floor_group=None,
+               selected_min_group=30, playhead_group=20, buffer_end_s=25.0, buffered_ranges="0.00-25.00"),
+            ev("SWITCH_SENT", t2, switch_seq=2, **{"from": B, "to": A}, request_id=None, old_request_id=7,
+               switch_floor="next-group", minimum_switching_group=30, playhead_ms=t2 - T0, last_received_group=29),
+            ev("SWITCH_SKIPPED", t2 + 100, switch_seq=3, **{"from": B, "to": R[1]}, reason="switch in flight", pending_request_id=7),
+            ev("SWITCH_ERROR", t2 + 3050, switch_seq=2, to=A, request_id=None, status=10, reason="switch: NoCommonBoundary",
+               failure="NoCommonBoundary", rtt_ms=3050),
+        ]
+        client += samples(T0, T0 + 60_000, lambda t: A if t < t1 + 511 else B)
+        relay_recs = [
+            relay("SWITCH_RECV", t1 + 20, request_id=None, old_request_id=0, minimum_switching_group=15, track="moqtail/" + B),
+            relay("SWITCH_PROMOTED", t1 + 30, track="moqtail/" + B, request_id=7, start_group=16, live_edge_group=17,
+                  live_edge_object=0, promoted_ts=t1 + 30),
+            relay("SWITCH_RECV", t2 + 20, request_id=None, old_request_id=7, minimum_switching_group=30, track="moqtail/" + A),
+            relay("SWITCH_WAIT", t2 + 21, old_request_id=7, track="moqtail/" + A, floor=30, live_edge_current=27,
+                  live_edge_target=27, waiting_for="floor"),
+            relay("SWITCH_FAILED", t2 + 3020, track="moqtail/" + A, request_id=9, failure="NoCommonBoundary", status_code=10),
+        ]
+        runner_recs = [runner("NET_CHANGE", T0 - 5000, rate_mbps=6, at_s=0, applied=True),
+                       runner("NET_CHANGE", T0 + 30_000, rate_mbps=1.5, at_s=30, applied=True),
+                       runner("RUN_END", T0 + 60_100, elapsed_s=60.0)]
+        return write_run(self.dir, client, runner_recs, duration_s=60.0, relay_recs=relay_recs,
+                         identity_extra={"mechanism": "pr1378", "mechanism_mode": "next-group"},
+                         client_meta_extra={"switch_floor": "next-group"})
+
+    def test_switches_join_by_seq_with_null_request_ids(self):
+        s = analyze.analyze(self.bundle())
+        sw = s["switches"]
+        self.assertEqual(sw["count"], 2)
+        self.assertTrue(sw["join"]["seq_join"])
+        self.assertEqual(sw["join"]["unjoined"], {"SWITCH_SKIPPED": 1})
+        self.assertEqual(sw["terminals"]["first_frame"], 1)
+        self.assertEqual(sw["terminals"]["error"], 1)
+        first, second = sw["list"]
+        self.assertEqual(first["selected_min_group"], 15)
+        self.assertEqual(first["switching_group"], 16)
+        self.assertAlmostEqual(first["relay_promoted_ms"], 30.0)
+        self.assertFalse(first["relay_waited"])
+        self.assertIsNone(first["failure"])
+        self.assertEqual(second["failure"], "NoCommonBoundary")
+        self.assertTrue(second["relay_waited"])
+        self.assertEqual(second["relay_waiting_for"], "floor")
+
+    def test_floor_failure_and_route_statistics(self):
+        s = analyze.analyze(self.bundle())
+        floor = s["switches"]["floor"]
+        self.assertEqual(floor["count"], 2)
+        self.assertEqual(floor["modes"], {"next-group": 2})
+        self.assertEqual(floor["buffer_raised"], 1)     # buffer floor above the receive floor
+        self.assertEqual(floor["seam_above_floor_groups"]["p50"], 1)
+        self.assertEqual(floor["relay_waits"], 1)
+        self.assertEqual(s["switches"]["failures"], {"NoCommonBoundary": 1})
+        routes = s["switch_routes"]
+        self.assertEqual(routes["post_seam_drops"], {"objects": 2, "bytes": 5000})
+        self.assertEqual(routes["released"]["by_reason"], {"publish-done-idle": 1})
+        self.assertEqual(routes["released"]["held_ms"]["p50"], 440.0)
+        self.assertEqual(routes["publish_done_recv"], {"current": 1})
+
+    def test_validates(self):
+        p = subprocess.run([sys.executable, str(EXPERIMENTS / "validate.py"), str(self.bundle()), "--no-write"],
+                           capture_output=True, text=True, timeout=60)
+        status = {}
+        for line in p.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0] in ("PASS", "FAIL", "SKIP", "INFO"):
+                status[parts[1]] = parts[0]
+        for k in ("terminals", "relay-stamps", "ordering", "clocks"):
+            self.assertEqual(status.get(k), "PASS", (k, p.stdout))
+
+
+class Pr1378OldBundle(Pr1378Records):
+    """P9: a pr1378 bundle from before SWITCH_OK carried the switching group takes
+    G_switch from the relay's SWITCH_PROMOTED.start_group."""
+
+    def test_switching_group_from_promoted(self):
+        run = self.bundle()
+        cl = run / "client-events.jsonl"
+        recs = [json.loads(l) for l in cl.read_text().splitlines() if l.strip()]
+        for r in recs:
+            if r["event"] == "SWITCH_OK":
+                r.pop("switching_group", None)
+        cl.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        s = analyze.analyze(run)
+        self.assertEqual(s["switches"]["list"][0]["switching_group"], 16)
+        self.assertEqual(s["switches"]["floor"]["seam_above_floor_groups"]["p50"], 1)
