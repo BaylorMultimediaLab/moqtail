@@ -883,10 +883,9 @@ export class Player {
         if (!el || this.catalog?.getRole(struct.trackName) !== 'video') return {};
         const playheadMs = el.currentTime * 1000;
         return {
-          aheadOfPlayheadMs:
-            struct.lastAppendedEndPTS_ms !== undefined
-              ? struct.lastAppendedEndPTS_ms - playheadMs
-              : undefined,
+          // What the playhead can still play without a gap, from the buffer itself:
+          // the append front is not it while a fill behind the front is under way.
+          aheadOfPlayheadMs: contiguousBufferAheadS(sourceBuffer.buffered, el.currentTime) * 1000,
           // A late keyframe is worth a discontinuity only if it fills a gap the
           // playhead has yet to play.
           fillsGapAhead: (dtsMs: number) => {
