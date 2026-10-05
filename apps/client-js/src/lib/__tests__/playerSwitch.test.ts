@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { RequestError, Tuple } from 'moqtail';
 import { Player } from '@/lib/player';
 import { events } from '@/lib/events/EventLog';
+import { GoodputTracker } from '@/lib/goodput';
 
 /**
  * Player.switchTrack against a fake MOQtail client and catalog: no relay, no
@@ -205,5 +206,45 @@ describe('Player.probeTrackBandwidth: PROBE object timestamps (F13)', () => {
     });
     await player.probeTrackBandwidth('.probe:3000:0', 500);
     expect(probes[0]).toMatchObject({ first_object_ms: null, last_object_ms: null });
+  });
+});
+
+/**
+ * Preflight 2026-10-05 (pr1378 live-edge r2): the relay reuses a track's alias for
+ * every subscription to it (draft-18 11.1 allows this for the same track), so a
+ * late object of an earlier subscription to the target track was mapped to the
+ * switched subscription, landed the switch one group below its start and was
+ * appended over the buffered source group; the decoder failed (MEDIA_ERR_DECODE).
+ * A target object below the source's last received group cannot be the switched
+ * subscription's: native starts at or after what the relay sent of the source.
+ */
+describe('Player.switchTrack: late objects of an earlier subscription to the target track', () => {
+  beforeEach(() => {
+    vi.spyOn(events, 'emit').mockImplementation(() => {});
+    vi.spyOn(GoodputTracker.prototype, 'getMaxGroup').mockReturnValue(60n);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('a target object below the source last received group does not land the switch', async () => {
+    const routed: Record<string, string | null> = {};
+    const env: { player?: Player; aliasMap?: Map<bigint, bigint> } = {};
+    const made = await makePlayer({
+      switchResult: async req => {
+        env.aliasMap!.set(req.requestId, 7n); // the same alias as an earlier subscription
+        routed.below = env.player!.routeVideoObject('720p', 59n);
+        routed.at = env.player!.routeVideoObject('720p', 60n);
+        routed.above = env.player!.routeVideoObject('720p', 61n);
+        return { requestId: req.requestId };
+      },
+    });
+    env.player = made.player;
+    env.aliasMap = made.aliasMap;
+    await made.player.switchTrack('720p');
+    expect(routed).toEqual({ below: 'earlier-subscription', at: 'land', above: 'land' });
+  });
+
+  it('the initial subscription has no lower bound', async () => {
+    const { player } = await makePlayer();
+    expect(player.routeVideoObject('360p', 0n)).toBe('current');
   });
 });

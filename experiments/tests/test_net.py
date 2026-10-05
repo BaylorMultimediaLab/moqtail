@@ -1109,3 +1109,17 @@ class AbortedRuns(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HtbClassRate(unittest.TestCase):
+    """The capacity a step set, as the kernel holds it (`tc class show`)."""
+
+    def test_parses_tc_rate_units(self):
+        self.assertEqual(net.parse_htb_class_rate(
+            "class htb 2:10 root leaf 20: prio 0 rate 1500Kbit ceil 1500Kbit burst 1599b cburst 1599b"), 1_500_000)
+        self.assertEqual(net.parse_htb_class_rate(
+            "class htb 2:10 root leaf 20: prio 0 rate 6Mbit ceil 6Mbit burst 1599b cburst 1599b\n"), 6_000_000)
+
+    def test_other_classes_and_no_class(self):
+        self.assertIsNone(net.parse_htb_class_rate("class htb 2:1 root rate 6Mbit ceil 6Mbit"))
+        self.assertIsNone(net.parse_htb_class_rate(""))
