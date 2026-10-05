@@ -250,20 +250,28 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   uses B, not the Stream Count.
 
 - **Old-track objects at or above G_switch are dropped once it is known (P2,
-  audit M6; review R6 D5).** From SWITCH_OK (which carries SWITCH_TRANSITION)
-  the write handler drops every object of the replaced subscription with group
-  > = G_switch as `DROP_STALE{reason: post-seam}`: the target's catch-up delivers
-  > that span on the new track, and appending both put two representations in
-  > one span of the SourceBuffer. Before SWITCH_OK only the floor the player sent
-  > is known (G_switch >= floor; the source keeps forwarding while selection
-  > waits and is bounded at the seam only at the hand-over), so objects of the
-  > replaced route with group >= floor are held, in arrival order, until the
-  > answer: SWITCH_OK appends those below G_switch and drops the rest
-  > (`DROP_STALE{post-seam, held: true}`); a failure or refusal appends them all.
-  > The hold is bounded by 4 MiB and by T_switch (3 s); a tripped bound appends
-  > everything held and is logged. `SWITCH_HOLD_RELEASED` records each hold that
-  > held something. (Until R6 these objects were appended, 1-3 frames in
-  > practice, biasing `media_seam_gap_ms` by -42..-125 ms.)
+  audit M6; review R6 D5, R7 D2).** From SWITCH_OK (which carries
+  SWITCH_TRANSITION) the write handler drops every object of the replaced
+  subscription whose group is at or above G_switch as
+  `DROP_STALE{reason: post-seam}`: the target's catch-up delivers that span on
+  the new track, and appending both put two representations in one span of the
+  SourceBuffer. Before SWITCH_OK only the floor the player sent is known
+  (G_switch is at or above the floor; the source keeps forwarding while
+  selection waits and is bounded at the seam only at the hand-over), so objects
+  of the replaced route at or above the floor are held, in arrival order, until
+  the answer: SWITCH_OK appends those below G_switch and drops the rest
+  (`DROP_STALE{post-seam, held: true}`); a failure or refusal appends them all.
+  The hold ends exactly when the switch resolves; the library resolves every
+  switch within its response deadline (`SWITCH_RESPONSE_TIMEOUT_MS`, 6 s, a
+  `ClientTimeout` failure), which is therefore the hold's time bound (R7 D2:
+  it had a 3 s bound from SWITCH_SENT, but a success can arrive up to T_switch
+  after the relay's own admission plus a round trip; the bound then appended
+  everything held, the post-seam duplicate included, as `bound-time`). Its
+  only other bound is 4 MiB; a tripped bound appends everything held and is
+  logged. `SWITCH_HOLD_RELEASED` records each hold that held something, and the
+  analyzer counts them by outcome (`switches.hold_released`, with
+  `bound_trips`). (Until R6 these objects were appended, 1-3 frames in
+  practice, biasing `media_seam_gap_ms` by -42..-125 ms.)
 - **PUBLISH_DONE for the replaced subscription (P5, audit M6).** The player
   handles every PUBLISH_DONE on a video subscription (`handlePublishDone`):
   for the subscription a SWITCH replaces it starts that route's release (P1)

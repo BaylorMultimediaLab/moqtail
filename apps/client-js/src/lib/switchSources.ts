@@ -441,14 +441,14 @@ export class SourcePump {
  * about 5 s of the top rung. Exceeding it releases the hold (append, logged).
  */
 export const SWITCH_HOLD_MAX_BYTES = 4 * 1024 * 1024;
-/**
- * Upper bound on how long old-track objects are held while a SWITCH is
- * unanswered (R6 D5): the relay's T_switch (`--t-switch-ms`, 3000 in every
- * pr1378 run), by which the relay has answered or timed the switch out.
- */
-export const SWITCH_HOLD_MAX_MS = 3000;
 
-export type HoldOutcome = 'ok' | 'failed' | 'bound-bytes' | 'bound-time';
+/**
+ * How a hold ended: `ok` (SWITCH_OK), `failed` (a failure, a refusal, the
+ * library's response deadline or an exception: the switch resolved without a
+ * seam), `bound-bytes` (the byte bound tripped). Bundles before R7 also have
+ * `bound-time` (a 3 s bound from SWITCH_SENT, removed: R7-D2).
+ */
+export type HoldOutcome = 'ok' | 'failed' | 'bound-bytes';
 
 /**
  * Old-track objects held while a pr1378 SWITCH is in flight (R6 D5).
@@ -461,9 +461,15 @@ export type HoldOutcome = 'ok' | 'failed' | 'bound-bytes' | 'bound-time';
  * (1-3 frames in practice) put two representations in one span and biased
  * media_seam_gap_ms by -42..-125 ms. They are held, in arrival order, until the
  * answer: SWITCH_OK appends those below G_switch and drops the rest as
- * DROP_STALE{post-seam}; a failure or refusal appends them all. The hold is
- * bounded by bytes and by time (T_switch); when a bound trips everything held
- * is appended (logged) and nothing more is held for that switch.
+ * DROP_STALE{post-seam}; a failure or refusal appends them all. The hold ends
+ * exactly when the switch resolves, and the library resolves every switch
+ * within its response deadline (`MOQtailClient.SWITCH_RESPONSE_TIMEOUT_MS`,
+ * 6 s, a ClientTimeout failure), so that deadline is its time bound (R7-D2: a
+ * 3 s bound from SWITCH_SENT released it before a success the relay may still
+ * send up to T_switch after its own admission plus a round trip, and appended
+ * the post-seam objects the hold exists to drop). The only other bound is the
+ * byte bound; when it trips everything held is appended (logged) and nothing
+ * more is held for that switch.
  */
 export class SwitchHold<T> {
   readonly #items: Array<{ group: bigint; bytes: number; item: T }> = [];
@@ -477,7 +483,6 @@ export class SwitchHold<T> {
     readonly floor: bigint,
     now: number,
     readonly maxBytes: number = SWITCH_HOLD_MAX_BYTES,
-    readonly maxMs: number = SWITCH_HOLD_MAX_MS,
   ) {
     this.#startedAt = now;
   }
@@ -495,11 +500,6 @@ export class SwitchHold<T> {
     this.#items.push({ group, bytes, item });
     this.#bytes += bytes;
     return this.#bytes > this.maxBytes ? 'bound-bytes' : undefined;
-  }
-
-  /** `bound-time` once the hold is older than its time bound, else undefined. */
-  expired(now: number): HoldOutcome | undefined {
-    return now - this.#startedAt >= this.maxMs ? 'bound-time' : undefined;
   }
 
   get size(): number {

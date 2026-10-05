@@ -109,7 +109,6 @@ interface MOQStreamStruct {
    * it is answered (R6 D5), and the timer that bounds the hold by T_switch.
    */
   hold?: SwitchHold<HeldObject>;
-  holdTimer?: ReturnType<typeof setTimeout>;
   /** Serialises the write handler's work, so held objects replay in order (R6 D5). */
   writeChain?: Promise<void>;
   /** Replays a held object through the write path with its verdict (R6 D5). */
@@ -2259,8 +2258,9 @@ export class Player {
     });
     videoStruct.switchInFlight = true;
     videoStruct.pump?.switchSent(subscriptionRequestId, record.seq);
-    // R6 D5: hold this route's objects at or above the floor until the answer,
-    // for at most T_switch.
+    // R6 D5: hold this route's objects at or above the floor until the answer
+    // (the switch's resolution, at the latest the library's response deadline:
+    // R7-D2).
     this.#startHold(videoStruct, record.seq, BigInt(minimumSwitchingGroupId));
     events.emit('SWITCH_SENT', {
       switch_seq: record.seq,
@@ -2413,12 +2413,9 @@ export class Player {
   /** Starts holding the replaced route's objects at or above `floor` (R6 D5). */
   #startHold(struct: MOQStreamStruct, seq: number, floor: bigint): void {
     if (struct.hold) this.#releaseHold(struct, struct.hold.seq, undefined, 'failed');
-    const hold = new SwitchHold<HeldObject>(seq, floor, performance.now());
-    struct.hold = hold;
-    struct.holdTimer = setTimeout(
-      () => this.#releaseHold(struct, seq, undefined, 'bound-time'),
-      hold.maxMs,
-    );
+    // No timer of its own (R7-D2): switchTrack releases it when the switch
+    // resolves, which the library guarantees within SWITCH_RESPONSE_TIMEOUT_MS.
+    struct.hold = new SwitchHold<HeldObject>(seq, floor, performance.now());
   }
 
   /**
@@ -2435,13 +2432,11 @@ export class Player {
     const hold = struct.hold;
     if (!hold || hold.seq !== seq) return;
     struct.hold = undefined;
-    if (struct.holdTimer !== undefined) clearTimeout(struct.holdTimer);
-    struct.holdTimer = undefined;
     const heldBytes = hold.bytes;
     const items = hold.release(seam);
     if (items.length === 0) return;
     const appended = items.filter(i => i.verdict === 'append').length;
-    if (outcome === 'bound-bytes' || outcome === 'bound-time') {
+    if (outcome === 'bound-bytes') {
       logger.warn(
         'media',
         `switch ${seq}: hold bound tripped (${outcome}); appending ${items.length} held objects`,

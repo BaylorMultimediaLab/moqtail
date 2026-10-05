@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import type { MoqtObject } from 'moqtail';
 import {
   DRAIN_TIMEOUT_MS,
-  SWITCH_HOLD_MAX_MS,
   SourcePump,
   SwitchHold,
   type PumpSource,
@@ -592,13 +591,12 @@ describe('SwitchHold (R6 D5): old-track objects at or above the floor wait for t
     ]);
   });
 
-  it('is bounded by bytes and by time (T_switch)', () => {
-    const hold = new SwitchHold<string>(3, 5n, 1000, 25, 3000);
+  // R7-D2: the only bound of its own is the byte bound; in time it ends when the
+  // switch resolves (player test: a success 3.1 s after SWITCH_SENT).
+  it('is bounded by bytes', () => {
+    const hold = new SwitchHold<string>(3, 5n, 1000, 25);
     expect(hold.add(5n, 10, 'a')).toBeUndefined();
     expect(hold.add(5n, 10, 'b')).toBeUndefined();
     expect(hold.add(6n, 10, 'c')).toBe('bound-bytes');
-    expect(hold.expired(3999)).toBeUndefined();
-    expect(hold.expired(4000)).toBe('bound-time');
-    expect(SWITCH_HOLD_MAX_MS).toBe(3000);
   });
 });

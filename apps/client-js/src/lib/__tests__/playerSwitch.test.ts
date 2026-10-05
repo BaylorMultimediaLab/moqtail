@@ -4,6 +4,7 @@ import { SwitchFailure } from 'moqtail/client';
 import { SwitchTransition } from 'moqtail/model';
 import { Player } from '@/lib/player';
 import { events } from '@/lib/events/EventLog';
+import { SwitchHold } from '@/lib/switchSources';
 
 /**
  * Player.switchTrack against a fake MOQtail client and catalog: no relay, no
@@ -222,6 +223,52 @@ describe('Player.switchTrack: the replaced subscription keeps being read (P1, au
     expect(player.videoRoutes()).toEqual([
       { requestId: 1n, trackName: '360p', seamGroup: null, publishDone: false },
     ]);
+  });
+});
+
+describe('Player.switchTrack: the hold of the replaced route ends when the switch resolves (R7-D2)', () => {
+  beforeEach(() => {
+    vi.spyOn(events, 'emit').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // The relay may answer up to T_switch (3 s, counted from its own admission)
+  // plus a round trip after SWITCH_SENT, and the library waits 6 s. A 3 s hold
+  // bound from SWITCH_SENT released the hold before such a late success
+  // ('bound-time': everything held appended, the post-seam duplicate included).
+  it('a success 3.1 s after SWITCH_SENT still releases the hold with its seam', async () => {
+    const release = vi.spyOn(SwitchHold.prototype, 'release');
+    vi.useFakeTimers();
+    const { player } = await makePlayer({
+      switchResult: () =>
+        new Promise(resolve => setTimeout(() => resolve(switchSuccess(42n, 5n, 6n)), 3100)),
+    });
+    const switching = player.switchTrack('720p');
+    await vi.advanceTimersByTimeAsync(3050);
+    expect(release).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(100);
+    await switching;
+    expect(release.mock.calls).toEqual([[5n]]);
+  });
+
+  it('a switch the library times out releases the hold at that resolution, as failed', async () => {
+    const release = vi.spyOn(SwitchHold.prototype, 'release');
+    vi.useFakeTimers();
+    const { player } = await makePlayer({
+      switchResult: () =>
+        new Promise(resolve =>
+          setTimeout(() => resolve(new SwitchFailure(0xa as never, 'ClientTimeout')), 6000),
+        ),
+    });
+    const switching = player.switchTrack('720p');
+    await vi.advanceTimersByTimeAsync(5990);
+    expect(release).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(20);
+    await switching;
+    expect(release.mock.calls).toEqual([[undefined]]);
   });
 });
 
