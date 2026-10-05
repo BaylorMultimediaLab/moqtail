@@ -30,6 +30,7 @@ import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
 import { StallTracker } from '@/lib/stall';
+import { AppendOrder, type OrderAction, type OrderContext } from '@/lib/appendOrder';
 import { parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
@@ -68,6 +69,13 @@ interface PendingSwitch {
   minGroup: bigint;
 }
 
+/** An object waiting in (or passing through) the decode-order scheduler. */
+interface OrderedObject {
+  object: MoqtObject;
+  trackName: string;
+  info: NonNullable<ReturnType<typeof parseMoofMediaInfo>>;
+}
+
 interface MOQStreamStruct {
   trackName: string;
   source: ReadableStream<MoqtObject>;
@@ -102,6 +110,8 @@ interface MOQStreamStruct {
    * MEDIA_ERR_DECODE on a bad one. The visible seam is the same either way.
    */
   awaitKeyframe?: boolean;
+  /** Decode-order append scheduling for this stream's SourceBuffer (lib/appendOrder.ts). */
+  order?: AppendOrder<OrderedObject>;
   buffer?: {
     sourceBuffer: SourceBuffer;
     ac: AbortController;
@@ -732,427 +742,574 @@ export class Player {
       let lastMSEErrorLogged = 0;
       let kickStarted = false;
 
+      // One object into the SourceBuffer, and what follows a successful append:
+      // the append front, the TimeMap, the switch seam (SWITCH_APPLIED). `true`
+      // unless every retry failed. Callers hold the append lock.
+      const appendOne = async (
+        object: MoqtObject,
+        objectTrackName: string,
+        info: OrderedObject['info'] | undefined,
+      ): Promise<boolean> => {
+        const payload = object.payload;
+        if (!(payload?.buffer instanceof ArrayBuffer)) return false;
+        // Append the data
+        let maxRetries = 5;
+        // When the successful appendBuffer call was made: the seam's target
+        // append front is dated here, not at updateend (F9).
+        let appendCalledAt = performance.now();
+        while (maxRetries--) {
+          try {
+            // Append the data
+            appendCalledAt = performance.now();
+            sourceBuffer.appendBuffer(payload.buffer);
+
+            // Wait for the source buffer to be consumed
+            await waitForBufferUpdate(sourceBuffer);
+            break;
+          } catch (error) {
+            // Wait for the source buffer to be ready
+            if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
+            else if (lastMSEErrorLogged + 5000 < performance.now()) {
+              lastMSEErrorLogged = performance.now();
+              const err = error as Error & { name?: string; code?: number };
+              const vErr = this.#element?.error;
+              logger.error(
+                'media',
+                `Error appending to SourceBuffer, retrying... (${maxRetries} attempts left). ` +
+                  `err.name=${err?.name} err.message=${err?.message} ` +
+                  `sb.updating=${sourceBuffer.updating} ` +
+                  `mse.readyState=${this.#mse?.readyState} ` +
+                  `video.error.code=${vErr?.code} video.error.message=${vErr?.message} ` +
+                  `payload.byteLength=${payload.byteLength} ` +
+                  `track=${objectTrackName}`,
+              );
+            }
+          }
+        }
+
+        if (maxRetries < 0) {
+          events.emit('ERROR', {
+            where: 'append-exhausted',
+            track: objectTrackName,
+            group: Number(object.location.group),
+            object: Number(object.location.object),
+            bytes: payload.byteLength,
+            mse_ready_state: this.#mse?.readyState ?? 'closed',
+            video_error_code: this.#element?.error?.code ?? 0,
+          });
+        } else {
+          const nowPerf = performance.now();
+          if (this.#starvedSince !== undefined) {
+            events.emit('DATA_RESUMED', {
+              track: objectTrackName,
+              group: Number(object.location.group),
+              starved_ms: nowPerf - this.#starvedSince,
+            });
+            this.#starvedSince = undefined;
+          }
+          struct.lastAppendPerf = nowPerf;
+          // The gate stays armed until a sync sample is actually in the buffer.
+          struct.awaitKeyframe = false;
+          // Append front and TimeMap move only for a frame that is in the buffer.
+          if (info !== undefined) {
+            struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
+            struct.lastFrameDurationMs = info.frameDurationMs;
+            // A frame with buffered media after it landed inside a gap: a
+            // fill (refetch or catch-up), not live delivery at the end (F4).
+            if (this.catalog?.getRole(struct.trackName) === 'video') {
+              const endS = struct.lastAppendedEndPTS_ms / 1000;
+              const ranges = sourceBuffer.buffered;
+              if (ranges.length > 0 && ranges.start(ranges.length - 1) > endS + 0.001) {
+                this.#gapFills.record(endS, nowPerf);
+              }
+            }
+            // Feed the TimeMap so measurements can resolve playhead -> group.
+            // Only the first object of each group records (idempotent in TimeMap),
+            // and frame 0 of a group has decodeTime == group start PTS.
+            if (this.#timeMap) {
+              this.#timeMap.recordGroupBoundary(Number(object.location.group), info.decodeTimeMs);
+            }
+            // Every target frame moves the pending switch's append front; the
+            // first one applies the switch (M9). Only the video track switches.
+            const applied =
+              this.catalog?.getRole(struct.trackName) === 'video'
+                ? this.#seams.appended({
+                    ptsMs: info.decodeTimeMs,
+                    endPtsMs: info.decodeTimeMs + info.frameDurationMs,
+                    group: Number(object.location.group),
+                    object: Number(object.location.object),
+                    now: nowPerf,
+                    appendStartedAt: appendCalledAt,
+                  })
+                : null;
+            if (applied !== null) {
+              events.emit(
+                'SWITCH_APPLIED',
+                switchAppliedFields(applied, {
+                  now: nowPerf,
+                  playheadMs: this.#element ? this.#element.currentTime * 1000 : undefined,
+                }),
+              );
+            }
+          }
+        }
+
+        // Check the buffered amount
+        if (sourceBuffer.buffered.length > 0 && !kickStarted) {
+          const minStart = sourceBuffer.buffered.start(0);
+          const maxEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+          const bufferDuration = maxEnd - minStart;
+          if (bufferDuration > 1.0) bufferNotification(maxEnd);
+        }
+        return maxRetries >= 0;
+      };
+
+      // Every SourceBuffer mutation of this stream (the object pipeline and the
+      // scheduler's timed releases) runs under one lock, in order.
+      let lock: Promise<void> = Promise.resolve();
+      const locked = <R>(fn: () => Promise<R>): Promise<R> => {
+        const run = lock.then(fn);
+        lock = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        return run;
+      };
+
+      const order = new AppendOrder<OrderedObject>();
+      struct.order = order;
+      const orderContext = (): OrderContext => {
+        const el = this.#element;
+        if (!el || this.catalog?.getRole(struct.trackName) !== 'video') return {};
+        const playheadMs = el.currentTime * 1000;
+        return {
+          aheadOfPlayheadMs:
+            struct.lastAppendedEndPTS_ms !== undefined
+              ? struct.lastAppendedEndPTS_ms - playheadMs
+              : undefined,
+          // A late keyframe is worth a discontinuity only if it fills a gap the
+          // playhead has yet to play.
+          fillsGapAhead: (dtsMs: number) => {
+            if (dtsMs < playheadMs + 100) return false;
+            const t = dtsMs / 1000;
+            const b = sourceBuffer.buffered;
+            for (let i = 0; i < b.length; i++) if (t >= b.start(i) && t < b.end(i)) return false;
+            return true;
+          },
+        };
+      };
+      const heldDrop = (a: OrderAction<OrderedObject>, now: number) => {
+        const { object, trackName } = a.frame.item;
+        // Its arrival was recorded when it was held; only the drop is reported.
+        events.emit('DROP_STALE', {
+          track: trackName,
+          current: struct.trackName,
+          pending: struct.pendingSwitch?.trackName ?? null,
+          group: Number(object.location.group),
+          object: Number(object.location.object),
+          bytes: object.payload?.byteLength ?? 0,
+          reason: a.kind === 'drop' ? a.reason : null,
+          waited_ms: now - a.frame.arrivedAt,
+        });
+      };
+      // Carries out the scheduler's actions in order; returns what became of
+      // `offered` ('held' when it is waiting for a gap).
+      const perform = async (
+        actions: OrderAction<OrderedObject>[],
+        offered?: MoqtObject,
+      ): Promise<'appended' | 'failed' | 'dropped' | 'held'> => {
+        let status: 'appended' | 'failed' | 'dropped' | 'held' = 'held';
+        for (const a of actions) {
+          const { object, trackName, info } = a.frame.item;
+          if (a.kind === 'append') {
+            const ok = await appendOne(object, trackName, info);
+            if (object === offered) status = ok ? 'appended' : 'failed';
+          } else if (object === offered) {
+            this.#dropStale(struct, object, trackName, {
+              track: trackName,
+              current: struct.trackName,
+              pending: struct.pendingSwitch?.trackName ?? null,
+              group: Number(object.location.group),
+              object: Number(object.location.object),
+              bytes: object.payload?.byteLength ?? 0,
+              reason: a.reason,
+            });
+            status = 'dropped';
+          } else {
+            heldDrop(a, performance.now());
+          }
+        }
+        return status;
+      };
+      // While frames are held, re-check every 100 ms (the playhead may be running
+      // out of media) and at the oldest one's deadline.
+      let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+      const armRelease = () => {
+        if (releaseTimer !== undefined) clearTimeout(releaseTimer);
+        releaseTimer = undefined;
+        const deadline = order.nextDeadline;
+        if (deadline === undefined) return;
+        const delay = Math.max(0, Math.min(deadline - performance.now(), 100));
+        releaseTimer = setTimeout(() => {
+          releaseTimer = undefined;
+          void locked(async () => {
+            await perform(order.tick(performance.now(), orderContext()));
+            armRelease();
+          }).catch(error => logger.error('media', 'append-order release failed:', error));
+        }, delay);
+      };
+      this.#disposers.push(() => {
+        if (releaseTimer !== undefined) clearTimeout(releaseTimer);
+      });
+
       // Create the WritableStream to handle incoming objects
       const writable = new WritableStream<MoqtObject>({
-        write: async (object, controller) => {
-          try {
-            // Skip end-of-group objects
-            if (object.isEndOfGroup()) {
-              logger.info(
-                'media',
-                `Received end-of-group object for track ${struct.trackName}, ignoring`,
-              );
-              return;
-            }
+        write: (object, controller) =>
+          locked(async () => {
+            try {
+              // Skip end-of-group objects
+              if (object.isEndOfGroup()) {
+                logger.info(
+                  'media',
+                  `Received end-of-group object for track ${struct.trackName}, ignoring`,
+                );
+                return;
+              }
 
-            // Make TypeScript happy
-            if (!(object.payload?.buffer instanceof ArrayBuffer)) {
-              console.warn('Received non-ArrayBuffer payload, ignoring', object);
-              return;
-            }
+              // Make TypeScript happy
+              if (!(object.payload?.buffer instanceof ArrayBuffer)) {
+                console.warn('Received non-ArrayBuffer payload, ignoring', object);
+                return;
+              }
 
-            // Cancel if aborted
-            if (ac.signal.aborted) {
-              controller.error(new DOMException('Stream aborted', 'InternalError'));
-              return;
-            }
+              // Cancel if aborted
+              if (ac.signal.aborted) {
+                controller.error(new DOMException('Stream aborted', 'InternalError'));
+                return;
+              }
 
-            // Resolve the incoming object's track name from its fullTrackName
-            // (wire-side truth). Always compute it — not just during pending
-            // switches — because the relay continues to flush in-flight
-            // old-track streams AFTER a switch completes. Those trailing
-            // packets have different HEVC SPS/PPS than the new init segment,
-            // so appending them would feed the SourceBuffer data it can't
-            // decode and stall MSE.
-            const objectTrackName = new TextDecoder().decode(object.fullTrackName.name);
+              // Resolve the incoming object's track name from its fullTrackName
+              // (wire-side truth). Always compute it — not just during pending
+              // switches — because the relay continues to flush in-flight
+              // old-track streams AFTER a switch completes. Those trailing
+              // packets have different HEVC SPS/PPS than the new init segment,
+              // so appending them would feed the SourceBuffer data it can't
+              // decode and stall MSE.
+              const objectTrackName = new TextDecoder().decode(object.fullTrackName.name);
 
-            // Drop anything that isn't the current track or the pending
-            // switch target. Covers two cases:
-            //   1. Rapid ABR switching (A→B→C) where intermediate-track data
-            //      arrives after pendingSwitch was overwritten to C.
-            //   2. Old-track trailing packets delivered after a switch has
-            //      already activated and pendingSwitch was cleared.
-            const route = this.#route(struct, objectTrackName, object.location.group);
-            if (route === 'stale') {
-              logger.info(
-                'media',
-                `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
-              );
-              this.#dropStale(struct, object, objectTrackName, {
-                track: objectTrackName,
-                current: struct.trackName,
-                pending: struct.pendingSwitch?.trackName ?? null,
-                group: object.location.group,
-                bytes: object.payload.byteLength,
-                object: object.location.object,
-              });
-              return;
-            }
+              // Drop anything that isn't the current track or the pending
+              // switch target. Covers two cases:
+              //   1. Rapid ABR switching (A→B→C) where intermediate-track data
+              //      arrives after pendingSwitch was overwritten to C.
+              //   2. Old-track trailing packets delivered after a switch has
+              //      already activated and pendingSwitch was cleared.
+              const route = this.#route(struct, objectTrackName, object.location.group);
+              if (route === 'stale') {
+                logger.info(
+                  'media',
+                  `Dropping stale track data (${objectTrackName}); current=${struct.trackName} pending=${struct.pendingSwitch?.trackName ?? 'none'}`,
+                );
+                this.#dropStale(struct, object, objectTrackName, {
+                  track: objectTrackName,
+                  current: struct.trackName,
+                  pending: struct.pendingSwitch?.trackName ?? null,
+                  group: object.location.group,
+                  bytes: object.payload.byteLength,
+                  object: object.location.object,
+                });
+                return;
+              }
 
-            if (route === 'pre-landing') {
-              // Same track name, but the library has not yet seen a stream for
-              // the switched subscription: this is a trailing object of the
-              // earlier subscription to that track, not the switch landing.
-              this.#dropStale(struct, object, objectTrackName, {
-                track: objectTrackName,
-                current: struct.trackName,
-                pending: struct.pendingSwitch?.trackName ?? null,
-                group: object.location.group,
-                bytes: object.payload.byteLength,
-                object: object.location.object,
-                reason: 'pre-landing',
-              });
-              return;
-            }
+              if (route === 'pre-landing') {
+                // Same track name, but the library has not yet seen a stream for
+                // the switched subscription: this is a trailing object of the
+                // earlier subscription to that track, not the switch landing.
+                this.#dropStale(struct, object, objectTrackName, {
+                  track: objectTrackName,
+                  current: struct.trackName,
+                  pending: struct.pendingSwitch?.trackName ?? null,
+                  group: object.location.group,
+                  bytes: object.payload.byteLength,
+                  object: object.location.object,
+                  reason: 'pre-landing',
+                });
+                return;
+              }
 
-            if (route === 'earlier-subscription') {
-              // A late object of an earlier subscription to this track, below what
-              // the current (or switched) subscription can deliver: appending it
-              // would put the old subscription's frames behind the seam, and
-              // landing on it would start the switch below its own start group.
-              this.#dropStale(struct, object, objectTrackName, {
-                track: objectTrackName,
-                current: struct.trackName,
-                pending: struct.pendingSwitch?.trackName ?? null,
-                group: object.location.group,
-                bytes: object.payload.byteLength,
-                object: object.location.object,
-                reason: 'earlier-subscription',
-                floor_group: this.#floorGroup(struct, objectTrackName) ?? null,
-              });
-              return;
-            }
+              if (route === 'earlier-subscription') {
+                // A late object of an earlier subscription to this track, below what
+                // the current (or switched) subscription can deliver: appending it
+                // would put the old subscription's frames behind the seam, and
+                // landing on it would start the switch below its own start group.
+                this.#dropStale(struct, object, objectTrackName, {
+                  track: objectTrackName,
+                  current: struct.trackName,
+                  pending: struct.pendingSwitch?.trackName ?? null,
+                  group: object.location.group,
+                  bytes: object.payload.byteLength,
+                  object: object.location.object,
+                  reason: 'earlier-subscription',
+                  floor_group: this.#floorGroup(struct, objectTrackName) ?? null,
+                });
+                return;
+              }
 
-            if (route === 'land' && struct.pendingSwitch) {
-              const { initData, mimeType, trackName: newTrackName, record } = struct.pendingSwitch;
-              const fromTrack = struct.trackName; // capture BEFORE overwriting
-              // The source's last appended frame at the moment the switch lands
-              // (the send-time snapshot in the record predates ~1 GOP of source
-              // frames that arrived while the SWITCH was in flight).
-              const sourceEndAtLandingMs = struct.lastAppendedEndPTS_ms;
-              struct.trackName = newTrackName;
-              struct.currentMinGroup = struct.pendingSwitch.minGroup;
-              struct.pendingSwitch = null;
-              // Whether the landing object is a keyframe: the trun sync-sample flag
-              // of its moof (undefined when the moof carries no flags).
-              const newTimescale = this.catalog?.getTimescale(newTrackName);
-              const landingIsSync =
-                newTimescale && newTimescale > 0
+              if (route === 'land' && struct.pendingSwitch) {
+                const {
+                  initData,
+                  mimeType,
+                  trackName: newTrackName,
+                  record,
+                } = struct.pendingSwitch;
+                const fromTrack = struct.trackName; // capture BEFORE overwriting
+                // The source's last appended frame at the moment the switch lands
+                // (the send-time snapshot in the record predates ~1 GOP of source
+                // frames that arrived while the SWITCH was in flight).
+                const sourceEndAtLandingMs = struct.lastAppendedEndPTS_ms;
+                struct.trackName = newTrackName;
+                struct.currentMinGroup = struct.pendingSwitch.minGroup;
+                struct.pendingSwitch = null;
+                // Whether the landing object is a keyframe: the trun sync-sample flag
+                // of its moof (undefined when the moof carries no flags).
+                const newTimescale = this.catalog?.getTimescale(newTrackName);
+                const landingIsSync =
+                  newTimescale && newTimescale > 0
+                    ? parseMoofMediaInfo(
+                        new Uint8Array(
+                          object.payload.buffer,
+                          object.payload.byteOffset,
+                          object.payload.byteLength,
+                        ),
+                        newTimescale,
+                      )?.isSync
+                    : undefined;
+
+                // The landing object. The seam fields come from the first object
+                // that passes the keyframe gate (SWITCH_APPLIED, M9).
+                events.emit('SWITCH_FIRST_OBJECT', {
+                  switch_seq: record.seq,
+                  from: fromTrack,
+                  to: newTrackName,
+                  group: object.location.group,
+                  object: object.location.object,
+                  landed_on_keyframe: landingIsSync ?? null,
+                  since_sent_ms: performance.now() - record.sentAt,
+                });
+                // A previous landing whose seam was never presented is overwritten now.
+                const { superseded } = this.#seams.landed(record, {
+                  group: Number(object.location.group),
+                  object: Number(object.location.object),
+                  landedOnKeyframe: landingIsSync ?? null,
+                  sourceEndMs: sourceEndAtLandingMs,
+                  now: performance.now(),
+                });
+                for (const old of superseded) {
+                  events.emit('SWITCH_SUPERSEDED', {
+                    switch_seq: old.seq,
+                    by_switch_seq: record.seq,
+                    playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
+                    landed: true,
+                  });
+                }
+                // Nothing of the target is appended before a sync sample, the landing
+                // object included: the gate below decides for every object, and the
+                // first one it lets into the buffer applies the switch.
+                struct.awaitKeyframe = true;
+                if (this.#resetLatencyOnLanding) {
+                  this.#latencyTracker.reset();
+                  events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
+                }
+
+                // A new track: the held frames of the old one cannot follow it, and the
+                // target starts the append order afresh at its keyframe.
+                for (const a of order.reset()) heldDrop(a, performance.now());
+                if (!(await applyInit(sourceBuffer, mimeType, initData, newTrackName))) {
+                  // Keep the pipeline alive: retry the init before the next object
+                  // append and drop this object (it cannot be decoded without it).
+                  struct.pendingInit = { mimeType, initData, attempts: 1 };
+                  this.#options.onTrackSwitched?.(newTrackName, record.seq);
+                  this.#seams.discarded();
+                  this.#dropStale(struct, object, objectTrackName, {
+                    track: objectTrackName,
+                    current: struct.trackName,
+                    pending: null,
+                    group: Number(object.location.group),
+                    bytes: object.payload.byteLength,
+                    object: Number(object.location.object),
+                    reason: 'init-pending',
+                  });
+                  return;
+                }
+
+                // NOW release the ABR switching guard — the relay has completed the
+                // transition and delivered data on the new track. Safe to switch again.
+                this.#options.onTrackSwitched?.(newTrackName, record.seq);
+              }
+
+              // Publisher emits one moof+mdat per access unit (see apps/publisher/src/cmaf.rs),
+              // so each moof's tfdt is a per-frame decode time and the trun carries that
+              // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
+              const timescale = this.catalog?.getTimescale(struct.trackName);
+              let decodeTimeMs: number | undefined;
+              const info =
+                timescale && timescale > 0
                   ? parseMoofMediaInfo(
                       new Uint8Array(
                         object.payload.buffer,
                         object.payload.byteOffset,
                         object.payload.byteLength,
                       ),
-                      newTimescale,
-                    )?.isSync
+                      timescale,
+                    )
                   : undefined;
 
-              // The landing object. The seam fields come from the first object
-              // that passes the keyframe gate (SWITCH_APPLIED, M9).
-              events.emit('SWITCH_FIRST_OBJECT', {
-                switch_seq: record.seq,
-                from: fromTrack,
-                to: newTrackName,
-                group: object.location.group,
-                object: object.location.object,
-                landed_on_keyframe: landingIsSync ?? null,
-                since_sent_ms: performance.now() - record.sentAt,
-              });
-              // A previous landing whose seam was never presented is overwritten now.
-              const { superseded } = this.#seams.landed(record, {
-                group: Number(object.location.group),
-                object: Number(object.location.object),
-                landedOnKeyframe: landingIsSync ?? null,
-                sourceEndMs: sourceEndAtLandingMs,
-                now: performance.now(),
-              });
-              for (const old of superseded) {
-                events.emit('SWITCH_SUPERSEDED', {
-                  switch_seq: old.seq,
-                  by_switch_seq: record.seq,
-                  playhead_ms: (this.#element?.currentTime ?? 0) * 1000,
-                  landed: true,
-                });
-              }
-              // Nothing of the target is appended before a sync sample, the landing
-              // object included: the gate below decides for every object, and the
-              // first one it lets into the buffer applies the switch.
-              struct.awaitKeyframe = true;
-              if (this.#resetLatencyOnLanding) {
-                this.#latencyTracker.reset();
-                events.emit('LATENCY_WINDOW_RESET', { track: newTrackName });
+              if (struct.pendingInit) {
+                const pi = struct.pendingInit;
+                pi.attempts += 1;
+                if (await applyInit(sourceBuffer, pi.mimeType, pi.initData, struct.trackName)) {
+                  events.emit('SWITCH_INIT_RECOVERED', {
+                    track: struct.trackName,
+                    attempts: pi.attempts,
+                  });
+                  struct.pendingInit = undefined;
+                  // The landing block's gate, which a failed init used to skip: the
+                  // switch is applied by the first sync sample after the recovery.
+                  struct.awaitKeyframe = true;
+                  for (const a of order.reset()) heldDrop(a, performance.now());
+                } else {
+                  this.#seams.discarded();
+                  this.#dropStale(struct, object, objectTrackName, {
+                    track: objectTrackName,
+                    current: struct.trackName,
+                    pending: struct.pendingSwitch?.trackName ?? null,
+                    group: Number(object.location.group),
+                    bytes: object.payload.byteLength,
+                    object: Number(object.location.object),
+                    reason: 'init-pending',
+                  });
+                  return;
+                }
               }
 
-              if (!(await applyInit(sourceBuffer, mimeType, initData, newTrackName))) {
-                // Keep the pipeline alive: retry the init before the next object
-                // append and drop this object (it cannot be decoded without it).
-                struct.pendingInit = { mimeType, initData, attempts: 1 };
-                this.#options.onTrackSwitched?.(newTrackName, record.seq);
-                this.#seams.discarded();
-                this.#dropStale(struct, object, objectTrackName, {
-                  track: objectTrackName,
-                  current: struct.trackName,
-                  pending: null,
-                  group: Number(object.location.group),
-                  bytes: object.payload.byteLength,
-                  object: Number(object.location.object),
-                  reason: 'init-pending',
-                });
-                return;
+              if (struct.awaitKeyframe) {
+                const isSync = info?.isSync ?? object.location.object === 0n;
+                if (!isSync) {
+                  this.#seams.discarded();
+                  this.#dropStale(struct, object, objectTrackName, {
+                    track: objectTrackName,
+                    current: struct.trackName,
+                    pending: struct.pendingSwitch?.trackName ?? null,
+                    group: Number(object.location.group),
+                    object: Number(object.location.object),
+                    bytes: object.payload.byteLength,
+                    reason: 'pre-keyframe',
+                  });
+                  return;
+                }
               }
+              decodeTimeMs = info?.decodeTimeMs;
 
-              // NOW release the ABR switching guard — the relay has completed the
-              // transition and delivered data on the new track. Safe to switch again.
-              this.#options.onTrackSwitched?.(newTrackName, record.seq);
-            }
-
-            // Publisher emits one moof+mdat per access unit (see apps/publisher/src/cmaf.rs),
-            // so each moof's tfdt is a per-frame decode time and the trun carries that
-            // frame's duration. End PTS = decodeTime + frameDuration (NOT + gopDuration).
-            const timescale = this.catalog?.getTimescale(struct.trackName);
-            let decodeTimeMs: number | undefined;
-            const info =
-              timescale && timescale > 0
-                ? parseMoofMediaInfo(
-                    new Uint8Array(
-                      object.payload.buffer,
-                      object.payload.byteOffset,
-                      object.payload.byteLength,
-                    ),
-                    timescale,
-                  )
-                : undefined;
-
-            if (struct.pendingInit) {
-              const pi = struct.pendingInit;
-              pi.attempts += 1;
-              if (await applyInit(sourceBuffer, pi.mimeType, pi.initData, struct.trackName)) {
-                events.emit('SWITCH_INIT_RECOVERED', {
-                  track: struct.trackName,
-                  attempts: pi.attempts,
-                });
-                struct.pendingInit = undefined;
-                // The landing block's gate, which a failed init used to skip: the
-                // switch is applied by the first sync sample after the recovery.
-                struct.awaitKeyframe = true;
+              // Appended in decode order (lib/appendOrder.ts): an object that does
+              // not continue the last appended frame waits for the gap before it, or is
+              // dropped when it is behind the append front, instead of being appended
+              // in arrival order (MSE would drop it and every frame up to the next
+              // keyframe, silently).
+              let failed = false;
+              if (info === undefined) {
+                failed = !(await appendOne(object, objectTrackName, undefined));
               } else {
-                this.#seams.discarded();
-                this.#dropStale(struct, object, objectTrackName, {
+                const now = performance.now();
+                const status = await perform(
+                  order.offer(
+                    {
+                      item: { object, trackName: objectTrackName, info },
+                      dtsMs: info.decodeTimeMs,
+                      durMs: info.frameDurationMs,
+                      isSync: info.isSync ?? object.location.object === 0n,
+                      arrivedAt: now,
+                    },
+                    now,
+                    orderContext(),
+                  ),
+                  object,
+                );
+                armRelease();
+                // A dropped object's arrival is recorded by #dropStale.
+                if (status === 'dropped') return;
+                failed = status === 'failed';
+              }
+
+              // Throughput: arrival spacing of this object's group (M11). A frame
+              // that could not be appended still crossed the link. The tracker
+              // also keeps the highest group received per track (F10).
+              this.#recordArrival(struct, object, objectTrackName, info, failed);
+
+              // First-received-group export for E2E smoke + connect-time metrics (Phase C).
+              // Only set once across all streams to capture the earliest received group.
+              if (typeof window !== 'undefined') {
+                if (window.__moqtailMetrics === undefined) {
+                  window.__moqtailMetrics = { abr: null, samples: null };
+                }
+                const isFirstObject = window.__moqtailMetrics.firstReceivedGroupId === undefined;
+                if (isFirstObject) {
+                  window.__moqtailMetrics.firstReceivedGroupId = Number(object.location.group);
+                  this.#tFirstObject = performance.now();
+                  const expectedGroup = this.#expectedStartGroupId;
+                  events.emit('FIRST_OBJECT', {
+                    track: struct.trackName,
+                    group: object.location.group,
+                    object: object.location.object,
+                    pts_ms: decodeTimeMs ?? null,
+                    expected_start_group: expectedGroup ?? null,
+                    clamped:
+                      expectedGroup !== undefined
+                        ? Number(object.location.group) > expectedGroup
+                        : null,
+                    since_connect_ms:
+                      this.#tConnectStart !== undefined
+                        ? this.#tFirstObject - this.#tConnectStart
+                        : null,
+                  });
+                }
+              }
+
+              // Read PRFT box (if any) at the head of the CMAF chunk.
+              // Publisher prepends `prft` per ISO/IEC 14496-12 §8.16.5 so the
+              // receiver can compute end-to-end latency per frame. MSE skips
+              // unknown top-level boxes, so the chunk is appended unchanged.
+              // `object.payload` is already a Uint8Array view at the right
+              // offset — pass it directly so we don't accidentally read from
+              // byte 0 of a shared underlying ArrayBuffer.
+              const prft = readPrft(object.payload);
+              let latencyMs: number | null = null;
+              if (prft !== null) {
+                latencyMs = Date.now() - prft.captureMs;
+                this.#latencyTracker.record(latencyMs);
+                const anchorTimescale =
+                  this.catalog?.getTimescale(objectTrackName) ?? this.#videoTimescale;
+                if (anchorTimescale > 0) {
+                  this.#prftAnchor = {
+                    captureMs: prft.captureMs,
+                    mediaMs: (prft.mediaTime * 1000) / anchorTimescale,
+                  };
+                }
+              }
+              if (this.#options.logObjects) {
+                events.emit('OBJECT_RECV', {
                   track: objectTrackName,
-                  current: struct.trackName,
-                  pending: struct.pendingSwitch?.trackName ?? null,
-                  group: Number(object.location.group),
-                  bytes: object.payload.byteLength,
-                  object: Number(object.location.object),
-                  reason: 'init-pending',
-                });
-                return;
-              }
-            }
-
-            if (struct.awaitKeyframe) {
-              const isSync = info?.isSync ?? object.location.object === 0n;
-              if (!isSync) {
-                this.#seams.discarded();
-                this.#dropStale(struct, object, objectTrackName, {
-                  track: objectTrackName,
-                  current: struct.trackName,
-                  pending: struct.pendingSwitch?.trackName ?? null,
-                  group: Number(object.location.group),
-                  object: Number(object.location.object),
-                  bytes: object.payload.byteLength,
-                  reason: 'pre-keyframe',
-                });
-                return;
-              }
-            }
-            decodeTimeMs = info?.decodeTimeMs;
-
-            // Append the data
-            let maxRetries = 5;
-            // When the successful appendBuffer call was made: the seam's target
-            // append front is dated here, not at updateend (F9).
-            let appendCalledAt = performance.now();
-            while (maxRetries--) {
-              try {
-                // Append the data
-                appendCalledAt = performance.now();
-                sourceBuffer.appendBuffer(object.payload.buffer);
-
-                // Wait for the source buffer to be consumed
-                await waitForBufferUpdate(sourceBuffer);
-                break;
-              } catch (error) {
-                // Wait for the source buffer to be ready
-                if (sourceBuffer.updating) await waitForBufferUpdate(sourceBuffer);
-                else if (lastMSEErrorLogged + 5000 < performance.now()) {
-                  lastMSEErrorLogged = performance.now();
-                  const err = error as Error & { name?: string; code?: number };
-                  const vErr = this.#element?.error;
-                  logger.error(
-                    'media',
-                    `Error appending to SourceBuffer, retrying... (${maxRetries} attempts left). ` +
-                      `err.name=${err?.name} err.message=${err?.message} ` +
-                      `sb.updating=${sourceBuffer.updating} ` +
-                      `mse.readyState=${this.#mse?.readyState} ` +
-                      `video.error.code=${vErr?.code} video.error.message=${vErr?.message} ` +
-                      `payload.byteLength=${object.payload.byteLength} ` +
-                      `track=${objectTrackName}`,
-                  );
-                }
-              }
-            }
-
-            if (maxRetries < 0) {
-              events.emit('ERROR', {
-                where: 'append-exhausted',
-                track: objectTrackName,
-                group: Number(object.location.group),
-                object: Number(object.location.object),
-                bytes: object.payload.byteLength,
-                mse_ready_state: this.#mse?.readyState ?? 'closed',
-                video_error_code: this.#element?.error?.code ?? 0,
-              });
-            } else {
-              const nowPerf = performance.now();
-              if (this.#starvedSince !== undefined) {
-                events.emit('DATA_RESUMED', {
-                  track: objectTrackName,
-                  group: Number(object.location.group),
-                  starved_ms: nowPerf - this.#starvedSince,
-                });
-                this.#starvedSince = undefined;
-              }
-              struct.lastAppendPerf = nowPerf;
-              // The gate stays armed until a sync sample is actually in the buffer.
-              struct.awaitKeyframe = false;
-              // Append front and TimeMap move only for a frame that is in the buffer.
-              if (info !== undefined) {
-                struct.lastAppendedEndPTS_ms = info.decodeTimeMs + info.frameDurationMs;
-                struct.lastFrameDurationMs = info.frameDurationMs;
-                // A frame with buffered media after it landed inside a gap: a
-                // fill (refetch or catch-up), not live delivery at the end (F4).
-                if (this.catalog?.getRole(struct.trackName) === 'video') {
-                  const endS = struct.lastAppendedEndPTS_ms / 1000;
-                  const ranges = sourceBuffer.buffered;
-                  if (ranges.length > 0 && ranges.start(ranges.length - 1) > endS + 0.001) {
-                    this.#gapFills.record(endS, nowPerf);
-                  }
-                }
-                // Feed the TimeMap so measurements can resolve playhead -> group.
-                // Only the first object of each group records (idempotent in TimeMap),
-                // and frame 0 of a group has decodeTime == group start PTS.
-                if (this.#timeMap) {
-                  this.#timeMap.recordGroupBoundary(
-                    Number(object.location.group),
-                    info.decodeTimeMs,
-                  );
-                }
-                // Every target frame moves the pending switch's append front; the
-                // first one applies the switch (M9). Only the video track switches.
-                const applied =
-                  this.catalog?.getRole(struct.trackName) === 'video'
-                    ? this.#seams.appended({
-                        ptsMs: info.decodeTimeMs,
-                        endPtsMs: info.decodeTimeMs + info.frameDurationMs,
-                        group: Number(object.location.group),
-                        object: Number(object.location.object),
-                        now: nowPerf,
-                        appendStartedAt: appendCalledAt,
-                      })
-                    : null;
-                if (applied !== null) {
-                  events.emit(
-                    'SWITCH_APPLIED',
-                    switchAppliedFields(applied, {
-                      now: nowPerf,
-                      playheadMs: this.#element ? this.#element.currentTime * 1000 : undefined,
-                    }),
-                  );
-                }
-              }
-            }
-
-            // Check the buffered amount
-            if (sourceBuffer.buffered.length > 0 && !kickStarted) {
-              const minStart = sourceBuffer.buffered.start(0);
-              const maxEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-              const bufferDuration = maxEnd - minStart;
-              if (bufferDuration > 1.0) bufferNotification(maxEnd);
-            }
-
-            // Throughput: arrival spacing of this object's group (M11). A frame
-            // that could not be appended still crossed the link. The tracker
-            // also keeps the highest group received per track (F10).
-            this.#recordArrival(struct, object, objectTrackName, info, maxRetries < 0);
-
-            // First-received-group export for E2E smoke + connect-time metrics (Phase C).
-            // Only set once across all streams to capture the earliest received group.
-            if (typeof window !== 'undefined') {
-              if (window.__moqtailMetrics === undefined) {
-                window.__moqtailMetrics = { abr: null, samples: null };
-              }
-              const isFirstObject = window.__moqtailMetrics.firstReceivedGroupId === undefined;
-              if (isFirstObject) {
-                window.__moqtailMetrics.firstReceivedGroupId = Number(object.location.group);
-                this.#tFirstObject = performance.now();
-                const expectedGroup = this.#expectedStartGroupId;
-                events.emit('FIRST_OBJECT', {
-                  track: struct.trackName,
                   group: object.location.group,
                   object: object.location.object,
+                  bytes: object.payload.byteLength,
                   pts_ms: decodeTimeMs ?? null,
-                  expected_start_group: expectedGroup ?? null,
-                  clamped:
-                    expectedGroup !== undefined
-                      ? Number(object.location.group) > expectedGroup
-                      : null,
-                  since_connect_ms:
-                    this.#tConnectStart !== undefined
-                      ? this.#tFirstObject - this.#tConnectStart
-                      : null,
+                  prft_capture_ms: prft?.captureMs ?? null,
+                  latency_ms: latencyMs,
                 });
               }
+            } catch (error) {
+              logger.error('media', 'Error processing media object:', error);
+              controller.error(error);
             }
-
-            // Read PRFT box (if any) at the head of the CMAF chunk.
-            // Publisher prepends `prft` per ISO/IEC 14496-12 §8.16.5 so the
-            // receiver can compute end-to-end latency per frame. MSE skips
-            // unknown top-level boxes, so the chunk is appended unchanged.
-            // `object.payload` is already a Uint8Array view at the right
-            // offset — pass it directly so we don't accidentally read from
-            // byte 0 of a shared underlying ArrayBuffer.
-            const prft = readPrft(object.payload);
-            let latencyMs: number | null = null;
-            if (prft !== null) {
-              latencyMs = Date.now() - prft.captureMs;
-              this.#latencyTracker.record(latencyMs);
-              const anchorTimescale =
-                this.catalog?.getTimescale(objectTrackName) ?? this.#videoTimescale;
-              if (anchorTimescale > 0) {
-                this.#prftAnchor = {
-                  captureMs: prft.captureMs,
-                  mediaMs: (prft.mediaTime * 1000) / anchorTimescale,
-                };
-              }
-            }
-            if (this.#options.logObjects) {
-              events.emit('OBJECT_RECV', {
-                track: objectTrackName,
-                group: object.location.group,
-                object: object.location.object,
-                bytes: object.payload.byteLength,
-                pts_ms: decodeTimeMs ?? null,
-                prft_capture_ms: prft?.captureMs ?? null,
-                latency_ms: latencyMs,
-              });
-            }
-          } catch (error) {
-            logger.error('media', 'Error processing media object:', error);
-            controller.error(error);
-          }
-        },
+          }),
       });
 
       // Pipe to the writable stream
@@ -1336,6 +1493,8 @@ export class Player {
     ended: boolean;
     watchdogTicks: number;
     frozenTicks: number;
+    /** Video frames waiting in the decode-order scheduler for a gap to fill. */
+    heldFrames: number;
     currentTime: number;
     bufferedRanges: string;
     mseReadyState: string;
@@ -1421,6 +1580,7 @@ export class Player {
       ended: el?.ended ?? false,
       watchdogTicks: this.#watchdog.ticks,
       frozenTicks: this.#watchdog.frozen,
+      heldFrames: videoStruct?.order?.heldCount ?? 0,
       currentTime: el?.currentTime ?? 0,
       bufferedRanges,
       mseReadyState: this.#mse?.readyState ?? 'closed',
