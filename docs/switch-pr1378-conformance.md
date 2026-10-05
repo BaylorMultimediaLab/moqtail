@@ -314,7 +314,18 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   finished, reset and open ones alike, read at the hand-over once the source is
   ended (`Subscription::opened_streams_below`, a per-group open counter that is
   kept for the subscription's lifetime; `send_stream_last_object_ids` forgets a
-  stream once it ends). Encoding: the varints back to back in the bytes-valued
+  stream once it ends). A stream is counted when its open begins, under the
+  send-stream map's lock with the subscription's `finished` flag checked, and
+  none is opened once it has finished (review R7 D3): an open that was already
+  waiting (e.g. for stream credit) when the source ended completes afterwards,
+  and is then FIN'd if its group is within the seam bound or reset beyond it,
+  never left open (the shared half of the fix); it is in B because it was
+  counted before B was read. It used to be counted when its open returned, so a
+  below-seam stream the subscriber sees could be missing from B, and the
+  player's done condition could hold while a counted stream was still
+  delivering. An open that fails after it was counted leaves B one too high:
+  the player then waits and falls back to `drain-timeout`, it never cuts.
+  Encoding: the varints back to back in the bytes-valued
   parameter `0x73`; a two-varint value (the PR's form, and this project's before
   R6) still decodes in both libraries, with B absent, and the player then falls
   back to `drain-timeout`; anything after the third varint is malformed. The

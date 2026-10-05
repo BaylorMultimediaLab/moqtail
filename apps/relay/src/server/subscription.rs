@@ -381,7 +381,8 @@ pub struct Subscription {
   opened_stream_count: Arc<AtomicU64>,
   /// SUBGROUP data streams opened for this subscription, per Group, kept for the
   /// subscription's lifetime (finished and reset streams included;
-  /// `send_stream_last_object_ids` forgets a stream once it ends). Read at a
+  /// `send_stream_last_object_ids` forgets a stream once it ends). Counted when
+  /// the open begins, before the subscription can finish (R7-D3). Read at a
   /// SWITCH hand-over for the below-seam stream count (pr1378, R6 D2).
   opened_streams_by_group: Arc<std::sync::Mutex<std::collections::BTreeMap<u64, u64>>>,
   finished: Arc<AtomicBool>,
@@ -1438,6 +1439,32 @@ impl Subscription {
       };
       let priority = compute_stream_priority(sub_prio, pub_prio, group_order, group_id);
 
+      // B (pr1378, R7-D3): a SUBGROUP stream is counted per group before it is
+      // opened, under the send-stream map's lock with `finished` checked. `finish`
+      // sets the flag before it drains the map under that lock, and the hand-over
+      // reads B after `finish`, so every stream whose open began before the
+      // subscription finished is in B (one whose open completes afterwards is
+      // FIN'd or reset below, and the subscriber sees it), and no stream is opened
+      // once it has finished. Counting when the open returned missed an open that
+      // was waiting (e.g. for stream credit) when B was read.
+      if let HeaderInfo::Subgroup { header } = &header_info {
+        let _map = self.send_stream_last_object_ids.write().await;
+        if self.finished.load(Ordering::Acquire) {
+          return Err(anyhow::anyhow!(
+            "subscription finished before stream {} was opened subscriber={} relay_track_id={}",
+            stream_id,
+            self.client_connection_id,
+            self.relay_track_id
+          ));
+        }
+        *self
+          .opened_streams_by_group
+          .lock()
+          .unwrap_or_else(|poisoned| poisoned.into_inner())
+          .entry(header.group_id)
+          .or_insert(0) += 1;
+      }
+
       let send_stream = match self
         .subscriber
         .open_stream(&stream_id, header_payload, priority)
@@ -1458,14 +1485,6 @@ impl Subscription {
       // Count every data stream opened for this subscription (PUBLISH_DONE
       // Stream Count), including subgroups that end up carrying no objects.
       self.opened_stream_count.fetch_add(1, Ordering::Relaxed);
-      if let HeaderInfo::Subgroup { header } = &header_info {
-        *self
-          .opened_streams_by_group
-          .lock()
-          .unwrap_or_else(|poisoned| poisoned.into_inner())
-          .entry(header.group_id)
-          .or_insert(0) += 1;
-      }
 
       // Register the stream for `finish` to end, unless the subscription finished
       // while this open waited (R7-D3): `finish` sets the flag before it drains the
@@ -2636,5 +2655,74 @@ mod tests_open_racing_finish {
   #[tokio::test]
   async fn a_stream_opened_after_finish_below_the_bound_is_finished() {
     assert_eq!(racing_open_after_finish(97, 2).await, End::Fin);
+  }
+}
+
+/// R7-D3 (pr1378 half): B, the below-seam stream count the target PUBLISH carries,
+/// is read at the hand-over after `finish()`. An open of a below-seam group that
+/// was waiting (here for stream credit) when the subscription finished completes
+/// afterwards and is FIN'd (shared half), so the subscriber sees it; it used to be
+/// counted only once its open returned, after B was read. Every stream the
+/// subscriber can see must be in B, or the player's done condition (B ended
+/// below-seam streams) can hold while a counted stream is still delivering.
+#[cfg(test)]
+mod tests_below_seam_count_race {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, publish, quic_pair_with_transports, relay_client, subscribe, test_track,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::transport::connection::TransportConnection;
+  use std::time::Duration;
+
+  #[tokio::test]
+  async fn a_below_seam_open_racing_the_hand_over_is_in_b() {
+    let mut subscriber_transport = wtransport::quinn::TransportConfig::default();
+    subscriber_transport.max_concurrent_uni_streams(1u32.into());
+    let (peer, server): (TransportConnection, TransportConnection) =
+      quic_pair_with_transports(None, Some(subscriber_transport)).await;
+    let client = relay_client(98, server);
+    let track = test_track(1, "video-720p");
+    let latest = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    );
+    let sub = subscribe(&track, &client, latest, false).await;
+    sub.read().await.mark_alias_announced();
+
+    publish(&track, 1, 0).await;
+    let mut first = tokio::time::timeout(Duration::from_secs(5), peer.accept_uni())
+      .await
+      .expect("group 1's stream")
+      .unwrap();
+    // Group 2's open waits for stream credit.
+    publish(&track, 2, 0).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The hand-over at G_switch = 3: bound at 2, end, read B.
+    let below_seam = {
+      let sub = sub.read().await;
+      sub.subscription_state.write().await.end_group = Some(2);
+      sub.finish().await;
+      sub.opened_streams_below(3)
+    };
+
+    // Group 1's stream ends; its credit lets the racing open complete.
+    let mut buf = [0u8; 256];
+    while let Ok(Some(_)) = first.read(&mut buf).await {}
+    let mut seen = 1;
+    while let Ok(Ok(mut recv)) =
+      tokio::time::timeout(Duration::from_millis(500), peer.accept_uni()).await
+    {
+      seen += 1;
+      while let Ok(Some(_)) = recv.read(&mut buf).await {}
+    }
+    assert_eq!(seen, 2, "groups 1 and 2 reach the subscriber");
+    assert_eq!(
+      below_seam, seen,
+      "B must count every below-seam stream the subscriber sees"
+    );
   }
 }
