@@ -98,6 +98,7 @@ export class MetricsCollector {
       ended: m.ended,
       buffered_ranges: m.bufferedRanges,
       watchdog_ticks: m.watchdogTicks,
+      held_frames: m.heldFrames,
       frozen_ticks: m.frozenTicks,
     });
 
