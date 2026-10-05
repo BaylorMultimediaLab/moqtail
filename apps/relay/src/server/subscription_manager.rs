@@ -156,20 +156,28 @@ impl SubscriptionManager {
   }
 
   pub async fn remove_subscription(&self, subscriber_id: usize) {
+    // Every caller of this reaches it because the subscriber went away, so the
+    // subscription's streams are reset.
+    if let Some(subscription) = self.detach_subscription(subscriber_id).await {
+      let sub = subscription.write().await;
+      sub.cancel().await;
+    }
+  }
+
+  /// Removes the subscription and its event sender without ending its streams; the
+  /// caller ends them. Close-After-Switch needs this: the replaced subscription's
+  /// streams below the seam must FIN and deliver, those at or above it be reset
+  /// (`Subscription::cancel_from_group`), and `remove_subscription`'s cancel reset
+  /// them all before that could run (review 2026-10-05).
+  pub async fn detach_subscription(
+    &self,
+    subscriber_id: usize,
+  ) -> Option<Arc<RwLock<Subscription>>> {
     info!(
       "Removing subscription for subscriber_id={} from relay_track_id={}",
       subscriber_id, self.relay_track_id
     );
-    let mut subscriptions = self.subscriptions.write().await;
-    let sub = subscriptions.remove(&subscriber_id);
-    drop(subscriptions);
-
-    // find the subscription by subscriber_id and cancel it. Every caller of this
-    // reaches it because the subscriber went away, so its streams are reset.
-    if let Some(subscription) = sub {
-      let sub = subscription.write().await;
-      sub.cancel().await;
-    }
+    let sub = self.subscriptions.write().await.remove(&subscriber_id);
 
     // Remove and dispose the sender for this subscriber from the appropriate partition
     let partition_index = self.get_subscriber_partition_index(subscriber_id);
@@ -182,6 +190,7 @@ impl SubscriptionManager {
       );
     }
     drop(senders);
+    sub
   }
 
   pub async fn subscriber_count(&self) -> usize {

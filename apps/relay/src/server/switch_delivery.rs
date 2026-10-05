@@ -735,10 +735,12 @@ pub(crate) async fn terminate_source(
     .write()
     .await
     .remove(&current_sub_req_id);
+  // Detached, not cancelled: a cancel resets every stream, and below the seam they
+  // must finish and deliver (cancel_from_group below; review 2026-10-05).
   current_track
     .read()
     .await
-    .remove_subscription(connection_id)
+    .detach_subscription(connection_id)
     .await;
   subscriber
     .subscriptions
@@ -1396,5 +1398,76 @@ mod tests_switch_wait {
     .await;
     assert_eq!(outcome, SelectOutcome::Ready(3));
     assert!(crate::server::events::test_capture::records("SWITCH_WAIT", 82).is_empty());
+  }
+}
+
+/// Review 2026-10-05: `terminate_source` removed the replaced subscription through
+/// `Track::remove_subscription`, whose cancel reset every stream, before
+/// `cancel_from_group` could finish the streams below the seam. Group 1 (below
+/// G_switch = 2) is media the subscriber plays before the seam and must FIN; group 2
+/// (at the seam) is covered by the target and is reset.
+#[cfg(test)]
+mod tests_terminate_source_keeps_below_seam {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, publish, quic_pair, relay_client, subscribe, test_track,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::model::control::subscribe::Subscribe;
+  use moqtail::model::error::StreamResetCode;
+  use moqtail::model::parameter::message_parameter::MessageParameter;
+  use moqtail::transport::connection::TransportReadError;
+  use std::time::Duration;
+
+  #[tokio::test]
+  async fn below_the_seam_finishes_and_at_the_seam_resets() {
+    let (peer, server) = quic_pair().await;
+    let client = relay_client(73, server);
+    let track = test_track(1, "video-720p");
+    let latest = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    );
+    let sub = subscribe(&track, &client, latest, false).await;
+    sub.read().await.mark_alias_announced();
+    // Groups 1 and 2 are open (their publisher streams have not closed).
+    publish(&track, 1, 0).await;
+    publish(&track, 2, 0).await;
+    let mut ends = Vec::new();
+    let mut recvs = Vec::new();
+    for _ in 0..2 {
+      recvs.push(
+        tokio::time::timeout(Duration::from_secs(5), peer.accept_uni())
+          .await
+          .expect("a group's stream")
+          .unwrap(),
+      );
+    }
+    let name = track.full_track_name.clone();
+    let track = Arc::new(RwLock::new(track));
+    terminate_source(&client, &track, &name, 73, 1, 2).await;
+    for mut recv in recvs {
+      let mut buf = [0u8; 256];
+      let end = loop {
+        match tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await {
+          Err(_) => break "open".to_string(),
+          Ok(Ok(Some(_))) => continue,
+          Ok(Ok(None)) => break "fin".to_string(),
+          Ok(Err(TransportReadError::Reset(code))) => break format!("reset {code}"),
+          Ok(Err(e)) => break format!("error {e:?}"),
+        }
+      };
+      ends.push(end);
+    }
+    assert_eq!(
+      ends,
+      vec![
+        "fin".to_string(),
+        format!("reset {}", StreamResetCode::Cancelled.to_u64())
+      ],
+      "group 1 (below the seam) finishes, group 2 (at it) is reset"
+    );
   }
 }

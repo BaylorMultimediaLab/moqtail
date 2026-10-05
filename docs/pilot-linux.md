@@ -1092,7 +1092,10 @@ branch, with a failing test each:
   branch (the `samples` failures); both now start at the client's CONNECT_START;
 - the relay could not reset a stream it had already FIN'd: on pr1378 every
   time-shifted shaped run then received ~1.9 MB of abandoned groups at or above
-  the switch seams (`pf-delivery-rate` 0.7 of the 1.5 Mbit/s step);
+  the switch seams (`pf-delivery-rate` 0.7 of the 1.5 Mbit/s step); and
+  pr1378's switch teardown cancelled the replaced subscription before its
+  seam-aware reset, so its open streams below the seam were reset too (media
+  a deep-buffer client was about to play);
 - the relay reuses a track's alias for every subscription to it, so a late
   object of an earlier subscription to the switch target landed four pr1378
   switches below their start group, and one run's decoder failed

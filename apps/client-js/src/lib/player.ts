@@ -2399,6 +2399,16 @@ export class Player {
       // the relay registered the post-switch subscription under, and the id
       // the NEXT SWITCH must reference as its Current Subscribe Request ID.
       videoStruct.requestId = result.requestId;
+      // The switched subscription starts at G_switch (>= the floor it was armed with):
+      // anything of the target below it is an earlier subscription's (review
+      // 2026-10-05). Target objects reach the write handler only after this.
+      const gSwitch = result.switchTransition.switchingGroupId;
+      if (gSwitch > pending.minGroup) {
+        pending.minGroup = gSwitch;
+        if (record.landedAt !== undefined && videoStruct.trackName === trackName) {
+          videoStruct.currentMinGroup = gSwitch;
+        }
+      }
       // Confirm the arming: the write handler re-injects the init segment at
       // the landing. onTrackSwitched (the ABR guard release) fires there, once
       // the target has actually delivered data.

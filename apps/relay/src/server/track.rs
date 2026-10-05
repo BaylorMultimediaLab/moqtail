@@ -447,6 +447,17 @@ impl Track {
       .await
   }
 
+  /// See `SubscriptionManager::detach_subscription`.
+  pub async fn detach_subscription(
+    &self,
+    subscriber_id: usize,
+  ) -> Option<Arc<RwLock<crate::server::subscription::Subscription>>> {
+    self
+      .subscription_manager
+      .detach_subscription(subscriber_id)
+      .await
+  }
+
   pub async fn subscriber_count(&self) -> usize {
     self.subscription_manager.subscriber_count().await
   }

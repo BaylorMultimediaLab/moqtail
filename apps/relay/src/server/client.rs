@@ -461,6 +461,37 @@ impl MOQTClient {
     Ok(Some((send_stream, Box::pin(ack))))
   }
 
+  /// As [`begin_close_stream`](Self::begin_close_stream), but only when the stream
+  /// open under `stream_id` is `expected`: a stream reopened under the same id in the
+  /// meantime (another subscription to the same track, same alias and group) is left
+  /// alone. `None` when the id holds no stream or another one.
+  pub async fn begin_close_stream_matching(
+    &self,
+    stream_id: &StreamId,
+    expected: &Arc<Mutex<TransportSendStream>>,
+  ) -> Result<Option<FinishAck>> {
+    let send_stream = {
+      let map = self.get_stream_map(stream_id);
+      let mut streams = map.write().await;
+      let key = stream_id.get_stream_id();
+      match streams.get(key.as_str()) {
+        Some(s) if Arc::ptr_eq(s, expected) => streams.remove(key.as_str()),
+        _ => None,
+      }
+    };
+    let Some(send_stream) = send_stream else {
+      return Ok(None);
+    };
+    let ack = send_stream.lock().await.finish_detached().map_err(|e| {
+      error!(
+        "close_stream | Failed to finish send stream ({}): {:?} connection_id: {}",
+        stream_id, e, self.connection_id
+      );
+      anyhow::anyhow!("Failed to finish send stream ({}): {:?}", stream_id, e)
+    })?;
+    Ok(Some(Box::pin(ack)))
+  }
+
   /// Removes the stream from the map, sends FIN and waits until the peer has
   /// acknowledged everything. `Ok(true)` when the stream was found, `Ok(false)` when
   /// none was open under this id.

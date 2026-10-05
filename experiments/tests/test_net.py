@@ -732,6 +732,17 @@ class Records(unittest.TestCase):
             self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", rx.cache_meta_hash(enc)))
             self.assertIsNone(rx.cache_meta_hash(enc / "nope"))
 
+    def test_find_record_since_skips_an_earlier_session(self):
+        """Review 2026-10-05: a rerun under the same run id (--repeat-index) found the
+        previous session's CONNECT_START first and anchored the clock on it."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "client-events.jsonl"
+            p.write_text('{"ts":1000,"event":"CONNECT_START"}\n{"ts":9000,"event":"CONNECT_START"}\n'
+                         '{"event":"CONNECT_START"}\n')
+            self.assertEqual(rx.find_record(p, "CONNECT_START")["ts"], 1000)
+            self.assertEqual(rx.find_record(p, "CONNECT_START", since_ms=5000)["ts"], 9000)
+            self.assertIsNone(rx.find_record(p, "CONNECT_START", since_ms=10_000))
+
 
 
 class RelayFlagsAgainstSource(unittest.TestCase):

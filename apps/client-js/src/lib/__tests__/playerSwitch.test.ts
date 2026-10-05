@@ -425,6 +425,17 @@ describe('Player.switchTrack: late objects of an earlier subscription to the tar
     });
   });
 
+  // Once SWITCH_OK names G_switch the bound rises to it: an earlier subscription's
+  // object between the floor and G_switch cannot land the switch either.
+  it('after SWITCH_OK the bound is G_switch', async () => {
+    const made = await makePlayer({ switchResult: async () => switchSuccess(42n, 63n, 66n) });
+    await made.player.switchTrack('720p');
+    made.aliasMap.set(42n, 8n); // the library mapped the PUBLISH's alias
+    expect(made.player.routeVideoObject('720p', 61n)).toBe('earlier-subscription');
+    expect(made.player.routeVideoObject('720p', 62n)).toBe('earlier-subscription');
+    expect(made.player.routeVideoObject('720p', 63n)).toBe('land');
+  });
+
   it('the initial subscription has no lower bound', async () => {
     const { player } = await makePlayer();
     expect(player.routeVideoObject('360p', 0n)).toBe('current');
