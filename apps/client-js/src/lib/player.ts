@@ -30,6 +30,7 @@ import { logger } from '@/lib/logger';
 import { GoodputTracker } from '@/lib/goodput';
 import { LatencyTracker } from '@/lib/latencyTracker';
 import { StallTracker } from '@/lib/stall';
+import { SourcePump, type PumpSource, type ReleaseReason } from '@/lib/switchSources';
 import { parseMoofBaseMediaDecodeTime, parseMoofMediaInfo } from '@/lib/util/MoofParser';
 import { TimeMap } from '@/lib/abr/TimeMap';
 import type { ProbeResult } from '@/lib/abr/ProbeManager';
@@ -67,16 +68,14 @@ interface PendingSwitch {
 
 interface MOQStreamStruct {
   trackName: string;
-  /**
-   * Current data route. Replaced on every SWITCH: under SWITCH PR #1378 the
-   * relay terminates the old subscription (PUBLISH_DONE) and delivers the
-   * target track on a fresh relay-initiated PUBLISH route, surfaced as
-   * `SwitchSuccess.stream`. The pump in startMedia() re-pipes whenever this
-   * changes, so the write handler (and its SourceBuffer) survives the seam.
-   */
+  /** The subscription's object stream (the startup route; see `pump` for the routes after a SWITCH). */
   source: ReadableStream<MoqtObject>;
-  /** Aborts only the in-flight pipe, so a SWITCH can re-bind `source` without tearing down the track. */
-  pipeAc?: AbortController;
+  /**
+   * The data routes the write handler is fed from, in subscription order
+   * (pr1378): every SWITCH queues the relay PUBLISH's stream behind the
+   * subscription it replaces, which is read until it is done (audit M5).
+   */
+  pump?: SourcePump;
   /**
    * True from the moment a SWITCH is sent until the relay's PUBLISH (success
    * or failure) resolves it. Prevents a second SWITCH from referencing a
@@ -509,6 +508,13 @@ export class Player {
       );
     };
 
+    // PUBLISH_DONE on a video subscription: a subscription a SWITCH replaced
+    // is released once it is done (lib/switchSources.ts).
+    this.client.onPeerPublishDone = (_msg, requestId) => {
+      const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+      vs?.pump?.publishDone(requestId);
+    };
+
     // Debug-only escape hatch: lets the network test harness force a SWITCH
     // without going through the AbrController. Used by Slice C/Phase B E2Es
     // (see tests/network/scenarios/test_naive_switch_discontinuity.py). Not
@@ -903,6 +909,10 @@ export class Player {
             //      arrives after pendingSwitch was overwritten to C.
             //   2. Old-track trailing packets delivered after a switch has
             //      already activated and pendingSwitch was cleared.
+            // The pump's account of the route this object came from (its last
+            // activity, for releasing a replaced subscription).
+            struct.pump?.admit(object.location.group);
+
             const route = this.#route(struct, objectTrackName);
             if (route === 'stale') {
               logger.info(
@@ -1327,44 +1337,17 @@ export class Player {
         },
       });
 
-      // Pump the current data route into `writable`, re-piping whenever a
-      // SWITCH replaces `struct.source`.
-      //
-      // Under SWITCH PR #1378 the relay tears the old subscription down
-      // (PUBLISH_DONE) and opens a new PUBLISH route for the target, so the
-      // post-switch objects arrive on a different ReadableStream; a single
-      // pipeTo() would leave every post-switch object unread.
-      //
+      // Pump the data routes into `writable` (lib/switchSources.ts): the
+      // startup subscription, then, after each SWITCH, the relay PUBLISH's
+      // stream, each one after the subscription it replaced is done with.
       // preventClose/preventAbort keep `writable` — and with it the
       // SourceBuffer, the pendingSwitch bookkeeping and the seam records —
       // alive across the seam. For live streams endOfStream() is never called
       // when a pipe ends (it would seal the MediaSource); only on dispose.
-      const pump = async () => {
-        while (!ac.signal.aborted) {
-          const current = struct.source;
-          const pipeAc = new AbortController();
-          struct.pipeAc = pipeAc;
-          try {
-            await current.pipeTo(writable, {
-              signal: AbortSignal.any([ac.signal, pipeAc.signal]),
-              preventClose: true,
-              preventAbort: true,
-              preventCancel: true,
-            });
-          } catch (error) {
-            const name = (error as Error)?.name;
-            if (!['AbortError', 'InternalError'].includes(name)) {
-              logger.error('media', 'Stream pipe error:', error);
-            }
-          }
-          if (ac.signal.aborted) break;
-          // The route was replaced by switchTrack() — pick up the new stream.
-          // Otherwise the source ended on its own and there is nothing to pump.
-          if (struct.source === current) break;
-          logger.info('media', `pump: re-binding to post-switch stream for ${struct.trackName}`);
-        }
-      };
-      void pump();
+      const pump = (struct.pump ??= this.#newPump(struct, struct.source, struct.requestId));
+      const tickId = setInterval(() => pump.tick(), 50);
+      this.#disposers.push(() => clearInterval(tickId));
+      void pump.run(writable, ac.signal);
     }
   }
 
@@ -1405,6 +1388,19 @@ export class Player {
   routeVideoObject(trackName: string): 'stale' | 'pre-landing' | 'land' | 'current' | null {
     const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
     return vs ? this.#route(vs, trackName) : null;
+  }
+
+  /**
+   * The video stream's data routes in pipe order (pr1378, lib/switchSources.ts):
+   * request id, track and the seam group once a SWITCH replaced it. For tests.
+   */
+  videoRoutes(): Array<{ requestId: bigint; trackName: string; seamGroup: bigint | null }> {
+    const vs = this.#streams.find(s => this.catalog?.getRole(s.trackName) === 'video');
+    return (vs?.pump?.routes() ?? []).map(r => ({
+      requestId: r.requestId,
+      trackName: r.trackName,
+      seamGroup: r.seamGroup ?? null,
+    }));
   }
 
   /**
@@ -2185,11 +2181,15 @@ export class Player {
         rtt_ms: performance.now() - switchSentAt,
       });
 
-      // Adopt the relay's new data route: `stream` is where the catch-up range
-      // and the post-switch live objects arrive. Aborting the in-flight pipe
-      // makes the pump re-bind to it.
-      videoStruct.source = result.stream;
-      videoStruct.pipeAc?.abort();
+      // Queue the relay's new data route (`stream`: the catch-up range and the
+      // post-switch live objects) behind the subscription it replaces, which
+      // keeps being read until it is done (audit M5).
+      videoStruct.pump?.replace(subscriptionRequestId, result.switchTransition.switchingGroupId, {
+        stream: result.stream,
+        requestId: result.requestId,
+        trackName,
+        switchSeq: record.seq,
+      });
       logger.info(
         'media',
         `switchTrack: seam at group ${result.switchTransition.switchingGroupId}, ` +
@@ -2224,6 +2224,43 @@ export class Player {
    */
   get lastSwitchSeq(): number | null {
     return this.#lastSwitchSeq;
+  }
+
+  /** The route queue for `struct`, starting with `stream` (lib/switchSources.ts). */
+  #newPump(struct: MOQStreamStruct, stream: ReadableStream<MoqtObject>, requestId: bigint) {
+    return new SourcePump(
+      { stream, requestId, trackName: struct.trackName },
+      {
+        onRelease: (source, reason) => this.#onSourceReleased(source, reason),
+        onError: (_source, error) => logger.error('media', 'Stream pipe error:', error),
+      },
+    );
+  }
+
+  /**
+   * A route left the queue. A subscription a SWITCH replaced is reported, and
+   * unless the library already completed it (its stream closed), its routing
+   * is released, so its late streams take the library's unrouted path
+   * (STOP_SENDING, DROP_STALE{unrouted}).
+   */
+  #onSourceReleased(source: PumpSource, reason: ReleaseReason): void {
+    if (source.replacedAt === undefined) return;
+    events.emit('SWITCH_SOURCE_RELEASED', {
+      switch_seq: source.replacedBySeq ?? null,
+      request_id: source.requestId,
+      track: source.trackName,
+      reason,
+      seam_group: source.seamGroup !== undefined ? Number(source.seamGroup) : null,
+      held_ms: performance.now() - source.replacedAt,
+      publish_done: source.publishDoneAt !== undefined,
+      objects_after_switch_ok: source.objectsAfterReplace,
+      post_seam_dropped: source.postSeamDropped,
+    });
+    if (reason !== 'closed' && this.client) {
+      void this.client.unsubscribe(source.requestId).catch(() => {
+        // Session closing or already released: nothing left to release.
+      });
+    }
   }
 
   /**
@@ -2443,6 +2480,10 @@ export class Player {
       pendingSwitch: null,
       lastAppendedEndPTS_ms: undefined,
     };
+
+    if (params.trackName !== 'catalog') {
+      struct.pump = this.#newPump(struct, result.stream, result.requestId);
+    }
 
     // The startup video track is what is presented until the first seam.
     if (params.trackName !== 'catalog' && this.catalog?.getRole(params.trackName) === 'video') {

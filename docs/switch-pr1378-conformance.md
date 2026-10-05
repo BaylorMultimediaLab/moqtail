@@ -187,3 +187,19 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   `SWITCH_ERROR.failure` names which, from the relay's reason phrase
   (`switch: <kind>`), and `ClientTimeout` marks the library's own response
   deadline (no relay answer at all).
+- **The replaced subscription is read until it is done (P1, audit M5).** The
+  PR has the relay deliver every current-track object below G_switch before
+  PUBLISH_DONE(SUBSCRIPTION_ENDED); the player used to stop reading the old
+  subscription at SWITCH_OK, so those objects crossed the link and were never
+  used. The player now queues the target PUBLISH's stream behind the old one
+  (`apps/client-js/src/lib/switchSources.ts`) and keeps feeding the old one to
+  the write handler until its stream closes (the library completes it once
+  PUBLISH_DONE's stream count is met), or, after its PUBLISH_DONE, until no
+  object has come from it for 300 ms (streams the relay reset at or above the
+  seam may never reach the client, so the count is not always met), or 6 s
+  after SWITCH_OK without a PUBLISH_DONE. It then releases the old receiver
+  (`unsubscribe`), so late streams take the library's unrouted path
+  (STOP_SENDING, `DROP_STALE{unrouted}`). The switch therefore lands after the
+  old track's tail, in play order. `SWITCH_SOURCE_RELEASED` records each
+  release. `onPeerPublishDone` now names the request id of the subscription
+  the PUBLISH_DONE ends.

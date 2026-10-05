@@ -39,7 +39,7 @@ export const handlerPublishDone: RequestStreamMessageHandler<PublishDone> = asyn
     return
   }
   if (client.onPeerPublishDone) {
-    client.onPeerPublishDone(msg)
+    client.onPeerPublishDone(msg, openingRequestId)
   }
   // PUBLISH_DONE carries no request id: the stream it arrives on names the request it
   // ends. That is either a SUBSCRIBE this side issued, or a PUBLISH the peer pushed

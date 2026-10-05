@@ -420,8 +420,12 @@ export class MOQtailClient {
   /** Fired when an inbound PUBLISH control message is received. */
   onPeerPublish?: (msg: Publish, stream: ReadableStream<MoqtObject>) => void
 
-  /** Fired when an inbound PUBLISH_DONE control message is received. */
-  onPeerPublishDone?: (msg: PublishDone) => void
+  /**
+   * Fired when an inbound PUBLISH_DONE control message is received, with the request
+   * id of the stream it arrived on (the subscription it ends), before the library
+   * completes that subscription.
+   */
+  onPeerPublishDone?: (msg: PublishDone, requestId: bigint) => void
 
   /** Fired when an inbound SUBSCRIBE_NAMESPACE control message is received. */
   onPeerSubscribeNamespace?: (msg: SubscribeNamespace) => void
@@ -3590,6 +3594,30 @@ if (import.meta.vitest) {
       expect(client.aliasFullTrackNameMap.has(7n)).toBe(false)
       expect(client.subscriptionAliasMap.has(4n)).toBe(false)
 
+      await client.disconnect()
+    })
+
+    // pr1378 (P1/P5): the player releases a subscription a SWITCH replaced once its
+    // PUBLISH_DONE has come, so the callback names the subscription it ends.
+    it('passes the request id of the subscription a PUBLISH_DONE ends to onPeerPublishDone', async () => {
+      const { client, transport } = await connected()
+      const seen: bigint[] = []
+      client.onPeerPublishDone = (_msg, requestId) => seen.push(requestId)
+      const subscribing = client.subscribe({
+        fullTrackName: ftn,
+        filterType: FilterType.LatestObject,
+        forward: true,
+        groupOrder: GroupOrder.Ascending,
+        priority: 0,
+      })
+      const subscribeStream = await openedStream(transport, 0)
+      const subscribeId = (subscribeStream.messages[0] as Subscribe).requestId
+      subscribeStream.respond(SubscribeOk.create(7n, [], []))
+      await subscribing
+      subscribeStream.respond(
+        new PublishDone(PublishDoneStatusCode.SubscriptionEnded, 0n, new ReasonPhrase('switched')),
+      )
+      await vi.waitFor(() => expect(seen).toEqual([subscribeId]))
       await client.disconnect()
     })
 

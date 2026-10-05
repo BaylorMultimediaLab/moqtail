@@ -201,6 +201,28 @@ describe('Player.switchTrack: a target object that arrives before switch() resol
   });
 });
 
+describe('Player.switchTrack: the replaced subscription keeps being read (P1, audit M5)', () => {
+  beforeEach(() => {
+    vi.spyOn(events, 'emit').mockImplementation(() => {});
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("queues the PUBLISH's stream behind the replaced subscription instead of abandoning it", async () => {
+    const { player } = await makePlayer({ switchResult: async () => switchSuccess(42n, 5n, 6n) });
+    await player.switchTrack('720p');
+    expect(player.videoRoutes()).toEqual([
+      { requestId: 1n, trackName: '360p', seamGroup: 5n },
+      { requestId: 42n, trackName: '720p', seamGroup: null },
+    ]);
+  });
+
+  it('a refused switch queues nothing', async () => {
+    const { player } = await makePlayer({ switchResult: async () => refusal() });
+    await player.switchTrack('720p');
+    expect(player.videoRoutes()).toEqual([{ requestId: 1n, trackName: '360p', seamGroup: null }]);
+  });
+});
+
 describe('Player.probeTrackBandwidth: PROBE object timestamps (F13)', () => {
   let probes: Array<Record<string, unknown>>;
   beforeEach(() => {
