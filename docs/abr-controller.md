@@ -21,16 +21,16 @@ definition the paper uses.
 
 ### 0.1 Inputs
 
-| input                            | source (`player.getMetrics()`)                                                                                                             | used by                                                 |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| throughput SWMA                  | `bandwidthBps`: mean of the last 5 group samples, each the bytes of objects 2..N over the arrival span of the group (`recvAt`, M11)        | ThroughputRule, EmergencyBufferRule's low-buffer cap    |
-| completed groups per track       | `samplesByTrack` (optional; fallback `sampleCount`), one sample per (track, group) (F5)                                                    | the dwell                                               |
-| contiguous buffer, instantaneous | `bufferContigSeconds` (fallback `bufferSeconds`): end of the buffered range that contains the playhead minus the playhead, 0 if none (M12) | EmergencyBufferRule, empty branch (`== 0`)              |
-| contiguous buffer, envelope      | its maximum over the last 1250 ms (`RulesContext.bufferEnvelopeSeconds`; also `buffer_rule_s`)                                             | EmergencyBufferRule, low branch (`< 0.5 s`) (F1)        |
-| playhead and presented seam      | `playheadMs`, `latestSeamPtsMs`: the latest applied seam whose region (from the hole in front of it) the playhead has entered, or null     | SwitchHistoryRule's seam exemption (F2)                 |
-| switch history                   | the controller's own record of confirmed landings                                                                                          | SwitchHistoryRule                                       |
-| presented frames                 | `totalFrames > 0`                                                                                                                          | EmergencyBufferRule stays silent before the first frame |
-| landing callback                 | `onTrackSwitched(trackName)` on every terminal outcome of a switch                                                                         | history, `ABR_DECISION`, the dwell clock (M17)          |
+| input                            | source (`player.getMetrics()`)                                                                                                             | used by                                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| throughput SWMA                  | `bandwidthBps`: mean of the last 5 group samples, each the bytes of objects 2..N over the arrival span of the group (`recvAt`, M11)        | ThroughputRule, EmergencyBufferRule's low-buffer cap                                                              |
+| completed groups per track       | `samplesByTrack` (optional; fallback `sampleCount`), one sample per (track, group) (F5)                                                    | the dwell                                                                                                         |
+| contiguous buffer, instantaneous | `bufferContigSeconds` (fallback `bufferSeconds`): end of the buffered range that contains the playhead minus the playhead, 0 if none (M12) | EmergencyBufferRule, empty branch (`== 0`)                                                                        |
+| contiguous buffer, envelope      | its maximum over the last 1250 ms (`RulesContext.bufferEnvelopeSeconds`; also `buffer_rule_s`)                                             | EmergencyBufferRule, low branch (`< 0.5 s`) (F1)                                                                  |
+| playhead and presented seam      | `playheadMs`, `latestSeamPtsMs`: the latest applied seam whose region (from the hole in front of it) the playhead has entered, or null     | SwitchHistoryRule's seam exemption (F2)                                                                           |
+| switch history                   | the controller's own record of confirmed landings                                                                                          | SwitchHistoryRule                                                                                                 |
+| presented frames                 | `totalFrames > 0`; buffer samples before the first frame are discarded                                                                     | EmergencyBufferRule stays silent before the first frame, its low branch until `bufferEnvelopeMs` after it (R4-D3) |
+| landing callback                 | `onTrackSwitched(trackName)` on every terminal outcome of a switch                                                                         | history, `ABR_DECISION`, the dwell clock (M17)                                                                    |
 
 Nothing else is read: no latency (raw or shift-corrected), no
 `targetShiftMs`, no `playbackRate`, no probe, no dropped frames, no
@@ -49,7 +49,12 @@ The emergency's two branches read two forms of the same contiguous buffer
 is judged on the envelope, i.e. it fires only when the buffer stayed below
 0.5 s for a whole group plus a tick: a drain, not the trough of the live-edge
 per-group sawtooth (each group lands as a burst at ≈1.1 s and drains to
-≈0.2-0.35 s before the next).
+≈0.2-0.35 s before the next). The envelope starts with the first presented
+frame (buffer samples from the pre-roll, whose length depends on the client
+type, are discarded), and the low branch stays silent until it covers a whole
+window, `bufferEnvelopeMs` after that frame: a shorter window can sit entirely
+on a trough (R4-D3: one live-edge-only emergency on the first tick in 20-24 of
+288 simulated pairs; test `EnvelopeWarmup`).
 
 "At a seam" (F2) is measured in media time around the seam being presented,
 not in groups since the landing: the playhead is in the seam's region, which

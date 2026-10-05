@@ -60,7 +60,12 @@
  * Startup: the rule abstains until a frame has been presented
  * (`totalFrames > 0`). Before that the buffer is empty by construction and no
  * stall is possible, and the duration of that phase depends on the client
- * type (a time-shifted client waits for its backlog).
+ * type (a time-shifted client waits for its backlog). The low branch stays
+ * silent for a further `bufferEnvelopeMs` (`RulesContext.bufferEnvelopeReady`):
+ * the controller discards buffer samples from before the first frame, and a
+ * shorter window can sit entirely on a trough of the live-edge sawtooth
+ * (R4-D3: one live-edge-only emergency on the first tick in 20-24 of 288
+ * simulated pairs). The empty branch is unaffected.
  *
  * Reasons contain "emergency", so AbrController labels the switch
  * `auto-emergency` and SwitchHistoryRule counts it as a drop (unless it is
@@ -93,7 +98,9 @@ export class EmergencyBufferRule implements AbrRule {
       return { representationIndex: 0, priority, reason: 'emergency-buffer-empty' };
     }
     // The low branch reads the envelope (F1); a caller that has none (unit
-    // contexts) gets the instantaneous value.
+    // contexts) gets the instantaneous value. It is silent until the envelope
+    // covers a whole window after the first frame (R4-D3).
+    if (context.bufferEnvelopeReady === false) return null;
     const buffer = context.bufferEnvelopeSeconds ?? instant;
     if (buffer >= lowBufferS) return null;
 

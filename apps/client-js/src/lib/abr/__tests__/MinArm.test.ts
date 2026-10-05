@@ -384,9 +384,56 @@ describe('min arm: (c) emergency on the instantaneous contiguous buffer', () => 
   it('buffer below 0.5 s -> highest rung under 0.7 x SWMA, over the throughput rule', async () => {
     // ThroughputRule: 0.9 x 2 Mbps = 1.8 -> 720p; the emergency: 0.7 x 2 =
     // 1.4 -> 360p at STRONG.
-    const h = harness({ activeTrack: '1080p', bandwidthBps: 2_000_000, bufferContigSeconds: 0.3 });
-    await h.tick();
-    expect(h.switches()).toEqual(['360p']);
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      // The envelope needs bufferEnvelopeMs of samples after the first frame
+      // (R4-D3); 10 Mbps holds 1080p meanwhile.
+      const h = harness({
+        activeTrack: '1080p',
+        bandwidthBps: 10_000_000,
+        bufferContigSeconds: 0.3,
+      });
+      for (let i = 0; i < 6; i++) {
+        await h.tick();
+        vi.advanceTimersByTime(250);
+      }
+      expect(h.switches()).toEqual([]);
+      await h.tick({ bandwidthBps: 2_000_000 });
+      expect(h.switches()).toEqual(['360p']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the low branch is silent for bufferEnvelopeMs after the first frame (R4-D3)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    try {
+      // Pre-roll (no frame yet) with an empty buffer, then frames at a trough
+      // of 0.3 s. ThroughputRule alone (0.9 x 5 Mbps = 4.5) keeps 1080p.
+      const h = harness({
+        activeTrack: '1080p',
+        bandwidthBps: 5_000_000,
+        bufferContigSeconds: 0,
+        totalFrames: 0,
+      });
+      for (let i = 0; i < 4; i++) {
+        await h.tick();
+        vi.advanceTimersByTime(250);
+      }
+      h.set({ totalFrames: undefined, bufferContigSeconds: 0.3 });
+      for (let i = 0; i < 5; i++) {
+        await h.tick();
+        vi.advanceTimersByTime(250);
+      }
+      expect(h.switches()).toEqual([]);
+      // 1250 ms after the first frame the whole window is below 0.5 s: a drain.
+      await h.tick();
+      expect(h.switches()).toEqual(['720p']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a low buffer is not an up-switch gate: with a healthy SWMA the throughput rule still climbs after the dwell', async () => {

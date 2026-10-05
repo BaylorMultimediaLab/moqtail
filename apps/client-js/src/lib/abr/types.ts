@@ -617,6 +617,13 @@ export interface RulesContext {
    * instantaneous value.
    */
   bufferEnvelopeSeconds?: number;
+  /**
+   * False until `bufferEnvelopeMs` has passed since the first presented frame
+   * (buffer samples before that frame are discarded): the envelope does not
+   * cover a whole window yet, and EmergencyBufferRule's low branch abstains.
+   * Absent (unit contexts) = ready.
+   */
+  bufferEnvelopeReady?: boolean;
   /** Total buffered-ahead across holes (last range end minus playhead), for the record only. */
   bufferTotalSeconds?: number;
   /** Completed groups since the last confirmed landing; null before the first landing. */
