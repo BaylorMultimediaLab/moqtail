@@ -229,3 +229,8 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   player as `DROP_STALE{unrouted, stream_type: fetch}`. This is the catch-up of
   a switch whose target the client has already released (e.g. the late-success
   path, or a target superseded before its catch-up arrived).
+- **Runner (P8).** `--mechanism pr1378 --mechanism-mode next-group|playhead`
+  passes `--t-switch-ms 3000`, `--congestion-controller` and `--udp-gso off`
+  (never the native-fix flags), selects the floor with `?switchFloor=`, and
+  refuses a run whose RELAY_CONFIG does not report `t_switch_ms` = 3000 (or
+  reports a native-fix field true).
