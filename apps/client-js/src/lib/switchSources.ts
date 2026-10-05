@@ -131,12 +131,23 @@ export class SourcePump {
     return true;
   }
 
-  /** The write handler's verdict on an object of the current source. */
-  admit(_group: bigint): 'append' | 'post-seam' {
+  /**
+   * The write handler's verdict on an object of the current source: once a
+   * SWITCH_OK has named this subscription's G_switch, its objects at or above
+   * it are `post-seam` (audit M6: the target's catch-up delivers that span on
+   * the new track; appending both put two representations in one span of the
+   * SourceBuffer). Objects that arrived before SWITCH_OK are appended: the seam
+   * was not known yet.
+   */
+  admit(group: bigint): 'append' | 'post-seam' {
     const head = this.#queue[0];
     if (!head) return 'append';
     head.lastObjectAt = this.#now();
     if (head.replacedAt !== undefined) head.objectsAfterReplace += 1;
+    if (head.seamGroup !== undefined && group >= head.seamGroup) {
+      head.postSeamDropped += 1;
+      return 'post-seam';
+    }
     return 'append';
   }
 

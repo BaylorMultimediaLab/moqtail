@@ -910,8 +910,24 @@ export class Player {
             //   2. Old-track trailing packets delivered after a switch has
             //      already activated and pendingSwitch was cleared.
             // The pump's account of the route this object came from (its last
-            // activity, for releasing a replaced subscription).
-            struct.pump?.admit(object.location.group);
+            // activity, for releasing a replaced subscription), and its verdict:
+            // a replaced subscription's objects at or above the G_switch its
+            // SWITCH_OK named are dropped, the target's catch-up covers them on
+            // the new track (audit M6).
+            if (struct.pump?.admit(object.location.group) === 'post-seam') {
+              this.#dropStale(struct, object, objectTrackName, {
+                track: objectTrackName,
+                current: struct.trackName,
+                pending: struct.pendingSwitch?.trackName ?? null,
+                group: object.location.group,
+                bytes: object.payload.byteLength,
+                object: object.location.object,
+                reason: 'post-seam',
+                seam_group: Number(struct.pump.current?.seamGroup ?? -1n),
+                switch_seq: struct.pump.current?.replacedBySeq ?? null,
+              });
+              return;
+            }
 
             const route = this.#route(struct, objectTrackName);
             if (route === 'stale') {

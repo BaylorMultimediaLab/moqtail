@@ -203,3 +203,12 @@ live_edge_current, live_edge_target, waiting_for}` once per switch, so a
   old track's tail, in play order. `SWITCH_SOURCE_RELEASED` records each
   release. `onPeerPublishDone` now names the request id of the subscription
   the PUBLISH_DONE ends.
+- **Old-track objects at or above G_switch are dropped once it is known (P2,
+  audit M6).** From SWITCH_OK (which carries SWITCH_TRANSITION) the write
+  handler drops every object of the replaced subscription with group >=
+  G_switch as `DROP_STALE{reason: post-seam}`: the target's catch-up delivers
+  that span on the new track, and appending both put two representations in
+  one span of the SourceBuffer. An old-track object at or above G_switch that
+  reached the write handler before SWITCH_OK cannot be recognised and is still
+  appended (residual): the source keeps forwarding while selection waits and
+  is bounded at the seam only at the hand-over.

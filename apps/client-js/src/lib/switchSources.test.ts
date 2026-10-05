@@ -153,3 +153,36 @@ describe('SourcePump (P1, audit M5): the replaced subscription is read until it 
     ac.abort();
   });
 });
+
+describe('SourcePump (P2, audit M6): old-track objects at or above G_switch are dropped once it is known', () => {
+  it('appends the replaced route below the seam and drops it at and above the seam', async () => {
+    const { pump, a, out, ac } = setup();
+    a.push(obj('A', 4)); // before SWITCH_OK: G_switch unknown, appended
+    await settle();
+    const b = feed();
+    pump.replace(1n, 5n, { stream: b.stream, requestId: 2n, trackName: 'B' });
+    a.push(obj('A', 4, 1));
+    a.push(obj('A', 5));
+    a.push(obj('A', 6));
+    a.close();
+    b.push(obj('B', 5));
+    await settle();
+    expect(out.written).toEqual(['A:4', 'A:4', 'B:5']);
+    expect(out.dropped).toEqual(['A:5', 'A:6']);
+    expect(pump.routes()[0]?.trackName).toBe('B');
+    ac.abort();
+  });
+
+  it('the target route is never cut by the seam of the route it replaced', async () => {
+    const { pump, a, out, ac } = setup();
+    const b = feed();
+    pump.replace(1n, 5n, { stream: b.stream, requestId: 2n, trackName: 'B' });
+    a.close();
+    b.push(obj('B', 5));
+    b.push(obj('B', 9));
+    await settle();
+    expect(out.written).toEqual(['B:5', 'B:9']);
+    expect(out.dropped).toEqual([]);
+    ac.abort();
+  });
+});
