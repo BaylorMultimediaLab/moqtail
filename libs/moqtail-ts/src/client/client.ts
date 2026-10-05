@@ -100,6 +100,8 @@ import {
   EarlyDiscardPolicyConfig,
   SubscribeResult,
   DiscardedStreamInfo,
+  DataStreamEnd,
+  DataStreamEndInfo,
   PushedReceiver,
   TrackAliasHolder,
 } from './types'
@@ -213,6 +215,12 @@ export class MOQtailClient {
    * receivers are not in `requests`, which only holds requests this side issued.
    */
   readonly pushedReceivers: Map<bigint, PushedReceiver> = new Map()
+
+  /**
+   * The routed SUBGROUP data streams whose ingest has not ended yet, per receiver.
+   * Read by {@link MOQtailClient.stopDataStreams}.
+   */
+  readonly #openDataStreams: Map<TrackAliasHolder, Set<{ groupId: bigint; stop: () => Promise<void> }>> = new Map()
 
   /**
    * The bidirectional request stream each locally issued request runs on, keyed by the
@@ -335,6 +343,15 @@ export class MOQtailClient {
    * Accounting event: lets an application count link usage it never consumed.
    */
   onStreamDiscarded?: (info: DiscardedStreamInfo) => void
+
+  /**
+   * Invoked when a data stream that was routed to a receiver (a SUBSCRIBE or a
+   * pushed PUBLISH receiver) ends, after its last object was enqueued on the
+   * receiver's object stream: how it ended (`fin`, `reset`, `stopped`), its group
+   * and subgroup, and what it delivered. Fires before the receiver is checked for
+   * completion. Exceptions thrown by the callback are logged and swallowed.
+   */
+  onDataStreamEnded?: (info: DataStreamEndInfo) => void
 
   /**
    * General-purpose error callback for surfaced exceptions not thrown to caller synchronously.
@@ -1718,6 +1735,7 @@ export class MOQtailClient {
       requestId: msg.requestId,
       fullTrackName: msg.fullTrackName,
       streamsAccepted: 0n,
+      streamsEnded: 0n,
       expectedStreams: undefined,
       largestLocation: undefined,
       controller: streamController,
@@ -1759,13 +1777,23 @@ export class MOQtailClient {
 
   /**
    * Completes a subscription or pushed receiver once PUBLISH_DONE has named its
-   * stream count and that many data streams have ended: closes its object stream and
-   * releases its alias route. Returns whether it completed. Called from the
-   * PUBLISH_DONE handler and from the end of each data stream, whichever comes last.
+   * stream count and that many of its data streams have ended (FIN, reset or
+   * stopped), with none of the streams routed to it still open: closes its object
+   * stream and releases its alias route. Returns whether it completed. Called from
+   * the PUBLISH_DONE handler and from the end of each data stream, whichever comes
+   * last.
+   *
+   * Counting ended streams, not accepted ones: PUBLISH_DONE can overtake the tail
+   * of a stream that is still delivering (the relay sends it once the last stream
+   * is opened and written, not once the subscriber has read it), and closing on
+   * the accepted count lost every object that stream still carried. A stream
+   * routed after completion finds no route and takes the unrouted path.
    */
   completeIfDone(holder: SubscribeRequest | PushedReceiver): boolean {
     if (holder.expectedStreams === undefined) return false
-    if (BigInt(holder.streamsAccepted) !== BigInt(holder.expectedStreams)) return false
+    const ended = BigInt(holder.streamsEnded)
+    if (ended < BigInt(holder.expectedStreams)) return false
+    if (ended !== BigInt(holder.streamsAccepted)) return false
     try {
       holder.controller?.close()
     } catch {
@@ -1781,6 +1809,36 @@ export class MOQtailClient {
     }
     logger.debug('MOQtailClient', `subscription ${holder.requestId} completed after ${holder.expectedStreams} streams`)
     return true
+  }
+
+  /**
+   * Asks the peer to stop (STOP_SENDING(CANCELLED)) every data stream routed to the
+   * receiver with request id `requestId` that is still open and whose group is at
+   * or above `fromGroup` (every open stream when `fromGroup` is omitted). Each one
+   * ends with {@link DataStreamEndInfo.end} `stopped`; objects it had already
+   * delivered stay on the receiver's object stream. Returns how many it stopped.
+   */
+  async stopDataStreams(requestId: bigint, fromGroup?: bigint): Promise<number> {
+    const stops: Promise<void>[] = []
+    for (const [holder, open] of this.#openDataStreams) {
+      if (this.#receiverRequestId(holder) !== requestId) continue
+      for (const stream of open) {
+        if (fromGroup === undefined || stream.groupId >= fromGroup) stops.push(stream.stop())
+      }
+    }
+    await Promise.all(stops)
+    return stops.length
+  }
+
+  /**
+   * The request id a receiver is addressed by: a pushed receiver's PUBLISH request
+   * id (its key in {@link MOQtailClient.pushedReceivers}), otherwise its own.
+   */
+  #receiverRequestId(holder: TrackAliasHolder): bigint {
+    for (const [publishRequestId, receiver] of this.pushedReceivers) {
+      if (receiver === holder) return publishRequestId
+    }
+    return holder.requestId
   }
 
   // TODO: Each announced track should checked against ongoing subscribe_namespace
@@ -2469,11 +2527,32 @@ export class MOQtailClient {
         if (subscription) {
           subscription.streamsAccepted++
           let firstObjectId: bigint | null = null
+          // How this stream's ingest ends (D1): counted in `streamsEnded` and
+          // reported whatever the cause, so a reset stream still lets the
+          // subscription complete.
+          let end: DataStreamEnd = 'reset'
+          let stoppedHere = false
+          let objectsDelivered = 0
+          let lastSubgroupId: bigint | undefined = header.subgroupId
+          let openStreams = this.#openDataStreams.get(subscription)
+          if (!openStreams) {
+            openStreams = new Set()
+            this.#openDataStreams.set(subscription, openStreams)
+          }
+          const openEntry = {
+            groupId: header.groupId,
+            stop: async () => {
+              stoppedHere = true
+              await recvStream.stopSending(StreamResetCode.Cancelled)
+            },
+          }
+          openStreams.add(openEntry)
 
           let subgroupTimeoutId: ReturnType<typeof setTimeout> | undefined
           const effectiveDiscardPolicy = subscription.earlyDiscardPolicy ?? this.#earlyDiscardPolicy
           if (effectiveDiscardPolicy?.subgroupReceiveTimeout !== undefined) {
             subgroupTimeoutId = setTimeout(() => {
+              stoppedHere = true
               reader.cancel(streamResetReason(StreamResetCode.DeliveryTimeout)).catch(() => {})
             }, effectiveDiscardPolicy.subgroupReceiveTimeout)
           }
@@ -2482,6 +2561,7 @@ export class MOQtailClient {
             while (true) {
               const { done, value: nextObject } = await reader.read()
               if (done) {
+                end = stoppedHere ? 'stopped' : 'fin'
                 break
               }
               if (nextObject) {
@@ -2519,17 +2599,40 @@ export class MOQtailClient {
                     subscription.largestLocation = moqtObject.location
 
                   subscription.controller?.enqueue(moqtObject)
+                  objectsDelivered++
+                  if (subgroupId !== null) lastSubgroupId = subgroupId
                   continue
                 }
                 throw new ProtocolViolationError('MOQtailClient', 'Received fetch object after subgroup header')
               }
             }
+          } catch (error) {
+            if (stoppedHere) end = 'stopped'
+            throw error
           } finally {
             if (subgroupTimeoutId !== undefined) clearTimeout(subgroupTimeoutId)
+            openStreams.delete(openEntry)
+            if (openStreams.size === 0 && this.#openDataStreams.get(subscription) === openStreams) {
+              this.#openDataStreams.delete(subscription)
+            }
+            subscription.streamsEnded++
+            try {
+              this.onDataStreamEnded?.({
+                requestId: this.#receiverRequestId(subscription),
+                trackAlias: header.trackAlias,
+                groupId: header.groupId,
+                subgroupId: lastSubgroupId,
+                end,
+                objects: objectsDelivered,
+                bytes: recvStream.bytesReceived,
+              })
+            } catch (callbackError) {
+              logger.error('MOQtailClient', 'onDataStreamEnded callback failed', callbackError)
+            }
+            // Subscribe Cleanup: the last stream to end completes the subscription,
+            // however it ended.
+            this.completeIfDone(subscription)
           }
-
-          // Subscribe Cleanup: the last expected stream completes the subscription.
-          this.completeIfDone(subscription)
           return
         }
 
@@ -3373,6 +3476,145 @@ if (import.meta.vitest) {
       await vi.waitFor(() => expect(client.subscriptions.has(9n)).toBe(false))
       expect(client.aliasFullTrackNameMap.has(9n)).toBe(false)
 
+      await client.disconnect()
+    })
+
+    /**
+     * Object `objectId` of a subgroup stream, as the bytes that follow its header:
+     * the id is written as the delta to `previousObjectId` (the delta is built by
+     * hand because `serialize` treats a previous id of 0 as absent).
+     */
+    function nextObjectBytes(objectId: number, payloadBytes: number, previousObjectId: bigint): Uint8Array {
+      const delta = BigInt(objectId) - previousObjectId - 1n
+      return SubgroupObject.newWithPayload(delta, null, new Uint8Array(payloadBytes))
+        .serialize(undefined)
+        .toUint8Array()
+    }
+
+    /** A pushed receiver for alias 9 and its object reader. */
+    async function pushedReceiver(transport: MockWebTransport, client: MOQtailClient) {
+      const pushed: ReadableStream<MoqtObject>[] = []
+      client.onPeerPublish = (_msg, stream) => pushed.push(stream)
+      const incoming = transport.openIncomingBiStream()
+      incoming.respond(new Publish(1n, ftn, 9n, [], []))
+      await vi.waitFor(() => expect(incoming.messages).toHaveLength(1))
+      return { incoming, reader: pushed[0]!.getReader() }
+    }
+
+    function readWithin(reader: ReadableStreamDefaultReader<MoqtObject>, ms: number) {
+      return Promise.race([
+        reader.read(),
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), ms)),
+      ])
+    }
+
+    // D1: PUBLISH_DONE names the stream count once the publisher has opened and
+    // written its last stream, so it can overtake the tail of a stream that is still
+    // delivering. The receiver used to close as soon as that many streams had been
+    // accepted, and the rest of the open stream was lost.
+    it('keeps a receiver open while a counted stream is still delivering after PUBLISH_DONE (D1)', async () => {
+      const { client, transport } = await connected()
+      const { incoming, reader } = await pushedReceiver(transport, client)
+      const dataStream = transport.openIncomingUniStream(subgroupStreamBytes(9n, 4n, 10))
+      const first = await reader.read()
+      expect(first.value?.location.group).toBe(4n)
+
+      incoming.respond(new PublishDone(PublishDoneStatusCode.SubscriptionEnded, 1n, new ReasonPhrase('switched')))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(client.subscriptions.has(9n)).toBe(true)
+
+      dataStream.enqueue(nextObjectBytes(1, 10, 0n))
+      const second = await readWithin(reader, 500)
+      expect(second).not.toBe('timeout')
+      expect((second as ReadableStreamReadResult<MoqtObject>).done).toBe(false)
+      expect((second as ReadableStreamReadResult<MoqtObject>).value?.location.object).toBe(1n)
+
+      dataStream.close()
+      const end = await readWithin(reader, 500)
+      expect((end as ReadableStreamReadResult<MoqtObject>).done).toBe(true)
+      await vi.waitFor(() => expect(client.subscriptions.has(9n)).toBe(false))
+      await client.disconnect()
+    })
+
+    // D1, probe-shaped: the relay sends a probe's PUBLISH_DONE right after
+    // SUBSCRIBE_OK, before the probe's data stream has even been seen.
+    it('delivers every object of a SUBSCRIBE whose PUBLISH_DONE precedes its stream header (D1)', async () => {
+      const { client, transport } = await connected()
+      const subscribing = client.subscribe({
+        fullTrackName: ftn,
+        filterType: FilterType.LatestObject,
+        forward: true,
+        groupOrder: GroupOrder.Ascending,
+        priority: 0,
+      })
+      const subscribeStream = await openedStream(transport, 0)
+      subscribeStream.respond(SubscribeOk.create(7n, [], []))
+      const result = await subscribing
+      if (result instanceof RequestError) throw new Error('subscribe failed')
+      subscribeStream.respond(new PublishDone(PublishDoneStatusCode.TrackEnded, 1n, new ReasonPhrase('probe')))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      const dataStream = transport.openIncomingUniStream(subgroupStreamBytes(7n, 3n, 10))
+      const reader = result.stream.getReader()
+      expect((await reader.read()).value?.location.object).toBe(0n)
+      for (let id = 1; id < 4; id++) {
+        dataStream.enqueue(nextObjectBytes(id, 10, BigInt(id - 1)))
+        const next = await readWithin(reader, 500)
+        expect((next as ReadableStreamReadResult<MoqtObject>).value?.location.object).toBe(BigInt(id))
+      }
+      dataStream.close()
+      expect(((await readWithin(reader, 500)) as ReadableStreamReadResult<MoqtObject>).done).toBe(true)
+      await client.disconnect()
+    })
+
+    // D1: a stream the peer resets has ended too; it must not hold the receiver
+    // open forever, and its end is reported as a reset.
+    it('counts a reset stream as ended and reports how each stream ended (D1)', async () => {
+      const { client, transport } = await connected()
+      const ends: DataStreamEndInfo[] = []
+      client.onDataStreamEnded = (info) => ends.push(info)
+      const { incoming, reader } = await pushedReceiver(transport, client)
+
+      const finished = transport.openIncomingUniStream(subgroupStreamBytes(9n, 4n, 10))
+      expect((await reader.read()).value?.location.group).toBe(4n)
+      const reset = transport.openIncomingUniStream(subgroupStreamBytes(9n, 5n, 10))
+      expect((await reader.read()).value?.location.group).toBe(5n)
+      incoming.respond(new PublishDone(PublishDoneStatusCode.SubscriptionEnded, 2n, new ReasonPhrase('switched')))
+      finished.enqueue(nextObjectBytes(1, 10, 0n))
+      finished.close()
+      expect((await reader.read()).value?.location.object).toBe(1n)
+      await vi.waitFor(() => expect(ends).toHaveLength(1))
+      expect(client.subscriptions.has(9n)).toBe(true)
+
+      reset.error(Object.assign(new Error('reset by peer'), { streamErrorCode: 0x2 }))
+      expect(((await readWithin(reader, 500)) as ReadableStreamReadResult<MoqtObject>).done).toBe(true)
+      expect(ends.map((e) => [e.requestId, e.groupId, e.subgroupId, e.end, e.objects])).toEqual([
+        [1n, 4n, 0n, 'fin', 2],
+        [1n, 5n, 0n, 'reset', 1],
+      ])
+      expect(client.subscriptions.has(9n)).toBe(false)
+      await client.disconnect()
+    })
+
+    // D1/D2 support: STOP_SENDING the receiver's open streams at or above a group,
+    // leaving those below it running.
+    it('stops only the open streams at or above a group with stopDataStreams', async () => {
+      const { client, transport } = await connected()
+      const ends: DataStreamEndInfo[] = []
+      client.onDataStreamEnded = (info) => ends.push(info)
+      const { reader } = await pushedReceiver(transport, client)
+      const below = transport.openIncomingUniStream(subgroupStreamBytes(9n, 4n, 10))
+      expect((await reader.read()).value?.location.group).toBe(4n)
+      transport.openIncomingUniStream(subgroupStreamBytes(9n, 6n, 10))
+      expect((await reader.read()).value?.location.group).toBe(6n)
+
+      expect(await client.stopDataStreams(1n, 5n)).toBe(1)
+      await vi.waitFor(() => expect(ends).toHaveLength(1))
+      expect(ends[0]).toMatchObject({ groupId: 6n, end: 'stopped' })
+      expect(transport.uniCancelReasons).toHaveLength(1)
+
+      below.enqueue(nextObjectBytes(1, 10, 0n))
+      expect((await reader.read()).value?.location.object).toBe(1n)
       await client.disconnect()
     })
   })

@@ -56,7 +56,10 @@ export interface TrackAliasHolder {
  * {@link MOQtailClient.completeIfDone} like any other pushed receiver.
  */
 export interface PushedReceiver extends TrackAliasHolder {
+  /** Data streams routed to this receiver (header read). */
   streamsAccepted: bigint
+  /** Of those, the streams whose ingest has ended (FIN, reset or stopped). */
+  streamsEnded: bigint
   /** Set by PUBLISH_DONE: the number of data streams the publisher opened. */
   expectedStreams: bigint | undefined
   largestLocation: Location | undefined
@@ -81,6 +84,39 @@ export type DiscardedStreamInfo = {
   subgroupId: bigint | undefined
   /** The name the alias last mapped to, if the client still remembers it. */
   fullTrackName: FullTrackName | undefined
+  bytes: number
+}
+
+/**
+ * How a routed SUBGROUP data stream ended (see {@link MOQtailClient.onDataStreamEnded}).
+ *
+ * `fin`: the peer finished the stream. `reset`: the peer reset it, or it failed
+ * (a parse error or a read error). `stopped`: this side cut it (STOP_SENDING via
+ * {@link MOQtailClient.stopDataStreams}, or the subgroup receive timeout).
+ */
+export type DataStreamEnd = 'fin' | 'reset' | 'stopped'
+
+/**
+ * The end of one data stream that was routed to a receiver (a SUBSCRIBE or a
+ * pushed PUBLISH receiver), reported after its last object was enqueued on the
+ * receiver's object stream. Lets an application tell which of a subscription's
+ * streams are still delivering, e.g. to decide when a replaced subscription has
+ * delivered everything below a switch seam.
+ */
+export type DataStreamEndInfo = {
+  /**
+   * The request id of the receiver the stream was routed to: the SUBSCRIBE's, or
+   * for a pushed receiver the PUBLISH's.
+   */
+  requestId: bigint
+  trackAlias: bigint
+  groupId: bigint
+  /** The subgroup id its objects carried (header or first object); undefined if none was resolved. */
+  subgroupId: bigint | undefined
+  end: DataStreamEnd
+  /** Objects of this stream enqueued on the receiver's object stream. */
+  objects: number
+  /** Bytes read off the wire on this stream, header included. */
   bytes: number
 }
 
