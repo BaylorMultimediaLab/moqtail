@@ -790,13 +790,8 @@ impl Subscription {
           "update_subscription | forward became true, opening pending stream {} for subscriber={} relay_track_id={}",
           pending_stream_id, self.client_connection_id, self.relay_track_id
         );
-        if self.handle_header(pending_header_info).await.is_ok() {
-          self
-            .send_stream_last_object_ids
-            .write()
-            .await
-            .insert(pending_stream_id, None);
-        }
+        // handle_header registers the stream (R7-D3).
+        let _ = self.handle_header(pending_header_info).await;
       }
     }
 
@@ -806,7 +801,7 @@ impl Subscription {
   pub async fn finish(&self) {
     if self
       .finished
-      .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
       .is_err()
     {
       return;
@@ -847,8 +842,31 @@ impl Subscription {
           relay_track_id
         );
 
-        for stream_id in stream_ids.iter() {
-          let res = subscriber.close_stream(stream_id).await;
+        // Every stream is FIN'd at once and the completions (each waits for the
+        // peer's ACK) are awaited together (R7-D6): one stream after another cost
+        // the subscriber a round trip per open stream before the last one ended,
+        // and the switch hand-over waits for the replaced subscription's streams
+        // to end.
+        let mut closing = tokio::task::JoinSet::new();
+        for stream_id in stream_ids.iter().cloned() {
+          let subscriber = subscriber.clone();
+          closing.spawn(async move {
+            let res = subscriber.close_stream(&stream_id).await;
+            (stream_id, res)
+          });
+        }
+        while let Some(joined) = closing.join_next().await {
+          let (stream_id, res) = match joined {
+            Ok(closed) => closed,
+            Err(e) => {
+              warn!(
+                "Background stream cleanup task failed for subscriber={} relay_track_id={} error: {:?}",
+                connection_id, relay_track_id, e
+              );
+              continue;
+            }
+          };
+          let stream_id = &stream_id;
           if let Err(e) = res {
             warn!(
               "Background stream cleanup error for subscriber={} stream_id={} relay_track_id={} error: {:?}",
@@ -1133,12 +1151,8 @@ impl Subscription {
               object.location,
               header
             );
+            // handle_header registers the stream (R7-D3).
             if let Ok((stream_id, send_stream)) = self.handle_header(header.clone()).await {
-              {
-                let mut send_stream_last_object_ids =
-                  self.send_stream_last_object_ids.write().await;
-                send_stream_last_object_ids.insert(stream_id.clone(), None);
-              }
               info!(
                 "Stream created - subscriber={} stream_id={} relay_track_id={} now={} received time={} object: {:?}",
                 self.client_connection_id,
@@ -1181,14 +1195,7 @@ impl Subscription {
                 // delta from whatever an earlier stream for this id last carried
                 // (R3-D3).
                 match self.handle_header(h).await {
-                  Ok((opened_id, send_stream)) => {
-                    self
-                      .send_stream_last_object_ids
-                      .write()
-                      .await
-                      .insert(opened_id, None);
-                    Some(send_stream)
-                  }
+                  Ok((_, send_stream)) => Some(send_stream),
                   Err(_) => None,
                 }
               } else {
@@ -1460,6 +1467,31 @@ impl Subscription {
           .or_insert(0) += 1;
       }
 
+      // Register the stream for `finish` to end, unless the subscription finished
+      // while this open waited (R7-D3): `finish` sets the flag before it drains the
+      // map under this same lock, so a stream registered here is always drained,
+      // and one that finds the flag set is ended here instead of being left open
+      // for the rest of the session.
+      let registered = {
+        let mut map = self.send_stream_last_object_ids.write().await;
+        let finished = self.finished.load(Ordering::Acquire);
+        if !finished {
+          map.insert(stream_id.clone(), None);
+        }
+        !finished
+      };
+      if !registered {
+        self
+          .end_stream_opened_after_finish(&stream_id, group_id)
+          .await;
+        return Err(anyhow::anyhow!(
+          "stream {} opened after the subscription finished subscriber={} relay_track_id={}",
+          stream_id,
+          self.client_connection_id,
+          self.relay_track_id
+        ));
+      }
+
       Ok((stream_id, send_stream.clone()))
     } else {
       error!(
@@ -1472,6 +1504,37 @@ impl Subscription {
         self.client_connection_id,
         self.relay_track_id
       ))
+    }
+  }
+
+  /// Ends a data stream whose open completed after `finish` had already drained
+  /// this subscription's streams (R7-D3). A stream of a group within the
+  /// subscription's end bound (or with no bound) is FIN'd, so the subscriber sees it
+  /// end like the others `finish` closed; one beyond the bound (at or above a
+  /// switch seam) is reset, as nothing on it is wanted.
+  async fn end_stream_opened_after_finish(&self, stream_id: &StreamId, group_id: u64) {
+    let beyond_bound = {
+      let state = self.subscription_state.read().await;
+      state.exceeds_end_group(group_id)
+    };
+    warn!(
+      "Stream opened after the subscription finished: subscriber={} stream_id={} relay_track_id={} group={} ({})",
+      self.client_connection_id,
+      stream_id,
+      self.relay_track_id,
+      group_id,
+      if beyond_bound { "reset" } else { "finished" }
+    );
+    if beyond_bound {
+      self
+        .subscriber
+        .reset_stream(stream_id, StreamResetCode::Cancelled.to_u64())
+        .await;
+    } else if let Err(e) = self.subscriber.close_stream(stream_id).await {
+      warn!(
+        "Failed to finish a stream opened after the subscription finished: subscriber={} stream_id={} relay_track_id={} error: {:?}",
+        self.client_connection_id, stream_id, self.relay_track_id, e
+      );
     }
   }
 
@@ -2391,5 +2454,187 @@ mod tests_end_group_bound {
     state.end_group = Some(5);
     assert!(!state.exceeds_end_group(5));
     assert!(state.exceeds_end_group(6));
+  }
+}
+
+/// R7-D6: ending a subscription with several data streams open FINs them all at
+/// once, so the subscriber sees every stream end about one round trip after the
+/// finish, not one round trip per stream.
+#[cfg(test)]
+mod tests_finish_streams_concurrently {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, publish, relay_client, subscribe, test_track, webtransport_pair_delayed,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::transport::data_stream_handler::RecvDataStream;
+  use std::time::{Duration, Instant};
+
+  const TRACK: u64 = 1;
+  const STREAMS: u64 = 6;
+  const ONE_WAY: Duration = Duration::from_millis(40);
+
+  #[tokio::test]
+  async fn finish_ends_every_open_stream_within_about_one_round_trip() {
+    let (peer, server) = webtransport_pair_delayed(ONE_WAY).await;
+    let client = relay_client(95, server);
+    let track = test_track(TRACK, "video-720p");
+    let latest = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    );
+    let sub = subscribe(&track, &client, latest, false).await;
+    sub.read().await.mark_alias_announced();
+
+    // One open stream per group: the publisher's streams never close here.
+    for group in 1..=STREAMS {
+      publish(&track, group, 0).await;
+    }
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<Instant>();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    for _ in 0..STREAMS {
+      let recv = tokio::time::timeout(Duration::from_secs(5), peer.accept_uni())
+        .await
+        .expect("stream within 5 s")
+        .expect("stream");
+      let (ended_tx, seen_tx) = (ended_tx.clone(), seen_tx.clone());
+      tokio::spawn(async move {
+        let data = RecvDataStream::new(
+          recv,
+          Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        );
+        while let (_, Some(_)) = data.next_object().await {
+          let _ = seen_tx.send(());
+        }
+        let _ = ended_tx.send(Instant::now());
+      });
+    }
+    for _ in 0..STREAMS {
+      tokio::time::timeout(Duration::from_secs(5), seen_rx.recv())
+        .await
+        .expect("each stream's first object");
+    }
+
+    let finished_at = Instant::now();
+    sub.read().await.finish().await;
+    let mut last_end = finished_at;
+    for _ in 0..STREAMS {
+      let ended = tokio::time::timeout(Duration::from_secs(5), ended_rx.recv())
+        .await
+        .expect("every stream ends")
+        .unwrap();
+      last_end = last_end.max(ended);
+    }
+    let took = last_end - finished_at;
+    // One way to deliver the FINs; sequential closing (each finish awaiting the
+    // peer's ACK before the next FIN) takes about one round trip per stream
+    // (here 40 ms + 5 x 80 ms).
+    assert!(
+      took < 4 * ONE_WAY,
+      "the last of {STREAMS} streams ended {took:?} after finish (one way {ONE_WAY:?})"
+    );
+  }
+}
+
+/// R7-D3 (shared half): an object event that passed the end-group check before the
+/// subscription was bounded and finished can complete its `open_stream` after
+/// `finish()` drained the send-stream map. That stream used to be inserted into the
+/// map anyway and was never FIN'd or reset. The race is made deterministic by
+/// granting the relay a single uni stream: the second group's open waits for credit
+/// while the test finishes the subscription.
+#[cfg(test)]
+mod tests_open_racing_finish {
+  use super::*;
+  use crate::server::test_support::{
+    TEST_NAMESPACE, publish, quic_pair_with_transports, relay_client, subscribe, test_track,
+  };
+  use moqtail::model::common::tuple::{Tuple, TupleField};
+  use moqtail::transport::connection::{
+    TransportConnection, TransportReadError, TransportRecvStream,
+  };
+  use std::time::Duration;
+
+  const TRACK: u64 = 1;
+
+  /// How a stream ends on the subscriber's side, read to its end.
+  #[derive(Debug, PartialEq, Eq)]
+  enum End {
+    Fin,
+    Reset(u64),
+    StillOpen,
+  }
+
+  async fn read_to_end(recv: &mut TransportRecvStream) -> End {
+    let mut buf = [0u8; 256];
+    loop {
+      match tokio::time::timeout(Duration::from_secs(1), recv.read(&mut buf)).await {
+        Err(_) => return End::StillOpen,
+        Ok(Ok(Some(_))) => continue,
+        Ok(Ok(None)) => return End::Fin,
+        Ok(Err(TransportReadError::Reset(code))) => return End::Reset(code),
+        Ok(Err(e)) => panic!("read failed: {e:?}"),
+      }
+    }
+  }
+
+  /// Opens group 1's stream, then queues group 2 while the relay has no stream
+  /// credit left, bounds the subscription at `end_group` and finishes it. Returns how
+  /// the stream the racing open finally created ends on the subscriber.
+  async fn racing_open_after_finish(conn: usize, end_group: u64) -> End {
+    let mut subscriber_transport = wtransport::quinn::TransportConfig::default();
+    subscriber_transport.max_concurrent_uni_streams(1u32.into());
+    let (peer, server): (TransportConnection, TransportConnection) =
+      quic_pair_with_transports(None, Some(subscriber_transport)).await;
+    let client = relay_client(conn, server);
+    let track = test_track(TRACK, "video-720p");
+    let latest = Subscribe::new_latest_object(
+      1,
+      Tuple::from_utf8_path(TEST_NAMESPACE),
+      TupleField::from_utf8("video-720p"),
+      vec![MessageParameter::new_forward(true)],
+    );
+    let sub = subscribe(&track, &client, latest, false).await;
+    sub.read().await.mark_alias_announced();
+
+    publish(&track, 1, 0).await;
+    let mut first = tokio::time::timeout(Duration::from_secs(5), peer.accept_uni())
+      .await
+      .expect("group 1's stream")
+      .unwrap();
+    // Group 2 passes the end-group check (none yet) and waits for stream credit.
+    publish(&track, 2, 0).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    {
+      let sub = sub.read().await;
+      sub.subscription_state.write().await.end_group = Some(end_group);
+      sub.finish().await;
+    }
+    // Group 1's stream ends (FIN by finish); reading it to the end returns the
+    // credit, and the racing open completes.
+    assert_eq!(read_to_end(&mut first).await, End::Fin);
+    let mut racing = tokio::time::timeout(Duration::from_secs(5), peer.accept_uni())
+      .await
+      .expect("the racing open completes once credit returns")
+      .unwrap();
+    read_to_end(&mut racing).await
+  }
+
+  /// A racing stream at or above the bound (the switch seam) is reset: the
+  /// subscriber discards that span anyway.
+  #[tokio::test]
+  async fn a_stream_opened_after_finish_above_the_bound_is_reset() {
+    assert_eq!(
+      racing_open_after_finish(96, 1).await,
+      End::Reset(StreamResetCode::Cancelled.to_u64())
+    );
+  }
+
+  /// A racing stream below the bound is FIN'd, so the subscriber sees it end.
+  #[tokio::test]
+  async fn a_stream_opened_after_finish_below_the_bound_is_finished() {
+    assert_eq!(racing_open_after_finish(97, 2).await, End::Fin);
   }
 }

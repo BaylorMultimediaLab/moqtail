@@ -2003,7 +2003,8 @@ export class MOQtailClient {
    * receiver with request id `requestId` that is still open and whose group is at
    * or above `fromGroup` (every open stream when `fromGroup` is omitted). Each one
    * ends with {@link DataStreamEndInfo.end} `stopped`; objects it had already
-   * delivered stay on the receiver's object stream. Returns how many it stopped.
+   * delivered stay on the receiver's object stream, and objects it yields after the
+   * stop (already parsed off the wire) are discarded. Returns how many it stopped.
    */
   async stopDataStreams(requestId: bigint, fromGroup?: bigint): Promise<number> {
     const stops: Promise<void>[] = []
@@ -2019,9 +2020,9 @@ export class MOQtailClient {
 
   /**
    * Ends the receiver with request id `requestId` (a SUBSCRIBE or a pushed PUBLISH
-   * receiver) on the application's word that it has everything it needs: its alias
-   * route is released (streams that arrive later take the unrouted path), every
-   * stream still open on it is stopped ({@link MOQtailClient.stopDataStreams}), and
+   * receiver) on the application's word that it has everything it needs: every
+   * stream still open on it is stopped ({@link MOQtailClient.stopDataStreams}), its
+   * alias route is released (streams that arrive later take the unrouted path), and
    * its object stream is closed, so a reader still gets every object already
    * enqueued and then the end. The request itself stays known, so
    * {@link MOQtailClient.unsubscribe} still cancels it. Returns whether a receiver
@@ -2031,8 +2032,12 @@ export class MOQtailClient {
     const request = this.requests.get(requestId)
     const holder = request instanceof SubscribeRequest ? request : this.pushedReceivers.get(requestId)
     if (holder === undefined) return false
+    // Stop the open streams before the route goes (R7-D5): an object already parsed
+    // on one of them is then discarded as a stopped stream's, not looked up against
+    // an alias that no longer names a track.
+    const stopping = this.stopDataStreams(requestId)
     this.releaseTrackAlias(holder)
-    await this.stopDataStreams(requestId)
+    await stopping
     try {
       holder.controller?.close()
     } catch {
@@ -2875,6 +2880,9 @@ export class MOQtailClient {
           let stoppedHere = false
           let objectsDelivered = 0
           let lastSubgroupId: bigint | undefined = header.subgroupId
+          // The track this stream belongs to, fixed when it is routed (R7-D5): the
+          // receiver may release its alias while the stream is still being read.
+          const streamFullTrackName = this.aliasFullTrackNameMap.get(header.trackAlias) ?? subscription.fullTrackName
           let openStreams = this.#openDataStreams.get(subscription)
           if (!openStreams) {
             openStreams = new Set()
@@ -2907,6 +2915,10 @@ export class MOQtailClient {
               }
               if (nextObject) {
                 if (nextObject instanceof SubgroupObject) {
+                  // A stopped stream's objects that were parsed before the stop took
+                  // effect are not delivered: the receiver asked for the stream to
+                  // end (and may already have closed its object stream).
+                  if (stoppedHere) continue
                   // TODO: validate if it's a valid subgroup object
                   if (!firstObjectId) {
                     firstObjectId = nextObject.objectId
@@ -2920,20 +2932,12 @@ export class MOQtailClient {
                     subgroupId = header.subgroupId ?? null
                   }
 
-                  const fullTrackName = this.aliasFullTrackNameMap.get(header.trackAlias)
-                  if (!fullTrackName) {
-                    throw new ProtocolViolationError(
-                      'MOQtailClient',
-                      `No full track name for received track alias ${header.trackAlias} (groupId=${header.groupId})`,
-                    )
-                  }
-
                   const moqtObject = MoqtObject.fromSubgroupObject(
                     nextObject,
                     header.groupId,
                     header.publisherPriority,
                     subgroupId,
-                    fullTrackName,
+                    streamFullTrackName,
                   )
                   if (!subscription.largestLocation) subscription.largestLocation = moqtObject.location
                   if (subscription.largestLocation.compare(moqtObject.location) == -1)
@@ -4101,6 +4105,31 @@ if (import.meta.vitest) {
 
       transport.openIncomingUniStream(subgroupStreamBytes(9n, 7n, 10))
       await vi.waitFor(() => expect(discarded).toHaveLength(1), { timeout: 2000 })
+      await client.disconnect()
+    })
+
+    // R7-D5: finishReceiver used to release the alias before stopping the streams
+    // still open on the receiver, so an object already parsed on one of them (at
+    // or above the seam) failed the alias lookup and was thrown as a protocol
+    // violation. The stopped stream's objects are now discarded quietly.
+    it('discards an object parsed on a stream finishReceiver stops without a protocol error (R7-D5)', async () => {
+      const { client, transport } = await connected()
+      const errors = vi.spyOn(logger, 'error')
+      const ends: DataStreamEndInfo[] = []
+      client.onDataStreamEnded = (info) => ends.push(info)
+      const { reader } = await pushedReceiver(transport, client)
+      const open = transport.openIncomingUniStream(subgroupStreamBytes(9n, 6n, 10))
+      expect((await reader.read()).value?.location.group).toBe(6n)
+
+      // The next object is on the wire when the application finishes the receiver.
+      open.enqueue(nextObjectBytes(1, 10, 0n))
+      expect(await client.finishReceiver(1n)).toBe(true)
+      expect(((await readWithin(reader, 500)) as ReadableStreamReadResult<MoqtObject>).done).toBe(true)
+      await vi.waitFor(() => expect(ends).toHaveLength(1))
+      expect(ends[0]).toMatchObject({ groupId: 6n, end: 'stopped', objects: 1 })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(errors).not.toHaveBeenCalled()
+      errors.mockRestore()
       await client.disconnect()
     })
   })

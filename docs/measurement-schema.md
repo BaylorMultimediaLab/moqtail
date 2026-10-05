@@ -318,7 +318,11 @@ Other definitions, unchanged:
   minus the floor) and `relay_waits`. `switch_routes` (pr1378 player, null
   without its records) gives `post_seam_drops` (`objects`, `bytes`), `released`
   (`count`, `by_reason`, `held_ms`, `objects_after_switch_ok`) and
-  `publish_done_recv` (counts by `role`).
+  `publish_done_recv` (counts by `role`). `switches.hold_released` (pr1378, _R7_;
+  null without SWITCH_HOLD_RELEASED records) gives `count`, `by_outcome` (counts
+  per `outcome`), `bound_trips` (holds released by a tripped bound, `bound-bytes`
+  or `bound-time`: those append the held objects at or above G_switch, so it
+  should be 0), `held_ms` stats, `appended_objects` and `dropped_post_seam`.
   `landed_behind_playhead` counts switches whose seam lay more than half a GOP
   behind the playhead at send.
 - **Switching diagnostics** (`switching`): inter-switch interval median/min,
