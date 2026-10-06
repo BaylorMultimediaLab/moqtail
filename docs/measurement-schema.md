@@ -278,6 +278,14 @@ the `detect_step` profile; otherwise every field is `null` and
 `quiet_before` attribution, `offset_recovery_ms`) stay as diagnostics for every
 profile.
 
+Throughput samples after the freeze (2026-10-06): a group is sampled only once its
+last object has arrived, and one idle for two group times without completing is
+closed unsampled. So t1 is the first _complete_ group after a capacity change (not
+comparable with t1 of earlier bundles); under heavy loss the window holds only
+the groups that got through (a group stalled behind repeated retransmissions is
+left out rather than read low); and the player-discarded bytes of an unsampled
+group appear in its DROP_STALE records, not in a THROUGHPUT_SAMPLE.
+
 **Censored metrics** (`time_to_half_shift_ms`, `down_reaction_ms`,
 `up_recovery_ms`): per run the value is a number or `null` = the event never
 happened before the run ended. Per condition they are summarised in seconds as
