@@ -610,8 +610,8 @@ class RelayFlags(unittest.TestCase):
 class Safety(unittest.TestCase):
     def test_cache_length_guard(self):
         # 200 s run + 15 s warm-up + 30 s margin = 245 > 240 groups: refused
-        self.assertIn("245", rx.check_cache_length(200, 15, 240))
-        self.assertIsNone(rx.check_cache_length(180, 15, 240))
+        self.assertIsNone(rx.check_cache_length(200, 15, 240))
+        self.assertIn("260", rx.check_cache_length(230, 15, 240))
         self.assertIsNotNone(rx.check_cache_length(60, 15, None))
 
     def test_warmup_gate_anchored_to_the_record(self):
@@ -1145,3 +1145,19 @@ class UdpSnmp(unittest.TestCase):
         self.assertEqual(u["RcvbufErrors"], 36)
         self.assertEqual(u["InDatagrams"], 18124)
         self.assertEqual(net.parse_udp_snmp("nothing"), {})
+
+
+class SessionFitsCache(unittest.TestCase):
+    """The publisher runs out gops seconds after its first group; the session must end
+    before that (with a few groups to spare), page load included."""
+
+    def test_a_200_s_session_fits_the_240_s_cache_after_22_s(self):
+        self.assertIsNone(rx.session_fits_cache(1_000_000, 1_022_000, 200, 240))
+
+    def test_a_slow_page_load_that_would_run_the_cache_out_is_refused(self):
+        msg = rx.session_fits_cache(1_000_000, 1_040_000, 200, 240)
+        self.assertIn("needs 245.0", msg)
+
+    def test_unknown_inputs_do_not_refuse(self):
+        self.assertIsNone(rx.session_fits_cache(None, 1_022_000, 200, 240))
+        self.assertIsNone(rx.session_fits_cache(1_000_000, 1_022_000, 200, None))
