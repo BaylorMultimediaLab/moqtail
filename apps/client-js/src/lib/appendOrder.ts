@@ -13,7 +13,7 @@
  *
  * The scheduler appends a frame when it continues the last appended frame, holds a
  * frame that lies ahead of a gap until the gap fills (given up after `maxWaitMs`
- * without progress, or when little media is left ahead of the playhead), and drops a frame behind the append front
+ * without progress; optionally when little media is left ahead of the playhead), and drops a frame behind the append front
  * that cannot be appended without discarding what follows it. It decides only; the
  * player appends and drops.
  */
@@ -59,11 +59,18 @@ export interface OrderContext {
 export interface AppendOrderOptions {
   /** Longest the held frames wait while the gap before them makes no progress (ms). */
   maxWaitMs: number;
-  /** Stop waiting once less than this much media is ahead of the playhead (ms). */
+  /**
+   * Stop waiting once less than this much media is ahead of the playhead (ms); 0
+   * never. Off by default (preflight 3, 2026-10-05): with the buffer already low,
+   * giving a gap up jumps the front past media that is about to arrive in order (a
+   * replay 0.6 s behind live lost two whole groups), and skipping a gap is the
+   * buffer's gap-crossing policy's call, not the append order's. The wait stays
+   * bounded by `maxWaitMs` without progress.
+   */
   minAheadMs: number;
 }
 
-export const DEFAULT_APPEND_ORDER: AppendOrderOptions = { maxWaitMs: 1000, minAheadMs: 300 };
+export const DEFAULT_APPEND_ORDER: AppendOrderOptions = { maxWaitMs: 1000, minAheadMs: 0 };
 
 export class AppendOrder<T> {
   readonly #opts: AppendOrderOptions;

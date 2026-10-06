@@ -191,3 +191,11 @@ class LandingBelowStart(unittest.TestCase):
                {"switch_seq": 9, "t4_group": None, "relay_start_group": 62},
                {"switch_seq": 10, "t4_group": 70, "relay_start_group": None}]
         self.assertEqual(validate.landing_below_start(sws), ["switch 8 landed on G60, relay start G61"])
+
+
+class ClientRcvbuf(unittest.TestCase):
+    def test_reports_the_session_delta(self):
+        start = [{"client_udp": {"udp": {"RcvbufErrors": 4}, "rmem_default": 212992, "rmem_max": 212992}}]
+        end = [{"client_udp": {"udp": {"RcvbufErrors": 40}, "rmem_default": 212992, "rmem_max": 212992}}]
+        self.assertIn("drops during the session=36", validate.client_rcvbuf_detail(start, end))
+        self.assertIn("not recorded", validate.client_rcvbuf_detail([], []))

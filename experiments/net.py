@@ -392,6 +392,14 @@ def parse_htb_class_rate(text: str, classid: str = HTB_CLASS) -> int | None:
     return None
 
 
+def parse_udp_snmp(text: str) -> dict[str, int]:
+    """The `Udp:` counters of /proc/net/snmp (header line, then values)."""
+    rows = [line.split() for line in text.splitlines() if line.startswith("Udp:")]
+    if len(rows) < 2:
+        return {}
+    return {k: int(v) for k, v in zip(rows[0][1:], rows[1][1:]) if v.lstrip("-").isdigit()}
+
+
 def leaf_stats(show_text: str, shape: Shape, topo: Topology) -> dict:
     """The bottleneck leaf's counters from `tc -s qdisc show dev <host_if>`
     (bytes, packets, drops, backlog, plus fq_codel's extended stats), the GSO
@@ -550,6 +558,9 @@ class NoneBackend:
     def stats(self) -> dict | None:
         return None
 
+    def client_udp(self) -> dict | None:
+        return None
+
     def teardown(self) -> None:
         pass
 
@@ -671,6 +682,20 @@ class NetnsBackend:
         if self.current.rate_mbps is not None:
             text = _run(f"tc class show dev {self.host_if}", check=False, quiet=True).stdout
             out["htb_class"] = {"classid": HTB_CLASS, "rate_bps": parse_htb_class_rate(text)}
+        return out
+
+    def client_udp(self) -> dict | None:
+        """The client namespace's UDP counters (InDatagrams, InErrors, RcvbufErrors,
+        ...) and the socket receive-buffer limits: a datagram the browser's socket had
+        no room for is lost after the qdisc, where `tc -s` cannot see it (preflight 3:
+        22-36 packets lost in a startup burst on three unshaped runs, 0 at the qdisc)."""
+        if self.topo is None:
+            return None
+        snmp = _run(f"ip netns exec {self.ns} cat /proc/net/snmp", check=False, quiet=True).stdout
+        out: dict = {"udp": parse_udp_snmp(snmp)}
+        for key in ("net.core.rmem_default", "net.core.rmem_max"):
+            r = _run(f"ip netns exec {self.ns} sysctl -n {key}", check=False, quiet=True)
+            out[key.split(".")[-1]] = int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
         return out
 
     # -- helpers -------------------------------------------------------------
