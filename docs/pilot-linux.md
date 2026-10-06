@@ -1172,6 +1172,72 @@ The decode-order scheduler no longer gives a gap up because the buffer is low:
 in preflight 3 that dropped a native replay arriving in order 0.6 s behind live
 (76 frames in five runs). The wait is bounded by 1 s without progress.
 
+### 11j. Confirmation, then the grid (2026-10-05)
+
+The confirmation round (`results-linux-2026-10-05/preflight_conf`, one repetition,
+12 runs) passed 12 of 12: no partly buffered group, no frame dropped by the
+decode-order scheduler (it held at most 22), no seam hole on pr1378, delivery at
+the link rate on every step, no packet lost on the unshaped runs and no client
+receive-buffer drop (rmem 212992 B; the three preflight-3 losses stay
+unexplained but did not recur, and `pf-loss` now names the client when it is
+the client). The native forward-trigger time-shifted run starved 9.4 s at the
+1.5 Mbit/s step, the native backlog effect seen before (the 720p target's first
+object never came behind the 1080p backlog; the next switch landed 10 s after
+its SWITCH_OK with a 12 s hole): an outcome, measured.
+
+The grid: three arms x two client types x five repetitions on `step_down_up`
+(6 / 1.5 / 6 Mbit/s at 0 / 60 / 120 s), 200 s each, repetition-major, the `min`
+controller (runner default), CUBIC, every run validated with the preflight
+invariants. 30 runs, about 2 h 15 min. A 200 s session fits the 240 s cache
+(the runner refuses a session that would outrun it).
+
+```sh
+# 1. clean state (as in 11a) and an empty results directory
+pkill -f run_experiment.py; pkill -f target/release/relay; pkill -f target/release/publisher; pkill -f firefox; pkill -f vite
+sudo ip netns del moqc 2>/dev/null; sudo ip link del veth-moqh 2>/dev/null; true
+cd ~/Documents/Baylor\ Research/moqtail
+mv results results-preflight-conf-$(date +%Y%m%d) 2>/dev/null; mkdir -p results logs
+git fetch origin && git checkout harness && git reset --hard origin/harness
+export ENC=data/encoded/tears_of_steel_240s_1080p
+python3 scripts/check_cache.py "$ENC" | tail -1          # must say OK
+
+# 2. the grid, repetition-major
+grid() {  # $1 profile (default step_down_up), $2 repetitions (default 5), $3 duration (default 200)
+  local profile=${1:-step_down_up} reps=${2:-5} dur=${3:-200}
+  git fetch -q origin
+  for rep in $(seq 0 $((reps - 1))); do
+    for arm in native native-ft pr1378; do
+      case $arm in
+        native)    branch=switch/native; mech="--mechanism native" ;;
+        native-ft) branch=switch/native; mech="--mechanism native --mechanism-mode forward-trigger" ;;
+        pr1378)    branch=switch/pr1378; mech="--mechanism pr1378 --mechanism-mode next-group" ;;
+      esac
+      git checkout -q $branch && git reset -q --hard origin/$branch
+      for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+        sudo -v
+        python3 experiments/run_experiment.py $mech $client \
+            --profile experiments/profiles/$profile.json --duration $dur \
+            --net netns --encoded-dir "$ENC" --repeat-index $rep --preflight --final
+      done
+    done
+  done
+}
+grid step_down_up 5 200
+
+# 3. one line per run, then pack and send
+python3 - <<'PY'
+import json, pathlib
+for v in sorted(pathlib.Path("results").glob("*/validation.json")):
+    d = json.loads(v.read_text())
+    print(("PASS " if d.get("passed") else "FAIL ") + v.parent.name, "" if d.get("passed") else d.get("failed"))
+PY
+bash experiments/pack_results.sh results grid.tar.gz
+tar czf grid-relay-logs.tar.gz results/*/relay.log
+```
+
+A FAIL is an apparatus failure under the validity rule (11b) and is worth a
+look before the batch goes on; bad playback is not a FAIL.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

@@ -253,7 +253,13 @@ CLIENT_STARTUP_TIMEOUT_S = 30.0  # STARTUP in client-events.jsonl after the sess
 # shaped link the dev server's page takes several seconds (6.6 s native, 6.9 s pr1378
 # at 6 Mbit/s + 40 ms in the 2026-10-05 preflight).
 CLIENT_CONNECT_TIMEOUT_S = 60.0
-CACHE_MARGIN_S = 30.0  # refuse duration + warmup + margin > gops_per_variant
+# Refuse duration + warmup + margin > gops_per_variant up front. The margin covers
+# the page load before the session starts (6.6-7.0 s on the shaped preflight link)
+# and a few groups of slack; `session_fits_cache` checks the real figure once the
+# session has started (2026-10-05: 30 s refused a 200 s run on the 240 s cache that
+# fits with 18 s to spare).
+CACHE_MARGIN_S = 15.0
+CACHE_TAIL_S = 5.0  # groups the publisher must still hold when the session ends
 RELAY_LISTENING_NEEDLE = "is running on"  # apps/relay/src/server.rs start(): "<version> is running on N UDP socket(s)"
 
 
@@ -266,6 +272,22 @@ def check_cache_length(duration: float, warmup: float, gops: int | None, margin:
     if need > gops:
         return (f"the GOP cache holds {gops} groups (1 s each) but the run needs duration {duration:g} + warmup "
                 f"{warmup:g} + margin {margin:g} = {need:g}; shorten --duration or prepare a longer cache")
+    return None
+
+
+def session_fits_cache(first_group_ts_ms: float | None, session_start_ts_ms: float, duration: float,
+                       gops: int | None, tail: float = CACHE_TAIL_S) -> str | None:
+    """Error text when the publisher (one group per second from its first, no loop)
+    runs out before the session ends plus `tail`, else None. A cache that runs out
+    mid-session starves the client, which would read as an outcome of the system
+    under test, so the run is aborted (invalid) instead."""
+    if first_group_ts_ms is None or gops is None:
+        return None
+    before = (session_start_ts_ms - first_group_ts_ms) / 1000.0
+    need = before + duration + tail
+    if need > gops:
+        return (f"the GOP cache holds {gops} groups but this session needs {need:.1f}: it started {before:.1f} s "
+                f"after the first group (warm-up and page load) and runs {duration:g} s (+{tail:g} s)")
     return None
 
 
@@ -1196,6 +1218,9 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             raise SystemExit(f"client logged no CONNECT_START within {CLIENT_CONNECT_TIMEOUT_S:g} s of the browser "
                              f"spawn; see {out / 'browser.log'} and {client_log}")
         t0 = connect["ts"] / 1000.0
+        short = session_fits_cache(first_group.get("ts"), connect["ts"], args.duration, cache_gops(args.encoded_dir))
+        if short:
+            raise SystemExit(f"cache too short for this session: {short}")
         rlog.emit("SESSION_START", {"client_udp": backend.client_udp(),
                                     "client_connect_start_ts": connect["ts"],
                                     "page_load_s": round(t0 - spawned, 3),
