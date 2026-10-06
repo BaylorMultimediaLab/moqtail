@@ -138,7 +138,11 @@ the link's actual delivery rate during the burst — not the source bitrate.
 Per-group sample: `groupBps = (bytes(objects 2..N)) / (t_N − t_1)`. First
 object's bytes are excluded from the numerator (it only sets `t_1`).
 
-Window of 5 samples (≈ 5 s) averaged for `getBandwidthBps()`. EMAs continue
+Window of 5 samples (≈ 5 s), aggregated by the harmonic mean for
+`getBandwidthBps()` (2026-10-06; it was the arithmetic mean). A group whose
+last object can be told is sampled only once complete; one left incomplete for
+two group times is not sampled (its first objects can arrive in a burst
+released by a retransmission, which reads the receive buffer's rate). EMAs continue
 to consume each per-group sample, weighted by group duration, for callers
 that want fast/slow asymmetry.
 
