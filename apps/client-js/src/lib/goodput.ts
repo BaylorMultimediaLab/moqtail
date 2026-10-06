@@ -135,11 +135,6 @@ interface OpenGroup {
  */
 const CLOSED_KEYS_MAX = 256;
 
-/** A later group of the track finalises a hinted group once it has been quiet this long (ms) ... */
-const QUIET_MIN_MS = 50;
-/** ... or this many of its own mean inter-arrival times, whichever is longer. */
-const QUIET_SPACINGS = 4;
-
 export class GoodputTracker {
   // SWMA window of per-group throughput samples (bps). Default size 5 ≈ 5s.
   #swma: number[] = [];
@@ -203,16 +198,23 @@ export class GoodputTracker {
     // Groups of this track that a later group has overtaken, and groups
     // nobody has added to for a long time.
     for (const [key, g] of this.#open) {
-      const idle = now - g.lastTs;
-      let close = idle >= this.#abandonMs;
-      if (!close && g.track === track && g.group < groupId) {
-        if (!g.hinted) close = true;
-        else {
-          const spacing = g.objects > 1 ? (g.lastTs - g.firstTs) / (g.objects - 1) : 0;
-          close = idle >= Math.max(QUIET_MIN_MS, QUIET_SPACINGS * spacing);
+      const abandoned = now - g.lastTs >= this.#abandonMs;
+      if (g.hinted) {
+        // A group whose last object can be told samples only when it is complete
+        // (its last object closes it, below). Objects of a group travel on one
+        // stream, in order, so an incomplete group is one whose rest is held up,
+        // typically behind a lost packet; what arrived of it so far came in a burst
+        // released by the retransmission, at the receive buffer's rate, not the
+        // link's (grid 2026-10-06: 6 objects in 7 ms read 21.7 Mbit/s on a 1.5
+        // Mbit/s link). Such a group is never sampled early; if it stays idle for
+        // two group times it is closed without a sample.
+        if (abandoned) {
+          this.#open.delete(key);
+          this.#closeUnsampled(g);
         }
+        continue;
       }
-      if (close) {
+      if (abandoned || (g.track === track && g.group < groupId)) {
         this.#open.delete(key);
         const sample = this.#finalize(g);
         if (sample) out.push(sample);
@@ -275,11 +277,19 @@ export class GoodputTracker {
     } else this.#unroutedPending += bytes;
   }
 
-  /** Conservative bandwidth: average of the SWMA window. 0 until first group completes. */
+  /**
+   * Conservative bandwidth: the harmonic mean of the SWMA window, 0 until the
+   * first group completes. The harmonic mean (as MPC's throughput predictor, Yin
+   * et al., SIGCOMM 2015) keeps one outlier from carrying the estimate: a group
+   * held behind a lost packet and then released in one burst reads the receive
+   * buffer's rate (up to 338 Mbit/s on a 1.5 Mbit/s link in the 2026-10-06 grid),
+   * and with the arithmetic mean one such sample lifted the estimate above the
+   * link for five groups (14 of 69 up-switches in the low phase rested on it).
+   */
   getBandwidthBps(): number {
     if (this.#swma.length === 0) return 0;
-    const sum = this.#swma.reduce((a, b) => a + b, 0);
-    return sum / this.#swma.length;
+    const inverse = this.#swma.reduce((a, b) => a + 1 / b, 0);
+    return this.#swma.length / inverse;
   }
 
   getFastEmaBps(): number {
@@ -378,6 +388,20 @@ export class GoodputTracker {
     this.#emaSlow = 0;
     this.#hasEmaData = false;
     this.#cumulativeBytes = 0;
+  }
+
+  /**
+   * Closes an incomplete group without a sample. Its key is remembered like a
+   * sampled group's, so its late objects are folded in rather than opening a new
+   * accumulator (which would sample the remainder, timed from wherever it resumed),
+   * and its library-discarded bytes go out with the next sample as unrouted bytes.
+   */
+  #closeUnsampled(g: OpenGroup): void {
+    this.#unroutedPending += g.libraryDiscardedBytes;
+    this.#closed.set(`${g.track}\u0000${g.group}`, { objects: 0, bytes: 0 });
+    if (this.#closed.size > CLOSED_KEYS_MAX) {
+      this.#closed.delete(this.#closed.keys().next().value!);
+    }
   }
 
   #finalize(g: OpenGroup): GroupSample | null {

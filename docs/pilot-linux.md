@@ -1238,6 +1238,71 @@ tar czf grid-relay-logs.tar.gz results/*/relay.log
 A FAIL is an apparatus failure under the validity rule (11b) and is worth a
 look before the batch goes on; bad playback is not a FAIL.
 
+### 11k. The freeze, and the grid (2026-10-06)
+
+The first grid (`results-linux-2026-10-05/grid`, 30 of 30 PASS) showed one
+defect left in the controller's input: a group held behind a lost packet
+arrives in one burst when the retransmission releases it, and its throughput
+sample read the receive buffer's rate (20-338 Mbit/s on the 1.5 Mbit/s step),
+so 14 of 69 up-switches in that phase rested on an inflated estimate, unevenly
+across arms. Now a group is sampled only when complete and the window is
+aggregated by its harmonic mean (contract, "Controller `min`"). The startup
+delay is reported after the catalog as well (`startup_after_catalog_ms`): the
+wait for the publisher's next catalog object depends on the page load.
+
+This is the freeze: the branches are tagged `freeze/2026-10-06`, and every
+result of the paper comes from that tag. After it a finding changes code only if
+the apparatus measured something wrong; everything else is a result.
+
+The comparison is as-shipped native against PR #1378 next-group, on both
+client types (contract, "Scope of the comparison"); native forward-trigger is
+out of the grid. 2 arms x 2 client types x 5 repetitions = 20 runs of 200 s,
+about 1 h 30 min:
+
+```sh
+# 1. clean state and an empty results directory
+pkill -f run_experiment.py; pkill -f target/release/relay; pkill -f target/release/publisher; pkill -f firefox; pkill -f vite
+sudo ip netns del moqc 2>/dev/null; sudo ip link del veth-moqh 2>/dev/null; true
+cd ~/Documents/Baylor\ Research/moqtail
+mv results results-grid1-$(date +%Y%m%d) 2>/dev/null; mkdir -p results logs
+git fetch origin --tags
+export ENC=data/encoded/tears_of_steel_240s_1080p
+python3 scripts/check_cache.py "$ENC" | tail -1          # must say OK
+
+# 2. the grid, repetition-major, from the frozen tags
+grid() {  # $1 profile (default step_down_up), $2 repetitions (default 5), $3 duration (default 200)
+  local profile=${1:-step_down_up} reps=${2:-5} dur=${3:-200}
+  for rep in $(seq 0 $((reps - 1))); do
+    for arm in native pr1378; do
+      case $arm in
+        native) branch=switch/native; mech="--mechanism native" ;;
+        pr1378) branch=switch/pr1378; mech="--mechanism pr1378 --mechanism-mode next-group" ;;
+      esac
+      # the local branch at the frozen commit (the runner checks the branch name;
+      # run_meta.json records the commit)
+      git checkout -q -B $branch freeze/2026-10-06/${branch#switch/}
+      for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+        sudo -v
+        python3 experiments/run_experiment.py $mech $client \
+            --profile experiments/profiles/$profile.json --duration $dur \
+            --net netns --encoded-dir "$ENC" --repeat-index $rep --preflight --final
+      done
+    done
+  done
+}
+grid step_down_up 5 200
+
+# 3. one line per run, then pack and send
+python3 - <<'PY'
+import json, pathlib
+for v in sorted(pathlib.Path("results").glob("*/validation.json")):
+    d = json.loads(v.read_text())
+    print(("PASS " if d.get("passed") else "FAIL ") + v.parent.name, "" if d.get("passed") else d.get("failed"))
+PY
+bash experiments/pack_results.sh results grid.tar.gz
+tar czf grid-relay-logs.tar.gz results/*/relay.log
+```
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
