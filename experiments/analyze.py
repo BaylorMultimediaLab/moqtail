@@ -885,9 +885,18 @@ def analyze(run: Path, t1_tol: float = 0.25, offset_tol_ms: float = 500.0, offse
     # Startup ---------------------------------------------------------------
     st = first(recs, "STARTUP")
     fo = first(recs, "FIRST_OBJECT")
+    connect = first(recs, "CONNECT_START")
+    catalog = first(recs, "CATALOG")
     startup_track = (st or {}).get("track") or client_meta.get("startup_track")
     out["startup"] = {
         "startup_delay_ms": st.get("startup_delay_ms") if st else None,
+        # The catalog arrives with the publisher's next catalog object, at a fixed
+        # point of the publisher's clock: how long the client waits for it depends
+        # on when its page finished loading (0.38 s longer on the native branch
+        # in the 2026-10-05 grid, whose client bundle loads faster). The startup
+        # after the catalog compares across branches; startup_delay_ms does not.
+        "catalog_wait_ms": (catalog["ts"] - connect["ts"]) if catalog and connect else None,
+        "startup_after_catalog_ms": (st["ts"] - catalog["ts"]) if st and catalog else None,
         "connect_to_first_object_ms": st.get("connect_to_first_object_ms") if st else None,
         "first_object_to_first_frame_ms": st.get("first_object_to_first_frame_ms") if st else None,
         "first_group": fo.get("group") if fo else None,
@@ -1881,7 +1890,7 @@ IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode"
                     "browser_version",
                     "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "congestion_controller", "background_flows",
                     "repeat_index", "timestamp_start"]
-METRIC_COLUMNS = ["startup_delay_ms", "run_duration_s", "stall_count", "stall_total_ms", "stall_blips", "media_skipped_ms", "wedge_skipped_ms",
+METRIC_COLUMNS = ["startup_delay_ms", "catalog_wait_ms", "startup_after_catalog_ms", "run_duration_s", "stall_count", "stall_total_ms", "stall_blips", "media_skipped_ms", "wedge_skipped_ms",
                   "switch_count", "switch_up", "switch_down",
                   "switches_per_minute", "direction_reversals", "aba_reversals", "median_inter_switch_ms",
                   "cooldown_activations", "switch_delivery_latency_p50_ms", "switch_visibility_delay_p50_ms", "switch_visibility_delay_p95_ms",
@@ -1928,6 +1937,8 @@ def agg_row(s: dict) -> dict:
     sw, stl, ts_, br, sh, rx = s["switches"], s["stalls"], s["time_shift"], s["bitrate"], s["shares"], s["reaction"]
     row.update({
         "startup_delay_ms": s["startup"]["startup_delay_ms"], "run_duration_s": s.get("run_duration_s"),
+        "catalog_wait_ms": s["startup"].get("catalog_wait_ms"),
+        "startup_after_catalog_ms": s["startup"].get("startup_after_catalog_ms"),
         "stall_count": stl["count"], "stall_total_ms": stl["total_ms"], "stall_blips": stl["blips"],
         "media_skipped_ms": stl["media_skipped_ms"], "wedge_skipped_ms": stl["wedge_skipped_ms"],
         "switch_count": sw["count"],
