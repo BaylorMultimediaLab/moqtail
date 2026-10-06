@@ -71,6 +71,21 @@ describe('AppendOrder', () => {
     expect(appended(o.tick(60, { aheadOfPlayheadMs: 250 }))).toEqual(['6.0']);
   });
 
+  // Preflight 3: a time-shifted client starving at a native landing on group 70; the
+  // replay of 70-71 arrived 0.6 s after the first live frames. Giving the gap up
+  // because the buffer was low dropped both groups.
+  it('by default a low buffer does not give up a gap that is about to fill', () => {
+    const o = new AppendOrder<string>();
+    at(o, f(70, 0), 0);
+    expect(at(o, f(72, 0), 10, { aheadOfPlayheadMs: 0 })).toEqual([]);
+    expect(o.tick(500, { aheadOfPlayheadMs: 0 })).toEqual([]);
+    const acts: OrderAction<string>[] = [];
+    for (let i = 1; i < 24; i++) acts.push(...at(o, f(70, i), 600, { aheadOfPlayheadMs: 0 }));
+    for (let i = 0; i < 24; i++) acts.push(...at(o, f(71, i), 650, { aheadOfPlayheadMs: 0 }));
+    expect(dropped(acts)).toEqual([]);
+    expect(appended(acts).slice(-1)).toEqual(['72.0']);
+  });
+
   it('a held frame without a keyframe before it keeps waiting, then goes with the gap', () => {
     const o = new AppendOrder<string>({ maxWaitMs: 100 });
     at(o, f(5, 0), 0);

@@ -1152,6 +1152,26 @@ drops (few, and only around losses) and the most frames it held; buffered
 ranges with sub-group holes become rare and, where they remain, match a
 `DROP_STALE{abandoned-gap}`.
 
+### 11i. Preflight 3 and what follows (2026-10-05)
+
+Preflight 3 (`results-linux-2026-10-05/preflight3`): 33 of 36 PASS. On the shaped
+profile every arm delivered at the link rate on every step, no group the player
+appended in full is only partly buffered any more (23 in preflight 2), and pr1378
+has no seam hole. The three failures are `pf-loss` on unshaped runs: 22-36
+packets lost in one burst 2-9 s into the session while the relay's congestion
+window was 234-279 KB, none dropped at the qdisc. That points at the client's
+UDP socket receive buffer (Linux default 212992 B) overflowing in a startup burst
+the unshaped link does not pace; shaped runs are paced by the bottleneck and do
+not see it. The runner now records the client namespace's UDP `RcvbufErrors` and
+`rmem_default`/`rmem_max` (SESSION_START, RUN_END) and `pf-loss` reports them, so
+the next unshaped run confirms or rules this out. Raising the limit
+(`sysctl -w net.core.rmem_max=... net.core.rmem_default=...`) is a host setting
+outside the namespace on most kernels; it is not changed by the runner.
+
+The decode-order scheduler no longer gives a gap up because the buffer is low:
+in preflight 3 that dropped a native replay arriving in order 0.6 s behind live
+(76 frames in five runs). The wait is bounded by 1 s without progress.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

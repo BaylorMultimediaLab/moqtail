@@ -1196,7 +1196,8 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
             raise SystemExit(f"client logged no CONNECT_START within {CLIENT_CONNECT_TIMEOUT_S:g} s of the browser "
                              f"spawn; see {out / 'browser.log'} and {client_log}")
         t0 = connect["ts"] / 1000.0
-        rlog.emit("SESSION_START", {"client_connect_start_ts": connect["ts"],
+        rlog.emit("SESSION_START", {"client_udp": backend.client_udp(),
+                                    "client_connect_start_ts": connect["ts"],
                                     "page_load_s": round(t0 - spawned, 3),
                                     "seen_after_s": round(time.time() - t0, 3)})
 
@@ -1232,7 +1233,8 @@ def run_once(args, repeat_index: int, shared_vite: Vite | None = None) -> int:
                     if p.poll() is not None:
                         raise SystemExit(f"{name} exited early with {p.returncode}; see {out / (name + '.log')}")
             time.sleep(0.2)
-        rlog.emit("RUN_END", {"elapsed_s": time.time() - t0, "qdisc_stats": backend.stats()})
+        rlog.emit("RUN_END", {"elapsed_s": time.time() - t0, "qdisc_stats": backend.stats(),
+                              "client_udp": backend.client_udp()})
     except BaseException as e:  # noqa: BLE001 - always tear down
         exit_code = 1 if not isinstance(e, KeyboardInterrupt) else 130
         print(f"[run] aborting: {e!r}")

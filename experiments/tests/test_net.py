@@ -1134,3 +1134,14 @@ class HtbClassRate(unittest.TestCase):
     def test_other_classes_and_no_class(self):
         self.assertIsNone(net.parse_htb_class_rate("class htb 2:1 root rate 6Mbit ceil 6Mbit"))
         self.assertIsNone(net.parse_htb_class_rate(""))
+
+
+class UdpSnmp(unittest.TestCase):
+    def test_parses_the_udp_rows(self):
+        text = ("Ip: Forwarding DefaultTTL\nIp: 1 64\n"
+                "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n"
+                "Udp: 18124 0 36 9000 36 0 0 0 0\n")
+        u = net.parse_udp_snmp(text)
+        self.assertEqual(u["RcvbufErrors"], 36)
+        self.assertEqual(u["InDatagrams"], 18124)
+        self.assertEqual(net.parse_udp_snmp("nothing"), {})

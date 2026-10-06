@@ -191,6 +191,19 @@ def qdisc_tree_errors(applied: list[dict]) -> list[str]:
     return bad
 
 
+def client_rcvbuf_detail(session_start: list[dict], run_end: list[dict]) -> str:
+    """How many datagrams the client namespace's UDP sockets dropped for lack of
+    receive-buffer room during the session (runner SESSION_START/RUN_END client_udp,
+    2026-10-05): losses there are the client host's, after the link."""
+    a = ((session_start[0] if session_start else {}).get("client_udp") or {})
+    b = ((run_end[0] if run_end else {}).get("client_udp") or {})
+    ua, ub = a.get("udp") or {}, b.get("udp") or {}
+    if "RcvbufErrors" not in ua or "RcvbufErrors" not in ub:
+        return "client UDP receive-buffer drops not recorded (runner before 2026-10-05)"
+    return (f"client UDP receive-buffer drops during the session={ub['RcvbufErrors'] - ua['RcvbufErrors']} "
+            f"(rmem_default={b.get('rmem_default')}, rmem_max={b.get('rmem_max')})")
+
+
 def landing_below_start(switches: list[dict]) -> list[str]:
     """pf-landing: switches whose first object (t4_group) is below the relay's start
     group for them (SWITCH_PROMOTED.start_group, joined as relay_start_group). The
@@ -622,7 +635,8 @@ def main() -> int:
         conn = summary.get("conn") or {}
         if unshaped and conn.get("samples"):
             rep.add("pf-loss", (conn.get("loss_rate") or 0) < 0.001,
-                    f"unshaped profile: CONN_STATS loss rate={conn.get('loss_rate'):.5f} (lost {conn.get('lost_packets')} of {conn.get('sent_packets')}; required < 0.1 %)")
+                    f"unshaped profile: CONN_STATS loss rate={conn.get('loss_rate'):.5f} (lost {conn.get('lost_packets')} of {conn.get('sent_packets')}; required < 0.1 %)"
+                    + "; " + client_rcvbuf_detail(by("SESSION_START"), by("RUN_END")))
         else:
             rep.add("pf-loss", None, "shaped profile or no CONN_STATS" if not unshaped else "no CONN_STATS records")
         dpi = conn.get("tx_datagrams_per_io")
