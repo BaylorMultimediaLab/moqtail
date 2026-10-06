@@ -40,7 +40,7 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
     t.recordObject(5_000, 1n);
 
     // (10_000 + 10_000) bytes * 8 bits / 0.2 s = 800_000 bps.
-    expect(t.getBandwidthBps()).toBe(800_000);
+    expect(t.getBandwidthBps()).toBeCloseTo(800_000, 3);
   });
 
   it('excludes the first object from the SWMA numerator', () => {
@@ -57,10 +57,10 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
 
     // (10_000 + 10_000) bytes * 8 / 0.2 s = 800_000 bps.
     // If first-object bytes were counted, this would be much higher.
-    expect(t.getBandwidthBps()).toBe(800_000);
+    expect(t.getBandwidthBps()).toBeCloseTo(800_000, 3);
   });
 
-  it('averages over a SWMA window of 5 group samples', () => {
+  it('takes the harmonic mean of a SWMA window of 5 group samples', () => {
     const t = new GoodputTracker();
     let groupId = 0n;
     const throughputs = [1, 2, 3, 4, 5, 6].map(n => n * 1_000_000);
@@ -76,8 +76,12 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
     }
     // Finalize the last group by emitting a stub object on the next groupId.
     t.recordObject(0, groupId);
-    // 6 samples produced; window keeps last 5: 2,3,4,5,6 Mbps → mean = 4 Mbps.
-    expect(t.getBandwidthBps()).toBeCloseTo(4_000_000, -3);
+    // 6 samples produced; window keeps last 5: 2,3,4,5,6 Mbps → harmonic mean
+    // = 5 / (1/2 + 1/3 + 1/4 + 1/5 + 1/6) = 3.448 Mbps.
+    expect(t.getBandwidthBps()).toBeCloseTo(
+      5_000_000 / (1 / 2 + 1 / 3 + 1 / 4 + 1 / 5 + 1 / 6),
+      -3,
+    );
   });
 
   it('feeds per-group throughputs into fast/slow EMAs', () => {
@@ -187,7 +191,7 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       const [sample] = t.recordObject(5_000, 1n, { recvAt: 2_000, track: 'v' });
       expect(sample).toMatchObject({ track: 'v', group: 0n, bytes: 20_000, durationMs: 200 });
       expect(sample!.bps).toBe(800_000);
-      expect(t.getBandwidthBps()).toBe(800_000);
+      expect(t.getBandwidthBps()).toBeCloseTo(800_000, 3);
     });
 
     it('finalises a group at its last object, without waiting for the next group', () => {
@@ -240,15 +244,51 @@ describe('GoodputTracker (SWMA on per-group object timing)', () => {
       expect(s).toMatchObject({ bytes: 4_000, durationMs: 20, discardedBytes: 4_500 });
     });
 
-    it('closes a group nobody finishes once it has been idle for two group times', () => {
+    it('closes a group nobody finishes after two idle group times, without a sample', () => {
       const t = new GoodputTracker();
       t.recordObject(1_000, 5n, { recvAt: 0, track: 'old', lastInGroup: false });
       t.recordObject(1_000, 5n, { recvAt: 10, track: 'old', lastInGroup: false });
       expect(t.recordObject(1_000, 6n, { recvAt: 500, track: 'new', lastInGroup: false })).toEqual(
         [],
       );
-      const out = t.recordObject(1_000, 6n, { recvAt: 2_100, track: 'new', lastInGroup: false });
-      expect(out.map(s => [s.track, s.group])).toEqual([['old', 5n]]);
+      // Idle for two group times: closed, but an incomplete group is not sampled.
+      expect(
+        t.recordObject(1_000, 6n, { recvAt: 2_100, track: 'new', lastInGroup: false }),
+      ).toEqual([]);
+      // Its late objects are folded in and do not sample the remainder.
+      expect(t.recordObject(1_000, 5n, { recvAt: 2_200, track: 'old', lastInGroup: true })).toEqual(
+        [],
+      );
+      expect(t.getSampleCount()).toBe(0);
+    });
+
+    // Grid 2026-10-06 (native forward-trigger live-edge r2): group 86's first six
+    // objects arrived in 7 ms, released by a retransmission, while the rest of the
+    // group was still held up; group 87 started arriving and the quiet rule closed
+    // group 86 on those six objects: 21.7 Mbit/s on a 1.5 Mbit/s link. A group
+    // whose last object can be told samples only when complete.
+    it('does not sample a group early on a burst of its first objects', () => {
+      const t = new GoodputTracker();
+      for (let i = 0; i < 6; i++)
+        expect(
+          t.recordObject(3_000, 86n, { recvAt: i * 1.4, track: 'v', lastInGroup: false }),
+        ).toEqual([]);
+      for (let i = 0; i < 3; i++)
+        expect(
+          t.recordObject(5_000, 87n, { recvAt: 200 + i * 40, track: 'v', lastInGroup: false }),
+        ).toEqual([]);
+      let out: ReturnType<GoodputTracker['recordObject']> = [];
+      for (let i = 6; i < 24; i++)
+        out = t.recordObject(3_000, 86n, {
+          recvAt: 300 + (i - 6) * 40,
+          track: 'v',
+          lastInGroup: i === 23,
+        });
+      expect(out).toHaveLength(1);
+      const [sample] = out;
+      expect(sample).toMatchObject({ group: 86n, durationMs: 300 + 17 * 40 });
+      // 23 objects x 3000 B over 0.98 s, not 15 kB over 7 ms.
+      expect(sample!.bps).toBeCloseTo((23 * 3_000 * 8) / 0.98, -2);
     });
 
     it('counts closed samples per track (the min arm dwell reads the landed track)', () => {
