@@ -1889,13 +1889,13 @@ def to_markdown(s: dict) -> str:
 IDENTITY_COLUMNS = ["run_id", "git_sha", "branch", "mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups",
                     "browser_version",
                     "gop_duration_ms", "ladder_id", "network_profile", "trace_id", "qdisc", "congestion_controller", "background_flows",
-                    "repeat_index", "timestamp_start"]
+                    "repeat_index", "duration_s", "timestamp_start"]
 METRIC_COLUMNS = ["startup_delay_ms", "catalog_wait_ms", "startup_after_catalog_ms", "run_duration_s", "stall_count", "stall_total_ms", "stall_blips", "media_skipped_ms", "wedge_skipped_ms",
                   "switch_count", "switch_up", "switch_down",
                   "switches_per_minute", "direction_reversals", "aba_reversals", "median_inter_switch_ms",
                   "cooldown_activations", "switch_delivery_latency_p50_ms", "switch_visibility_delay_p50_ms", "switch_visibility_delay_p95_ms",
                   "media_seam_gap_p50_ms", "seam_ahead_p50_ms", "seam_buffer_hole_p50_ms", "seam_dropped_frames_p50",
-                  "landed_on_group_start", "landed_on_keyframe", "landed_on_keyframe_known", "presented_switches", "superseded", "superseded_frac",
+                  "landed_on_group_start", "landed_on_keyframe", "landed_on_keyframe_known", "landed_on_keyframe_frac", "presented_switches", "superseded", "superseded_frac",
                   "open_switches", "failed_switches", "landed_behind_playhead", "abs_playback_jump_p95_ms", "viewer_pause_p95_ms",
                   "followed_within_window", "followed_by_latency_trend", "initial_live_edge_mean_ms",
                   "time_to_half_shift_ms", "half_shift_lost", "advancing_fraction", "longest_no_progress_ms", "longest_frozen_with_data_ms", "session_destroyed",
@@ -1958,6 +1958,9 @@ def agg_row(s: dict) -> dict:
         "landed_on_group_start": sw["landed_on_group_start"],
         "landed_on_keyframe": sw["landed_on_keyframe"],
         "landed_on_keyframe_known": sw["landed_on_keyframe_known"],
+        # The contract's headline is the per-run fraction; a ratio of two condition medians
+        # is not the median ratio (review 2026-10-07).
+        "landed_on_keyframe_frac": (sw["landed_on_keyframe"] / sw["landed_on_keyframe_known"]) if sw["landed_on_keyframe_known"] else None,
         "presented_switches": sw["presented"],
         "landed_behind_playhead": sw.get("landed_behind_playhead"),
         "superseded": sw["superseded"], "superseded_frac": sw["superseded_frac"],
@@ -2023,7 +2026,10 @@ def agg_row(s: dict) -> dict:
 # (2026-09-30); qdisc and the relay's congestion controller are factors of the 2026-10
 # grid (tail-drop vs fq_codel, cubic vs bbr).
 CONDITION_KEYS = ["mechanism", "mechanism_mode", "controller", "controller_params", "abr_overrides", "client_type", "delay_groups",
-                  "network_profile", "qdisc", "congestion_controller", "background_flows", "ladder_id"]
+                  "network_profile", "qdisc", "congestion_controller", "background_flows", "ladder_id",
+                  # A 60 s preflight run and a 200 s grid run on the same profile are not one
+                  # condition (review 2026-10-07).
+                  "duration_s"]
 
 
 def bootstrap_ci(values: list[float], iterations: int = 2000, seed: int = 1) -> tuple[float, float] | None:
@@ -2101,11 +2107,18 @@ def main() -> int:
     args = ap.parse_args()
     rows = []
     excluded = []
+    seen_runs: set[str] = set()
     for run in args.runs:
         if not run.is_dir():
             continue
         s = analyze(run, args.t1_tolerance, args.offset_tolerance, args.offset_hold,
                     args.initial_window, args.reversal_window, args.feedback_window, args.sustain)
+        # The same run given twice (overlapping globs, a bundle and its copy) counts once.
+        run_id = str(s.get("run_id") or run.name)
+        if run_id in seen_runs:
+            print(f"skipping {run}: run_id {run_id} already analyzed in this invocation")
+            continue
+        seen_runs.add(run_id)
         s["validity"] = read_validity(run)
         (run / "summary.json").write_text(json.dumps(s, indent=2, default=str))
         md = to_markdown(s)

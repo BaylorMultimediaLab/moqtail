@@ -32,15 +32,25 @@ Checks (each PASS / FAIL / SKIP / INFO with the numbers behind it):
                   <= client receipt of G
   playback        the measurement stayed interpretable: the playhead never stood
                   still longer than --max-freeze-s WHILE PLAYABLE DATA EXISTED (a
-                  player wedge), and the MoQ session was not destroyed by a failed
-                  switch. A freeze with nothing to play is starvation, an outcome
+                  player wedge), nor while the player DISCARDED a group or more of
+                  objects of its own current or pending track (a routing wedge,
+                  2026-10-07: grid2 native time-shifted r0/r1 dropped every target
+                  object as pre-landing for 125 s with nothing buffered), and the
+                  MoQ session was not destroyed by a failed switch. A freeze with
+                  nothing to play and nothing discarded is starvation, an outcome
                   of the system under test, and keeps the run valid however long
                   it lasts (the advancing fraction is reported, not judged)
   media-error     no media element error (MEDIA_ERROR): after one the decoder has
                   stopped and every append throws, so nothing later is a measurement
   clean-worktree  (--final only) the run was made from a committed tree
 
---preflight adds the apparatus invariants of docs/rebuild-2026-10-04.md ("Preflight"):
+--preflight adds the apparatus invariants of docs/rebuild-2026-10-04.md ("Preflight").
+Four of them key on outcomes of the system under test as much as on the apparatus
+(pf-keyframe, pf-behind, pf-terminal, pf-delivery-rate): on a grid run they are
+reported (INFO) and FAIL only with --strict-preflight, meant for the short preflight
+batches on experiments/profiles/preflight_step.json (2026-10-07; before that a grid run
+could be excluded for a pr1378 landing off a keyframe or a switch left open by
+starvation, against the validity rule).
 
   pf-keyframe       keyframe landings = 100 % (as-shipped native: reported, not asserted)
   pf-behind         landed_behind_playhead = 0
@@ -83,6 +93,7 @@ Exit status 1 if any check fails.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import statistics
 import sys
@@ -275,6 +286,36 @@ def delivery_rate(applied: list[dict], tput: list[dict], probes: list[dict] | No
     return bad == 0, "; ".join(parts)
 
 
+WEDGE_DISCARD_OBJECTS = 24  # one group of the Tears of Steel cache (24 objects): a freeze during which the player
+                            # threw away at least this many objects of its own track is a routing wedge
+
+
+def frozen_discards(recs: list[dict], max_freeze_ms: float) -> dict:
+    """The stretch without playhead progress longer than ``max_freeze_ms`` during which the
+    player discarded the most objects of a track it was supposed to play: DROP_STALE records
+    whose ``track`` is the record's own ``pending`` or ``current`` track (the pending switch
+    target dropped as ``pre-landing``, or the current track dropped as stale). Starvation
+    discards nothing, so it scores 0; a routing wedge (2026-10-07) scores a group or more.
+    Returns ``{"freeze_ms", "discarded", "start_ts", "end_ts"}``."""
+    samples = sorted((r for r in recs if r.get("event") == "SAMPLE" and r.get("playhead_ms") is not None), key=lambda r: r["ts"])
+    drops = sorted((r["ts"] for r in recs if r.get("event") == "DROP_STALE" and r.get("track") is not None
+                    and r["track"] in (r.get("pending"), r.get("current"))))
+    best = {"freeze_ms": 0.0, "discarded": 0, "start_ts": None, "end_ts": None}
+    start = None
+    for a, b in zip(samples, samples[1:]):
+        if b["playhead_ms"] > a["playhead_ms"] + 1:
+            start = None
+            continue
+        start = a["ts"] if start is None else start
+        if b["ts"] - start > max_freeze_ms:
+            lo = bisect.bisect_left(drops, start)
+            hi = bisect.bisect_right(drops, b["ts"])
+            n = hi - lo
+            if n > best["discarded"] or (n == best["discarded"] and b["ts"] - start > best["freeze_ms"]):
+                best = {"freeze_ms": b["ts"] - start, "discarded": n, "start_ts": start, "end_ts": b["ts"]}
+    return best
+
+
 class Report:
     def __init__(self) -> None:
         self.rows: list[tuple[str, str, str]] = []
@@ -327,6 +368,9 @@ def main() -> int:
     ap.add_argument("--final", action="store_true",
                     help="paper-quality gate: also require a clean git worktree at run time")
     ap.add_argument("--preflight", action="store_true", help="also assert the apparatus invariants (see above)")
+    ap.add_argument("--strict-preflight", action="store_true",
+                    help="with --preflight: pf-keyframe, pf-behind, pf-terminal and pf-delivery-rate may FAIL "
+                         "(preflight batches only; on a grid run they are reported)")
     ap.add_argument("--no-write", action="store_true", help="do not write validation.json into the run directory")
     args = ap.parse_args()
 
@@ -516,11 +560,20 @@ def main() -> int:
     if wedged is None:  # summary from an older analyzer: fall back to the raw freeze length
         wedged = longest
     destroyed = summary.get("switches", {}).get("session_destroyed")
-    ok = frac is not None and wedged <= args.max_freeze_s * 1000 and not destroyed
+    # A freeze during which the player threw away objects of its own track (the pending
+    # target as 'pre-landing', the current track as stale) is a routing wedge: data the
+    # system under test delivered was not measured. Nothing is buffered in that state, so
+    # the frozen-with-data rule above cannot see it (2026-10-07).
+    fd = frozen_discards(recs, args.max_freeze_s * 1000)
+    routing_wedge = fd["discarded"] >= WEDGE_DISCARD_OBJECTS
+    ok = frac is not None and wedged <= args.max_freeze_s * 1000 and not destroyed and not routing_wedge
     starved = (summary.get("starvation") or {}).get("raw_total_ms") or 0
     rep.add("playback", ok, f"playhead advancing in {fmt_pct(frac)} of sample intervals (reported, not judged); longest no-progress "
                             f"{longest / 1000:.1f} s, of which frozen with playable data {wedged / 1000:.1f} s (max {args.max_freeze_s:g}: "
-                            f"a player wedge is an apparatus failure, starvation is an outcome); session destroyed={destroyed}; "
+                            f"a player wedge is an apparatus failure, starvation is an outcome); objects of its own track discarded "
+                            f"during a freeze > {args.max_freeze_s:g} s: {fd['discarded']}"
+                            + (f" over {fd['freeze_ms'] / 1000:.1f} s" if fd["start_ts"] is not None else "")
+                            + f" (>= {WEDGE_DISCARD_OBJECTS} = a routing wedge); session destroyed={destroyed}; "
                             f"data starved {starved / 1000:.1f} s (raw episodes from the last append)")
     # A media element error (MEDIA_ERR_DECODE and the like) ends playback for the rest of
     # the run: every later append throws InvalidStateError, so the player can no longer
@@ -541,6 +594,16 @@ def main() -> int:
 
     # preflight ----------------------------------------------------------------
     if args.preflight:
+        # Outcome-sensitive invariants: on the preflight profile a correct apparatus meets
+        # them, but a grid run can miss them because of the system under test (a pr1378
+        # landing off a keyframe, a switch left open by starvation, a connection delivering
+        # below the link). They fail a run only with --strict-preflight (2026-10-07).
+        def pf(name: str, ok: bool | None, detail: str) -> None:
+            if args.strict_preflight or ok is None:
+                rep.add(name, ok, detail)
+            else:
+                rep.info(name, detail + ("" if ok else " [would FAIL with --strict-preflight]"))
+
         mode = identity.get("mechanism_mode") or summary.get("mechanism_mode")
         as_shipped_native = mech == "native" and not mode
         known = sw_block.get("landed_on_keyframe_known") or 0
@@ -551,9 +614,9 @@ def main() -> int:
         elif as_shipped_native:
             rep.info("pf-keyframe", detail + " (as-shipped native: reported, not asserted)")
         else:
-            rep.add("pf-keyframe", kf == known, detail + " (required 100 %)")
+            pf("pf-keyframe", kf == known, detail + " (required 100 %)")
         behind = sw_block.get("landed_behind_playhead") or 0
-        rep.add("pf-behind", behind == 0, f"landed_behind_playhead={behind} (required 0)")
+        pf("pf-behind", behind == 0, f"landed_behind_playhead={behind} (required 0)")
         below = landing_below_start(sw_block.get("list") or [])
         rep.add("pf-landing", not below,
                 f"switches whose first object is below the relay's start group: {len(below)}"
@@ -566,8 +629,8 @@ def main() -> int:
         # With switch_seq the client emits SWITCH_SUPERSEDED; an inferred terminal then means a
         # record is missing. Old bundles (fallback join) have only inferred superseded switches.
         inferred = [sw for sw in switches if sw.get("terminal_source") == "inferred"] if join.get("seq_join") else []
-        rep.add("pf-terminal", one_each and not open_late and not inferred and not join.get("conflicting_terminals")
-                and not unjoined and not join.get("duplicates"),
+        pf("pf-terminal", one_each and not open_late and not inferred and not join.get("conflicting_terminals")
+           and not unjoined and not join.get("duplicates"),
                 f"terminals={terms}; open switches sent > {grace / 1000:g} s before the end={len(open_late)}; "
                 f"terminal inferred without a record (switch_seq bundles)={len(inferred)}; conflicting={join.get('conflicting_terminals')}; "
                 f"unjoined={unjoined or 'none'}; duplicates={join.get('duplicates') or 'none'}")
@@ -645,7 +708,7 @@ def main() -> int:
         else:
             rep.add("pf-relay-gso", dpi <= 1.05, f"relay sent {dpi:.3f} UDP datagrams per I/O to the client (required <= 1.05: no GSO batches)")
         est_ok, est_detail = delivery_rate(applied, list(by("THROUGHPUT_SAMPLE")), list(by("PROBE")), client_end)
-        rep.add("pf-delivery-rate", est_ok, est_detail)
+        pf("pf-delivery-rate", est_ok, est_detail)
         steps = [p for p in (summary.get("link") or {}).get("probe_measured_per_step", []) if p.get("rate_mbps") is not None and p["rate_mbps"] <= 1.5]
         if steps:
             low = min(steps, key=lambda p: p["rate_mbps"])
@@ -661,7 +724,7 @@ def main() -> int:
         summary["validity"] = {"valid": not rep.failed, "reasons": failed, "final": args.final, "aborted": aborted}
         (args.run / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         (args.run / "validation.json").write_text(json.dumps({
-            "passed": not rep.failed, "final": args.final, "preflight": args.preflight,
+            "passed": not rep.failed, "final": args.final, "preflight": args.preflight, "strict_preflight": args.strict_preflight,
             "failed": failed,
             "checks": [{"name": r[0], "status": r[1], "detail": r[2]} for r in rep.rows],
             "gop_tolerance": args.gop_tolerance, "clock_tolerance_ms": args.clock_tolerance_ms,
