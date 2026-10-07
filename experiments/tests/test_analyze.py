@@ -68,15 +68,17 @@ def runner(event: str, ts: float, **fields) -> dict:
     return rec
 
 
-def samples(start: float, end: float, track_at, playhead_at=None, presented_at=None, step: float = 250.0) -> list[dict]:
+def samples(start: float, end: float, track_at, playhead_at=None, presented_at=None, step: float = 250.0,
+            buffer_at=None) -> list[dict]:
     """SAMPLE every `step` ms; `track_at(t)` gives the subscribed track, `playhead_at(t)` the
-    playhead (default: advancing with wall time), `presented_at(t)` SAMPLE.presented_track."""
+    playhead (default: advancing with wall time), `presented_at(t)` SAMPLE.presented_track,
+    `buffer_at(t)` SAMPLE.buffer_s (default 5.0)."""
     out = []
     t = start
     while t <= end:
         tr = track_at(t)
         rec = ev("SAMPLE", t, track=tr, bitrate_kbps=next(x["bitrate"] for x in LADDER if x["track"] == tr) / 1000,
-                 playhead_ms=(playhead_at(t) if playhead_at else (t - T0)), buffer_s=5.0,
+                 playhead_ms=(playhead_at(t) if playhead_at else (t - T0)), buffer_s=(buffer_at(t) if buffer_at else 5.0),
                  live_edge_distance_ms=10_000.0, time_shift_error_ms=0.0)
         if presented_at is not None:
             rec["presented_track"] = presented_at(t)
@@ -900,14 +902,14 @@ class ValidateScript(TmpRun):
                      superseded_record: bool = True, validation: dict | None = None, mechanism_mode: str | None = None,
                      rates: tuple = (6, 1.5), net_fields: dict | None = None, meta_extra: dict | None = None,
                      extra_client: list[dict] | None = None, identity_extra: dict | None = None,
-                     client_meta_extra: dict | None = None) -> Path:
+                     client_meta_extra: dict | None = None, playhead_at=None, buffer_at=None) -> Path:
         A, B = R[0], R[4]
         client = startup(A) + [ev("CLOCK_MAP", T0 - 1100, user_agent="Mozilla/5.0 Firefox/157.0")]
         client += switch(1, T0 + 1000, A, B, with_seq=with_seq) + switch(2, T0 + 2000, B, A, with_seq=with_seq)
         client.append(first_frame(T0 + 4000, B, A, vis_ms=2000.0, seq=2 if with_seq else None))
         if with_seq and superseded_record:
             client.append(ev("SWITCH_SUPERSEDED", T0 + 2500, switch_seq=1, by_switch_seq=2, playhead_ms=2500))
-        client += samples(T0, T0 + 60_000, lambda t: A)
+        client += samples(T0, T0 + 60_000, lambda t: A, playhead_at=playhead_at, buffer_at=buffer_at)
         client += extra_client or []
         runner_recs = [runner("NET_CHANGE", T0 - 5000, rate_mbps=rates[0], at_s=0, applied=True, **(net_fields or {})),
                        runner("NET_CHANGE", T0 + 30_000, rate_mbps=rates[1], at_s=30, applied=applied, **(net_fields or {}))]
@@ -955,6 +957,61 @@ class ValidateScript(TmpRun):
     def test_aborted_marker_fails(self):
         code, st = self.validate(self.complete_run(validation={"passed": False, "failed": ["aborted"]}))
         self.assertEqual((code, st["aborted"]), (1, "FAIL"))
+
+    # Review 2026-10-07 (grid2 native time-shifted r0/r1): the player dropped every object of
+    # its pending target as 'pre-landing' for 125 s with nothing buffered. The frozen-with-data
+    # rule saw starvation (PASS); the run was excluded by relay-stamps / pf-terminal instead.
+    def _frozen(self, drops: int, track: str) -> Path:
+        A, B = R[0], R[4]
+        ph = lambda t: (t - T0) if (t - T0) < 20_000 else (20_000.0 if (t - T0) < 35_000 else (t - T0) - 15_000)  # noqa: E731
+        bf = lambda t: 0.0 if 20_000 <= (t - T0) < 35_000 else 5.0  # noqa: E731
+        extra = [ev("DROP_STALE", T0 + 25_000 + i * 100, track=track, current=A, pending=B, group=50 + i // 24,
+                    object=i % 24, bytes=5000, reason="pre-landing") for i in range(drops)]
+        return self.complete_run(playhead_at=ph, buffer_at=bf, extra_client=extra)
+
+    def test_playback_keeps_a_starvation_freeze_valid(self):
+        _, st = self.validate(self._frozen(0, R[4]))
+        self.assertEqual(st["playback"], "PASS")
+
+    def test_playback_fails_a_freeze_during_which_own_objects_were_discarded(self):
+        code, st = self.validate(self._frozen(30, R[4]))          # a group or more of the pending target
+        self.assertEqual((code, st["playback"]), (1, "FAIL"))      # before the fix: PASS
+        _, st = self.validate(self._frozen(30, R[2]))             # a track it was not waiting for: stale, not a wedge
+        self.assertEqual(st["playback"], "PASS")
+
+    def test_frozen_discards_helper(self):
+        import validate as v
+        recs = [ev("SAMPLE", T0 + i * 250, playhead_ms=(0 if i < 60 else i * 250)) for i in range(100)]
+        recs += [ev("DROP_STALE", T0 + 5_000 + i, track="x", pending="x") for i in range(10)]
+        recs += [ev("DROP_STALE", T0 + 5_000 + i, track="y", pending="x", current="z") for i in range(5)]
+        fd = v.frozen_discards(recs, 10_000)
+        self.assertEqual(fd["discarded"], 10)
+        self.assertGreater(fd["freeze_ms"], 10_000)
+        self.assertEqual(v.frozen_discards(recs, 20_000)["discarded"], 0)
+
+    def test_outcome_sensitive_preflight_checks_are_reported_unless_strict(self):
+        # An open switch (sent 50 s before the end, never landed) is what starvation after a
+        # SWITCH looks like: pf-terminal must not exclude a grid run for it.
+        A, B = R[0], R[4]
+        open_sw = switch(3, T0 + 10_000, A, B, land_after_ms=None)
+        _, st = self.validate(self.complete_run(extra_client=open_sw), "--preflight")
+        self.assertEqual(st["pf-terminal"], "INFO")                # before the fix: FAIL
+        self.assertEqual(st["pf-behind"], "INFO")
+        code, st = self.validate(self.complete_run(extra_client=open_sw), "--preflight", "--strict-preflight")
+        self.assertEqual((code, st["pf-terminal"]), (1, "FAIL"))
+
+    def test_keyframe_fraction_and_duration_in_the_aggregate(self):
+        s = analyze.analyze(self.complete_run())
+        s["validity"] = {"valid": True}
+        row = analyze.agg_row(s)
+        self.assertEqual(row["landed_on_keyframe_frac"], 1.0)
+        self.assertEqual(row["duration_s"], 60.0)
+        other = dict(row, duration_s=200.0, run_id="other")
+        self.assertEqual(len(analyze.condition_stats([row, other])), 2)   # before the fix: 1
+        self.assertIn("landed_on_keyframe_frac_median", analyze.condition_stats([row])[0])
+        s2 = json.loads(json.dumps(s))
+        s2["identity"]["duration_s"] = 200.0
+        self.assertNotEqual(compare.cond_key(s), compare.cond_key(s2))
 
     def test_missing_run_end_fails(self):
         code, st = self.validate(self.complete_run(run_end=False))
@@ -1055,17 +1112,23 @@ class ValidateScript(TmpRun):
     def test_preflight_keyframe_counts_landings_superseded_before_append(self):
         # D3: the off-keyframe landing has no SWITCH_APPLIED; pf-keyframe passed (2 of 2) before the fix.
         extra = landed_off_keyframe_then_superseded(3, T0 + 5000, R[0], R[4], by=4) + switch(4, T0 + 5500, R[0], R[2], with_seq=True)
-        _, st = self.validate(self.complete_run(with_seq=True, mechanism_mode="forward-trigger", extra_client=extra), "--preflight")
+        run = self.complete_run(with_seq=True, mechanism_mode="forward-trigger", extra_client=extra)
+        _, st = self.validate(run, "--preflight", "--strict-preflight")
         self.assertEqual(st["pf-keyframe"], "FAIL")
+        _, st = self.validate(run, "--preflight")
+        self.assertEqual(st["pf-keyframe"], "INFO")     # 2026-10-07: reported on a grid run, never an exclusion
 
     def test_preflight_requires_superseded_records_with_switch_seq(self):
-        _, st = self.validate(self.complete_run(with_seq=True), "--preflight")
+        # pf-terminal and pf-keyframe assert only with --strict-preflight (2026-10-07).
+        _, st = self.validate(self.complete_run(with_seq=True), "--preflight", "--strict-preflight")
         self.assertEqual(st["pf-terminal"], "PASS")
         self.assertEqual(st["pf-keyframe"], "INFO")      # as-shipped native: reported, not asserted
         self.assertEqual(st["pf-relay-cc"], "FAIL")      # no RELAY_CONFIG record
-        _, st = self.validate(self.complete_run(with_seq=True, superseded_record=False), "--preflight")
+        _, st = self.validate(self.complete_run(with_seq=True, superseded_record=False), "--preflight", "--strict-preflight")
         self.assertEqual(st["pf-terminal"], "FAIL")
-        _, st = self.validate(self.complete_run(with_seq=True, mechanism_mode="forward-trigger"), "--preflight")
+        _, st = self.validate(self.complete_run(with_seq=True, superseded_record=False), "--preflight")
+        self.assertEqual(st["pf-terminal"], "INFO")
+        _, st = self.validate(self.complete_run(with_seq=True, mechanism_mode="forward-trigger"), "--preflight", "--strict-preflight")
         self.assertEqual(st["pf-keyframe"], "PASS")
 
 

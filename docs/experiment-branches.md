@@ -5,13 +5,13 @@ edge) and a **live-edge** client behave under ABR switching, for three track
 switching mechanisms. Each mechanism has its own branch; everything they share
 lives on `harness`.
 
-| Branch          | Base                               | Switching mechanism                                                   |
-| --------------- | ---------------------------------- | --------------------------------------------------------------------- |
-| `main`          | mirror of `moqtail/moqtail:main`   | none; kept in sync with upstream (`git pull --ff-only upstream main`) |
-| `harness`       | `main` at tag `base/2026-09-03`    | none; the shared experiment layer (below)                             |
-| `switch/native` | `harness`                          | upstream moqtail's own SWITCH                                         |
-| `switch/pr1378` | `harness`                          | moq-transport PR #1378 (SWITCH message, G_switch, catch-up FETCH)     |
-| `switch/pr1674` | `harness` + upstream `switch-from` | moq-transport PR #1674 SWITCH_FROM (hard) and PR #1675 (soft)         |
+| Branch          | Base                               | Switching mechanism                                                                                       |
+| --------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `main`          | mirror of `moqtail/moqtail:main`   | none; kept in sync with upstream (`git pull --ff-only upstream main`)                                     |
+| `harness`       | `main` at tag `base/2026-09-03`    | none; the shared experiment layer (below)                                                                 |
+| `switch/native` | `harness`                          | upstream moqtail's own SWITCH                                                                             |
+| `switch/pr1378` | `harness`                          | moq-transport PR #1378 (SWITCH message, G_switch, catch-up FETCH); the PR is closed unmerged (2026-07-30) |
+| `switch/pr1674` | `harness` + upstream `switch-from` | moq-transport PR #1674 SWITCH_FROM (hard) and PR #1675 (soft)                                             |
 
 Pinned tags never move: `base/2026-09-03` (upstream main this layout was cut
 from), `upstream-switch-from/2026-09-12` (the switch-from snapshot merged into

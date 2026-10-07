@@ -2439,6 +2439,38 @@ export class Player {
       this.#options.onTrackSwitched?.(videoStruct.trackName, skippedSeq);
       return skippedSeq;
     }
+    // A SWITCH to the track a pending switch already targets is never sent
+    // (2026-10-07). The alias check above does not cover it: the library maps
+    // the switched request's alias at the header of the first target stream,
+    // which under a saturated link precedes the first object (the landing) by
+    // up to a second, and the controller re-fires the same target every tick
+    // once its guard has timed out. On native such a repeat is harmful: the
+    // relay finds the subscriber already on that track and answers SUBSCRIBE_OK
+    // without a new subscription or promotion, the library never maps the new
+    // request id (its alias is already routed), and #route then drops every
+    // target object as 'pre-landing' for the rest of the run (grid2 native
+    // time-shifted r0/r1: 125 s of starvation with full groups arriving). A
+    // different target still supersedes the pending switch as before. On this
+    // branch `switchInFlight` already covers an unanswered SWITCH; this closes
+    // the same window after SWITCH_OK, so both arms run the same rule.
+    const pendingSame = videoStruct.pendingSwitch;
+    if (pendingSame && pendingSame.trackName === trackName) {
+      logger.warn(
+        'media',
+        `switchTrack: a switch to ${trackName} is already pending; skipping the repeat`,
+      );
+      const skippedSeq = this.#seams.allocateSeq();
+      this.#lastSwitchSeq = skippedSeq;
+      events.emit('SWITCH_SKIPPED', {
+        switch_seq: skippedSeq,
+        from: videoStruct.trackName,
+        to: trackName,
+        reason: 'same target pending',
+        pending_request_id: subscriptionRequestId,
+      });
+      this.#options.onTrackSwitched?.(videoStruct.trackName, skippedSeq);
+      return skippedSeq;
+    }
 
     // The floor (Minimum Switching Group ID). Buffer-aware: the highest group
     // completely buffered ahead of the playhead, so the switch never
