@@ -1303,6 +1303,78 @@ bash experiments/pack_results.sh results grid.tar.gz
 tar czf grid-relay-logs.tar.gz results/*/relay.log
 ```
 
+### 11l. Grid 2 reviewed; the same-target skip; grid 3 (2026-10-07)
+
+Grid 2 (`results-linux-2026-10-05/grid2`, 18 of 20 PASS) was reviewed three
+ways before anything was read from it: the as-shipped native path against the
+upstream base, `switch/pr1378` against the text of PR #1378, and the analyzer
+against the raw logs (every number of the grid-2 tables reproduced from an
+independent script; contract, "Amendments of 2026-10-07"). The two invalid runs
+(native time-shifted r0, r1) were a player wedge: after the capacity drop the
+controller re-fired the pending 1080p -> 720p decision once its guard timed
+out, and the player let a second SWITCH to the same target through in the
+half second between the library mapping the alias (first target stream header)
+and the first object landing; the upstream relay answered it without a new
+subscription, the new request id was never mapped, and every 720p object was
+dropped as pre-landing for 125 s. The fix is on every arm: the player never
+sends a SWITCH to the target a pending switch already asked for
+(`SWITCH_SKIPPED{same target pending}`). The validator now catches that class
+(`playback`: a freeze during which the player discarded a group of its own
+track's objects) and no longer lets the four outcome-sensitive preflight checks
+fail a grid run (`--strict-preflight` arms them for preflight batches).
+
+Two facts for the paper: upstream removed the SWITCH control message on
+2026-10-06 (switch-from replaced it), so native is "as shipped through
+2026-10-05"; and PR #1378 is closed unmerged, so pr1378 implements a proposal.
+
+The tags are `freeze/2026-10-07/{harness,native,pr1378}`. Grid 3 is grid 2
+again from them, same commands as 11k with the tag changed (about 1 h 30 min):
+
+```sh
+pkill -f run_experiment.py; pkill -f target/release/relay; pkill -f target/release/publisher; pkill -f firefox; pkill -f vite
+sudo ip netns del moqc 2>/dev/null; sudo ip link del veth-moqh 2>/dev/null; true
+cd ~/Documents/Baylor\ Research/moqtail
+mv results results-grid2-$(date +%Y%m%d) 2>/dev/null; mkdir -p results logs
+git fetch origin --tags
+export ENC=data/encoded/tears_of_steel_240s_1080p
+python3 scripts/check_cache.py "$ENC" | tail -1          # must say OK
+
+grid() {  # $1 profile (default step_down_up), $2 repetitions (default 5), $3 duration (default 200)
+  local profile=${1:-step_down_up} reps=${2:-5} dur=${3:-200}
+  for rep in $(seq 0 $((reps - 1))); do
+    for arm in native pr1378; do
+      case $arm in
+        native) branch=switch/native; mech="--mechanism native" ;;
+        pr1378) branch=switch/pr1378; mech="--mechanism pr1378 --mechanism-mode next-group" ;;
+      esac
+      git checkout -q -B $branch freeze/2026-10-07/${branch#switch/}
+      for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+        sudo -v
+        python3 experiments/run_experiment.py $mech $client \
+            --profile experiments/profiles/$profile.json --duration $dur \
+            --net netns --encoded-dir "$ENC" --repeat-index $rep --preflight --final
+      done
+    done
+  done
+}
+grid step_down_up 5 200
+
+python3 - <<'PY'
+import json, pathlib
+for v in sorted(pathlib.Path("results").glob("*/validation.json")):
+    d = json.loads(v.read_text())
+    print(("PASS " if d.get("passed") else "FAIL ") + v.parent.name, "" if d.get("passed") else d.get("failed"))
+PY
+bash experiments/pack_results.sh results grid3.tar.gz
+tar czf grid3-relay-logs.tar.gz results/*/relay.log
+```
+
+What to expect: 20 of 20 PASS; native time-shifted now lands its slow post-drop
+switches instead of wedging (a `SWITCH_SKIPPED{same target pending}` burst where
+r0/r1 used to send the repeat); no `WEDGE_UNHANDLED`. A run that still fails
+`playback` with "discarded ... (>= 24 = a routing wedge)" is a new apparatus
+defect, not an outcome: send it.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

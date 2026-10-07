@@ -167,7 +167,10 @@ def cond_key(s: dict) -> str:
     qdisc = i.get("qdisc") or s.get("qdisc") or "?"
     cc = i.get("congestion_controller") or s.get("congestion_controller") or "bbr"
     profile = i.get("network_profile") or s.get("profile")
-    return f"{mech}\n{ct or ''}\n{profile}{' bg' + str(bg) if bg else ''} {qdisc} {cc}\nctl {ctl}"
+    # Runs of different configured length are not one condition (review 2026-10-07).
+    dur = i.get("duration_s") or s.get("duration_s")
+    dur_s = f" {dur:g} s" if isinstance(dur, (int, float)) else ""
+    return f"{mech}\n{ct or ''}\n{profile}{' bg' + str(bg) if bg else ''} {qdisc} {cc}{dur_s}\nctl {ctl}"
 
 
 def cell(kind: str, values: list, width: int) -> str:
@@ -203,11 +206,16 @@ def main() -> int:
     ap.add_argument("--headline-only", action="store_true", help="omit the diagnostics block")
     args = ap.parse_args()
     groups: dict[str, list[dict]] = {}
+    seen_runs: set[str] = set()
     for r in args.runs:
         p = r / "summary.json"
         if not p.exists():
             continue
         s = json.loads(p.read_text())
+        run_id = str(s.get("run_id") or r.name)
+        if run_id in seen_runs:  # the same run given twice counts once
+            continue
+        seen_runs.add(run_id)
         if not is_valid(s.get("validity")) and not args.all:
             continue
         groups.setdefault(cond_key(s), []).append(s)

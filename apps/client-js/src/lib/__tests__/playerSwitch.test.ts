@@ -248,3 +248,53 @@ describe('Player.switchTrack: late objects of an earlier subscription to the tar
     expect(player.routeVideoObject('360p', 0n)).toBe('current');
   });
 });
+
+/**
+ * Grid 2 (2026-10-06, native time-shifted r0/r1): after the capacity drop the
+ * controller's guard timed out and re-decided the pending target every tick; the
+ * library mapped the pending request's alias at the header of the first target
+ * stream, about half a second before its first object, so the "previous switch
+ * not landed" skip let a second SWITCH to the same track through. The relay
+ * answered it without a new subscription, the new request id was never mapped,
+ * and every target object was dropped as pre-landing until the run ended.
+ */
+describe('Player.switchTrack: a repeat SWITCH to the pending target (2026-10-07)', () => {
+  let emitted: Emitted;
+  beforeEach(() => {
+    emitted = [];
+    vi.spyOn(events, 'emit').mockImplementation((e, f) => {
+      emitted.push([e, (f ?? {}) as Record<string, unknown>]);
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('is skipped even once the alias is mapped, while a different target still supersedes', async () => {
+    const env: { aliasMap?: Map<bigint, bigint> } = {};
+    const made = await makePlayer({
+      switchResult: async req => {
+        // SWITCH_OK processed and the first target stream's header seen: the
+        // library mapped the alias, but no object has landed the switch yet.
+        env.aliasMap!.set(req.requestId, 8n);
+        return { requestId: req.requestId };
+      },
+    });
+    env.aliasMap = made.aliasMap;
+    await made.player.switchTrack('720p');
+    expect(made.client.switch).toHaveBeenCalledTimes(1);
+    expect(made.player.hasSwitchInFlight()).toBe(true);
+
+    const seq = await made.player.switchTrack('720p');
+    expect(made.client.switch).toHaveBeenCalledTimes(1);
+    const skipped = emitted.filter(([e]) => e === 'SWITCH_SKIPPED');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]![1]).toMatchObject({
+      switch_seq: seq,
+      to: '720p',
+      reason: 'same target pending',
+    });
+    expect(made.callbacks.at(-1)).toEqual(['360p', seq]);
+
+    await made.player.switchTrack('480p');
+    expect(made.client.switch).toHaveBeenCalledTimes(2);
+  });
+});
