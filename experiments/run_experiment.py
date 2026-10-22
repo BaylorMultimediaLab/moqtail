@@ -123,7 +123,25 @@ CONTROLLER_KNOBS = {
     # (1.2 Mbps of probe on a 1.5 Mbps link, 0.9 s standing delay). Off, or capped.
     "grid-noprobe": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60, "probeMode": "off"},
     "grid-probe64k": {"latencyResetOnLanding": 1, "bufferSignal": "envelope", "switchHistoryMode": "veto", "switchHistoryWindowS": 60, "probeMaxBytes": 65536},
+    # Rule-set ablation of the min arm (docs/abr-controller.md 0.7, 2026-10-21): the min
+    # arbiter, gates and pins with a different rule set (player URL `rules=`). min =
+    # ThroughputRule + EmergencyBufferRule + SwitchHistoryRule (veto).
+    "min-t": {"rules": "ThroughputRule"},
+    "min-bola": {"rules": "BolaRule"},
+    "min-t-bola": {"rules": "ThroughputRule,BolaRule"},
+    "min-sh": {"rules": "SwitchHistoryRule"},
+    "min-ib": {"rules": "InsufficientBufferRule"},
+    "min-t-ib-sh": {"rules": "ThroughputRule,InsufficientBufferRule,SwitchHistoryRule"},
+    "min-t-eb": {"rules": "ThroughputRule,EmergencyBufferRule"},
+    "min-t-sh": {"rules": "ThroughputRule,SwitchHistoryRule"},
 }
+# Rule names the player's RULE_ORDER knows (apps/client-js/src/lib/abr/types.ts).
+RULE_NAMES = ("ThroughputRule", "BolaRule", "ProbeRule", "InsufficientBufferRule", "BufferDrainRateRule",
+              "LatencyTrendRule", "SwitchHistoryRule", "DroppedFramesRule", "AbandonRequestsRule", "L2ARule",
+              "LoLPRule", "EmergencyBufferRule")
+for _arm, _knobs in CONTROLLER_KNOBS.items():
+    for _r in _knobs.get("rules", "").split(","):
+        assert not _r or _r in RULE_NAMES, f"arm {_arm}: unknown rule {_r}"
 
 
 def controller_family(arm: str) -> str:
@@ -131,6 +149,8 @@ def controller_family(arm: str) -> str:
     or baseline (the shipped controller and its ablation knobs)."""
     if arm in CONTROLLER_ARMS:
         return arm
+    if arm.startswith("min-"):
+        return "min"
     return "grid" if arm.startswith("grid-") else "baseline"
 
 
@@ -913,7 +933,8 @@ def main() -> int:
     ap.add_argument("--abr", default="", help="extra ABR URL params, e.g. 'stableBufferTime=8&bufferTimeDefault=8'")
     ap.add_argument("--controller", choices=list(CONTROLLER_PARAMS), default=DEFAULT_CONTROLLER,
                     help="ABR controller arm: min (the paper controller, default; one URL param "
-                         f"{CONTROLLER_ARM_PARAM}=min) | grid (the frozen pre-rebuild controller) | baseline (as shipped) "
+                         f"{CONTROLLER_ARM_PARAM}=min) | min-* (min with another rule set, docs/abr-controller.md 0.7) "
+                         "| grid (the frozen pre-rebuild controller) | baseline (as shipped) "
                          "| the ablation arms of docs/abr-controller.md 9; recorded in the identity block")
     ap.add_argument("--controller-param", action="append", metavar="KEY=VALUE",
                     help="override one controller URL parameter (grid/baseline knobs: probeMinBytes, probeMinDurationMs, "

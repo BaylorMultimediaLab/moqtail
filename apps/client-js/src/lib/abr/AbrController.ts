@@ -12,6 +12,7 @@ import {
   effectiveBufferEnvelopeMs,
   effectiveSegmentDurationS,
   resolveControllerSettings,
+  minBolaEngagement,
 } from './types';
 
 export interface AbrMetrics {
@@ -961,6 +962,20 @@ export class AbrController {
         events.emit('ABR_STRATEGY', { using_bola: false, buffer_s: bufferLevel });
       }
       this.#rulesCollection.setShouldUseBolaRule(false);
+      return;
+    }
+
+    // min arm, rule-set ablation (2026-10-21): BolaRule as the set's only climbing
+    // rule (no ThroughputRule) runs on every tick; there is nothing to toggle to.
+    if (
+      this.#settings.controller.arm === 'min' &&
+      minBolaEngagement(this.#settings.controller) === 'always'
+    ) {
+      if (!this.#usingBolaRule) {
+        this.#usingBolaRule = true;
+        events.emit('ABR_STRATEGY', { using_bola: true, buffer_s: bufferLevel });
+      }
+      this.#rulesCollection.setShouldUseBolaRule(true);
       return;
     }
 
