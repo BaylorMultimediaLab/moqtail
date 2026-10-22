@@ -9,6 +9,7 @@ import {
   SwitchRequestPriority,
   describeController,
   effectiveBufferEnvelopeMs,
+  minBolaEngagement,
   resolveControllerSettings,
 } from '../types';
 import type { AbrSettings, ControllerSettings, Track } from '../types';
@@ -943,5 +944,89 @@ describe('min arm: (l) ABR_DECISION and ABR_SWITCH_PHANTOM carry the switch_seq 
     h.land('720p');
     const decision = emit.mock.calls.find(c => c[0] === 'ABR_DECISION')![1];
     expect(decision).toMatchObject({ switch_seq: null });
+  });
+});
+
+/**
+ * Rule-set ablation of the min arm (2026-10-21): the same arbiter, gates and
+ * pins with a different rule set, so each rule's contribution can be isolated.
+ */
+describe('min arm: rule-set ablation (controller.ruleSet)', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('the default set is unchanged: exactly the three min rules, BOLA off', () => {
+    const d = describeController(minSettings());
+    expect(d.activeRules).toEqual(
+      RULE_ORDER.filter(n => (MIN_ARM_RULES as readonly string[]).includes(n)),
+    );
+    expect(d.bolaEngagement).toBe('off');
+  });
+
+  it('a set selects exactly those rules and keeps the pins', () => {
+    const r = resolveControllerSettings(minSettings({ ruleSet: ['ThroughputRule'] }));
+    for (const name of RULE_ORDER) {
+      expect(r.rules[name]?.active, name).toBe(name === 'ThroughputRule');
+    }
+    expect(r.rules['ThroughputRule']!.parameters['downToLowest']).toBe(1);
+    expect(r.controller.probeMode).toBe('off');
+    expect(r.controller.switchHistoryMode).toBe('veto');
+    expect(r.controller.upDwellGroups).toBe(3);
+    const d = describeController(
+      minSettings({ ruleSet: ['ThroughputRule', 'InsufficientBufferRule', 'SwitchHistoryRule'] }),
+    );
+    expect(d.activeRules).toEqual([
+      'ThroughputRule',
+      'InsufficientBufferRule',
+      'SwitchHistoryRule',
+    ]);
+    expect(d.rules['InsufficientBufferRule']).toBeDefined();
+  });
+
+  it('refuses an unknown rule name', () => {
+    expect(() =>
+      resolveControllerSettings(minSettings({ ruleSet: ['ThroughputRule', 'BolaRul'] })),
+    ).toThrow(/unknown rule/);
+  });
+
+  it('BolaRule alone engages on every tick; with ThroughputRule the DYNAMIC hysteresis decides', async () => {
+    const base = { ...DEFAULT_ABR_SETTINGS.controller, arm: 'min' as const };
+    expect(minBolaEngagement({ ...base, ruleSet: ['BolaRule'] })).toBe('always');
+    expect(minBolaEngagement({ ...base, ruleSet: ['ThroughputRule', 'BolaRule'] })).toBe('dynamic');
+    // ABR_STRATEGY is emitted whenever the engagement changes (ABR_TICK is throttled).
+    const strategy: Array<Record<string, unknown>> = [];
+    vi.spyOn(events, 'emit').mockImplementation((e, f) => {
+      if (e === 'ABR_STRATEGY') strategy.push((f ?? {}) as Record<string, unknown>);
+    });
+    const bola = harness(
+      { activeTrack: '360p', bandwidthBps: 10_000_000, bufferContigSeconds: 2 },
+      { settings: minSettings({ ruleSet: ['BolaRule'] }) },
+    );
+    await bola.tick();
+    expect(strategy).toEqual([{ using_bola: true, buffer_s: 2 }]); // engaged at once, 2 s of buffer
+    expect(bola.collection.isRuleActive('ThroughputRule')).toBe(false);
+    expect(bola.collection.isRuleActive('BolaRule')).toBe(true);
+    await bola.tick();
+    expect(strategy).toHaveLength(1); // and stays engaged
+
+    strategy.length = 0;
+    const dyn = harness(
+      { activeTrack: '360p', bandwidthBps: 10_000_000, bufferContigSeconds: 2 },
+      { settings: minSettings({ ruleSet: ['ThroughputRule', 'BolaRule'] }) },
+    );
+    await dyn.tick();
+    expect(strategy).toEqual([]); // below bufferTimeDefault: throughput decides
+    expect(dyn.switches()).toEqual(['1080p']);
+    dyn.land('1080p'); // the switching guard returns before the strategy update
+    await dyn.tick({ bufferContigSeconds: 20 });
+    expect(strategy).toEqual([{ using_bola: true, buffer_s: 20 }]);
+  });
+
+  it('SwitchHistoryRule alone never asks for anything (an empty history vetoes nothing)', async () => {
+    const h = harness(
+      { activeTrack: '360p', bandwidthBps: 10_000_000, bufferContigSeconds: 5 },
+      { settings: minSettings({ ruleSet: ['SwitchHistoryRule'] }) },
+    );
+    for (let i = 0; i < 5; i++) await h.tick();
+    expect(h.switches()).toEqual([]);
   });
 });

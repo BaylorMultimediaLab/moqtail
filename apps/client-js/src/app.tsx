@@ -243,6 +243,7 @@ function TrackGroup({
  *   ?logObjects=1    one OBJECT_RECV record per received frame
  *   ?relay=<url> ?namespace=<ns>  connection defaults
  *   ?controllerArm=min|grid|baseline  the ABR controller arm (abrSettings.controller.arm)
+ *   ?rules=ThroughputRule,BolaRule    min arm only: the rule set it runs (rule-set ablation)
  * Together with ?clientMode, ?timeShift and the ABR overrides below.
  */
 const truthyParam = (v: string | null) => v === '1' || v === 'true';
@@ -342,6 +343,15 @@ export function App() {
     // The controller arm; resolveControllerSettings derives the rest from it.
     const arm = controllerArmParam(params.get('controllerArm'));
     if (arm !== null) controller.arm = arm;
+    // min arm rule-set ablation: ?rules=ThroughputRule,BolaRule (names of
+    // RULE_ORDER; resolveControllerSettings refuses an unknown one).
+    const ruleList = params.get('rules');
+    if (ruleList !== null && ruleList.trim() !== '') {
+      controller.ruleSet = ruleList
+        .split(',')
+        .map(r => r.trim())
+        .filter(r => r !== '');
+    }
     const rules = { ...DEFAULT_ABR_SETTINGS.rules };
     if (controller.switchHistoryMode === 'off') {
       rules.SwitchHistoryRule = { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false };
