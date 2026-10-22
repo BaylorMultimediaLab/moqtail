@@ -108,6 +108,14 @@ export interface ControllerSettings {
    */
   ruleSet: readonly string[] | null;
   /**
+   * `min` arm with a rule set only: how SwitchHistoryRule runs, the arm's veto
+   * (default) or dash.js's eviction (`evict`), so that the two can be told apart
+   * (2026-10-22: arms `min-t-ib-sh`, `min-t-bola-sh`). The 60 s window applies
+   * to both. Ignored without a rule set (the paper controller pins the veto).
+   * URL `?historyMode=evict`.
+   */
+  ruleSetHistoryMode: 'veto' | 'evict';
+  /**
    * `min` arm: no up-switch until this many completed groups (throughput
    * samples) of the landed track have arrived since the last confirmed
    * landing (`ABR_GATED why = up-dwell`). Down-switches are never held. The
@@ -247,6 +255,7 @@ export function bufferEnvelope(
 export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
   arm: 'baseline',
   ruleSet: null,
+  ruleSetHistoryMode: 'veto',
   upDwellGroups: 3,
   historyIgnoreGroupsAfterLanding: 2,
   segmentDurationS: 1,
@@ -459,7 +468,12 @@ export function resolveControllerSettings(settings: AbrSettings): AbrSettings {
       probeMinDurationMs: 0,
       probeMaxBytes: 0,
       bufferSignal: 'envelope',
-      switchHistoryMode: 'veto',
+      // Pinned to the veto for the paper controller. A rule-set ablation arm may
+      // ask for dash.js's eviction instead (2026-10-22: `min-t-ib-sh`,
+      // `min-t-bola-sh`), so that eviction and veto can be told apart; the 60 s
+      // window below applies to both (dash.js's own rule has no time window).
+      switchHistoryMode:
+        controller.ruleSet !== null && controller.ruleSetHistoryMode === 'evict' ? 'evict' : 'veto',
       // The arm is defined with a bounded memory; 0 (unbounded) is not accepted.
       switchHistoryWindowS:
         controller.switchHistoryWindowS > 0 ? controller.switchHistoryWindowS : 60,

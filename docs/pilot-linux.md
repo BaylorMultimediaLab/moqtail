@@ -1381,15 +1381,17 @@ Grid 3 (`results-linux-2026-10-05/grid3`, 20 of 20, the paper's step_down_up
 data) ran the `min` controller: ThroughputRule, EmergencyBufferRule and
 SwitchHistoryRule (veto). To justify that set, the same arm runs with other
 sets and nothing else changed (abr-controller.md 0.7): runner arms `min-t`,
-`min-bola`, `min-t-bola`, `min-sh`, `min-ib`, `min-t-ib-sh`, and the two
-one-rule-out arms `min-t-eb` and `min-t-sh`. The mechanism code is byte-identical
-to `freeze/2026-10-07`; the tags for this batch are `freeze/2026-10-21/*`
-(client controller + runner arms only). `identity.controller` carries the arm
-name, so the runs pool per arm in `stats.csv`/`compare.py`.
+`min-bola`, `min-t-bola`, `min-ib`, `min-t-ib-sh`, `min-t-bola-sh`, and the two
+one-rule-out arms `min-t-eb` and `min-t-sh`. The two three-rule arms run
+SwitchHistoryRule as dash.js ships it (eviction); every other arm with the rule
+runs the min veto, so eviction and veto can be told apart. The mechanism code is
+byte-identical to `freeze/2026-10-07`; the tags for this batch are
+`freeze/2026-10-22/*` (client controller + runner arms only). `identity.controller`
+carries the arm name, so the runs pool per arm in `stats.csv`/`compare.py`.
 
 Repetitions: 3 per arm for the arms with a climbing rule (12 runs, about 55
-min each); 1 for `min-sh` and `min-bola`, which cannot climb by construction.
-Expect `min-t-bola` to equal `min-t` (BOLA never engages below 18 s of buffer).
+min each); 1 for `min-bola`, which cannot climb by construction. Expect
+`min-t-bola` to equal `min-t` (BOLA never engages below 18 s of buffer).
 
 The pinned certificate from 2026-10-07 expired on 2026-10-20: regenerate it
 first.
@@ -1410,7 +1412,7 @@ ablation() {  # $1 controller arm, $2 repetitions (default 3), $3 duration (defa
         native) branch=switch/native; mech="--mechanism native" ;;
         pr1378) branch=switch/pr1378; mech="--mechanism pr1378 --mechanism-mode next-group" ;;
       esac
-      git checkout -q -B $branch freeze/2026-10-21/${branch#switch/}
+      git checkout -q -B $branch freeze/2026-10-22/${branch#switch/}
       for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
         sudo -v
         python3 experiments/run_experiment.py $mech $client --controller $ctl \
@@ -1420,8 +1422,8 @@ ablation() {  # $1 controller arm, $2 repetitions (default 3), $3 duration (defa
     done
   done
 }
-for ctl in min-t min-t-eb min-t-sh min-ib min-t-ib-sh min-t-bola; do ablation $ctl 3; done
-for ctl in min-sh min-bola; do ablation $ctl 1; done
+for ctl in min-t min-t-eb min-t-sh min-ib min-t-ib-sh min-t-bola-sh min-t-bola; do ablation $ctl 3; done
+ablation min-bola 1
 
 python3 - <<'PY'
 import json, pathlib
