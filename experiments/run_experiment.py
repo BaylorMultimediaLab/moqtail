@@ -126,12 +126,15 @@ CONTROLLER_KNOBS = {
     # Rule-set ablation of the min arm (docs/abr-controller.md 0.7, 2026-10-21): the min
     # arbiter, gates and pins with a different rule set (player URL `rules=`). min =
     # ThroughputRule + EmergencyBufferRule + SwitchHistoryRule (veto).
+    # The two three-rule arms run SwitchHistoryRule as dash.js ships it (eviction), so that
+    # eviction and the min arm's veto can be told apart (2026-10-22); the 60 s window applies
+    # to both.
     "min-t": {"rules": "ThroughputRule"},
     "min-bola": {"rules": "BolaRule"},
     "min-t-bola": {"rules": "ThroughputRule,BolaRule"},
-    "min-sh": {"rules": "SwitchHistoryRule"},
     "min-ib": {"rules": "InsufficientBufferRule"},
-    "min-t-ib-sh": {"rules": "ThroughputRule,InsufficientBufferRule,SwitchHistoryRule"},
+    "min-t-ib-sh": {"rules": "ThroughputRule,InsufficientBufferRule,SwitchHistoryRule", "historyMode": "evict"},
+    "min-t-bola-sh": {"rules": "ThroughputRule,BolaRule,SwitchHistoryRule", "historyMode": "evict"},
     "min-t-eb": {"rules": "ThroughputRule,EmergencyBufferRule"},
     "min-t-sh": {"rules": "ThroughputRule,SwitchHistoryRule"},
 }

@@ -1021,6 +1021,35 @@ describe('min arm: rule-set ablation (controller.ruleSet)', () => {
     expect(strategy).toEqual([{ using_bola: true, buffer_s: 20 }]);
   });
 
+  it('a rule set may run SwitchHistoryRule as dash.js eviction; without a set the veto stays pinned', () => {
+    const trio = ['ThroughputRule', 'InsufficientBufferRule', 'SwitchHistoryRule'];
+    const evict = resolveControllerSettings(
+      minSettings({ ruleSet: trio, ruleSetHistoryMode: 'evict' }),
+    );
+    expect(evict.controller.switchHistoryMode).toBe('evict');
+    expect(evict.controller.switchHistoryWindowS).toBe(60); // the window applies to both modes
+    expect(
+      describeController(minSettings({ ruleSet: trio, ruleSetHistoryMode: 'evict' }))
+        .switchHistoryMode,
+    ).toBe('evict');
+    // Without the explicit request the veto stays, whatever the baseline field says.
+    expect(
+      resolveControllerSettings(minSettings({ ruleSet: trio })).controller.switchHistoryMode,
+    ).toBe('veto');
+    expect(
+      resolveControllerSettings(minSettings({ ruleSet: trio, switchHistoryMode: 'evict' }))
+        .controller.switchHistoryMode,
+    ).toBe('veto');
+    // Without a rule set the paper controller pins the veto.
+    expect(
+      resolveControllerSettings(minSettings({ ruleSetHistoryMode: 'evict' })).controller
+        .switchHistoryMode,
+    ).toBe('veto');
+    expect(describeController(minSettings({ ruleSetHistoryMode: 'evict' })).switchHistoryMode).toBe(
+      'veto',
+    );
+  });
+
   it('SwitchHistoryRule alone never asks for anything (an empty history vetoes nothing)', async () => {
     const h = harness(
       { activeTrack: '360p', bandwidthBps: 10_000_000, bufferContigSeconds: 5 },

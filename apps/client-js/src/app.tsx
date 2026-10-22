@@ -244,6 +244,7 @@ function TrackGroup({
  *   ?relay=<url> ?namespace=<ns>  connection defaults
  *   ?controllerArm=min|grid|baseline  the ABR controller arm (abrSettings.controller.arm)
  *   ?rules=ThroughputRule,BolaRule    min arm only: the rule set it runs (rule-set ablation)
+ *   ?historyMode=evict|veto           with ?rules: SwitchHistoryRule as dash.js eviction or the min veto
  * Together with ?clientMode, ?timeShift and the ABR overrides below.
  */
 const truthyParam = (v: string | null) => v === '1' || v === 'true';
@@ -352,6 +353,11 @@ export function App() {
         .map(r => r.trim())
         .filter(r => r !== '');
     }
+    // ?historyMode=evict: with a rule set, SwitchHistoryRule as dash.js eviction
+    // instead of the min veto.
+    const historyMode = params.get('historyMode');
+    if (historyMode === 'evict' || historyMode === 'veto')
+      controller.ruleSetHistoryMode = historyMode;
     const rules = { ...DEFAULT_ABR_SETTINGS.rules };
     if (controller.switchHistoryMode === 'off') {
       rules.SwitchHistoryRule = { ...DEFAULT_ABR_SETTINGS.rules.SwitchHistoryRule, active: false };
