@@ -99,6 +99,15 @@ export interface ControllerSettings {
   /** The rule set (see ControllerArm). The controller selects everything else from it when `min`. */
   arm: ControllerArm;
   /**
+   * `min` arm only (2026-10-21, rule-set ablation): the rules the arm runs,
+   * by name (RULE_ORDER); null = MIN_ARM_RULES. Everything else of the arm
+   * (arbiter, gates, pins, contiguous buffer) is unchanged, so an arm with a
+   * different set isolates the rule. BolaRule in the set without ThroughputRule
+   * engages BOLA on every tick; with ThroughputRule the dash.js DYNAMIC
+   * hysteresis decides (BOLA on at bufferTimeDefault). URL `?rules=A,B`.
+   */
+  ruleSet: readonly string[] | null;
+  /**
    * `min` arm: no up-switch until this many completed groups (throughput
    * samples) of the landed track have arrived since the last confirmed
    * landing (`ABR_GATED why = up-dwell`). Down-switches are never held. The
@@ -237,6 +246,7 @@ export function bufferEnvelope(
 
 export const DEFAULT_CONTROLLER_SETTINGS: ControllerSettings = {
   arm: 'baseline',
+  ruleSet: null,
   upDwellGroups: 3,
   historyIgnoreGroupsAfterLanding: 2,
   segmentDurationS: 1,
@@ -413,7 +423,12 @@ export function resolveControllerSettings(settings: AbrSettings): AbrSettings {
     return { ...settings, rules, controller };
   }
 
-  const minRules = new Set<string>(MIN_ARM_RULES);
+  const minRules = new Set<string>(controller.ruleSet ?? MIN_ARM_RULES);
+  for (const name of minRules) {
+    if (!(RULE_ORDER as readonly string[]).includes(name)) {
+      throw new Error(`min arm: unknown rule in ruleSet: ${name}`);
+    }
+  }
   const rules: Record<string, RuleConfig> = {};
   for (const [name, cfg] of Object.entries({ ...DEFAULT_ABR_SETTINGS.rules, ...settings.rules })) {
     rules[name] = { ...cfg, active: minRules.has(name) };
@@ -456,6 +471,17 @@ export function resolveControllerSettings(settings: AbrSettings): AbrSettings {
       latencyResetOnLanding: false,
     },
   };
+}
+
+/**
+ * How BOLA engages on the `min` arm (rule-set ablation): 'off' when BolaRule
+ * is not in the set, 'always' when it is the set's only climbing rule (no
+ * ThroughputRule), 'dynamic' (dash.js hysteresis on bufferTimeDefault) with both.
+ */
+export function minBolaEngagement(controller: ControllerSettings): 'off' | 'always' | 'dynamic' {
+  const set = new Set<string>(controller.ruleSet ?? MIN_ARM_RULES);
+  if (!set.has('BolaRule')) return 'off';
+  return set.has('ThroughputRule') ? 'dynamic' : 'always';
 }
 
 /** Group duration the rules see (ControllerSettings.segmentDurationS; 1 when not positive). */
@@ -525,6 +551,8 @@ export interface ControllerDescription {
   latencyTrendDeltaMs: number;
   bufferTimeDefault: number;
   stableBufferTime: number;
+  /** min arm: how BolaRule engages ('off' unless it is in the rule set). */
+  bolaEngagement: 'off' | 'always' | 'dynamic';
   /** Rules that run, in registration (tie-break) order. */
   activeRules: string[];
   /** Priority and parameters of every active rule. */
@@ -606,6 +634,7 @@ export function describeController(settings: AbrSettings): ControllerDescription
     latencyTrendThreshold: param('LatencyTrendRule', 'trendThreshold'),
     latencyTrendDeltaMs: param('LatencyTrendRule', 'trendDeltaMs'),
     bufferTimeDefault: r.bufferTimeDefault,
+    bolaEngagement: isMin ? minBolaEngagement(c) : rule('BolaRule').active ? 'dynamic' : 'off',
     stableBufferTime: r.stableBufferTime,
     activeRules,
     rules,

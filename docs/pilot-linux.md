@@ -1375,6 +1375,67 @@ r0/r1 used to send the repeat); no `WEDGE_UNHANDLED`. A run that still fails
 `playback` with "discarded ... (>= 24 = a routing wedge)" is a new apparatus
 defect, not an outcome: send it.
 
+### 11m. Controller rule-set ablation (2026-10-21)
+
+Grid 3 (`results-linux-2026-10-05/grid3`, 20 of 20, the paper's step_down_up
+data) ran the `min` controller: ThroughputRule, EmergencyBufferRule and
+SwitchHistoryRule (veto). To justify that set, the same arm runs with other
+sets and nothing else changed (abr-controller.md 0.7): runner arms `min-t`,
+`min-bola`, `min-t-bola`, `min-sh`, `min-ib`, `min-t-ib-sh`, and the two
+one-rule-out arms `min-t-eb` and `min-t-sh`. The mechanism code is byte-identical
+to `freeze/2026-10-07`; the tags for this batch are `freeze/2026-10-21/*`
+(client controller + runner arms only). `identity.controller` carries the arm
+name, so the runs pool per arm in `stats.csv`/`compare.py`.
+
+Repetitions: 3 per arm for the arms with a climbing rule (12 runs, about 55
+min each); 1 for `min-sh` and `min-bola`, which cannot climb by construction.
+Expect `min-t-bola` to equal `min-t` (BOLA never engages below 18 s of buffer).
+
+The pinned certificate from 2026-10-07 expired on 2026-10-20: regenerate it
+first.
+
+```sh
+cd ~/Documents/Baylor\ Research/moqtail
+./scripts/gen-dev-cert.sh && openssl x509 -in apps/relay/cert/cert.pem -noout -enddate
+mv results results-grid3-$(date +%Y%m%d) 2>/dev/null; mkdir -p results logs
+git fetch origin --tags
+export ENC=data/encoded/tears_of_steel_240s_1080p
+python3 scripts/check_cache.py "$ENC" | tail -1          # must say OK
+
+ablation() {  # $1 controller arm, $2 repetitions (default 3), $3 duration (default 200)
+  local ctl=$1 reps=${2:-3} dur=${3:-200}
+  for rep in $(seq 0 $((reps - 1))); do
+    for arm in native pr1378; do
+      case $arm in
+        native) branch=switch/native; mech="--mechanism native" ;;
+        pr1378) branch=switch/pr1378; mech="--mechanism pr1378 --mechanism-mode next-group" ;;
+      esac
+      git checkout -q -B $branch freeze/2026-10-21/${branch#switch/}
+      for client in "--client-mode live-edge" "--client-mode time-shifted --time-shift 10"; do
+        sudo -v
+        python3 experiments/run_experiment.py $mech $client --controller $ctl \
+            --profile experiments/profiles/step_down_up.json --duration $dur \
+            --net netns --encoded-dir "$ENC" --repeat-index $rep --preflight --final
+      done
+    done
+  done
+}
+for ctl in min-t min-t-eb min-t-sh min-ib min-t-ib-sh min-t-bola; do ablation $ctl 3; done
+for ctl in min-sh min-bola; do ablation $ctl 1; done
+
+python3 - <<'PY'
+import json, pathlib
+for v in sorted(pathlib.Path("results").glob("*/validation.json")):
+    d = json.loads(v.read_text())
+    print(("PASS " if d.get("passed") else "FAIL ") + v.parent.name, "" if d.get("passed") else d.get("failed"))
+PY
+bash experiments/pack_results.sh results ablation-rules.tar.gz
+tar czf ablation-rules-relay-logs.tar.gz results/*/relay.log
+```
+
+Read it with `compare.py` over `results/*` plus the grid-3 directory (the `min`
+column): one column per arm x client type x mechanism.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:

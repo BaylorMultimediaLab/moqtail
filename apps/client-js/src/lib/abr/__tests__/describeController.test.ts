@@ -53,6 +53,7 @@ describe('describeController', () => {
       latencyTrendDeltaMs: 100,
       bufferTimeDefault: 18,
       stableBufferTime: 18,
+      bolaEngagement: 'off',
       activeRules: ['ThroughputRule', 'SwitchHistoryRule', 'EmergencyBufferRule'],
       rules: {
         ThroughputRule: { priority: 0.5, parameters: { downToLowest: 1 } },

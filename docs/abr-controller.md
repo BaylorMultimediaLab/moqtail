@@ -298,6 +298,34 @@ What remains asymmetric, and is reported rather than tuned:
   `droppedFrames`, and `probeTrackBandwidth` returning `{bps, dtMs}` per the
   M18 contract in `ProbeManager.ts`.
 
+### 0.7 Rule-set ablation of `min` (2026-10-21)
+
+To justify the rule set, `min` can be run with another set and nothing else
+changed: `controller.ruleSet` (player URL `?rules=A,B`, runner arms `min-*`)
+replaces the three rules of 0.2 while the arbiter, the switching guard, slow
+start, the dwell, the contiguous buffer and every pin of 0.3 stay as they are.
+Rules keep their shipped parameters and priorities (section 5); only
+ThroughputRule carries the arm's `downToLowest`. BolaRule as the set's only
+climbing rule (no ThroughputRule) runs on every tick (`bolaEngagement:
+always` in RUN_META.controller); with ThroughputRule in the set the dash.js
+DYNAMIC hysteresis decides as in the shipped controller (`dynamic`: BOLA on at
+`bufferTimeDefault` = 18 s of buffer, off at 9 s).
+
+| runner arm    | rules                                                  | what to expect on these clients                                                                                                                                 |
+| ------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `min`         | Throughput + EmergencyBuffer + SwitchHistory (veto)    | the paper controller (grid 3)                                                                                                                                   |
+| `min-t`       | Throughput                                             | no emergency: at the drop the client waits for a complete group's sample before leaving 1080p (2.7 s at 1.5 Mbit/s); no veto against a repeated failed climb    |
+| `min-t-eb`    | Throughput + EmergencyBuffer                           | `min` without the veto                                                                                                                                          |
+| `min-t-sh`    | Throughput + SwitchHistory                             | `min` without the emergency                                                                                                                                     |
+| `min-bola`    | BOLA                                                   | BOLA alone, every tick; with 1 s (live-edge) or 10 s (time-shifted) of buffer its score keeps it on the low rungs: `MINIMUM_BUFFER_S` = 10, `bufferTime` = 18 s |
+| `min-t-bola`  | Throughput + BOLA (DYNAMIC)                            | BOLA engages only above 18 s of buffer, which neither client reaches: expected identical to `min-t` (that is the finding of 0.4)                                |
+| `min-sh`      | SwitchHistory                                          | never switches: the veto only caps climbs other rules ask for, and with no switches the history stays empty (stays on the startup rung for the whole run)       |
+| `min-ib`      | InsufficientBuffer                                     | dash.js's rule alone: up-votes to the highest rung under `0.7 x SWMA x buffer`, so it climbs on a 10 s client and is bound by ~1 s of buffer at the live edge   |
+| `min-t-ib-sh` | Throughput + InsufficientBuffer + SwitchHistory (veto) | the dash.js trio with the min arbiter: InsufficientBuffer's emergency half replaces EmergencyBufferRule and its admission binds per client type (M18)           |
+
+`min-sh` and `min-bola` are degenerate by construction (one repetition
+documents it); the informative arms are the ones with a climbing rule.
+
 ## 1. The loop
 
 ```
