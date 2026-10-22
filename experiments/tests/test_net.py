@@ -680,7 +680,7 @@ class Controller(unittest.TestCase):
 
     def test_min_rule_set_arms(self):
         # 2026-10-21: min-* arms are the min family with a rule set; the URL carries both.
-        for arm in ("min-t", "min-bola", "min-t-bola", "min-sh", "min-ib", "min-t-ib-sh", "min-t-eb", "min-t-sh"):
+        for arm in ("min-t", "min-bola", "min-t-bola", "min-ib", "min-t-ib-sh", "min-t-bola-sh", "min-t-eb", "min-t-sh"):
             with self.subTest(arm=arm):
                 self.assertEqual(rx.controller_family(arm), "min")
                 p = rx.controller_params(self._args(arm))
@@ -688,8 +688,12 @@ class Controller(unittest.TestCase):
                 for r in p["rules"].split(","):
                     self.assertIn(r, rx.RULE_NAMES)
         self.assertEqual(rx.controller_params(self._args("min-t-ib-sh")),
-                         {"controllerArm": "min", "rules": "ThroughputRule,InsufficientBufferRule,SwitchHistoryRule"})
+                         {"controllerArm": "min", "rules": "ThroughputRule,InsufficientBufferRule,SwitchHistoryRule",
+                          "historyMode": "evict"})
+        self.assertEqual(rx.controller_params(self._args("min-t-bola-sh"))["historyMode"], "evict")
+        self.assertNotIn("historyMode", rx.controller_params(self._args("min-t-sh")))   # the veto, as in min
         self.assertNotIn("rules", rx.controller_params(self._args("min")))
+        self.assertNotIn("min-sh", rx.CONTROLLER_KNOBS)
 
     def test_url_carries_controller_arm(self):
         # the exact query fragment the runner appends (run_once builds it the same way)
