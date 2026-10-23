@@ -328,7 +328,15 @@ DYNAMIC hysteresis decides as in the shipped controller (`dynamic`: BOLA on at
 | `min-t-ib-sh`   | Throughput + InsufficientBuffer + SwitchHistory (evict) | the dash.js trio with the min arbiter: InsufficientBuffer's emergency half replaces EmergencyBufferRule and its admission binds per client type (M18); eviction |
 | `min-t-bola-sh` | Throughput + BOLA (DYNAMIC) + SwitchHistory (evict)     | dash.js's default rule set with the min arbiter; BOLA stays inert below 18 s of buffer, so this is Throughput + eviction against `min-t-sh` (Throughput + veto) |
 
-`min-bola` is degenerate by construction (one repetition documents it; a
+Result of the batch (2026-10-23, pilot-linux.md 11m): the emergency rule is
+the component that costs the most at the live edge (4-6 emergencies per run on
+both mechanisms, half the switch rate without it, and on native a seam hole per
+extra switch: 6.2 s stalled under `min` against 1.3 s under `min-t-sh`); it is
+also the component that catches pr1378's drop early (0.4 s against 1.3 s). The
+veto is neutral to helpful; eviction and veto are equivalent at the live edge.
+Time-shifted, the emergency never fires and pr1378 is indifferent to the rule
+set, while native's retained shift falls with the switch rate. `min-bola` is
+degenerate by construction (one repetition documents it; a
 SwitchHistoryRule-only arm was dropped for the same reason: it can never
 switch). Eviction versus veto is read from `min-t-sh` against `min-t-bola-sh`,
 and from `min` against `min-t-ib-sh`, where InsufficientBuffer's emergency half

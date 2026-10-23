@@ -1438,6 +1438,27 @@ tar czf ablation-rules-relay-logs.tar.gz results/*/relay.log
 Read it with `compare.py` over `results/*` plus the grid-3 directory (the `min`
 column): one column per arm x client type x mechanism.
 
+Result (2026-10-23, `results-linux-2026-10-05/ablation-rules`, 88 of 88 PASS,
+every arm's rule set confirmed in RUN_META.controller): the ablation does not
+rank `min` first. Live-edge, both mechanisms: EmergencyBufferRule fires 4-6 times
+per run (about a third within 2 s of a seam), each a round trip to the low rungs;
+without it switches/min halve (6.1 -> 3.0-3.7 native, 4.6 -> 3.6-4.0 pr1378) and
+the presented bitrate rises 15-20 %. On native every extra switch is a seam hole,
+so stall time falls from 6.2 s [5.5, 8.5] (`min`) to 3.0 s (`min-t`) and 1.3 s
+[0.8, 1.9] (`min-t-sh`); on pr1378 the emergency is what catches the drop early,
+so without it stall rises from 0.4 s to 1.3-1.4 s. Eviction and veto are
+equivalent at the live edge (`min-t-bola-sh` 1.0 s vs `min-t-sh` 1.3 s, both
+3.0 switches/min). Time-shifted: the emergency never fires; pr1378 is
+indifferent to the controller (every climbing arm 2870-2900 kbit/s, 10.5 s
+retained); native's retained shift tracks the switch rate (10.4 s at 3.3/min
+under `min-t`, 7.3 s at 4.5/min under `min`, 5.0 s at 5.7/min under eviction)
+but the 95 % intervals overlap at n = 3. InsufficientBuffer collapses the
+live-edge client to ~1.0-1.1 Mbit/s with 7-12 switches/min (14 s stalled on
+native); BOLA alone sits on rung 0; `min-t-bola` equals `min-t` as predicted.
+Decision pending: keep `min` (grid 3) and report this, or adopt `min-t-sh`
+(best or near-best in every cell, no rule that reacts to the mechanism's seam
+holes) and re-run the grid under it.
+
 ## 9. What to look at, and what to send
 
 Per run, in `results/<run_id>/`:
